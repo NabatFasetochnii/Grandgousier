@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grandgousier"
+version = "0.5.33.2"
+description = "Archive photometry engine for MASTER-like telescope archives"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "Nikita Chazov"}]
+dependencies = [
+    "astropy>=6.0",
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "PyYAML>=6.0",
+    "tqdm>=4.66",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+photometry = [
+    "photutils>=1.12",
+    "ccdproc>=2.4",
+    "astroscrappy>=1.2",
+    "sep>=1.2",
+    "astroquery>=0.4.7",
+]
+gaia = [
+    "astroquery>=0.4.7",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+grandgousier = "grandgousier.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["grandgousier*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

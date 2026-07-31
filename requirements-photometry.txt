@@ -1,0 +1,8 @@
+# Optional dependencies for MVP2+ photometry and image reduction.
+-r requirements.txt
+photutils>=1.12
+ccdproc>=2.4
+astroscrappy>=1.2
+sep>=1.2
+astroquery>=0.4.7
+matplotlib>=3.8

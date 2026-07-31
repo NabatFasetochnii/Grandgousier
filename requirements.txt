@@ -1,0 +1,12 @@
+# Core dependencies for Grandgousier MVP1.
+# Prefer this file when pipenv locking is unreliable or network access is slow.
+astropy>=6.0
+numpy>=1.26
+pandas>=2.1
+sqlalchemy>=2.0
+psycopg[binary]>=3.1
+pydantic>=2.5
+pydantic-settings>=2.1
+PyYAML>=6.0
+tqdm>=4.66
+matplotlib>=3.8

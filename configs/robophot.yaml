@@ -1,0 +1,199 @@
+name: RoboPhot
+version: 0.1
+
+# RoboPhot/Grandgousier instrument profile.
+# Photometric-system unit should be built as:
+#   instrument + site + telescope/channel + camera_serial + filter + observing_mode
+# For the uploaded test frame the expected unit is:
+#   RoboPhot + KAO + APM-RoboPhot/TRIP + ML0742515 + i + science
+#
+# Notes for this instrument:
+# - The frame has solved WCS; CRVAL1/CRVAL2 should be preferred as field center.
+# - OBJRA/OBJDEC are the requested object coordinates.
+# - ALPHA is stored in hours as a numeric value; do not use it as ra_center with
+#   the current parser, because numeric RA values are interpreted as degrees.
+# - The three TRIP channels should be separated primarily by SERNUM/CAMERA/FILTER.
+
+header_aliases:
+  # identifiers / paths
+  frame_uid: [FRAMEID, FRAMEUID, UUID]
+  raw_path: [RAWPATH, FILENAME, FILE]
+  calibration_path: [CALPATH, CALIBPATH]
+  dark_path: [DARK]
+  flat_path: [FLAT]
+
+  # time
+  date_obs: [DATE-OBS]
+  jd: [JD-OBS, JD]
+  mjd: [MJD-OBS, MJD]
+
+  # exposure / frame type
+  exptime: [EXPTIME, EXPOSURE]
+  filter: [FILTER]
+  object: [OBJNAME, OBJECT]
+  image_type: [IMAGETYP, IMAGETYPE, FRAME, FRAMETYP]
+  observing_mode: [IMAGETYP]
+  observer: [OBSERVER]
+  count_in_sequence: [COUNT]
+  sequence_length: [MAXCNT]
+
+  # observatory / instrument split
+  site: [OBSERVAT, OBSERVATORY, OBSERVID, OBSID, SITE]
+  site_code: [OBSERVID, OBSID]
+  telescope: [TELESCOP]
+  instrument_name: [INSTRUME]
+  tube: [TELESCOP]
+  camera: [SERNUM, CAMERA]
+  camera_model: [CAMERA]
+  detector: [DETECTOR]
+  organization: [ORIGIN]
+
+  # pointing: prefer solved WCS center. OBJRA/OBJDEC are requested target coordinates.
+  ra_center: [CRVAL1, OBJRA]
+  dec_center: [CRVAL2, OBJDEC]
+  ra_requested: [OBJRA]
+  dec_requested: [OBJDEC]
+  scope_ra_hours: [ALPHA]
+  scope_dec_deg: [DELTA]
+  equinox: [EQUINOX]
+
+  # image geometry
+  naxis1: [NAXIS1]
+  naxis2: [NAXIS2]
+  image_width_full: [IMAGEW, NAXIS1]
+  image_height_full: [IMAGEH, NAXIS2]
+  x_start: [XSTART]
+  y_start: [YSTART]
+  binning_x: [XBINNING, XBIN, BINNING]
+  binning_y: [YBINNING, YBIN, BINNING]
+  binning: [BINNING]
+  pixel_size_um: [PIXSZ]
+  pixel_size_x_um: [XPIXSZ, XPIXZ, PIXSZ]
+  pixel_size_y_um: [YPIXSZ, YPIXZ, PIXSZ]
+  bitpix: [BITPIX]
+  bscale: [BSCALE]
+  bzero: [BZERO]
+
+  # detector
+  gain: [GAIN]
+  read_noise: [RDNOISE, READNOIS, READNOISE]
+  ccd_temp: [CCD-TEMP, CCDTEMP]
+  set_temp: [SET-TEMP]
+  heatsink_temp: [HEATSINK]
+  cooler_power: [COOLPOWR]
+  readout_rate_kpix_s: [RATE]
+
+  # observing conditions / telescope state
+  airmass: [AIRMASS]
+  sky_temp: [SKY-TEMP]
+  ambient_temp: [AMB-TEMP]
+  extinction: [EXTINCT]
+  seeing_arcsec: [SEEING]
+  wind: [WIND]
+  sun_zenith_distance_deg: [SUN-ZD]
+  moon_phase: [MOONPHAS]
+  moon_distance_deg: [MOONANGL]
+  longitude_deg: [LONGDEG]
+  latitude_deg: [LATDEG]
+  altitude_m: [ALTITUDE]
+  focus: [FOCUS]
+  tracking: [TRACKING]
+  slewing: [SLEWING]
+  looking_east: [LOOKEAST]
+  mount_initialized: [INIT]
+  communication_fault: [COMFAULT]
+
+  # already-existing calibrated-header / SExtractor products
+  sex_fwhm: [FWHM, SEXFWHM]
+  sex_ellipticity: [ELL, SEXELL]
+  sex_n_stars: [NSTARS, SEXNSTAR]
+  sex_background_adu: [BKG, BACKGRND]
+  zero_point: [ZEROPOI, ZEROPT, ZEROPOINT]
+  zero_point_error: [ZEROERR, ZPERR]
+
+  # WCS core
+  wcs_ctype1: [CTYPE1]
+  wcs_ctype2: [CTYPE2]
+  wcs_crval1: [CRVAL1]
+  wcs_crval2: [CRVAL2]
+  wcs_crpix1: [CRPIX1]
+  wcs_crpix2: [CRPIX2]
+  wcs_cd11: [CD1_1]
+  wcs_cd12: [CD1_2]
+  wcs_cd21: [CD2_1]
+  wcs_cd22: [CD2_2]
+  wcs_cunit1: [CUNIT1]
+  wcs_cunit2: [CUNIT2]
+
+filter_aliases:
+  g: g
+  G: g
+  sg: g
+  SG: g
+  r: r
+  R: r
+  sr: r
+  SR: r
+  i: i
+  I: i
+  B: B
+  b: B
+  V: V
+  v: V
+  clear: clear
+  CLEAR: clear
+  C: clear
+  c: clear
+  NONE: unknown
+  None: unknown
+  null: unknown
+  '': unknown
+
+image_type_aliases:
+  OBJECT: science
+  Object: science
+  object: science
+  LIGHT: science
+  Light: science
+  light: science
+  SCIENCE: science
+  Science: science
+  science: science
+  TEST: test
+  Test: test
+  test: test
+  FOCUS: focus
+  Focus: focus
+  focus: focus
+  DARK: dark
+  Dark: dark
+  dark: dark
+  BIAS: bias
+  Bias: bias
+  bias: bias
+  ZERO: bias
+  Zero: bias
+  zero: bias
+  FLAT: flat
+  Flat: flat
+  flat: flat
+  TWILIGHT FLAT: flat
+  Twilight Flat: flat
+  twilight flat: flat
+
+# RoboPhot/TRIP current science frames are 16-bit unsigned data with BZERO=32768.
+# The detector can reach values close to the unsigned 16-bit limit; use a conservative
+# margin before the formal saturation level when setting quality flags.
+saturation_level_adu: 65000
+pixel_scale_arcsec: 0.65
+nominal_gain_e_per_adu: 1.4
+nominal_read_noise_e: 9.0
+
+quality_policy:
+  saturated_margin_adu: 5000
+  max_usable_adu: 60000
+  min_good_elevation_deg: 20
+  max_good_sex_ellipticity: 0.35
+  max_good_sex_fwhm_arcsec: 5.0
+  min_good_sex_n_stars: 20
+  max_good_background_adu: null

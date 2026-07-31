@@ -1,0 +1,2 @@
+event_uid,event_type,event_subtype,source_catalog,source_event_id,external_catalog,external_id,target_name,t_start_bjd_tdb,t_peak_bjd_tdb,t_end_bjd_tdb,t0_bjd_tdb,period_days,duration_hours,expected_sign,expected_depth_ppt,priority
+manual:TIC42026841501:20230919,transit,toi,manual,TIC420268415.01,gaia_dr3_master,2304896849394561408,TIC 420268415.01,2460207.440,2460207.4465,2460207.453,2460207.45,,1.2,dimming,6.6,1
