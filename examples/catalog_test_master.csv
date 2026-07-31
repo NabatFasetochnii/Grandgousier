@@ -1,0 +1,4 @@
+source_id,ra,dec,phot_g_mean_mag,bp_rp
+center_master_1,308.42117832,87.00918630,14.2,1.1
+near_master_1,308.4220,87.0090,15.1,0.8
+outside_test,310.0,85.0,13.5,1.5

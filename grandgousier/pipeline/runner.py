@@ -13,6 +13,7 @@ from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
 from grandgousier.db.bulk import DEFAULT_BULK_INSERT_BATCH_SIZE
+from grandgousier.pipeline.provenance import summarize_candidate_ensemble_exclusions
 
 from grandgousier.astrometry.wcs_check import check_frames_wcs
 from grandgousier.calibration.aperture_zp import aperture_zp_calibrate
@@ -1464,9 +1465,14 @@ def _quality_policy_summary(config: FieldPipelineConfig, result: PipelineRunResu
     target_result = _step_result(result, "resolve_target_object") or {}
     target_resolved = bool(target_result.get("resolved"))
     exclusion_history = _candidate_ensemble_exclusion_history(result)
-    requested_exclusion_ids = exclusion_history[-1].get("requested_excluded_object_ids", []) if exclusion_history else []
-    actual_exclusion_ids = exclusion_history[-1].get("actually_excluded_reference_object_ids", []) if exclusion_history else []
     convergence_result = _step_result(result, "candidate_ensemble_convergence") or {}
+    exclusion_summary = summarize_candidate_ensemble_exclusions(
+        exclusion_history,
+        convergence_result,
+    )
+    requested_exclusion_ids = exclusion_summary["requested_excluded_object_ids"]
+    actual_exclusion_ids = exclusion_summary["actually_excluded_reference_object_ids"]
+    actual_exclusion_iteration = exclusion_summary["actual_exclusions_iteration"]
     iteration_limit = (
         max(2, int(config.candidate_ensemble_convergence_max_iterations or 10))
         if config.candidate_ensemble_until_converged
@@ -1501,6 +1507,7 @@ def _quality_policy_summary(config: FieldPipelineConfig, result: PipelineRunResu
         "candidate_ensemble_requested_excluded_objects": len(requested_exclusion_ids),
         "candidate_ensemble_actual_excluded_reference_object_ids": actual_exclusion_ids,
         "candidate_ensemble_actual_excluded_reference_objects": len(actual_exclusion_ids),
+        "candidate_ensemble_actual_exclusions_iteration": actual_exclusion_iteration,
         # Backwards-compatible aliases from 0.5.33.0. These are the requested
         # exclusions; the actual reference exclusions are recorded above.
         "candidate_ensemble_excluded_object_ids": requested_exclusion_ids,

@@ -1,10 +1,24 @@
 # Grandgousier
 
-Версия: **0.5.32.6**
+Версия: **0.5.33.3**
 
 Grandgousier - Python-пакет для индексирования FITS-архивов, forced-aperture фотометрии, локальной и ensemble-калибровки, reference/color calibration, QC объектов, проверки event coverage и отбора кандидатов в переменные объекты.
 
-Текущий статус: MVP5.32.0. Кодовая база уже ушла дальше старой инженерной карты: кроме forced photometry и self-calibration реализованы field/series grouping, source-detection branch, event registry, reference photometry layer, PS1/reference-band color calibration, pipeline run logging и сохранение aperture-stability QC для derived calibrations. Фактическая инженерная карта вынесена в `docs/CURRENT_ARCHITECTURE.md`.
+Текущий статус: MVP5.33.3. Кодовая база уже ушла дальше старой инженерной карты: кроме forced photometry и self-calibration реализованы field/series grouping, source-detection branch, event registry, reference photometry layer, PS1/reference-band color calibration, pipeline run logging и сохранение aperture-stability QC для derived calibrations. Фактическая инженерная карта вынесена в `docs/CURRENT_ARCHITECTURE.md`.
+
+## Навигация по актуальной документации
+
+Для продолжения разработки и переноса работы в новый чат используйте:
+
+- `CONTEXT.md` — короткая входная точка;
+- `docs/context/CURRENT_STATE.md` — подтверждённое текущее состояние;
+- `docs/context/NEXT_TASKS.md` — ближайшие задачи;
+- `docs/context/KNOWN_ISSUES.md` — известные ограничения;
+- `docs/context/COMMANDS.md` — воспроизводимые команды;
+- `context/project_state.yaml` — машиночитаемое резюме;
+- `python scripts/build_context_bundle.py` — сборка переносного context bundle.
+
+Старые `README_MVP*.md` сохранены как история патчей, но не являются источником текущих инструкций.
 
 ## Что умеет текущая версия
 
@@ -31,6 +45,10 @@ Grandgousier - Python-пакет для индексирования FITS-арх
 19. One-command archive processing: `process-archive-path` автоматически определяет профиль инструмента, индексирует FITS, собирает `field_series` и запускает стандартный pipeline.
 20. Gaia auto-catalog footprint теперь строится по DB-центру кадра с диагностикой причин отказа, а FITS WCS/CD используются для радиуса/масштаба.
 21. One-command pipeline ограничивает working catalog для forced photometry, делает pre-photometry frame QC и по умолчанию не запускает дорогой aperture-stability sweep.
+22. Accepted candidates экспортируются в CSV/JSON/HTML/PNG с отдельным export QC.
+23. Candidate-excluded ensemble calibration поддерживает fixed iteration mode и режим до сходимости.
+24. Manifest разделяет requested candidate exclusions и actual exclusions из reference set.
+25. В 0.5.33.3 top-level actual exclusions привязаны к последней реально выполненной ensemble iteration.
 
 ## Установка
 
@@ -52,7 +70,7 @@ py -3.11 -m venv .venv
 Переменная подключения к БД:
 
 ```powershell
-$env:GRANDGOUSIER_DATABASE_URL="postgresql+psycopg://grandgousier:glodga@localhost:5432/grandgousier"
+$env:GRANDGOUSIER_DATABASE_URL="postgresql+psycopg://USER:PASSWORD@localhost:5432/grandgousier"
 ```
 
 Инициализация новой БД:
@@ -114,6 +132,25 @@ python -m grandgousier.cli process-archive-path `
 ```
 
 Если pipeline технически завершился, но не дал научных точек, manifest получит `science_status`, например `WARNING_NO_MEASUREMENTS`, а общий статус команды станет `DONE_WITH_WARNINGS`. Если зависает внешний сервис Gaia/astroquery, остановите команду `Ctrl+C` и повторите позже либо используйте уже импортированный каталог через `--catalog-name`. Для отладки доступны `--auto-catalog-timeout-sec`, `--auto-catalog-max-radius-deg`, `--auto-catalog-query-mode per_frame` и `--allow-empty-catalog`.
+
+## Candidate-excluded ensemble calibration
+
+Обычный фиксированный режим сохраняет заданное общее число ensemble stages, включая initial pass:
+
+```powershell
+--exclude-candidates-from-ensemble `
+--candidate-ensemble-max-iterations 3
+```
+
+Режим до сходимости продолжает пересчёт, пока текущий field QC не перестанет добавлять новые accepted candidate object IDs в cumulative exclusion set:
+
+```powershell
+--exclude-candidates-from-ensemble `
+--candidate-ensemble-until-converged `
+--candidate-ensemble-convergence-max-iterations 10
+```
+
+Последняя запись `candidate_ensemble_exclusion_history` может быть terminal convergence check с `executed=false`. Поэтому сводные actual exclusions относятся к последней выполненной calibration; её номер записывается в `candidate_ensemble_actual_exclusions_iteration`. Подробности и контрольная команда находятся в `docs/context/COMMANDS.md`.
 
 ## Типовой workflow для одной серии
 
@@ -419,7 +456,7 @@ py -3.11 -m venv .venv
 Для текущей сессии PowerShell:
 
 ```powershell
-$env:GRANDGOUSIER_DATABASE_URL="postgresql+psycopg://grandgousier:glodga@localhost:5432/grandgousier"
+$env:GRANDGOUSIER_DATABASE_URL="postgresql+psycopg://USER:PASSWORD@localhost:5432/grandgousier"
 ```
 
 Или подключить готовый dev-скрипт:

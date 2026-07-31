@@ -1,0 +1,38 @@
+# Python environments and build products
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+*.py[cod]
+
+# Local IDE/session files
+.idea/
+.vscode/
+
+# Local configuration/secrets
+.env
+.env.local
+
+# Large/raw astronomy products
+*.fits
+*.fit
+*.fts
+*.fit.gz
+*.fits.gz
+*.fts.gz
+*.cat
+
+# Runtime outputs
+logs/
+exports/
+reports/
+*.log
+*.tmp
+# Local database snapshots and generated context bundles
+backup_*.sql
+artifacts/context/*.md

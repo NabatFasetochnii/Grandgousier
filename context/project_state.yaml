@@ -1,0 +1,44 @@
+schema_version: 1
+project: Grandgousier
+version: 0.5.33.3
+updated: 2026-08-01
+
+active_work:
+  status: verification_required_on_real_database
+  title: Verify final candidate-ensemble provenance after convergence
+  base_version: 0.5.33.2
+
+last_verified_real_run:
+  software_version: 0.5.33.2
+  dataset: robophot_bk_lyn_2026_03_28_i
+  manifest: reports/check_05332_bklyn_20260328_i_candidate_excluded_until_converged.json
+  status: DONE
+  science_status: OK
+  candidate_ensemble_mode: until_converged
+  converged: true
+  stop_reason: converged
+  final_ensemble_iteration: 6
+  candidate_excluded_iterations_executed: 5
+  requested_excluded_objects: 16
+  actual_excluded_reference_objects_final_executed_iteration: 12
+  final_candidate_objects: 16
+  exported_candidate_light_curves: 15
+
+test_objects:
+  bk_lyn:
+    object_id: 6751
+    catalog_source_id: 31299
+    gaia_dr3_source_id: "702296666944246784"
+
+known_issues:
+  - id: no_end_to_end_convergence_fixture
+    status: open
+  - id: minimum_reference_set_policy
+    status: open
+  - id: actual_exclusions_terminal_history_entry
+    status: fixed_in_0.5.33.3
+
+next_task_ids:
+  - verify_0_5_33_3_bk_lyn
+  - add_end_to_end_convergence_fixture
+  - define_minimum_reference_set_policy

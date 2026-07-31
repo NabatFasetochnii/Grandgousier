@@ -87,7 +87,86 @@ def test_candidate_ensemble_exclusion_history_separates_requested_and_actual():
     qp = _quality_policy_summary(cfg, result)
     assert qp["candidate_ensemble_requested_excluded_object_ids"] == [1, 2, 3]
     assert qp["candidate_ensemble_actual_excluded_reference_object_ids"] == [1, 3]
+    assert qp["candidate_ensemble_actual_exclusions_iteration"] == 2
     assert qp["candidate_ensemble_exclusion_iterations_executed"] == 1
+
+
+def test_quality_policy_uses_last_executed_iteration_for_actual_exclusions():
+    result = PipelineRunResult(
+        run_uid="r",
+        pipeline_run_id=None,
+        status="DONE",
+        calibration_names={"ensemble": "ens_final"},
+    )
+    result.steps.extend(
+        [
+            PipelineStepRecord(
+                step_name="select_candidate_reference_exclusions_iter6",
+                status="DONE",
+                result={
+                    "iteration": 6,
+                    "will_run_iteration": True,
+                    "requested_excluded_object_ids": [1, 2, 3, 4],
+                    "new_requested_excluded_object_ids": [4],
+                },
+            ),
+            PipelineStepRecord(
+                step_name="ensemble_calibrate_candidate_excluded_iter6",
+                status="DONE",
+                result={
+                    "candidate_ensemble_iteration": 6,
+                    "target_calibration_name": "ens6",
+                    "requested_excluded_object_ids": [1, 2, 3, 4],
+                    "actually_excluded_reference_object_ids": [1, 3, 4],
+                    "reference_candidates": 20,
+                    "usable_reference_objects": 17,
+                },
+            ),
+            PipelineStepRecord(
+                step_name="select_candidate_reference_exclusions_iter7",
+                status="DONE",
+                result={
+                    "iteration": 7,
+                    "will_run_iteration": False,
+                    "requested_excluded_object_ids": [1, 2, 3, 4],
+                    "new_requested_excluded_object_ids": [],
+                    "stop_reason": "converged: no new accepted candidate reference exclusions",
+                },
+            ),
+            PipelineStepRecord(
+                step_name="candidate_ensemble_convergence",
+                status="DONE",
+                result={
+                    "iteration_mode": "until_converged",
+                    "until_converged": True,
+                    "iteration_limit": 10,
+                    "iterations_executed": 5,
+                    "final_candidate_object_ids": [1, 2, 3, 4],
+                    "final_candidate_objects": 4,
+                    "requested_excluded_object_ids": [1, 2, 3, 4],
+                    "requested_excluded_objects": 4,
+                    "new_final_candidate_object_ids": [],
+                    "new_final_candidate_objects": 0,
+                    "converged": True,
+                    "stop_reason": "converged",
+                },
+            ),
+        ]
+    )
+    cfg = FieldPipelineConfig(
+        catalog_name="cat",
+        calibration_prefix="p",
+        exclude_candidates_from_ensemble=True,
+        candidate_ensemble_until_converged=True,
+    )
+
+    qp = _quality_policy_summary(cfg, result)
+
+    assert qp["candidate_ensemble_requested_excluded_object_ids"] == [1, 2, 3, 4]
+    assert qp["candidate_ensemble_actual_excluded_reference_object_ids"] == [1, 3, 4]
+    assert qp["candidate_ensemble_actual_excluded_reference_objects"] == 3
+    assert qp["candidate_ensemble_actual_exclusions_iteration"] == 6
+    assert qp["candidate_ensemble_converged"] is True
 
 
 def test_quality_policy_records_until_converged_mode_and_final_convergence():
