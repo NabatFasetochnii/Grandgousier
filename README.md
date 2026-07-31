@@ -52,7 +52,7 @@ py -3.11 -m venv .venv
 Переменная подключения к БД:
 
 ```powershell
-$env:GRANDGOUSIER_DATABASE_URL="postgresql+psycopg://grandgousier:glodga@localhost:5432/grandgousier"
+$env:GRANDGOUSIER_DATABASE_URL="postgresql+psycopg://USER:PASSWORD@localhost:5432/grandgousier"
 ```
 
 Инициализация новой БД:
