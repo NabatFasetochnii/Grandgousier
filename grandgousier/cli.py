@@ -8,6 +8,7 @@ import re
 import sys
 from pathlib import Path
 
+from grandgousier import __version__
 from grandgousier.db.init_db import init_db, reset_db
 from grandgousier.db.session import make_session_factory
 from grandgousier.logging_config import configure_logging
@@ -270,6 +271,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_stage1_execute.add_argument(
         "--batch-size", dest="stage1_batch_size", type=int, default=None,
         help="Bounded Stage-1 metadata/execution batch size; config default is 128",
+    )
+    p_stage1_execute.add_argument(
+        "--checkpoint", default=None,
+        help="Durable Stage-1 checkpoint path; default is next to --report-out",
+    )
+    resume_group = p_stage1_execute.add_mutually_exclusive_group()
+    resume_group.add_argument("--resume", action="store_true", help="Resume the matching incomplete Stage-1 run")
+    resume_group.add_argument(
+        "--restart-run", action="store_true",
+        help="Start a new operational run without deleting existing products",
     )
     p_stage1_execute.add_argument("--format", choices=("table", "json"), default="table")
     p_stage1_execute.set_defaults(func=cmd_stage1_execute)
@@ -2593,7 +2604,12 @@ def cmd_stage1_execute(args: argparse.Namespace) -> int:
     )
     from grandgousier.archive.stage1_contract import ArchiveRequest
     from grandgousier.archive.stage1_execution import (
+        Stage1StopRequested,
         execute_stage1_stream,
+    )
+    from grandgousier.archive.stage1_checkpoint import (
+        Stage1Checkpoint,
+        execution_fingerprint,
     )
     from grandgousier.archive.stage1_planner import normalize_stage1_batch_size
     from grandgousier.config import read_config_file
@@ -2629,6 +2645,27 @@ def cmd_stage1_execute(args: argparse.Namespace) -> int:
         csv_path = plan_path.with_suffix(".csv")
         report_path = Path(args.report_out)
         report_csv_path = Path(args.csv_out) if args.csv_out else report_path.with_suffix(".csv")
+        checkpoint_path = (
+            Path(args.checkpoint)
+            if args.checkpoint
+            else report_path.with_suffix(".checkpoint.sqlite3")
+        )
+        run_fingerprint = execution_fingerprint(
+            source=runtime.descriptor.to_dict(),
+            request=request.to_dict(),
+            product_store=product_store.public_descriptor,
+            batch_size=batch_size,
+            overwrite=bool(args.overwrite),
+            max_dark_temperature_delta_c=args.max_dark_temperature_delta_c,
+            software_version=__version__,
+        )
+        checkpoint = Stage1Checkpoint.open(
+            checkpoint_path,
+            source_id=args.source,
+            config_fingerprint=run_fingerprint,
+            resume=bool(args.resume),
+            restart=bool(args.restart_run),
+        )
         try:
             summary = execute_stage1_stream(
                 request=request,
@@ -2643,11 +2680,17 @@ def cmd_stage1_execute(args: argparse.Namespace) -> int:
                 report_csv_path=report_csv_path,
                 overwrite=bool(args.overwrite),
                 max_dark_temperature_delta_c=args.max_dark_temperature_delta_c,
+                checkpoint=checkpoint,
+                run_fingerprint=run_fingerprint,
             )
         finally:
             close_provider = getattr(runtime.asset_provider, "close", None)
             if callable(close_provider):
                 close_provider()
+            checkpoint.close()
+    except (KeyboardInterrupt, Stage1StopRequested):
+        print("Stage 1 execution interrupted; resume with --resume", file=sys.stderr)
+        return PROCESSING
     except Exception as exc:
         print(f"Stage 1 execution failed before item processing: {type(exc).__name__}: {exc}", file=sys.stderr)
         return USAGE

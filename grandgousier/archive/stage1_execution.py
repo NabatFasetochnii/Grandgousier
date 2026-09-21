@@ -4,7 +4,9 @@ import csv
 import hashlib
 import json
 import os
+import signal
 import shutil
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +20,10 @@ from grandgousier.archive.disk_guard import (
     DiskRequirement,
     STAGE1_METADATA_OVERHEAD_BYTES,
     check_disk_budget,
+)
+from grandgousier.archive.stage1_checkpoint import (
+    Stage1Checkpoint,
+    item_fingerprint,
 )
 from grandgousier.archive.master_reduction import (
     REDUCTION_ALGORITHM,
@@ -42,6 +48,10 @@ STAGE1_EXECUTION_SCHEMA = "grandgousier.stage1.execution.v1"
 STAGE1_PROVENANCE_SCHEMA = "grandgousier.stage1.product-provenance.v1"
 SOURCE_PROCESSED_COPY_RECIPE = "SOURCE_PROCESSED_COPY_V1"
 _SUCCESS_STATUSES = {"REDUCED", "IMPORTED", "SKIPPED_EXISTING", "ADOPTED_EXISTING"}
+
+
+class Stage1StopRequested(RuntimeError):
+    """Raised when a graceful process stop was requested at a safe boundary."""
 
 
 def _utc_now() -> str:
@@ -85,6 +95,34 @@ def _read_json(path: Path) -> Mapping[str, Any] | None:
     except Exception:
         return None
     return payload if isinstance(payload, Mapping) else None
+
+
+def _checkpoint_product_is_durable(result: Mapping[str, Any]) -> bool:
+    if str(result.get("status") or "") not in _SUCCESS_STATUSES:
+        return False
+    product_text = str(result.get("product_path") or "").strip()
+    provenance_text = str(result.get("provenance_path") or "").strip()
+    expected_checksum = str(result.get("product_checksum_sha256") or "").strip()
+    fingerprint = str(result.get("fingerprint") or "").strip()
+    if not product_text or not provenance_text or not expected_checksum or not fingerprint:
+        return False
+    product_path = Path(product_text)
+    provenance_path = Path(provenance_text)
+    if not product_path.is_file() or not provenance_path.is_file():
+        return False
+    try:
+        actual_checksum = _sha256_file(product_path)
+    except OSError:
+        return False
+    if actual_checksum.casefold() != expected_checksum.casefold():
+        return False
+    sidecar = _read_json(provenance_path)
+    if sidecar is None or sidecar.get("schema") != STAGE1_PROVENANCE_SCHEMA:
+        return False
+    if str(sidecar.get("fingerprint") or "") != fingerprint:
+        return False
+    product = sidecar.get("product")
+    return isinstance(product, Mapping) and str(product.get("checksum_sha256") or "").casefold() == actual_checksum.casefold()
 
 
 @dataclass(frozen=True, slots=True)
@@ -922,6 +960,8 @@ def execute_stage1_stream(
     report_csv_path: str | Path | None = None,
     overwrite: bool = False,
     max_dark_temperature_delta_c: float | None = 5.0,
+    checkpoint: Stage1Checkpoint | None = None,
+    run_fingerprint: str | None = None,
 ) -> Stage1StreamingExecutionSummary:
     """Stream Stage-1 planning, execution, and reports in bounded batches."""
     from grandgousier.archive.stage1_contract import STAGE1_PLAN_SCHEMA
@@ -988,6 +1028,18 @@ def execute_stage1_stream(
     planned_items = 0
     blocked_plan_items = 0
     counts: dict[str, int] = {}
+    checkpoint_discovered = 0
+    stop_requested = threading.Event()
+    previous_sigterm = None
+
+    def request_stop(_signum, _frame) -> None:
+        stop_requested.set()
+
+    try:
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, request_stop)
+    except (OSError, ValueError):
+        previous_sigterm = None
 
     def write_plan_item(item: CalibrationPlanItem) -> None:
         obs = item.observation
@@ -1013,25 +1065,30 @@ def execute_stage1_stream(
             }
         )
 
-    def write_result(result: Stage1ExecutionItemResult) -> None:
-        row = result.to_dict()
+    def write_result(result: Stage1ExecutionItemResult | Mapping[str, Any]) -> None:
+        row = result.to_dict() if isinstance(result, Stage1ExecutionItemResult) else dict(result)
         report_json.write_item(row)
         report_csv.write(
             {
-                "native_observation_id": result.native_observation_id,
-                "source_observation_uid": result.source_observation_uid,
-                "observation_uid": result.observation_uid,
-                "action": result.action,
-                "status": result.status,
-                "product_locator": result.product.locator if result.product else "",
-                "product_path": result.product_path,
-                "product_checksum_sha256": result.product_checksum_sha256,
-                "provenance_path": result.provenance_path,
-                "fingerprint": result.fingerprint,
-                "error": result.error,
+                "native_observation_id": row.get("native_observation_id"),
+                "source_observation_uid": row.get("source_observation_uid"),
+                "observation_uid": row.get("observation_uid"),
+                "action": row.get("action"),
+                "status": row.get("status"),
+                "product_locator": (
+                    (row.get("product") or {}).get("locator", "")
+                    if isinstance(row.get("product"), Mapping)
+                    else ""
+                ),
+                "product_path": row.get("product_path"),
+                "product_checksum_sha256": row.get("product_checksum_sha256"),
+                "provenance_path": row.get("provenance_path"),
+                "fingerprint": row.get("fingerprint"),
+                "error": row.get("error"),
             }
         )
-        counts[result.status] = counts.get(result.status, 0) + 1
+        status = str(row.get("status") or "")
+        counts[status] = counts.get(status, 0) + 1
 
     try:
         for plan_batch in iter_stage1_plan_batches(
@@ -1041,16 +1098,37 @@ def execute_stage1_stream(
             product_store=product_store,
             batch_size=batch_size,
         ):
+            if stop_requested.is_set():
+                raise Stage1StopRequested("Stage-1 stop requested before the next batch")
             discovered_records = plan_batch.discovered_records
+            if checkpoint is not None:
+                checkpoint.record_discovery(
+                    discovered=discovered_records - checkpoint_discovered,
+                    planned=len(plan_batch.items),
+                )
+                checkpoint_discovered = discovered_records
             if not plan_batch.items:
                 continue
             planned_items += len(plan_batch.items)
             for item in plan_batch.items:
                 write_plan_item(item)
-            if any(item.status != "READY" for item in plan_batch.items):
-                context = None
-                results = tuple(
-                    _result_for_item(
+            context = None
+            batch_blocked = any(item.status != "READY" for item in plan_batch.items)
+            for item in plan_batch.items:
+                if stop_requested.is_set():
+                    raise Stage1StopRequested("Stage-1 stop requested at an item boundary")
+                item_key = None
+                if checkpoint is not None and run_fingerprint is not None:
+                    item_key = item_fingerprint(
+                        run_fingerprint=run_fingerprint,
+                        item=item.to_dict(),
+                    )
+                    stored = checkpoint.get_completed(item_key)
+                    if stored is not None and _checkpoint_product_is_durable(stored):
+                        write_result(stored)
+                        continue
+                if batch_blocked:
+                    result = _result_for_item(
                         item,
                         status="BLOCKED",
                         product=item.product,
@@ -1060,22 +1138,26 @@ def execute_stage1_stream(
                             else "Batch contains blocked Stage-1 items; no partial batch execution was performed"
                         ),
                     )
-                    for item in plan_batch.items
-                )
-                blocked_plan_items += sum(item.status == "BLOCKED" for item in results)
-            else:
-                context = _ExecutionContext(asset_provider)
-                results = tuple(
-                    _execute_item(
+                else:
+                    if context is None:
+                        context = _ExecutionContext(asset_provider)
+                    if checkpoint is not None:
+                        checkpoint.mark_attempted()
+                    result = _execute_item(
                         item,
                         context=context,
                         product_store=product_store,
                         overwrite=bool(overwrite),
                         max_dark_temperature_delta_c=max_dark_temperature_delta_c,
                     )
-                    for item in plan_batch.items
-                )
-            for result in results:
+                if result.successful and item_key is not None:
+                    result_payload = result.to_dict()
+                    if _checkpoint_product_is_durable(result_payload):
+                        checkpoint.mark_completed(item_key=item_key, result=result_payload)
+                elif result.status == "FAILED" and checkpoint is not None:
+                    checkpoint.mark_failed()
+                if result.status == "BLOCKED":
+                    blocked_plan_items += 1
                 write_result(result)
             context = None
 
@@ -1100,6 +1182,8 @@ def execute_stage1_stream(
             planned_items=planned_items,
             counts=dict(counts),
         )
+        if checkpoint is not None:
+            checkpoint.set_terminal_status("COMPLETE" if summary.status == "READY" else "FAILED")
         report_json.finalize(
             {
                 "summary": summary.to_dict()["summary"],
@@ -1110,12 +1194,25 @@ def execute_stage1_stream(
         plan_csv.finalize()
         report_csv.finalize()
         return summary
-    except Exception:
+    except (KeyboardInterrupt, Stage1StopRequested):
+        if checkpoint is not None:
+            checkpoint.set_terminal_status("INTERRUPTED")
         plan_json.abort()
         report_json.abort()
         plan_csv.abort()
         report_csv.abort()
         raise
+    except Exception:
+        if checkpoint is not None:
+            checkpoint.set_terminal_status("FAILED")
+        plan_json.abort()
+        report_json.abort()
+        plan_csv.abort()
+        report_csv.abort()
+        raise
+    finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def write_stage1_execution_json(report: Stage1ExecutionReport, path: str | Path) -> Path:
