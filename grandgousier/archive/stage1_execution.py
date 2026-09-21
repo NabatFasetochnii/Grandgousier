@@ -26,11 +26,14 @@ from grandgousier.archive.master_reduction import (
     reduce_master_task,
 )
 from grandgousier.archive.stage1_contract import (
+    ArchiveRequest,
+    ArchiveSourceDescriptor,
     AssetProvider,
     AssetRef,
     CalibrationPlan,
     CalibrationPlanItem,
     LocalAsset,
+    MetadataProvider,
     ProductRef,
     ProductStore,
 )
@@ -185,6 +188,132 @@ class Stage1ExecutionReport:
 
     def to_json(self, *, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
+
+
+@dataclass(frozen=True, slots=True)
+class Stage1StreamingExecutionSummary:
+    source_id: str
+    generated_at_utc: str
+    plan_status: str
+    discovered_records: int
+    planned_items: int
+    counts: Mapping[str, int]
+    schema: str = STAGE1_EXECUTION_SCHEMA
+
+    @property
+    def failed_items(self) -> int:
+        return int(self.counts.get("FAILED", 0))
+
+    @property
+    def blocked_items(self) -> int:
+        return int(self.counts.get("BLOCKED", 0))
+
+    @property
+    def status(self) -> str:
+        if self.failed_items:
+            return "FAILED"
+        if self.blocked_items:
+            return "BLOCKED"
+        return "READY"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "generated_at_utc": self.generated_at_utc,
+            "status": self.status,
+            "source_id": self.source_id,
+            "plan_schema": "grandgousier.stage1.plan.v1",
+            "plan_status": self.plan_status,
+            "summary": {
+                "discovered_records": self.discovered_records,
+                "items": self.planned_items,
+                "successful_items": sum(
+                    value
+                    for key, value in self.counts.items()
+                    if key in _SUCCESS_STATUSES
+                ),
+                "blocked_items": self.blocked_items,
+                "failed_items": self.failed_items,
+                "reduced": int(self.counts.get("REDUCED", 0)),
+                "imported": int(self.counts.get("IMPORTED", 0)),
+                "skipped_existing": int(self.counts.get("SKIPPED_EXISTING", 0)),
+                "adopted_existing": int(self.counts.get("ADOPTED_EXISTING", 0)),
+            },
+            "items": [],
+        }
+
+
+class _StreamingJsonArtifact:
+    def __init__(self, path: str | Path, prefix: Mapping[str, Any]) -> None:
+        self.target = Path(path)
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        self.temp = self.target.with_name(self.target.name + ".part")
+        if self.temp.exists():
+            self.temp.unlink()
+        self.handle = self.temp.open("w", encoding="utf-8")
+        self.handle.write("{")
+        self._first_field = True
+        for key, value in prefix.items():
+            self._field(key, value)
+        self.handle.write(',"items":[')
+        self._first_item = True
+
+    def _field(self, key: str, value: Any) -> None:
+        if not self._first_field:
+            self.handle.write(",")
+        json.dump(key, self.handle, ensure_ascii=False)
+        self.handle.write(":")
+        json.dump(value, self.handle, ensure_ascii=False)
+        self._first_field = False
+
+    def write_item(self, value: Mapping[str, Any]) -> None:
+        if not self._first_item:
+            self.handle.write(",")
+        json.dump(value, self.handle, ensure_ascii=False)
+        self._first_item = False
+
+    def finalize(self, fields: Mapping[str, Any]) -> Path:
+        self.handle.write("]")
+        for key, value in fields.items():
+            self._field(key, value)
+        self.handle.write("}\n")
+        self.handle.close()
+        os.replace(self.temp, self.target)
+        return self.target
+
+    def abort(self) -> None:
+        try:
+            self.handle.close()
+        finally:
+            if self.temp.exists():
+                self.temp.unlink()
+
+
+class _StreamingCsvArtifact:
+    def __init__(self, path: str | Path, columns: Sequence[str]) -> None:
+        self.target = Path(path)
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        self.temp = self.target.with_name(self.target.name + ".part")
+        if self.temp.exists():
+            self.temp.unlink()
+        self.handle = self.temp.open("w", encoding="utf-8", newline="")
+        self.writer = csv.DictWriter(self.handle, fieldnames=columns)
+        self.writer.writeheader()
+
+    def write(self, row: Mapping[str, Any]) -> None:
+        self.writer.writerow(row)
+
+    def finalize(self) -> Path:
+        self.handle.close()
+        os.replace(self.temp, self.target)
+        return self.target
+
+    def abort(self) -> None:
+        try:
+            self.handle.close()
+        finally:
+            if self.temp.exists():
+                self.temp.unlink()
 
 
 class _ExecutionContext:
@@ -779,6 +908,216 @@ def execute_stage1_plan(
     )
 
 
+def execute_stage1_stream(
+    *,
+    request: ArchiveRequest,
+    source: ArchiveSourceDescriptor,
+    metadata_provider: MetadataProvider,
+    asset_provider: AssetProvider,
+    product_store: ProductStore,
+    batch_size: int | str | None = None,
+    plan_json_path: str | Path,
+    report_json_path: str | Path,
+    plan_csv_path: str | Path | None = None,
+    report_csv_path: str | Path | None = None,
+    overwrite: bool = False,
+    max_dark_temperature_delta_c: float | None = 5.0,
+) -> Stage1StreamingExecutionSummary:
+    """Stream Stage-1 planning, execution, and reports in bounded batches."""
+    from grandgousier.archive.stage1_contract import STAGE1_PLAN_SCHEMA
+    from grandgousier.archive.stage1_planner import iter_stage1_plan_batches
+
+    generated_at = _utc_now()
+    plan_json = _StreamingJsonArtifact(
+        plan_json_path,
+        {
+            "schema": STAGE1_PLAN_SCHEMA,
+            "generated_at_utc": generated_at,
+            "source": source.to_dict(),
+            "request": request.to_dict(),
+            "product_store": dict(product_store.public_descriptor),
+        },
+    )
+    report_json = _StreamingJsonArtifact(
+        report_json_path,
+        {
+            "schema": STAGE1_EXECUTION_SCHEMA,
+            "generated_at_utc": generated_at,
+            "source_id": source.source_id,
+            "plan_schema": STAGE1_PLAN_SCHEMA,
+        },
+    )
+    plan_csv = _StreamingCsvArtifact(
+        plan_csv_path or Path(plan_json_path).with_suffix(".csv"),
+        (
+            "source_id",
+            "native_observation_id",
+            "source_observation_uid",
+            "observation_uid",
+            "identity_status",
+            "instrument",
+            "camera",
+            "filter",
+            "observed_at",
+            "action",
+            "status",
+            "input_state",
+            "product_locator",
+            "asset_roles",
+            "missing_asset_roles",
+            "issues",
+        ),
+    )
+    report_csv = _StreamingCsvArtifact(
+        report_csv_path or Path(report_json_path).with_suffix(".csv"),
+        (
+            "native_observation_id",
+            "source_observation_uid",
+            "observation_uid",
+            "action",
+            "status",
+            "product_locator",
+            "product_path",
+            "product_checksum_sha256",
+            "provenance_path",
+            "fingerprint",
+            "error",
+        ),
+    )
+    discovered_records = 0
+    planned_items = 0
+    blocked_plan_items = 0
+    counts: dict[str, int] = {}
+
+    def write_plan_item(item: CalibrationPlanItem) -> None:
+        obs = item.observation
+        plan_json.write_item(item.to_dict())
+        plan_csv.write(
+            {
+                "source_id": obs.source_id,
+                "native_observation_id": obs.native_observation_id,
+                "source_observation_uid": obs.source_observation_uid,
+                "observation_uid": obs.observation_uid,
+                "identity_status": obs.identity_status,
+                "instrument": obs.instrument,
+                "camera": obs.camera,
+                "filter": obs.filter_name,
+                "observed_at": obs.observed_at,
+                "action": item.action,
+                "status": item.status,
+                "input_state": obs.input_state,
+                "product_locator": item.product.locator if item.product else "",
+                "asset_roles": ",".join(asset.role for asset in obs.assets),
+                "missing_asset_roles": ",".join(item.missing_asset_roles),
+                "issues": " | ".join(item.issues),
+            }
+        )
+
+    def write_result(result: Stage1ExecutionItemResult) -> None:
+        row = result.to_dict()
+        report_json.write_item(row)
+        report_csv.write(
+            {
+                "native_observation_id": result.native_observation_id,
+                "source_observation_uid": result.source_observation_uid,
+                "observation_uid": result.observation_uid,
+                "action": result.action,
+                "status": result.status,
+                "product_locator": result.product.locator if result.product else "",
+                "product_path": result.product_path,
+                "product_checksum_sha256": result.product_checksum_sha256,
+                "provenance_path": result.provenance_path,
+                "fingerprint": result.fingerprint,
+                "error": result.error,
+            }
+        )
+        counts[result.status] = counts.get(result.status, 0) + 1
+
+    try:
+        for plan_batch in iter_stage1_plan_batches(
+            request=request,
+            source=source,
+            metadata_provider=metadata_provider,
+            product_store=product_store,
+            batch_size=batch_size,
+        ):
+            discovered_records = plan_batch.discovered_records
+            if not plan_batch.items:
+                continue
+            planned_items += len(plan_batch.items)
+            for item in plan_batch.items:
+                write_plan_item(item)
+            if any(item.status != "READY" for item in plan_batch.items):
+                context = None
+                results = tuple(
+                    _result_for_item(
+                        item,
+                        status="BLOCKED",
+                        product=item.product,
+                        error=(
+                            "; ".join(item.issues)
+                            if item.status != "READY"
+                            else "Batch contains blocked Stage-1 items; no partial batch execution was performed"
+                        ),
+                    )
+                    for item in plan_batch.items
+                )
+                blocked_plan_items += sum(item.status == "BLOCKED" for item in results)
+            else:
+                context = _ExecutionContext(asset_provider)
+                results = tuple(
+                    _execute_item(
+                        item,
+                        context=context,
+                        product_store=product_store,
+                        overwrite=bool(overwrite),
+                        max_dark_temperature_delta_c=max_dark_temperature_delta_c,
+                    )
+                    for item in plan_batch.items
+                )
+            for result in results:
+                write_result(result)
+            context = None
+
+        plan_status = "EMPTY" if planned_items == 0 else ("BLOCKED" if blocked_plan_items else "READY")
+        plan_status_value = plan_status
+        plan_json.finalize(
+            {
+                "summary": {
+                    "discovered_records": discovered_records,
+                    "science_items": planned_items,
+                    "ready_items": planned_items - blocked_plan_items,
+                    "blocked_items": blocked_plan_items,
+                },
+                "status": plan_status_value,
+            }
+        )
+        summary = Stage1StreamingExecutionSummary(
+            source_id=source.source_id,
+            generated_at_utc=generated_at,
+            plan_status=plan_status_value,
+            discovered_records=discovered_records,
+            planned_items=planned_items,
+            counts=dict(counts),
+        )
+        report_json.finalize(
+            {
+                "summary": summary.to_dict()["summary"],
+                "status": summary.status,
+                "plan_status": summary.plan_status,
+            }
+        )
+        plan_csv.finalize()
+        report_csv.finalize()
+        return summary
+    except Exception:
+        plan_json.abort()
+        report_json.abort()
+        plan_csv.abort()
+        report_csv.abort()
+        raise
+
+
 def write_stage1_execution_json(report: Stage1ExecutionReport, path: str | Path) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -830,7 +1169,9 @@ __all__ = [
     "STAGE1_PROVENANCE_SCHEMA",
     "Stage1ExecutionItemResult",
     "Stage1ExecutionReport",
+    "Stage1StreamingExecutionSummary",
     "execute_stage1_plan",
+    "execute_stage1_stream",
     "write_stage1_execution_csv",
     "write_stage1_execution_json",
 ]

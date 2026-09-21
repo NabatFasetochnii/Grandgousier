@@ -65,6 +65,8 @@ archives:
   master-prepared:
     adapter: master-manifest
     instrument_profile: MASTER
+    # optional; bounded production execution window, default 128
+    stage1_batch_size: 128
     metadata:
       backend: prepared-inventory
       manifest: C:\master\gpx\inventory.csv
@@ -88,6 +90,8 @@ products:
 Credential-bearing values в user-facing summary/plan редактируются. Production MASTER credentials и private endpoints не входят в package defaults.
 
 В MASTER локальный cache не считается полной копией удалённого архива. Начиная с 0.6.1.1 \texttt{metadata.cache\_root} и \texttt{assets.cache\_root} независимы: первый может содержать только processing headers, необходимые для metadata/identity enrichment, а второй задаёт основной cache для materialized raw/calibration assets. \texttt{assets.search\_roots} позволяет добавить другие существующие cache-каталоги. При \cli{stage1-execute} provider сначала ищет ref во всех локальных roots; только отсутствующий ref при \texttt{fetch\_missing: true} загружается существующим repository-local transport. \cli{stage1-plan} этот transport не импортирует и ничего не скачивает.
+
+Production \cli{stage1-execute} читает discovery stream и обрабатывает его фиксированными bounded batches. Размер batch задаётся через \texttt{archives.<source>.stage1\_batch\_size} или одноимённый CLI override; default равен 128. Plan и execution report записываются инкрементально во временные artifacts и атомарно публикуются после нормального завершения. В памяти удерживается только текущая batch и небольшое состояние summary; exact RSS не фиксирован, но объём archive records не удерживается целиком. Явный \cli{stage1-plan} сохраняет прежний materialized preview/export режим.
 
 Перед каждым missing-asset download и каждой записью Stage~1 product выполняется disk preflight. Для каждого filesystem requirements агрегируются, а операция разрешается только если \texttt{free >= required + stage1\_disk\_reserve\_bytes}. Для download учитывается peak \texttt{.part}; для product учитываются временный product и небольшой provenance overhead. Если размер remote asset или output неизвестен, используется консервативная внутренняя оценка. При нехватке места операция останавливается до создания target directory или начала записи. Это safety guard, а не quota manager и не транзакционная reservation: внешний потребитель диска всё ещё может изменить free space после проверки.
 

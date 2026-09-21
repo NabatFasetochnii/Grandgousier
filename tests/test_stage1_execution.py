@@ -354,8 +354,10 @@ def test_stage1_execute_cli_contract() -> None:
             "5",
             "--plan-out",
             "plan.json",
-            "--report-out",
-            "execution.json",
+             "--report-out",
+             "execution.json",
+             "--batch-size",
+             "7",
         ]
     )
     assert args.command == "stage1-execute"
@@ -364,3 +366,4 @@ def test_stage1_execute_cli_contract() -> None:
     assert args.limit == 5
     assert args.overwrite is False
     assert args.max_dark_temperature_delta_c == 5.0
+    assert args.stage1_batch_size == 7

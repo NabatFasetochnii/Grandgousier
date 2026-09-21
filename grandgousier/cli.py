@@ -267,6 +267,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-dark-temperature-delta-c", type=float, default=5.0,
         help="MASTER only: maximum allowed |science-dark| CCD temperature difference in C; default 5",
     )
+    p_stage1_execute.add_argument(
+        "--batch-size", dest="stage1_batch_size", type=int, default=None,
+        help="Bounded Stage-1 metadata/execution batch size; config default is 128",
+    )
     p_stage1_execute.add_argument("--format", choices=("table", "json"), default="table")
     p_stage1_execute.set_defaults(func=cmd_stage1_execute)
 
@@ -2589,11 +2593,9 @@ def cmd_stage1_execute(args: argparse.Namespace) -> int:
     )
     from grandgousier.archive.stage1_contract import ArchiveRequest
     from grandgousier.archive.stage1_execution import (
-        execute_stage1_plan,
-        write_stage1_execution_csv,
-        write_stage1_execution_json,
+        execute_stage1_stream,
     )
-    from grandgousier.archive.stage1_planner import build_stage1_plan, write_stage1_plan_json
+    from grandgousier.archive.stage1_planner import normalize_stage1_batch_size
     from grandgousier.config import read_config_file
     from grandgousier.exit_codes import OK, PRECONDITION, PROCESSING, USAGE
 
@@ -2616,19 +2618,29 @@ def cmd_stage1_execute(args: argparse.Namespace) -> int:
             radius_deg=args.radius_deg,
             limit=args.limit,
         )
-        plan = build_stage1_plan(
-            request=request,
-            source=runtime.descriptor,
-            metadata_provider=runtime.metadata_provider,
-            asset_provider=runtime.asset_provider,
-            product_store=product_store,
-        )
-        plan_path = write_stage1_plan_json(plan, args.plan_out)
+        source_config = payload.get("archives", {}).get(args.source, {})
+        configured_batch_size = args.stage1_batch_size
+        if configured_batch_size is None and isinstance(source_config, dict):
+            configured_batch_size = source_config.get("stage1_batch_size")
+        if configured_batch_size is None:
+            configured_batch_size = payload.get("stage1_batch_size")
+        batch_size = normalize_stage1_batch_size(configured_batch_size)
+        plan_path = Path(args.plan_out)
+        csv_path = plan_path.with_suffix(".csv")
+        report_path = Path(args.report_out)
+        report_csv_path = Path(args.csv_out) if args.csv_out else report_path.with_suffix(".csv")
         try:
-            report = execute_stage1_plan(
-                plan,
+            summary = execute_stage1_stream(
+                request=request,
+                source=runtime.descriptor,
+                metadata_provider=runtime.metadata_provider,
                 asset_provider=runtime.asset_provider,
                 product_store=product_store,
+                batch_size=batch_size,
+                plan_json_path=plan_path,
+                report_json_path=report_path,
+                plan_csv_path=csv_path,
+                report_csv_path=report_csv_path,
                 overwrite=bool(args.overwrite),
                 max_dark_temperature_delta_c=args.max_dark_temperature_delta_c,
             )
@@ -2636,41 +2648,31 @@ def cmd_stage1_execute(args: argparse.Namespace) -> int:
             close_provider = getattr(runtime.asset_provider, "close", None)
             if callable(close_provider):
                 close_provider()
-        report_path = write_stage1_execution_json(report, args.report_out)
-        csv_path = write_stage1_execution_csv(
-            report,
-            args.csv_out or str(Path(args.report_out).with_suffix(".csv")),
-        )
     except Exception as exc:
         print(f"Stage 1 execution failed before item processing: {type(exc).__name__}: {exc}", file=sys.stderr)
         return USAGE
 
     if args.format == "json":
-        print(report.to_json(indent=2))
+        print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2))
     else:
-        summary = report.to_dict()["summary"]
+        report_summary = summary.to_dict()["summary"]
         print(
             "Stage 1 execution: "
-            f"status={report.status}, source={args.source}, items={summary['items']}, "
-            f"successful={summary['successful_items']}, blocked={summary['blocked_items']}, "
-            f"failed={summary['failed_items']}, reduced={summary['reduced']}, "
-            f"imported={summary['imported']}, skipped_existing={summary['skipped_existing']}, "
-            f"adopted_existing={summary['adopted_existing']}"
+            f"status={summary.status}, source={args.source}, items={report_summary['items']}, "
+            f"successful={report_summary['successful_items']}, blocked={report_summary['blocked_items']}, "
+            f"failed={report_summary['failed_items']}, reduced={report_summary['reduced']}, "
+            f"imported={report_summary['imported']}, skipped_existing={report_summary['skipped_existing']}, "
+            f"adopted_existing={report_summary['adopted_existing']}, batch_size={batch_size}"
         )
-        for item in report.results:
-            label = item.native_observation_id or item.source_observation_uid or "?"
-            target = item.product_path or (item.product.locator if item.product else "-")
-            print(f"  {item.status}: {label} -> {target}")
-            if item.error:
-                print(f"    {item.error}", file=sys.stderr)
         print(f"Executed plan: {plan_path}")
         print(f"Execution JSON: {report_path}")
-        print(f"Execution CSV: {csv_path}")
+        print(f"Plan CSV: {csv_path}")
+        print(f"Execution CSV: {report_csv_path}")
         print("Stage 1 execution does not write Grandgousier DB state or invoke Stage 2.")
 
-    if report.status == "READY":
+    if summary.status == "READY":
         return OK
-    if report.status == "BLOCKED":
+    if summary.status == "BLOCKED":
         return PRECONDITION
     return PROCESSING
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -12,7 +13,7 @@ from astropy.coordinates import SkyCoord
 from astropy.io import fits
 import astropy.units as u
 
-from grandgousier.archive.manifest import manifest_path_to_local, read_archive_manifest_csv
+from grandgousier.archive.manifest import manifest_path_to_local, iter_archive_manifest_csv
 from grandgousier.archive.disk_guard import (
     DEFAULT_STAGE1_DISK_RESERVE_BYTES,
     DEFAULT_UNKNOWN_ASSET_BYTES,
@@ -231,16 +232,21 @@ class FitsFilesystemMetadataProvider(MetadataProvider):
         self.science_asset_role = science_asset_role
         self.required_asset_roles = tuple(required_asset_roles or ())
 
-    def _paths(self) -> list[Path]:
+    def _paths(self) -> Iterable[Path]:
         if not self.root.is_dir():
             raise ValueError(f"FITS source root does not exist: {self.root}")
-        iterator = self.root.rglob("*") if self.recursive else self.root.glob("*")
         endings = (".fits", ".fit", ".fts", ".fits.gz", ".fit.gz", ".fts.gz")
-        return sorted(
-            path
-            for path in iterator
-            if path.is_file() and path.name.casefold().endswith(endings)
-        )
+        if not self.recursive:
+            for path in sorted(self.root.iterdir(), key=lambda value: value.name.casefold()):
+                if path.is_file() and path.name.casefold().endswith(endings):
+                    yield path
+            return
+        for directory, directories, filenames in os.walk(self.root):
+            directories.sort(key=str.casefold)
+            for name in sorted(filenames, key=str.casefold):
+                path = Path(directory) / name
+                if path.name.casefold().endswith(endings):
+                    yield path
 
     def search(self, request: ArchiveRequest) -> Iterable[ObservationRecord]:
         emitted = 0
@@ -347,9 +353,8 @@ class MasterManifestMetadataProvider(MetadataProvider):
     def search(self, request: ArchiveRequest) -> Iterable[ObservationRecord]:
         if not self.manifest.is_file():
             raise ValueError(f"MASTER inventory does not exist: {self.manifest}")
-        rows = read_archive_manifest_csv(self.manifest)
         emitted = 0
-        for row in rows:
+        for row in iter_archive_manifest_csv(self.manifest):
             cached_header = self._cached_header(row)
             uniqnum = _first_nonempty(row.get("uniqnum"), row.get("UNIQNUM"))
             if uniqnum is None and cached_header is not None:

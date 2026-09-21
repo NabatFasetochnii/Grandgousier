@@ -3,12 +3,18 @@ from __future__ import annotations
 import csv
 import re
 from pathlib import Path, PurePosixPath
+from typing import Iterator
 
 
 def read_archive_manifest_csv(path: str | Path) -> list[dict[str, str]]:
     """Read a prepared archive manifest without assuming a remote transport."""
+    return list(iter_archive_manifest_csv(path))
+
+
+def iter_archive_manifest_csv(path: str | Path) -> Iterator[dict[str, str]]:
+    """Yield prepared archive manifest rows without retaining the full manifest."""
     with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
-        return list(csv.DictReader(handle))
+        yield from csv.DictReader(handle)
 
 
 def manifest_path_to_local(path_value: str, root: str | Path) -> Path:

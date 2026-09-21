@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
+from collections.abc import Iterator
+from dataclasses import dataclass
 
 from grandgousier.archive.stage1_contract import (
     ArchiveRequest,
@@ -16,6 +18,20 @@ from grandgousier.archive.stage1_contract import (
 )
 
 CALIBRATION_ROLES = ("bias", "dark", "flat", "processing_header")
+DEFAULT_STAGE1_BATCH_SIZE = 128
+
+
+@dataclass(frozen=True, slots=True)
+class Stage1PlanBatch:
+    items: tuple[CalibrationPlanItem, ...]
+    discovered_records: int
+
+
+def normalize_stage1_batch_size(value: int | str | None) -> int:
+    batch_size = DEFAULT_STAGE1_BATCH_SIZE if value is None else int(value)
+    if batch_size <= 0:
+        raise ValueError("stage1_batch_size must be a positive integer")
+    return batch_size
 
 
 def build_stage1_plan(
@@ -51,6 +67,39 @@ def build_stage1_plan(
         items=items,
         discovered_records=len(records),
     )
+
+
+def iter_stage1_plan_batches(
+    *,
+    request: ArchiveRequest,
+    source: ArchiveSourceDescriptor,
+    metadata_provider: MetadataProvider,
+    product_store: ProductStore,
+    batch_size: int | str | None = None,
+) -> Iterator[Stage1PlanBatch]:
+    """Yield deterministic, bounded metadata-only plan batches."""
+    if request.source_id != source.source_id:
+        raise ValueError(
+            f"ArchiveRequest source_id {request.source_id!r} does not match "
+            f"source descriptor {source.source_id!r}"
+        )
+    size = normalize_stage1_batch_size(batch_size)
+    batch: list[CalibrationPlanItem] = []
+    discovered = 0
+    for record in metadata_provider.search(request):
+        discovered += 1
+        if record.source_id != source.source_id:
+            raise ValueError(
+                f"MetadataProvider returned source_id {record.source_id!r} for "
+                f"source {source.source_id!r}"
+            )
+        if record.frame_type == "science":
+            batch.append(_plan_science_record(record, product_store=product_store))
+        if discovered % size == 0:
+            yield Stage1PlanBatch(items=tuple(batch), discovered_records=discovered)
+            batch.clear()
+    if discovered % size and batch:
+        yield Stage1PlanBatch(items=tuple(batch), discovered_records=discovered)
 
 
 def _plan_science_record(
@@ -173,4 +222,12 @@ def write_stage1_plan_csv(plan: CalibrationPlan, path: str | Path) -> Path:
     return target
 
 
-__all__ = ["build_stage1_plan", "write_stage1_plan_csv", "write_stage1_plan_json"]
+__all__ = [
+    "DEFAULT_STAGE1_BATCH_SIZE",
+    "Stage1PlanBatch",
+    "build_stage1_plan",
+    "iter_stage1_plan_batches",
+    "normalize_stage1_batch_size",
+    "write_stage1_plan_csv",
+    "write_stage1_plan_json",
+]
