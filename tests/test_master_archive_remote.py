@@ -32,8 +32,8 @@ def test_master_remote_path_local_mapping_is_mirrored(tmp_path: Path) -> None:
 
 
 def test_master_database_url_accepts_sqlalchemy_driver_prefix() -> None:
-    assert normalize_master_database_url("postgresql+psycopg://postgres@192.168.240.17/imdata") == (
-        "postgresql://postgres@192.168.240.17/imdata"
+    assert normalize_master_database_url("postgresql+psycopg://user:password@example.invalid/imdata") == (
+        "postgresql://user:password@example.invalid/imdata"
     )
 
 
@@ -219,11 +219,11 @@ def test_master_search_normalizes_paths_and_uses_parameterized_sbox() -> None:
     )
 
     def connect_fn(dsn):
-        assert dsn == "postgresql://postgres@192.168.240.17/imdata"
+        assert dsn == "postgresql://user:password@example.invalid/imdata"
         return _FakeConnection(cursor)
 
     rows = search_master_archive(
-        database_url="postgresql+psycopg://postgres@192.168.240.17/imdata",
+        database_url="postgresql+psycopg://user:password@example.invalid/imdata",
         ra_deg=327.60625,
         dec_deg=72.1686111,
         filters=["R", "V"],

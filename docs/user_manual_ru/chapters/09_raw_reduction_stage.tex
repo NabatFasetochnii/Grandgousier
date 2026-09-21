@@ -151,7 +151,7 @@ MASTER PostgreSQL OR authenticated MASTER HTTPS
 Удалённая БД и HTTP Basic Auth настраиваются отдельно от основной БД Grandgousier. Прямой PostgreSQL может быть ограничен серверным \cli{pg\_hba.conf}; в этом случае достаточно HTTPS-доступа. Рекомендуется использовать environment variables, чтобы пароль не попадал в историю shell и логи:
 
 \begin{lstlisting}
-$env:GRANDGOUSIER_MASTER_DATABASE_URL="postgresql://postgres@192.168.240.17/imdata"
+# Set GRANDGOUSIER_MASTER_DATABASE_URL from a secret-managed environment before running.
 $env:GRANDGOUSIER_MASTER_HTTP_USER="MASTER_USER"
 \end{lstlisting}
 

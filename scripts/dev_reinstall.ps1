@@ -1,9 +1,10 @@
 param(
     [switch]$ResetDb,
-    [string]$DatabaseUrl = "postgresql+psycopg://grandgousier:glodga@localhost:5432/grandgousier"
+    [string]$DatabaseUrl = $env:GRANDGOUSIER_DATABASE_URL
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $DatabaseUrl) { throw "Database URL must be configured through the environment or -DatabaseUrl" }
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $projectRoot
 

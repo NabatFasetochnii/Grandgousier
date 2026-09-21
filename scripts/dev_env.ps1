@@ -1,3 +1,3 @@
-$env:GRANDGOUSIER_DATABASE_URL="postgresql+psycopg://grandgousier:glodga@localhost:5432/grandgousier"
+if (-not $env:GRANDGOUSIER_DATABASE_URL) { throw "GRANDGOUSIER_DATABASE_URL must be configured before running this script" }
 $env:PGCLIENTENCODING="UTF8"
-Write-Host "GRANDGOUSIER_DATABASE_URL=$env:GRANDGOUSIER_DATABASE_URL"
+Write-Host "Database environment is configured"
