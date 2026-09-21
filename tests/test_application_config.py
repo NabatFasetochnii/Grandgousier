@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from grandgousier.config import (
     application_settings_mapping,
     archive_sources_mapping,
@@ -10,6 +12,7 @@ from grandgousier.config import (
     public_config_summary,
     read_config_file,
 )
+from grandgousier.db.session import make_engine
 from grandgousier.services.runtime import FieldArchiveJobConfig
 from grandgousier.settings import get_settings
 
@@ -143,3 +146,29 @@ def test_get_settings_overlays_explicit_application_config(tmp_path: Path, monke
     path.write_text('{"logging":{"level":"ERROR"}}', encoding="utf-8")
     settings = get_settings(config_file=path)
     assert settings.log_level == "ERROR"
+
+
+def test_database_configuration_is_optional_until_a_db_operation(monkeypatch):
+    monkeypatch.delenv("GRANDGOUSIER_DATABASE_URL", raising=False)
+
+    settings = get_settings()
+
+    assert settings.database_url is None
+    with pytest.raises(RuntimeError, match="Database configuration is required"):
+        make_engine()
+
+
+def test_explicit_database_environment_configuration_is_read(monkeypatch):
+    monkeypatch.setenv("GRANDGOUSIER_DATABASE_URL", "postgresql+psycopg://user:password@example.invalid/db")
+
+    settings = get_settings()
+
+    assert settings.database_url == "postgresql+psycopg://user:password@example.invalid/db"
+
+
+def test_non_db_settings_import_without_database_configuration(monkeypatch):
+    monkeypatch.delenv("GRANDGOUSIER_DATABASE_URL", raising=False)
+
+    settings = get_settings()
+
+    assert settings.log_level == "INFO"

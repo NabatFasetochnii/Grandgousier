@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -8,7 +9,7 @@ from grandgousier.config import application_settings_mapping, read_config_file
 
 
 class Settings(BaseSettings):
-    database_url: str = "postgresql+psycopg://grandgousier:glodga@localhost:5432/grandgousier"
+    database_url: Optional[str] = None
     log_level: str = "INFO"
 
     model_config = SettingsConfigDict(

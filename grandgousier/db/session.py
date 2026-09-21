@@ -8,6 +8,8 @@ from grandgousier.settings import get_settings
 
 def make_engine(database_url: str | None = None):
     url = database_url or get_settings().database_url
+    if not url:
+        raise RuntimeError("Database configuration is required for database operations")
     return create_engine(url, pool_pre_ping=True, future=True)
 
 
