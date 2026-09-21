@@ -123,7 +123,8 @@ def migration_path(spec: MigrationSpec, *, root: Path | None = None) -> Path:
 
 def migration_checksum(spec: MigrationSpec, *, root: Path | None = None) -> str:
     data = migration_path(spec, root=root).read_bytes()
-    return hashlib.sha256(data).hexdigest()
+    canonical = data.replace(b"\r\n", b"\n")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def validate_manifest(*, root: Path | None = None) -> None:

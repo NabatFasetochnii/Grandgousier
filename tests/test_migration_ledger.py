@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -57,6 +58,36 @@ def test_migration_checksums_are_sha256_of_repository_files() -> None:
         digest = migration_checksum(spec)
         assert re.fullmatch(r"[0-9a-f]{64}", digest)
         assert migration_path(spec).is_file()
+
+
+def test_migration_checksum_only_canonicalizes_crlf(tmp_path: Path) -> None:
+    spec = MigrationSpec("temporary", "temporary.sql")
+
+    lf = b"SELECT 1;\n"
+    (tmp_path / spec.filename).write_bytes(lf)
+    lf_checksum = migration_checksum(spec, root=tmp_path)
+    assert lf_checksum == hashlib.sha256(lf).hexdigest()
+
+    (tmp_path / spec.filename).write_bytes(b"SELECT 1;\r\n")
+    assert migration_checksum(spec, root=tmp_path) == lf_checksum
+
+    (tmp_path / spec.filename).write_bytes(b"SELECT 2;\r\n")
+    assert migration_checksum(spec, root=tmp_path) != lf_checksum
+
+    (tmp_path / spec.filename).write_bytes(b"SELECT 1;")
+    no_final_newline_checksum = migration_checksum(spec, root=tmp_path)
+    assert no_final_newline_checksum != lf_checksum
+
+    (tmp_path / spec.filename).write_bytes(b"SELECT 1;\r")
+    assert migration_checksum(spec, root=tmp_path) != lf_checksum
+
+    (tmp_path / spec.filename).write_bytes(b"SELECT 1;\r\nSELECT 2;")
+    crlf_checksum = migration_checksum(spec, root=tmp_path)
+    (tmp_path / spec.filename).write_bytes(b"SELECT 1;\nSELECT 2;")
+    assert migration_checksum(spec, root=tmp_path) == crlf_checksum
+
+    (tmp_path / spec.filename).write_bytes(b"SELECT 1; \n")
+    assert migration_checksum(spec, root=tmp_path) != lf_checksum
 
 
 def test_managed_migration_contains_no_psql_meta_commands() -> None:
