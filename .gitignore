@@ -36,3 +36,6 @@ reports/
 # Local database snapshots and generated context bundles
 backup_*.sql
 artifacts/context/*.md
+
+# Local validated release snapshots
+/release/validated_windows_py311*/
