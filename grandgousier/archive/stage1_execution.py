@@ -12,6 +12,13 @@ from typing import Any, Mapping, Sequence
 
 from grandgousier import __version__
 from grandgousier.archive.manifest import extract_numeric_frame_id
+from grandgousier.archive.disk_guard import (
+    DEFAULT_STAGE1_DISK_RESERVE_BYTES,
+    DEFAULT_UNKNOWN_PRODUCT_BYTES,
+    DiskRequirement,
+    STAGE1_METADATA_OVERHEAD_BYTES,
+    check_disk_budget,
+)
 from grandgousier.archive.master_reduction import (
     REDUCTION_ALGORITHM,
     MasterReductionResult,
@@ -348,6 +355,30 @@ def _master_task_from_item(
     )
 
 
+def _check_product_write_budget(
+    *,
+    output_path: Path,
+    provenance_path: Path,
+    product_bytes: int,
+    reserve_bytes: int,
+) -> None:
+    check_disk_budget(
+        (
+            DiskRequirement(
+                target=output_path,
+                required_bytes=max(0, int(product_bytes)),
+                label="Stage-1 product",
+            ),
+            DiskRequirement(
+                target=provenance_path,
+                required_bytes=STAGE1_METADATA_OVERHEAD_BYTES,
+                label="Stage-1 provenance",
+            ),
+        ),
+        reserve_bytes=reserve_bytes,
+    )
+
+
 def _result_for_item(
     item: CalibrationPlanItem,
     *,
@@ -454,6 +485,18 @@ def _execute_item(
                         product_checksum_sha256=output_checksum,
                         execution_status="ADOPTED_EXISTING",
                     )
+                    _check_product_write_budget(
+                        output_path=output_path,
+                        provenance_path=provenance_path,
+                        product_bytes=0,
+                        reserve_bytes=int(
+                            getattr(
+                                product_store,
+                                "disk_reserve_bytes",
+                                DEFAULT_STAGE1_DISK_RESERVE_BYTES,
+                            )
+                        ),
+                    )
                     _atomic_write_json(provenance_path, provenance)
                     return _result_for_item(
                         item,
@@ -475,6 +518,18 @@ def _execute_item(
                     error="Existing product has no provenance sidecar and differs from source; use --overwrite after review",
                 )
 
+            _check_product_write_budget(
+                output_path=output_path,
+                provenance_path=provenance_path,
+                product_bytes=(
+                    0
+                    if inputs[0].path.resolve(strict=False) == output_path.resolve(strict=False)
+                    else inputs[0].size_bytes
+                ),
+                reserve_bytes=int(
+                    getattr(product_store, "disk_reserve_bytes", DEFAULT_STAGE1_DISK_RESERVE_BYTES)
+                ),
+            )
             output_path.parent.mkdir(parents=True, exist_ok=True)
             temp = output_path.with_name(output_path.name + ".part")
             if temp.exists():
@@ -595,10 +650,24 @@ def _execute_item(
                 ),
             )
 
+        _check_product_write_budget(
+            output_path=output_path,
+            provenance_path=provenance_path,
+            product_bytes=max(
+                DEFAULT_UNKNOWN_PRODUCT_BYTES,
+                max(value.size_bytes for value in inputs),
+            ),
+            reserve_bytes=int(
+                getattr(product_store, "disk_reserve_bytes", DEFAULT_STAGE1_DISK_RESERVE_BYTES)
+            ),
+        )
         reduction: MasterReductionResult = reduce_master_task(
             task,
             overwrite=overwrite,
             max_dark_temperature_delta_c=max_dark_temperature_delta_c,
+            disk_reserve_bytes=int(
+                getattr(product_store, "disk_reserve_bytes", DEFAULT_STAGE1_DISK_RESERVE_BYTES)
+            ),
         )
         if reduction.status == "FAILED":
             return _result_for_item(

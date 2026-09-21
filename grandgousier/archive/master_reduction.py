@@ -6,12 +6,19 @@ import os
 import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
 
 from grandgousier import __version__
+from grandgousier.archive.disk_guard import (
+    DEFAULT_STAGE1_DISK_RESERVE_BYTES,
+    DEFAULT_UNKNOWN_PRODUCT_BYTES,
+    DiskRequirement,
+    STAGE1_METADATA_OVERHEAD_BYTES,
+    check_disk_budget,
+)
 from grandgousier.archive.manifest import extract_numeric_frame_id, infer_date_parts, manifest_path_to_local
 
 REDUCTION_ALGORITHM = "MASTER_DARK_FLAT_V1"
@@ -554,6 +561,24 @@ def compact_existing_master_output(task: MasterReductionTask) -> MasterReduction
     fits = _require_astropy_fits()
     temp_path = task.output_path.with_name(task.output_path.name + ".compact.part")
     try:
+        check_disk_budget(
+            (
+                DiskRequirement(
+                    target=temp_path,
+                    required_bytes=max(
+                        DEFAULT_UNKNOWN_PRODUCT_BYTES,
+                        int(task.output_path.stat().st_size),
+                    ),
+                    label="MASTER compacted product",
+                ),
+                DiskRequirement(
+                    target=task.output_path,
+                    required_bytes=STAGE1_METADATA_OVERHEAD_BYTES,
+                    label="MASTER compact metadata",
+                ),
+            ),
+            reserve_bytes=DEFAULT_STAGE1_DISK_RESERVE_BYTES,
+        )
         with fits.open(task.output_path, memmap=False, uint=True) as hdul:
             if len(hdul) < 2 or str(hdul[1].name or "").upper() != "DQ" or hdul[1].data is None:
                 raise ValueError("processed FITS must contain a DQ image extension")
@@ -619,6 +644,7 @@ def reduce_master_task(
     *,
     overwrite: bool = False,
     max_dark_temperature_delta_c: float | None = 5.0,
+    disk_reserve_bytes: int | str | None = None,
 ) -> MasterReductionResult:
     if task.output_path.exists() and task.output_path.stat().st_size > 0 and not overwrite:
         return _existing_output_result(task)
@@ -633,6 +659,28 @@ def reduce_master_task(
 
     fits = _require_astropy_fits()
     try:
+        check_disk_budget(
+            (
+                DiskRequirement(
+                    target=task.output_path,
+                    required_bytes=max(
+                        DEFAULT_UNKNOWN_PRODUCT_BYTES,
+                        max(int(path.stat().st_size) for path in (
+                            task.raw_local_path,
+                            task.header_local_path,
+                            task.dark_local_path,
+                            task.flat_local_path,
+                        )),
+                    ),
+                    label="MASTER reduced product",
+                ),
+            ),
+            reserve_bytes=(
+                DEFAULT_STAGE1_DISK_RESERVE_BYTES
+                if disk_reserve_bytes is None
+                else disk_reserve_bytes
+            ),
+        )
         with fits.open(task.raw_local_path, memmap=False, uint=True) as hdul:
             raw_header = hdul[0].header.copy()
             raw_data = np.array(hdul[0].data, copy=True)

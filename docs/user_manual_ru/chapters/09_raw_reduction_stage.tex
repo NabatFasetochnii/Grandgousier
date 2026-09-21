@@ -73,17 +73,23 @@ archives:
       backend: master-cache
       cache_root: C:\master\gpx
       fetch_missing: true
+      # optional; default is 1 GiB and is never consumed by Stage 1
+      # stage1_disk_reserve_bytes: 1073741824
       # optional additional local caches:
       # search_roots: [C:\master\gpx\smoke]
 
 products:
   backend: filesystem
   root: C:\grandgousier\products
+  # optional; applies to product writes and provenance sidecars
+  # stage1_disk_reserve_bytes: 1073741824
 \end{lstlisting}
 
 Credential-bearing values в user-facing summary/plan редактируются. Production MASTER credentials и private endpoints не входят в package defaults.
 
 В MASTER локальный cache не считается полной копией удалённого архива. Начиная с 0.6.1.1 \texttt{metadata.cache\_root} и \texttt{assets.cache\_root} независимы: первый может содержать только processing headers, необходимые для metadata/identity enrichment, а второй задаёт основной cache для materialized raw/calibration assets. \texttt{assets.search\_roots} позволяет добавить другие существующие cache-каталоги. При \cli{stage1-execute} provider сначала ищет ref во всех локальных roots; только отсутствующий ref при \texttt{fetch\_missing: true} загружается существующим repository-local transport. \cli{stage1-plan} этот transport не импортирует и ничего не скачивает.
+
+Перед каждым missing-asset download и каждой записью Stage~1 product выполняется disk preflight. Для каждого filesystem requirements агрегируются, а операция разрешается только если \texttt{free >= required + stage1\_disk\_reserve\_bytes}. Для download учитывается peak \texttt{.part}; для product учитываются временный product и небольшой provenance overhead. Если размер remote asset или output неизвестен, используется консервативная внутренняя оценка. При нехватке места операция останавливается до создания target directory или начала записи. Это safety guard, а не quota manager и не транзакционная reservation: внешний потребитель диска всё ещё может изменить free space после проверки.
 
 \section{Exact Stage 1 -> Stage 2 handoff (0.6.2.x)}
 

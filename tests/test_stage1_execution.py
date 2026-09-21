@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from grandgousier.archive.disk_guard import DiskDiagnostic, DiskSpaceGuardError
 from grandgousier.archive.master_reduction import MasterReductionResult
 from grandgousier.archive.stage1_contract import (
     ArchiveRequest,
@@ -122,6 +123,41 @@ def test_processed_import_writes_product_provenance_and_is_idempotent(tmp_path: 
     assert second.results[0].fingerprint == first.results[0].fingerprint
 
 
+def test_processed_import_does_not_write_when_disk_preflight_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source.fits"
+    source.write_bytes(b"fits-like-source-v1")
+    ref = AssetRef("source", "processed", "filesystem", "source.fits")
+    store = FakeStore(tmp_path / "products")
+    obs = _ready_observation(action="IMPORT_PROCESSED", assets=(ref,))
+    plan = _plan_for(obs, store, action="IMPORT_PROCESSED")
+    assets = FakeAssets({ref.ref_uid: source})
+
+    def fail_preflight(*args, **kwargs):
+        del args, kwargs
+        raise DiskSpaceGuardError(
+            (
+                DiskDiagnostic(
+                    filesystem=str(tmp_path),
+                    target=str(store.root),
+                    required_bytes=100,
+                    free_bytes=10,
+                    reserve_bytes=1,
+                    deficit_bytes=91,
+                ),
+            )
+        )
+
+    monkeypatch.setattr("grandgousier.archive.stage1_execution.check_disk_budget", fail_preflight)
+
+    report = execute_stage1_plan(plan, asset_provider=assets, product_store=store)
+
+    assert report.status == "FAILED"
+    assert report.results[0].status == "FAILED"
+    assert not store.root.exists()
+
+
 def test_changed_processed_input_refuses_stale_existing_product(tmp_path: Path) -> None:
     source = tmp_path / "source.fits"
     source.write_bytes(b"version-one")
@@ -237,10 +273,17 @@ def test_master_execute_reuses_existing_reducer_contract(tmp_path: Path, monkeyp
     assets = FakeAssets(paths)
     captured = {}
 
-    def fake_reduce(task, *, overwrite=False, max_dark_temperature_delta_c=5.0):
+    def fake_reduce(
+        task,
+        *,
+        overwrite=False,
+        max_dark_temperature_delta_c=5.0,
+        disk_reserve_bytes=None,
+    ):
         captured["task"] = task
         captured["overwrite"] = overwrite
         captured["max_dark_temperature_delta_c"] = max_dark_temperature_delta_c
+        captured["disk_reserve_bytes"] = disk_reserve_bytes
         task.output_path.parent.mkdir(parents=True, exist_ok=True)
         task.output_path.write_bytes(b"reduced-product")
         return MasterReductionResult(task=task, status="REDUCED")
@@ -255,6 +298,7 @@ def test_master_execute_reuses_existing_reducer_contract(tmp_path: Path, monkeyp
     assert task.header_remote_path == "processing_header.fits"
     assert task.dark_remote_path == "dark.fits"
     assert task.flat_remote_path == "flat.fits"
+    assert captured["disk_reserve_bytes"] is not None
     assert task.raw_local_path == paths[refs[0].ref_uid]
     assert task.output_path == Path(report.results[0].product_path)
     sidecar = json.loads(Path(report.results[0].provenance_path).read_text(encoding="utf-8"))

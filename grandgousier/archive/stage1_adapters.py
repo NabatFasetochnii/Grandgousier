@@ -13,6 +13,14 @@ from astropy.io import fits
 import astropy.units as u
 
 from grandgousier.archive.manifest import manifest_path_to_local, read_archive_manifest_csv
+from grandgousier.archive.disk_guard import (
+    DEFAULT_STAGE1_DISK_RESERVE_BYTES,
+    DEFAULT_UNKNOWN_ASSET_BYTES,
+    DiskRequirement,
+    check_disk_budget,
+    estimate_size,
+    normalize_disk_reserve,
+)
 from grandgousier.archive.stage1_contract import (
     ArchiveRequest,
     ArchiveSourceDescriptor,
@@ -451,6 +459,7 @@ class MasterCacheAssetProvider(AssetProvider):
         retries: int = 4,
         timeout_connect: float = 15.0,
         timeout_read: float = 180.0,
+        disk_reserve_bytes: int | str | None = None,
     ) -> None:
         self.source_id = source_id
         self.cache_root = Path(cache_root)
@@ -463,6 +472,7 @@ class MasterCacheAssetProvider(AssetProvider):
         self.retries = max(0, int(retries))
         self.timeout_connect = float(timeout_connect)
         self.timeout_read = float(timeout_read)
+        self.disk_reserve_bytes = normalize_disk_reserve(disk_reserve_bytes)
         self._session = None
         self._transport = None
 
@@ -518,6 +528,19 @@ class MasterCacheAssetProvider(AssetProvider):
         if not url:
             raise RuntimeError(f"Cannot map MASTER asset to repository fetch URL: {ref.locator!r}")
         target = manifest_path_to_local(ref.locator, self.cache_root)
+        required_bytes = estimate_size(
+            ref.metadata.get("size_bytes"), fallback=DEFAULT_UNKNOWN_ASSET_BYTES
+        )
+        check_disk_budget(
+            (
+                DiskRequirement(
+                    target=target,
+                    required_bytes=required_bytes,
+                    label=f"MASTER asset {ref.role}",
+                ),
+            ),
+            reserve_bytes=self.disk_reserve_bytes,
+        )
         task = transport.MasterFetchTask(
             remote_path=ref.locator,
             url=url,
@@ -562,9 +585,16 @@ class MasterCacheAssetProvider(AssetProvider):
 
 
 class FilesystemProductStore(ProductStore):
-    def __init__(self, *, root: str | Path, store_id: str = "default") -> None:
+    def __init__(
+        self,
+        *,
+        root: str | Path,
+        store_id: str = "default",
+        disk_reserve_bytes: int | str | None = None,
+    ) -> None:
         self.root = Path(root)
         self.store_id = str(store_id).strip() or "default"
+        self.disk_reserve_bytes = normalize_disk_reserve(disk_reserve_bytes)
 
     @property
     def public_descriptor(self) -> Mapping[str, Any]:
@@ -639,7 +669,11 @@ def build_product_store(payload: Mapping[str, Any]) -> ProductStore:
     if root in {None, ""}:
         raise ValueError("products.root is required for filesystem ProductStore")
     return FilesystemProductStore(
-        root=str(root), store_id=str(products.get("store_id") or "default")
+        root=str(root),
+        store_id=str(products.get("store_id") or "default"),
+        disk_reserve_bytes=products.get(
+            "stage1_disk_reserve_bytes", DEFAULT_STAGE1_DISK_RESERVE_BYTES
+        ),
     )
 
 
@@ -720,6 +754,9 @@ def _master_manifest_factory(source_id: str, raw: Mapping[str, Any]) -> ArchiveS
         retries=int(assets.get("retries", 4)),
         timeout_connect=float(assets.get("timeout_connect", 15.0)),
         timeout_read=float(assets.get("timeout_read", 180.0)),
+        disk_reserve_bytes=assets.get(
+            "stage1_disk_reserve_bytes", DEFAULT_STAGE1_DISK_RESERVE_BYTES
+        ),
     )
     descriptor = ArchiveSourceDescriptor(
         source_id=source_id,
