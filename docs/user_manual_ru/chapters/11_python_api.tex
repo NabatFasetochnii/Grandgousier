@@ -1,0 +1,108 @@
+\chapter{Python API}
+
+Начиная с версии \manualversion{} Grandgousier публикует небольшой стабильный Python API в пространстве имён \texttt{grandgousier.api}. Только символы, экспортированные из этого пространства имён и перечисленные в данной главе, следует считать публичным программным контрактом. Импорт функций непосредственно из внутренних модулей \texttt{grandgousier.photometry.*}, \texttt{grandgousier.interseries.*}, \texttt{grandgousier.calibration.*} остаётся допустимым для разработки, но не является обещанием совместимости между версиями.
+
+P2 намеренно не переносит научные алгоритмы в новые реализации. Публичные функции являются тонкими адаптерами над теми же численными ядрами, которые использует проверенный Stage~2/Stage~3 pipeline. В этой версии публичный API не выполняет запись в БД, не создаёт файлы и не запускает orchestration.
+
+\section{Физический бюджет ошибки aperture photometry}
+
+\begin{lstlisting}[language=Python]
+from grandgousier.api import compute_aperture_error_budget
+
+budget = compute_aperture_error_budget(
+    net_flux_adu=12000.0,
+    local_background_adu_per_pix=110.0,
+    annulus_sigma_adu_per_pix=7.5,
+    n_aperture_pixels=29,
+    n_annulus_pixels=80,
+    gain_e_per_adu=1.4,
+    read_noise_e=8.3,
+    telescope_aperture_m=0.60,
+    site_altitude_m=290.0,
+    airmass=1.15,
+    exptime_s=30.0,
+)
+
+print(budget.selected_mag_err)
+print(budget.to_dict())
+\end{lstlisting}
+
+Поток и фон задаются в ADU, gain --- в электронах/ADU, read noise --- в электронах, экспозиция --- в секундах. По умолчанию используется production-модель \texttt{physical\_aperture\_v1}. Неподдерживаемое имя модели, некорректное число пикселей и недопустимые параметры, которые должны быть неотрицательными, приводят к \texttt{ValueError}. Функция не выполняет I/O.
+
+\section{Измерение одной circular aperture}
+
+\begin{lstlisting}[language=Python]
+from astropy.io import fits
+from grandgousier.api import measure_circular_aperture
+
+with fits.open("frame.fits", memmap=True) as hdul:
+    data = hdul[0].data
+    m = measure_circular_aperture(
+        data,
+        x_pix=1024.3,
+        y_pix=998.7,
+        aperture_radius_pix=3.0,
+        annulus_inner_pix=7.0,
+        annulus_outer_pix=10.0,
+        exptime_s=30.0,
+        instrumental_zero_point_mag=25.0,
+        saturation_level_adu=60000.0,
+        gain_e_per_adu=1.4,
+        read_noise_e=8.3,
+    )
+
+print(m.flux_adu, m.instrumental_mag, m.mag_err)
+\end{lstlisting}
+
+Входной массив изображения имеет форму NumPy \texttt{(ny,nx)} и значения в ADU. Координаты задаются в нулевой системе координат массива: \texttt{x\_pix} растёт вдоль столбцов, \texttt{y\_pix} --- вдоль строк. Радиусы задаются в пикселях. Wrapper вызывает существующее circular-ядро Stage~2 и возвращает \texttt{CircularApertureMeasurement}; он не индексирует кадр, не запрашивает каталог и не записывает measurements в PostgreSQL.
+
+\section{Численный inter-series API M2/M3}
+
+Public M2 принимает уже агрегированные M1-подобные состояния объектов. В этом интерфейсе Grandgousier не определяет reference eligibility автоматически: вызывающий код должен сам сформировать научно корректную выборку и передать \texttt{reference\_eligible}.
+
+\begin{lstlisting}[language=Python]
+from grandgousier.api import (
+    InterseriesObjectState,
+    compute_interseries_pair_offset,
+    solve_interseries_offsets,
+)
+
+left = [
+    InterseriesObjectState(1, 15.10, 0.010),
+    InterseriesObjectState(2, 16.02, 0.012),
+]
+right = [
+    InterseriesObjectState(1, 15.13, 0.011),
+    InterseriesObjectState(2, 16.05, 0.013),
+]
+
+pair = compute_interseries_pair_offset(
+    left,
+    right,
+    left_series_id=10,
+    right_series_id=11,
+    min_common_objects=2,
+)
+
+# Для реального графа передаются все OK pair solutions.
+graph = solve_interseries_offsets(
+    [10, 11],
+    [pair],
+    reference_series_id=10,
+)
+\end{lstlisting}
+
+Научный контракт знака фиксирован:
+
+\[
+\Delta_{ab}=m_b-m_a,\qquad z_a-z_b=\Delta_{ab},\qquad
+m_{\mathrm{global}}=m_{\mathrm{science}}+z_s.
+\]
+
+M2 использует те же median/MAD iterative clipping и uncertainty floor, что production Stage~3. M3 использует тот же weighted least-squares graph и то же масштабирование covariance \(\max(1,\chi^2_\nu)\). Пороговые значения автоматически не ослабляются. Эти функции не создают M4 generations и не выполняют exact SCIENCE linkage; persistence/provenance остаются обязанностью обычного Stage~3 service/CLI layer.
+
+\section{Граница зависимостей и совместимости}
+
+P2 API является facade, а не переразбиением зависимостей. Набор package dependencies пока остаётся общим для Grandgousier. Импорт \texttt{grandgousier.api} не подключается к PostgreSQL. Circular measurement лениво импортирует существующий Stage~2 module только при вызове; M2/M3 adapters аналогично загружают текущую Stage~3 implementation только при использовании.
+
+Будущие совместимые релизы могут добавлять новые public symbols. Код, которому нужна стабильность, должен импортировать их из \texttt{grandgousier.api}, а не из implementation modules. Изменение единиц, sign convention, полей публичных dataclasses или численной семантики требует отдельного решения по API/scientific compatibility и regression tests.

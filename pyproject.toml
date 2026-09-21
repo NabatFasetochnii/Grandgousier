@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "grandgousier"
-version = "0.5.33.3"
-description = "Archive photometry engine for MASTER-like telescope archives"
-readme = "README.md"
+version = "0.7.0.9"
+description = "Astronomical archive photometry and calibration engine"
+readme = "README_PUBLIC.md"
 requires-python = ">=3.11"
 authors = [{name = "Nikita Chazov"}]
 dependencies = [
@@ -20,6 +20,8 @@ dependencies = [
     "PyYAML>=6.0",
     "tqdm>=4.66",
     "matplotlib>=3.8",
+    "certifi>=2024.2.2",
+    "requests>=2.31",
 ]
 
 [project.optional-dependencies]
@@ -29,13 +31,20 @@ photometry = [
     "astroscrappy>=1.2",
     "sep>=1.2",
     "astroquery>=0.4.7",
+    "requests>=2.31",
 ]
 gaia = [
     "astroquery>=0.4.7",
+    "requests>=2.31",
 ]
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
+]
+release = [
+    "build>=1.2,<2",
+    "wheel>=0.44,<1",
+    "packaging>=23.2,<27",
 ]
 
 [project.scripts]
@@ -43,6 +52,9 @@ grandgousier = "grandgousier.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["grandgousier*"]
+
+[tool.setuptools.package-data]
+"grandgousier.resources" = ["configs/*.yaml", "migrations/*.sql", "acceptance/*.json"]
 
 [tool.ruff]
 line-length = 100

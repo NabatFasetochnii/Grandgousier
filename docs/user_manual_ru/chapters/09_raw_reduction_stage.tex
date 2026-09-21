@@ -1,0 +1,420 @@
+\chapter{Stage 1: archive-source contract и подготовка raw FITS}
+
+
+\section{Canonical archive-source contract 0.6.0}
+
+Stage~1 теперь отделяет астрономический контракт от конкретной БД и storage. \texttt{MetadataProvider} выполняет discovery и возвращает canonical \texttt{ObservationRecord}; \texttt{AssetProvider} материализует opaque asset reference только в execute-workflow; \texttt{ProductStore} принадлежит Grandgousier и хранит derived products независимо от source archive.
+
+\begin{verbatim}
+source-specific metadata/storage
+  -> MetadataProvider + AssetProvider
+  -> ObservationRecord / AssetRef
+  -> CalibrationPlan
+  -> ProductStore
+  -> processed FITS
+  -> existing Stage 2
+\end{verbatim}
+
+Первый generic planner запускается командой:
+
+\begin{lstlisting}
+python -m grandgousier.cli stage1-plan `
+  --config grandgousier.yaml `
+  --source master-prepared `
+  --filter V `
+  --out reports\stage1_master_plan.json `
+  --csv-out reports\stage1_master_plan.csv
+\end{lstlisting}
+
+Это metadata-only операция: она не вызывает \texttt{AssetProvider.materialize()}, не создаёт calibrated FITS, не запускает Stage~2 и не пишет в Grandgousier DB. Source root и product root могут находиться в несвязанных каталогах или backend'ах.
+
+После проверки plan версия 0.6.1.0 добавляет отдельный execution contour; 0.6.1.1 исправляет materialization для частичного MASTER cache:
+
+\begin{verbatim}
+CalibrationPlan
+  -> AssetProvider.materialize(required refs)
+  -> existing instrument reduction OR processed import
+  -> filesystem ProductStore
+  -> processed FITS + *.provenance.json
+\end{verbatim}
+
+Для MASTER новый слой не содержит альтернативной calibration math: action \texttt{REDUCE\_RAW} строит \texttt{MasterReductionTask} из canonical refs и передаёт его существующему \texttt{MASTER\_DARK\_FLAT\_V1}. Для source с \texttt{input\_state=processed} action \texttt{IMPORT\_PROCESSED} копирует FITS побайтно в ProductStore. Raw execution других instruments в 0.6.1.0 намеренно не угадывается и требует отдельного instrument-specific reducer.
+
+До вычисления output executor считает SHA-256 materialized inputs и deterministic fingerprint от stable source identity, action, recipe, параметров и checksums. Product sidecar не сохраняет local cache paths или credentials; он содержит canonical asset refs, identity, recipe/fingerprint и checksum output. Повторный запуск без \cli{--overwrite} возвращает \texttt{SKIPPED\_EXISTING} только после проверки fingerprint и checksum. Несовпадение считается precondition failure, а не поводом молча перезаписать FITS.
+
+\texttt{stage1-execute} по-прежнему не пишет в Grandgousier DB и не вызывает Stage~2 автоматически. Начиная с 0.6.2.0 Observation-aware handoff выделен в отдельную явную команду \cli{stage1-handoff}; таким образом materialization и DB/science ingestion остаются независимыми recovery boundaries.
+
+Primary source identity не зависит от пути. Для MASTER authoritative native identity остаётся \texttt{UNIQNUM}; для RoboPhot используется существующее P4-правило \texttt{SERNUM + DATE-OBS}, причём \texttt{DATE-OBS} уже UTC и смещение $+05{:}00$ не добавляется. Legacy \texttt{frame\_uid} остаётся file-product identifier и не заменяет observation identity.
+
+MASTER raw science, processing header, SDARK и SFLAT представлены отдельными asset refs. Исторический inventory MASTER не гарантирует наличие \texttt{UNIQNUM}. Если authoritative \texttt{UNIQNUM} отсутствует и его нельзя прочитать из уже локально доступного processing header, canonical plan получает \texttt{BLOCKED}; использование \texttt{raw\_id} или пути как подмены физической identity запрещено.
+
+Пример конфигурации:
+
+\begin{lstlisting}
+archives:
+  robophot-local:
+    adapter: fits-filesystem
+    instrument_profile: RoboPhot
+    metadata:
+      backend: fits-headers
+      root: D:\RoboPhot
+    assets:
+      backend: filesystem
+      root: D:\RoboPhot
+
+  master-prepared:
+    adapter: master-manifest
+    instrument_profile: MASTER
+    metadata:
+      backend: prepared-inventory
+      manifest: C:\master\gpx\inventory.csv
+      cache_root: C:\master\gpx
+    assets:
+      backend: master-cache
+      cache_root: C:\master\gpx
+      fetch_missing: true
+      # optional additional local caches:
+      # search_roots: [C:\master\gpx\smoke]
+
+products:
+  backend: filesystem
+  root: C:\grandgousier\products
+\end{lstlisting}
+
+Credential-bearing values в user-facing summary/plan редактируются. Production MASTER credentials и private endpoints не входят в package defaults.
+
+В MASTER локальный cache не считается полной копией удалённого архива. Начиная с 0.6.1.1 \texttt{metadata.cache\_root} и \texttt{assets.cache\_root} независимы: первый может содержать только processing headers, необходимые для metadata/identity enrichment, а второй задаёт основной cache для materialized raw/calibration assets. \texttt{assets.search\_roots} позволяет добавить другие существующие cache-каталоги. При \cli{stage1-execute} provider сначала ищет ref во всех локальных roots; только отсутствующий ref при \texttt{fetch\_missing: true} загружается существующим repository-local transport. \cli{stage1-plan} этот transport не импортирует и ничего не скачивает.
+
+\section{Exact Stage 1 -> Stage 2 handoff (0.6.2.x)}
+
+После успешного \cli{stage1-execute} Stage~2 не должен сканировать весь ProductStore. Источником handoff является один конкретный execution report:
+
+\begin{lstlisting}
+python -m grandgousier.cli stage1-handoff `
+  --config grandgousier.yaml `
+  --execution-report reports\stage1_execution.json `
+  --report-out reports\stage1_handoff.json
+\end{lstlisting}
+
+Без \cli{--execute} команда выполняет только preflight и не пишет в БД. Для каждого product она:
+
+\begin{itemize}
+  \item проверяет schema execution report и успешный Stage~1 status;
+  \item пересчитывает SHA-256 FITS и сверяет его с report и \texttt{*.provenance.json};
+  \item сверяет provenance fingerprint и canonical observation identity;
+  \item читает FITS header по реальному ProductStore path;
+  \item запускает существующий P4 observation-science guard до вставки нового \texttt{Frame}.
+\end{itemize}
+
+Результат \texttt{ALREADY\_REPRESENTED} является безопасным no-op: существующий science representative сохраняется, alternate ProductStore FITS не индексируется, Stage~2 для него не запускается. Начиная с 0.6.2.1 то же handoff-поведение применяется к историческому P4-состоянию \texttt{EXISTING\_MULTIPLE\_REPRESENTATIVES}: оно остаётся видимым в поле \texttt{p4\_action} и не ремонтируется автоматически, но наличие нескольких уже назначенных products однозначно запрещает добавление ещё одного, поэтому handoff возвращает retained/no-op и не вызывает Stage~2. \texttt{AMBIGUOUS\_MULTIPLE\_PRODUCTS}, \texttt{IDENTITY\_CONFLICT} или отсутствие identity по-прежнему блокируют весь handoff до DB writes.
+
+После проверки plan разрешается:
+
+\begin{lstlisting}
+python -m grandgousier.cli stage1-handoff `
+  --config grandgousier.yaml `
+  --execution-report reports\stage1_execution.json `
+  --execute `
+  --stage2-manifest-out reports\stage1_handoff_stage2.json `
+  --report-out reports\stage1_handoff_execute.json
+\end{lstlisting}
+
+Для действительно новых observations в существующий \cli{process-archive-path} передаётся explicit list exact FITS paths. Временные копии/hardlinks не создаются, поэтому file-product \texttt{frame\_uid} вычисляется от настоящего ProductStore path. Соседние FITS в том же дереве не обнаруживаются. Scientific defaults и алгоритмы Stage~2 при этом остаются теми же, что у существующего pipeline.
+
+Handoff намеренно не агрегирует ранее индексированные, но не вошедшие в series products из других execution reports. Поэтому production request следует materialize'ить и передавать серией целиком; небольшой smoke report с числом новых кадров меньше \texttt{min\_frames\_per\_series} может корректно проиндексировать эти exact products, но не обязан создать \texttt{field\_series}. Это предпочтительнее скрытого сканирования старого ProductStore.
+
+\section{Статус}
+
+MASTER-specific execution contour, существовавший до 0.6.0, сохраняется без изменения scientific semantics. В нём Stage~1 состоит из двух реализованных частей. Stage~1A ищет удалённые наблюдения MASTER через прямой PostgreSQL либо аутентифицированный HTTPS-интерфейс \cli{processing.php}, строит inventory и воспроизводимо скачивает raw/header/SDARK/SFLAT. Stage~1B командой \cli{master-archive-reduce} локально строит science-ready primary FITS по подтверждённой для реального GPX\_TF17 формуле
+
+\[
+I_{\mathrm{cal}}(x,y)=\frac{I_{\mathrm{raw}}(x,y)-D_{\mathrm{SDARK}}(x,y)}{F_{\mathrm{SFLAT}}(x,y)}.
+\]
+
+SDARK рассматривается как уже собранный median master dark, а SFLAT --- как уже нормированный median master flat. Поэтому Grandgousier не масштабирует dark автоматически и не нормирует flat повторно. Точный TAN--SIP WCS и processing metadata берутся из отдельного \cli{*\_header.fits}.
+
+Текущий контракт Stage~1:
+
+\begin{verbatim}
+MASTER PostgreSQL OR authenticated MASTER HTTPS
+  -> master-archive-search
+  -> inventory CSV
+  -> master-archive-fetch
+  -> local raw/header/SDARK/SFLAT cache
+  -> master-archive-reduce
+  -> float32 processed FITS + DQ extension + reduction report
+  -> Stage 2 series photometry
+\end{verbatim}
+
+\section{Параметры доступа к MASTER}
+
+Удалённая БД и HTTP Basic Auth настраиваются отдельно от основной БД Grandgousier. Прямой PostgreSQL может быть ограничен серверным \cli{pg\_hba.conf}; в этом случае достаточно HTTPS-доступа. Рекомендуется использовать environment variables, чтобы пароль не попадал в историю shell и логи:
+
+\begin{lstlisting}
+$env:GRANDGOUSIER_MASTER_DATABASE_URL="postgresql://postgres@192.168.240.17/imdata"
+$env:GRANDGOUSIER_MASTER_HTTP_USER="MASTER_USER"
+\end{lstlisting}
+
+HTTP password можно либо задать через \cli{GRANDGOUSIER\_MASTER\_HTTP\_PASSWORD}, либо не задавать вообще: при HTTPS discovery и при \cli{master-archive-fetch --execute} программа запросит его через скрытый интерактивный prompt.
+
+Optional переменная \cli{GRANDGOUSIER\_MASTER\_HTTP\_BASE\_URL} переопределяет стандартный адрес \cli{https://master.kourovka.ru}.
+
+\section{Поиск наблюдений без скачивания}
+
+Команда \cli{master-archive-search} работает read-only относительно MASTER и локальной Grandgousier DB. \cli{--search-transport auto} (default) использует PostgreSQL, если он доступен, и автоматически переключается на HTTPS при отказе соединения. \cli{--search-transport http} полностью обходит PostgreSQL и читает те же \cli{processed\_frames} через веб-интерфейс MASTER. HTTPS transport использует штатное поле веб-формы \cli{coord2000} страницы \cli{master2/processing.php}, затем локально применяет запрошенный прямоугольник, временные границы и фильтры. Это обходит несовместимость production web-interface с прямой передачей pgSphere-предиката через \cli{where\_long}. HTTPS parser извлекает raw/header и разрешает dark/flat raw IDs через \cli{master2/index.php}; итоговый inventory имеет тот же формат для обоих transport. Начиная с 0.5.41.8 parser не зависит от CSS-класса строки и фиксированного номера Raw-колонки: result row распознаётся по canonical raw-path, поэтому небольшие presentation-изменения HTML MASTER не должны превращаться в ложную пустую выборку. Начиная с 0.5.41.9, если production \cli{processing.php} не выводит отдельную Header-ссылку, но science raw имеет строгий canonical path \cli{/master/imdata/rawdata/YYYY/MM/DD/ID.*}, parser восстанавливает стандартный путь \cli{/master/imdata/procdata/YYYY/MM/DD/ID\_header.fits}. Явная Header-ссылка, когда она присутствует, имеет приоритет; дополнительные HEAD-запросы на каждый science frame не выполняются. В текущем HTTPS transport поддерживается \cli{--radius-deg <= 0.95}; для более широких запросов требуется PostgreSQL transport.
+
+Пример для временного GPX cache:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-search `
+  --search-transport http `
+  --http-user "googlov" `
+  --ra 327.60625 `
+  --dec 72.1686111 `
+  --radius-deg 0.8 `
+  --out "C:\master\gpx\inventory.csv"
+\end{lstlisting}
+
+Можно ограничить выборку временем, фильтром и числом строк:
+
+\begin{lstlisting}
+--datetime-start "2018-09-01" `
+--datetime-end "2018-11-01" `
+--filter R `
+--filter V `
+--limit 100
+\end{lstlisting}
+
+Поле \cli{night\_utc} определяется как календарная дата после сдвига timestamp на $-12$ часов. Это объединяет кадры одной астрономической ночи, пересекающей полночь UTC.
+
+Inventory содержит, среди прочего, \cli{processed\_frame\_id}, время, координаты, фильтр, exposure/FWHM/ellipticity/ZP/background, \cli{raw\_path}, \cli{header\_path}, \cli{dark\_path}, \cli{flat\_path}, извлечённые raw IDs и HTTP URLs.
+
+\section{Преобразование серверных путей}
+
+В MASTER внутренний путь вида
+
+\begin{verbatim}
+/master/imdata/rawdata/2018/10/02/380242.fit.gz
+\end{verbatim}
+
+публикуется через HTTPS как
+
+\begin{verbatim}
+https://master.kourovka.ru/data/master/imdata/rawdata/2018/10/02/380242.fit.gz
+\end{verbatim}
+
+Grandgousier применяет это преобразование только для путей внутри \cli{/master/}. Неопознанный path считается precondition error, а не угадывается эвристически.
+
+\section{План скачивания}
+
+Без \cli{--execute} downloader только читает inventory, дедуплицирует одинаковые calibration files и показывает план:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-fetch `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --out-root "C:\master\gpx"
+\end{lstlisting}
+
+По умолчанию выбираются четыре роли: raw, header, dark и flat. Можно ограничить transfer повторяемым параметром \cli{--role}.
+
+\section{Реальное скачивание}
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-fetch `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --out-root "C:\master\gpx" `
+  --http-user "MASTER_USER" `
+  --execute
+\end{lstlisting}
+
+Локальный cache зеркалит подтверждённую часть server path, например:
+
+\begin{verbatim}
+C:\master\gpx\master\imdata\rawdata\2018\10\02\380242.fit.gz
+C:\master\gpx\master\imdata\procdata\2018\10\02\380242_header.fits
+\end{verbatim}
+
+Одинаковые dark/flat, используемые множеством science frames, скачиваются один раз.
+
+Для точечного восстановления отдельных science raw без повторного скачивания уже очищенного архива можно ограничить inventory по raw ID. Например:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-fetch `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --out-root "C:\master\gpx" `
+  --http-user "MASTER_USER" `
+  --role raw `
+  --raw-id 376190 `
+  --raw-id 376430 `
+  --execute
+\end{lstlisting}
+
+Если запрошенный raw ID отсутствует в manifest, команда завершается precondition error вместо молчаливой пустой выборки.
+
+\section{Надёжность и provenance transfer}
+
+Downloader использует:
+
+\begin{itemize}
+  \item HTTP Basic Auth;
+  \item временный файл с суффиксом \cli{.part};
+  \item atomic rename после успешного завершения;
+  \item Range request для продолжения незавершённого \cli{.part};
+  \item retry/backoff для transient HTTP 429/5xx и transport errors;
+  \item пропуск уже существующих непустых файлов, если не задан \cli{--overwrite};
+  \item SHA-256 для каждого завершённого файла, если не задан \cli{--no-checksum};
+  \item CSV report \cli{master\_fetch\_report.csv} со status, size, checksum и ошибкой.
+\end{itemize}
+
+Неудачный transfer оставляет \cli{.part}, поэтому следующий запуск может продолжить его. HTTP 401 и 404 считаются явными ошибками и не маскируются повторным созданием пути.
+
+
+\section{Предварительное разбиение удалённого inventory на серии}
+
+До скачивания десятков или сотен FITS можно оценить структуру наблюдений командой
+
+\begin{verbatim}
+python -m grandgousier.cli master-archive-series `
+  --manifest "C:\master\gpx\full_inventory.csv" `
+  --max-field-separation-arcmin 30 `
+  --max-series-gap-minutes 60
+\end{verbatim}
+
+Команда read-only и не обращается ни к MASTER, ни к Grandgousier DB. Она сначала объединяет близкие центры полей в provisional field clusters, затем внутри каждого поля делит строки по фильтру и разрывает последовательность, если промежуток между соседними экспозициями превышает заданный предел. В таблице выводятся номер provisional series, field cluster, ночь, фильтр, число кадров, начало/конец, длительность, средний центр, диапазон raw IDs и число различных SDARK/SFLAT.
+
+Это именно предварительное разбиение: remote \cli{processed\_frames} inventory не содержит надёжных tube/camera metadata. После скачивания headers и индексации authoritative series создаёт Stage~2 по полю, \cli{instrument\_unit/filter} и времени. Поэтому \cli{master-archive-series} предназначен для планирования объёма загрузки и выбора ночей, а не для создания записей \cli{field\_series}.
+
+\section{Stage 1B: raw $\rightarrow$ processed FITS}
+
+Перед выполнением рекомендуется сначала запустить plan-only:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-reduce `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --cache-root "C:\master\gpx"
+\end{lstlisting}
+
+Реальная редукция:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-reduce `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --cache-root "C:\master\gpx" `
+  --execute
+\end{lstlisting}
+
+По умолчанию output root равен \cli{<cache-root>/processed}; структура даты сохраняется:
+
+\begin{verbatim}
+C:\master\gpx\processed\2018\09\07\375506_processed.fits
+\end{verbatim}
+
+Существующий непустой processed FITS получает статус \cli{SKIPPED\_EXISTING}; для пересборки требуется \cli{--overwrite}. Для smoke test доступен \cli{--limit}. CSV-report по умолчанию записывается как \cli{<out-root>/master\_reduction\_report.csv}.
+
+Начиная с 0.5.42.2 итоговые reduction metrics записываются непосредственно в primary header: \cli{GGNPIX} (число пикселей), \cli{GGNIFLAT} (невалидные flat pixels), \cli{GGNSAT} (raw saturation flags), \cli{GGMEDADU} (медиана calibrated image) и, когда обе температуры известны, \cli{GGDTEMP} ($|T_{science}-T_{dark}|$ в градусах C). При \cli{SKIPPED\_EXISTING} Grandgousier читает только primary FITS header и восстанавливает эти значения в \cli{master\_reduction\_report.csv}, не загружая science image или DQ arrays. Одновременно сверяются \cli{GGRAW}, \cli{GGHDR}, \cli{DARK} и \cli{FLAT}; несовпадение provenance переводит задачу в \cli{FAILED}, а не в молчаливый skip.
+
+Processed FITS, созданные версиями 0.5.42.0--0.5.42.1, новых metric cards не содержат. Они по-прежнему считаются существующими и не пересчитываются автоматически; console помечает такой skip как \cli{metrics=legacy\_missing}. Для перехода на полностью self-describing outputs их нужно один раз пересоздать с \cli{--overwrite}.
+
+Начиная с 0.5.43.1 DQ хранится как uint8, поскольку текущая схема использует только биты 0--4. Для существующих Stage~1B FITS доступен \cli{--compact-existing}: Grandgousier проверяет provenance, переписывает только контейнер processed FITS с uint8 DQ и не выполняет повторно $(raw-SDARK)/SFLAT$. Это особенно полезно для больших архивов, где legacy uint16 DQ занимает один лишний байт на каждый пиксель. Начиная с 0.5.43.3 legacy uint16 DQ читается при compact без FITS memory mapping: это необходимо для стандартного unsigned FITS-представления с BZERO/BSCALE и устраняет ошибку Astropy \texttt{Cannot load a memory-mapped image}.
+
+\subsection{Precondition checks}
+
+До записи output проверяются:
+
+\begin{itemize}
+  \item наличие всех четырёх локальных компонентов raw/header/dark/flat;
+  \item двумерная и одинаковая геометрия raw, SDARK и SFLAT;
+  \item типы \cli{LIGHT}, \cli{SDARK}, \cli{SFLAT};
+  \item совпадение \cli{ID\_CAM}, \cli{XBINNING}, \cli{YBINNING};
+  \item совпадение science/SFLAT filter;
+  \item совпадение science/SDARK exposure; automatic dark scaling намеренно запрещён;
+  \item согласованность science и processing header по camera/filter/exposure и \cli{IMAGEW/IMAGEH};
+  \item наличие solved WCS в processing header: CTYPE/CRPIX/CRVAL и complete CD matrix либо CDELT1/2;
+  \item если processing header содержит \cli{DARK}/\cli{FLAT}, эти ссылки должны совпадать с inventory;
+  \item по умолчанию $|T_{science}-T_{dark}|\le 5\,^{\circ}\mathrm{C}$; порог задаётся \cli{--max-dark-temperature-delta-c}. Отрицательное значение отключает только этот temperature guard.
+\end{itemize}
+
+Нарушение этих условий даёт \cli{FAILED}; Grandgousier не пытается молча подобрать другой calibration frame или изменить научную формулу.
+
+\subsection{Формат результата и WCS}
+
+Primary HDU содержит calibrated image в \cli{float32}. Отрицательные пиксели после dark subtraction сохраняются и не clipping-уются к нулю. Невалидный flat ($F\le0$ или NaN/Inf) даёт NaN в calibrated image.
+
+Грубый telescope WCS исходного raw полностью удаляется перед наложением решённого MASTER WCS из \cli{*\_header.fits}. Это важно: raw может содержать approximate \cli{CDELT/CROTA}, тогда как processing header содержит CD-матрицу и SIP-polynomials. В одном output header они не смешиваются.
+
+В primary header также записываются provenance cards \cli{GGSTAGE}, \cli{GGALG}, \cli{GGVER}, \cli{GGRAW}, \cli{GGHDR}; \cli{DARK}/\cli{FLAT} указывают применённые MASTER products. \cli{GGDRKSC=F} фиксирует отсутствие dark scaling, \cli{GGFLNRM=F} --- отсутствие дополнительной нормировки flat. \cli{GGMSMETA=T} явно помечает ZEROPOI/BACKGRND/SEX* и другие скопированные MASTER processing metadata как reference provenance: Grandgousier не пересчитывает эти поля на Stage~1B. При записи FITS рассчитываются стандартные \cli{CHECKSUM}/\cli{DATASUM}; publication выполняется через временный \cli{.part} и atomic rename. Начиная с 0.5.42.1 длинные path-valued cards \cli{DARK}, \cli{FLAT}, \cli{GGRAW}, \cli{GGHDR} записываются без FITS comment: значение пути сохраняется полностью, а лишний комментарий не провоцирует \cli{VerifyWarning} о превышении 80-символьной FITS card.
+
+\subsection{DQ extension}
+
+Второй HDU \cli{DQ} содержит unsigned 8-bit bitmask; в primary header это фиксируется как \cli{GGDQSCH=MASTER\_DQ\_V2} и \cli{GGDQDT=UINT8}:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Bit & Значение & Смысл \\
+\midrule
+0 & 1  & невалидный raw pixel \\
+1 & 2  & невалидный dark pixel \\
+2 & 4  & невалидный/неположительный flat pixel \\
+3 & 8  & raw достиг физического saturation level FITS integer range \\
+4 & 16 & calibrated value не является конечным числом \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Saturation flag не заменяет instrument-specific saturation model; это базовый detector-range guard. Значение calibrated pixel при saturation не обнуляется автоматически, а помечается DQ.
+
+\subsection{Подтверждение формулы на реальном MASTER кадре}
+
+Для GPX\_TF17 V science frame \cli{375506.fit.gz} серверный header связывает \cli{SDARK=375453.fit.gz} и \cli{SFLAT=373624.fit.gz}. SDARK имеет ту же экспозицию 50~s и создан как median из пяти dark frames; SFLAT --- float32 median из четырёх flat frames и уже нормирован около единицы в центральной области. Применение $(raw-SDARK)/SFLAT$ даёт фон, который совместно с MASTER zero point и решённым pixel scale воспроизводит сохранённый \cli{BACKGRND=20.88} mag/arcsec$^2$ примерно до $0.01$~mag. Это является эмпирическим основанием алгоритма \cli{MASTER\_DARK\_FLAT\_V1}; более сложные detector corrections в эту версию не добавлены без наблюдательного подтверждения.
+
+
+\section{Управление дисковым пространством MASTER}
+
+Для архивной задачи, где долговременным продуктом являются фотометрические ряды в БД, необязательно постоянно хранить все промежуточные изображения. Начиная с 0.5.43.1 используется двухступенчатая безопасная политика.
+
+Science raw можно удалить сразу после подтверждённого Stage~1B. При этом сохраняются компактные \cli{*\_header.fits}, SDARK и SFLAT, а processed FITS остаётся доступным для Stage~2. Встроенный вариант:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-reduce `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --cache-root "C:\master\gpx" `
+  --execute `
+  --delete-raw-after-success
+\end{lstlisting}
+
+Для уже созданных processed FITS используется отдельная plan-only команда:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-prune `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --cache-root "C:\master\gpx" `
+  --scope raw
+\end{lstlisting}
+
+При \cli{--scope raw} файл удаляется только если соответствующий processed FITS существует и проходит проверку \cli{GGSTAGE/GGALG/GGRAW/GGHDR/DARK/FLAT}. Для фактического удаления требуется одновременно \cli{--execute --yes}.
+
+Processed FITS можно удалить только после успешной Stage~2 фотометрии:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-prune `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --cache-root "C:\master\gpx" `
+  --scope processed
+\end{lstlisting}
+
+Grandgousier разрешает такую строку только если processed path уже индексирован как MASTER frame, \cli{frames.processing\_status=PHOTOMETRY\_DONE} и для frame существуют финальные строки \cli{science\_measurements}. Поэтому простой факт наличия base photometry недостаточен для автоматического удаления изображения. После проверки команда снова требует явные \cli{--execute --yes}. CSV-аудит записывается в \cli{master\_prune\_report.csv}.
+
+Для старого архива с uint16 DQ рекомендуемый порядок при почти заполненном диске: сначала \cli{master-archive-prune --scope raw --execute --yes}, затем \cli{master-archive-reduce --compact-existing --delete-raw-after-success --execute}. Уже готовые кадры будут только компактированы; отсутствующие processed FITS будут построены обычным Stage~1B, после чего их raw сразу удалится. \cli{--overwrite} и \cli{--compact-existing} взаимоисключающие.
+
+
+\section{Fallback при недоступном PostgreSQL}
+
+Если MASTER PostgreSQL отвечает ошибкой \cli{no pg\_hba.conf entry}, это означает серверный ACL, а не ошибку SQL Grandgousier. Режим \cli{auto} печатает warning и использует HTTPS fallback. Чтобы не тратить время на заведомо запрещённое PostgreSQL-соединение, задайте \cli{--search-transport http}. HTTPS discovery использует тот же HTTP Basic Auth realm, что и веб-интерфейс MASTER.
+
+
+\section{MASTER large-field safeguards в Stage 2}
+
+Начиная с 0.5.43.0 pre-photometry QC больше не интерпретирует абсолютное число локальных максимумов одинаково для детекторов любой площади. Исторический порог \cli{5000} сохраняется для кадров до $2048\times2048$, а для больших изображений effective limit масштабируется пропорционально числу пикселей. Для MASTER $4098\times4098$ при стандартной настройке это примерно \cli{20020}; одновременно в QC сохраняются raw count, effective limit и density в maxima/Mpix.
+
+Auto-Gaia также учитывает большой MASTER field. Если \cli{--auto-catalog-max-radius-deg} не задан, default равен $1.6^\circ$ для MASTER и $1.0^\circ$ для остальных профилей. Если общий \cli{frame\_union} шире safety radius, запрос автоматически распадается на пространственные clusters повторяющихся/близких pointings, а не отбрасывает весь набор и не делает запрос на каждый кадр. Если \cli{--auto-catalog-mag-limit} не задан, он наследует \cli{--working-catalog-mag-limit}. Достижение TAP \cli{MAXREC} теперь выводится как \cli{row\_limit\_reached\_cones} и warning о потенциально обрезанном каталоге.

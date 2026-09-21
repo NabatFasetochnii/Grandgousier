@@ -10,8 +10,39 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from grandgousier.db.models import ObjectQc
-from grandgousier.quality.lightcurve_quality import build_rms_mag_summary, build_variable_candidates, load_object_scatter_rows
+from grandgousier.quality.candidate_axis_correlation import CANDIDATE_AXIS_CORRELATION_COLUMNS
+from grandgousier.quality.lightcurve_quality import (
+    ObjectScatterRow,
+    build_rms_mag_summary,
+    build_variable_candidates,
+    load_object_scatter_rows,
+)
 from grandgousier.quality.object_quality import load_object_qc_map
+
+
+LOW_AMPLITUDE_CRITERION_NAMES: tuple[str, ...] = (
+    "n_measurements",
+    "intrinsic_rms",
+    "rms_over_mag_err",
+    "mad_over_mag_err",
+    "robust_peak_to_peak",
+)
+
+LOW_AMPLITUDE_DIAGNOSTIC_COLUMNS: tuple[str, ...] = (
+    "low_amplitude_passed",
+    "low_amplitude_borderline",
+    "low_amplitude_failed_criteria",
+    "low_amplitude_failed_criteria_count",
+    "low_amplitude_min_threshold_ratio",
+    "low_amplitude_borderline_threshold_ratio",
+    "low_amplitude_near_threshold",
+    "low_amplitude_diagnostic_max_failed_criteria",
+    *(
+        f"low_amplitude_{criterion}_{component}"
+        for criterion in LOW_AMPLITUDE_CRITERION_NAMES
+        for component in ("value", "threshold", "pass", "margin", "ratio")
+    ),
+)
 
 
 @dataclass
@@ -57,6 +88,10 @@ def build_candidate_triage(
     low_amplitude_min_rms_over_mag_err: float | None = 2.3,
     low_amplitude_min_mad_over_mag_err: float | None = 2.0,
     low_amplitude_min_robust_peak_to_peak: float | None = 0.08,
+    enable_borderline_candidate_diagnostics: bool = True,
+    borderline_threshold_ratio: float = 0.9,
+    diagnostic_max_failed_criteria: int = 2,
+    object_rows: list[ObjectScatterRow] | None = None,
 ) -> CandidateTriageResult:
     """Return candidate variables with explicit rejection reasons.
 
@@ -64,14 +99,17 @@ def build_candidate_triage(
     the output so a strict filter producing "No rows" can be diagnosed.
     """
 
-    object_rows = load_object_scatter_rows(
-        session,
-        calibration_name=calibration_name,
-        catalog_name=catalog_name,
-        instrument_unit_id=instrument_unit_id,
-        frame_ids=frame_ids,
-        min_measurements=min_measurements,
-    )
+    if object_rows is None:
+        object_rows = load_object_scatter_rows(
+            session,
+            calibration_name=calibration_name,
+            catalog_name=catalog_name,
+            instrument_unit_id=instrument_unit_id,
+            frame_ids=frame_ids,
+            min_measurements=min_measurements,
+        )
+    else:
+        object_rows = list(object_rows)
     rms_candidates = build_variable_candidates(
         object_rows,
         bin_width=bin_width,
@@ -84,6 +122,19 @@ def build_candidate_triage(
 
     candidate_map: dict[int, dict[str, Any]] = {}
     origin_map: dict[int, set[str]] = {}
+    low_amplitude_diagnostics = _intrinsic_threshold_diagnostics(
+        object_rows,
+        min_measurements=max(int(min_measurements), int(low_amplitude_min_measurements)),
+        min_intrinsic_rms=low_amplitude_min_intrinsic_rms,
+        min_rms_over_mag_err=low_amplitude_min_rms_over_mag_err,
+        min_mad_over_mag_err=low_amplitude_min_mad_over_mag_err,
+        intrinsic_mag_err_floor=intrinsic_mag_err_floor,
+        min_robust_peak_to_peak=low_amplitude_min_robust_peak_to_peak,
+        bin_width=bin_width,
+        min_objects_per_bin=min_objects_per_bin,
+        borderline_threshold_ratio=borderline_threshold_ratio,
+        diagnostic_max_failed_criteria=diagnostic_max_failed_criteria,
+    )
 
     def _merge_candidate(candidate: dict[str, Any], origin: str) -> None:
         object_id_value = candidate.get("object_id")
@@ -151,9 +202,32 @@ def build_candidate_triage(
         for candidate in forced_targets:
             _merge_candidate(candidate, "target")
 
+    if enable_borderline_candidate_diagnostics:
+        rows_by_id = {int(row.object_id): row for row in object_rows}
+        for object_id, diagnostics in low_amplitude_diagnostics.items():
+            if object_id in candidate_map or object_id in target_ids:
+                continue
+            diagnostic_class = None
+            if diagnostics.get("low_amplitude_borderline"):
+                diagnostic_class = "BORDERLINE_LOW_AMPLITUDE"
+            elif diagnostics.get("low_amplitude_near_threshold"):
+                diagnostic_class = "NEAR_THRESHOLD_LOW_AMPLITUDE"
+            if diagnostic_class is None:
+                continue
+            source_row = rows_by_id.get(object_id)
+            if source_row is None:
+                continue
+            candidate = source_row.to_dict()
+            candidate.update(diagnostics)
+            candidate["candidate_diagnostic_class"] = diagnostic_class
+            candidate_map[object_id] = candidate
+            origin_map[object_id] = set()
+
     raw_candidates = list(candidate_map.values())
     for candidate in raw_candidates:
         object_id = int(candidate["object_id"])
+        candidate.update(low_amplitude_diagnostics.get(object_id, {}))
+        candidate.setdefault("candidate_diagnostic_class", None)
         origins = origin_map.get(object_id, set())
         if object_id in target_ids:
             origins.add("target")
@@ -202,7 +276,23 @@ def build_candidate_triage(
             max_mag_median=max_mag_median,
             max_ref_mag_delta=max_ref_mag_delta,
         )
-        status = "ACCEPTED" if not reasons else "REJECTED"
+        diagnostic_class = enriched.get("candidate_diagnostic_class")
+        is_borderline = (
+            diagnostic_class == "BORDERLINE_LOW_AMPLITUDE"
+            and not _has_auto_origin(enriched)
+            and not enriched.get("is_target")
+        )
+        is_near_threshold = (
+            diagnostic_class == "NEAR_THRESHOLD_LOW_AMPLITUDE"
+            and not _has_auto_origin(enriched)
+            and not enriched.get("is_target")
+        )
+        if is_borderline:
+            status = "BORDERLINE"
+        elif is_near_threshold:
+            status = "DIAGNOSTIC"
+        else:
+            status = "ACCEPTED" if not reasons else "REJECTED"
         enriched["candidate_status"] = status
         enriched["rejection_reasons"] = ",".join(reasons)
         enriched["n_rejection_reasons"] = len(reasons)
@@ -213,8 +303,9 @@ def build_candidate_triage(
 
     rows.sort(
         key=lambda d: (
-            0 if d.get("candidate_status") == "ACCEPTED" else 1,
+            {"ACCEPTED": 0, "BORDERLINE": 1, "DIAGNOSTIC": 2, "REJECTED": 3}.get(str(d.get("candidate_status")), 3),
             0 if d.get("is_target") else 1,
+            -(float(d.get("low_amplitude_min_threshold_ratio") or 0.0)),
             -(float(d.get("rms_excess") or 0.0)),
             -(float(d.get("mag_rms") or 0.0)),
         )
@@ -237,6 +328,10 @@ def build_candidate_triage(
         "forced_target_candidates": sum(1 for row in raw_candidates if row.get("candidate_origin") == "target"),
         "accepted": int(status_counter.get("ACCEPTED", 0)),
         "rejected": int(status_counter.get("REJECTED", 0)),
+        "borderline": int(status_counter.get("BORDERLINE", 0)),
+        "borderline_low_amplitude": sum(1 for row in raw_candidates if row.get("candidate_diagnostic_class") == "BORDERLINE_LOW_AMPLITUDE"),
+        "near_threshold": int(status_counter.get("DIAGNOSTIC", 0)),
+        "near_threshold_low_amplitude": sum(1 for row in raw_candidates if row.get("candidate_diagnostic_class") == "NEAR_THRESHOLD_LOW_AMPLITUDE"),
         "rejection_counts": dict(sorted(reason_counter.items())),
         "filters": {
             "min_measurements": min_measurements,
@@ -267,6 +362,9 @@ def build_candidate_triage(
             "low_amplitude_min_rms_over_mag_err": low_amplitude_min_rms_over_mag_err,
             "low_amplitude_min_mad_over_mag_err": low_amplitude_min_mad_over_mag_err,
             "low_amplitude_min_robust_peak_to_peak": low_amplitude_min_robust_peak_to_peak,
+            "enable_borderline_candidate_diagnostics": enable_borderline_candidate_diagnostics,
+            "borderline_threshold_ratio": borderline_threshold_ratio,
+            "diagnostic_max_failed_criteria": max(1, int(diagnostic_max_failed_criteria)),
         },
     }
     return CandidateTriageResult(rows=rows, summary=summary)
@@ -286,6 +384,113 @@ def _has_any_intrinsic_origin(row: dict[str, Any]) -> bool:
 
 def _has_auto_origin(row: dict[str, Any]) -> bool:
     return _has_origin(row, "rms_excess") or _has_any_intrinsic_origin(row)
+
+
+
+def _intrinsic_threshold_diagnostics(
+    object_rows,
+    *,
+    min_measurements: int,
+    min_intrinsic_rms: float | None,
+    min_rms_over_mag_err: float | None,
+    min_mad_over_mag_err: float | None,
+    intrinsic_mag_err_floor: float | None,
+    min_robust_peak_to_peak: float | None,
+    bin_width: float,
+    min_objects_per_bin: int,
+    borderline_threshold_ratio: float,
+    diagnostic_max_failed_criteria: int,
+) -> dict[int, dict[str, Any]]:
+    """Evaluate every low-amplitude criterion without discarding failed rows."""
+
+    rms_bins = build_rms_mag_summary(
+        object_rows,
+        bin_width=bin_width,
+        min_objects_per_bin=min_objects_per_bin,
+    )
+    med_by_bin = {
+        int(math.floor(float(s["mag_bin_center"]) / float(bin_width))): s.get("rms_median")
+        for s in rms_bins
+    }
+    threshold_ratio = max(0.0, min(1.0, float(borderline_threshold_ratio)))
+    max_failed = max(1, int(diagnostic_max_failed_criteria))
+    out: dict[int, dict[str, Any]] = {}
+    for row in object_rows:
+        object_id = int(row.object_id)
+        mag_rms = float(row.mag_rms) if _is_finite_number(row.mag_rms) else None
+        mag_mad = float(row.mag_mad) if _is_finite_number(row.mag_mad) else None
+        mag_err = float(row.mag_err_median) if _is_finite_number(row.mag_err_median) else None
+        effective_mag_err = mag_err
+        if effective_mag_err is not None and intrinsic_mag_err_floor is not None and _is_finite_number(intrinsic_mag_err_floor):
+            effective_mag_err = max(effective_mag_err, float(intrinsic_mag_err_floor))
+        rms_over_err = mag_rms / effective_mag_err if mag_rms is not None and effective_mag_err and effective_mag_err > 0 else None
+        mad_over_err = mag_mad / effective_mag_err if mag_mad is not None and effective_mag_err and effective_mag_err > 0 else None
+        robust_peak_to_peak = float(row.robust_peak_to_peak) if _is_finite_number(getattr(row, "robust_peak_to_peak", None)) else None
+        baseline = None
+        rms_excess = None
+        if _is_finite_number(row.mag_median):
+            idx = int(math.floor(float(row.mag_median) / float(bin_width)))
+            baseline = med_by_bin.get(idx)
+            if _is_finite_number(baseline) and float(baseline) > 0 and mag_rms is not None:
+                rms_excess = mag_rms / float(baseline)
+
+        criteria = (
+            ("n_measurements", float(row.n_measurements), float(min_measurements)),
+            ("intrinsic_rms", mag_rms, min_intrinsic_rms),
+            ("rms_over_mag_err", rms_over_err, min_rms_over_mag_err),
+            ("mad_over_mag_err", mad_over_err, min_mad_over_mag_err),
+            ("robust_peak_to_peak", robust_peak_to_peak, min_robust_peak_to_peak),
+        )
+        ratios: list[float] = []
+        failed: list[str] = []
+        diagnostics: dict[str, Any] = {
+            "baseline_rms": baseline,
+            "rms_excess": rms_excess,
+            "rms_over_mag_err": rms_over_err,
+            "mad_over_mag_err": mad_over_err,
+            "effective_mag_err_median": effective_mag_err,
+            "intrinsic_variability_score": min(v for v in (rms_over_err, mad_over_err) if v is not None) if any(v is not None for v in (rms_over_err, mad_over_err)) else None,
+        }
+        for name, value, threshold in criteria:
+            enabled = threshold is not None and _is_finite_number(threshold) and float(threshold) > 0
+            passed = True if not enabled else value is not None and _is_finite_number(value) and float(value) >= float(threshold)
+            margin = None if not enabled or value is None else float(value) - float(threshold)
+            ratio = None if not enabled or value is None else float(value) / float(threshold)
+            diagnostics[f"low_amplitude_{name}_value"] = value
+            diagnostics[f"low_amplitude_{name}_threshold"] = threshold
+            diagnostics[f"low_amplitude_{name}_pass"] = bool(passed)
+            diagnostics[f"low_amplitude_{name}_margin"] = margin
+            diagnostics[f"low_amplitude_{name}_ratio"] = ratio
+            if enabled:
+                ratios.append(float(ratio) if ratio is not None and math.isfinite(float(ratio)) else float("-inf"))
+                if not passed:
+                    failed.append(name)
+        min_ratio = min(ratios) if ratios else None
+        passed_all = not failed
+        diagnostics["low_amplitude_passed"] = passed_all
+        diagnostics["low_amplitude_failed_criteria"] = ",".join(failed)
+        diagnostics["low_amplitude_failed_criteria_count"] = len(failed)
+        diagnostics["low_amplitude_min_threshold_ratio"] = min_ratio
+        diagnostics["low_amplitude_borderline_threshold_ratio"] = threshold_ratio
+        diagnostics["low_amplitude_diagnostic_max_failed_criteria"] = max_failed
+        diagnostics["low_amplitude_borderline"] = bool(
+            not passed_all
+            and failed
+            and len(failed) <= 1
+            and min_ratio is not None
+            and math.isfinite(min_ratio)
+            and min_ratio >= threshold_ratio
+        )
+        diagnostics["low_amplitude_near_threshold"] = bool(
+            not passed_all
+            and failed
+            and len(failed) <= max_failed
+            and min_ratio is not None
+            and math.isfinite(min_ratio)
+            and min_ratio >= threshold_ratio
+        )
+        out[object_id] = diagnostics
+    return out
 
 
 def _intrinsic_variability_candidate_rows(
@@ -454,6 +659,29 @@ def candidate_triage_columns() -> list[str]:
         "candidate_origin",
         "is_target",
         "target_reason",
+        "candidate_diagnostic_class",
+        "all_usable_candidate_status",
+        "all_usable_candidate_origin",
+        "good_frame_confirmation_status",
+        "good_frame_count",
+        "good_frame_min_required",
+        "good_frame_candidate_status",
+        "good_frame_candidate_origin",
+        "good_frame_n_measurements",
+        "good_frame_mag_median",
+        "good_frame_mag_rms",
+        "good_frame_mag_mad",
+        "good_frame_robust_peak_to_peak",
+        "good_frame_mag_err_median",
+        "good_frame_baseline_rms",
+        "good_frame_rms_excess",
+        "good_frame_rms_over_mag_err",
+        "good_frame_mad_over_mag_err",
+        "good_frame_intrinsic_variability_score",
+        "good_frame_candidate_diagnostic_class",
+        "good_frame_rejection_reasons",
+        *CANDIDATE_AXIS_CORRELATION_COLUMNS,
+        *LOW_AMPLITUDE_DIAGNOSTIC_COLUMNS,
         "object_id",
         "catalog_name",
         "source_id",
@@ -473,8 +701,12 @@ def candidate_triage_columns() -> list[str]:
         "effective_mag_err_median",
         "intrinsic_variability_score",
         "mag_err_median",
+        "mag_err_systematic_median",
         "ref_mag",
         "color",
+        "reference_catalog_name",
+        "reference_band",
+        "reference_residual_status",
         "nearest_neighbor_arcsec",
         "dynamic_blend_arcsec",
         "dynamic_crowded_arcsec",
@@ -541,6 +773,15 @@ def _enrich_candidate(candidate: dict[str, Any], qc: ObjectQc | None) -> dict[st
     row["det_snr_median"] = det.get("det_snr_median")
     row["det_snr_max"] = det.get("det_snr_max")
     row["mag_ref_delta"] = phot.get("mag_ref_delta")
+    row["reference_residual_status"] = (
+        "AVAILABLE"
+        if phot.get("mag_ref_delta") is not None
+        else (
+            "MISSING_OBJECT_REFERENCE"
+            if phot.get("reference_catalog_name") or phot.get("reference_band")
+            else "NOT_CONFIGURED"
+        )
+    )
     row["aperture_min_corr_with_ref"] = ap.get("min_corr_with_ref")
     row["aperture_max_rms_delta_vs_ref"] = ap.get("max_rms_delta_vs_ref")
     row["aperture_max_abs_median_delta_vs_ref"] = ap.get("max_abs_median_delta_vs_ref")
@@ -608,9 +849,7 @@ def _candidate_rejection_reasons(
 
     if max_ref_mag_delta is not None:
         abs_delta = row.get("abs_mag_ref_delta")
-        if abs_delta is None:
-            reasons.append("NO_REF_MAG_DELTA")
-        elif float(abs_delta) > float(max_ref_mag_delta):
+        if abs_delta is not None and float(abs_delta) > float(max_ref_mag_delta):
             reasons.append("REF_MAG_DELTA_TOO_LARGE")
 
     # Remove duplicates while preserving order.

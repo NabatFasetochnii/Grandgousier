@@ -216,7 +216,7 @@ def import_events_csv(
     """Import a generic event registry CSV.
 
     The CSV may contain any subset of the fields documented in
-    README_MVP5_16_EVENT_REGISTRY_PATCH.md. Unknown columns are preserved in raw_json.
+    the historical event-registry format archived in docs/PROJECT_HISTORY.md. Unknown columns are preserved in raw_json.
     """
 
     result = ImportEventsResult(dry_run=dry_run)
@@ -544,10 +544,11 @@ def list_event_frame_coverage(
             efc.details->>'baseline_status' AS baseline_status,
             efc.details->>'event_observability_status' AS event_observability_status,
             efc.details->>'event_observability_reasons' AS event_observability_reasons,
-            f.raw_path
+            fl.locator AS raw_path
         FROM event_frame_coverage efc
         JOIN event_registry e ON e.event_id = efc.event_id
         JOIN frames f ON f.frame_id = efc.frame_id
+        JOIN frame_locations fl ON fl.frame_id = f.frame_id AND fl.is_primary
         LEFT JOIN calibration_versions cv ON cv.calibration_version_id = efc.calibration_version_id
         LEFT JOIN measurements m ON m.measurement_id = efc.measurement_id
         WHERE {' AND '.join(wheres)}
@@ -764,10 +765,11 @@ def list_event_detection_links(
             edl.nearest_catalog_source_id,
             edl.nearest_catalog_sep_arcsec,
             edl.confidence,
-            f.raw_path
+            fl.locator AS raw_path
         FROM event_detection_links edl
         JOIN event_registry e ON e.event_id = edl.event_id
         JOIN frames f ON f.frame_id = edl.frame_id
+        JOIN frame_locations fl ON fl.frame_id = f.frame_id AND fl.is_primary
         WHERE {' AND '.join(wheres)}
         ORDER BY e.event_id, edl.time_relation, edl.frame_time_jd_approx NULLS LAST, edl.detection_snr DESC NULLS LAST
     """
@@ -868,7 +870,7 @@ def _candidate_detections_near_position(
     sql = f"""
         SELECT
             sd.source_detection_id,
-            sd.frame_id,
+            drf.frame_id,
             sd.ra_deg,
             sd.dec_deg,
             sd.snr,
@@ -883,7 +885,8 @@ def _candidate_detections_near_position(
                   AND dcm.match_status = 'MATCHED'
             ) AS catalog_matched,
             (
-                SELECT dcm.catalog_name FROM detection_catalog_matches dcm
+                SELECT cs.catalog_name FROM detection_catalog_matches dcm
+                JOIN catalog_sources cs ON cs.catalog_source_id = dcm.catalog_source_id
                 WHERE dcm.source_detection_id = sd.source_detection_id
                   AND dcm.match_status = 'MATCHED'
                 ORDER BY dcm.sep_arcsec NULLS LAST
@@ -905,7 +908,8 @@ def _candidate_detections_near_position(
                 LIMIT 1
             ) AS nearest_catalog_sep_arcsec
         FROM source_detections sd
-        JOIN frames f ON f.frame_id = sd.frame_id
+        JOIN detection_run_frames drf ON drf.detection_run_frame_id = sd.detection_run_frame_id
+        JOIN frames f ON f.frame_id = drf.frame_id
         WHERE {' AND '.join(wheres)}
         ORDER BY f.mjd NULLS LAST, sd.snr DESC NULLS LAST
     """
@@ -1095,12 +1099,41 @@ def _match_one_event_to_objects(
 def _match_by_external_id(session: Session, *, ext_cat: str, ext_id: str, catalog_name: str | None) -> list[dict[str, Any]]:
     ext_cat_lower = ext_cat.lower()
     matches: list[dict[str, Any]] = []
-    if ext_cat_lower in {"gaia", "gaia_dr3", "gaiaedr3"}:
-        rows = session.execute(text("SELECT object_id FROM objects WHERE gaia_dr3_id = :ext_id"), {"ext_id": ext_id}).mappings().all()
-        for r in rows:
-            matches.append({"object_id": int(r["object_id"]), "match_type": "gaia_dr3_id", "separation_arcsec": None, "confidence": 1.0})
 
-    # Match through measurement flags, useful for gaia_dr3_master source_id values.
+    gaia_aliases = {"gaia", "gaia_dr3", "gaiaedr3", "gaiadr3", "gaia_dr3_master"}
+    if ext_cat_lower in gaia_aliases:
+        link_sql = text(
+            """
+            SELECT DISTINCT ocl.object_id, cs.catalog_name
+            FROM object_catalog_links ocl
+            JOIN catalog_sources cs ON cs.catalog_source_id = ocl.catalog_source_id
+            WHERE lower(cs.catalog_name) IN ('gaia', 'gaia_dr3', 'gaiaedr3', 'gaiadr3', 'gaia_dr3_master')
+              AND cs.source_id = :source_id
+            """
+        )
+        link_params = {"source_id": ext_id}
+    else:
+        link_sql = text(
+            """
+            SELECT DISTINCT ocl.object_id, cs.catalog_name
+            FROM object_catalog_links ocl
+            JOIN catalog_sources cs ON cs.catalog_source_id = ocl.catalog_source_id
+            WHERE lower(cs.catalog_name) = :catalog_name
+              AND cs.source_id = :source_id
+            """
+        )
+        link_params = {"catalog_name": ext_cat_lower, "source_id": ext_id}
+    rows = session.execute(link_sql, link_params).mappings().all()
+    for r in rows:
+        matches.append({
+            "object_id": int(r["object_id"]),
+            "match_type": "object_catalog_link",
+            "separation_arcsec": None,
+            "confidence": 1.0,
+        })
+
+    # Historical measurement flags remain a compatibility evidence source for
+    # older imported products; new object identity is never derived from them.
     flag_catalog = catalog_name or ext_cat
     rows = session.execute(
         text(
@@ -1115,15 +1148,6 @@ def _match_by_external_id(session: Session, *, ext_cat: str, ext_id: str, catalo
     ).mappings().all()
     for r in rows:
         matches.append({"object_id": int(r["object_id"]), "match_type": "measurement_flag_source_id", "separation_arcsec": None, "confidence": 0.98})
-
-    # Generic JSON external_ids fallback: supports keys such as TIC, tic, VSX, etc.
-    rows = session.execute(text("SELECT object_id, external_ids FROM objects WHERE external_ids IS NOT NULL")).mappings().all()
-    for r in rows:
-        external_ids = r.get("external_ids") or {}
-        for key, value in external_ids.items():
-            if str(key).lower() == ext_cat_lower and str(value) == ext_id:
-                matches.append({"object_id": int(r["object_id"]), "match_type": "object_external_ids", "separation_arcsec": None, "confidence": 0.95})
-                break
     return matches
 
 

@@ -18,15 +18,11 @@ except ModuleNotFoundError:  # pragma: no cover - Python >=3.11 is required by t
 ROOT = Path(__file__).resolve().parents[1]
 CONTEXT_FILES = [
     Path("CONTEXT.md"),
-    Path("docs/context/CURRENT_STATE.md"),
-    Path("docs/context/NEXT_TASKS.md"),
-    Path("docs/context/KNOWN_ISSUES.md"),
-    Path("docs/context/TEST_DATASETS.md"),
-    Path("docs/context/COMMANDS.md"),
-    Path("context/project_state.yaml"),
+    Path("docs/ROADMAP.md"),
     Path("docs/CURRENT_ARCHITECTURE.md"),
+    Path("context/project_state.yaml"),
+    Path("docs/user_manual_ru/README.md"),
 ]
-
 _DATABASE_URL_RE = re.compile(r"(postgresql(?:\+\w+)?://[^:\s/@]+:)([^@\s]+)(@)", re.IGNORECASE)
 
 
@@ -108,6 +104,12 @@ def _manifest_summary(path: Path) -> str:
         "field_name": result.get("field_name"),
         "filter_name": result.get("filter_name"),
         "ensemble_calibration": result.get("ensemble_calibration"),
+        "color_calibration": result.get("color_calibration"),
+        "science_calibration": result.get("science_calibration") or qp.get("science_calibration"),
+        "color_calibration_activated": qp.get("color_calibration_activated"),
+        "color_reference_band": qp.get("color_reference_band"),
+        "color_index": qp.get("color_index"),
+        "color_term": qp.get("color_term"),
         "candidate_ensemble_iteration_mode": qp.get("candidate_ensemble_iteration_mode"),
         "candidate_ensemble_converged": qp.get("candidate_ensemble_converged"),
         "candidate_ensemble_stop_reason": qp.get("candidate_ensemble_stop_reason"),
@@ -138,8 +140,8 @@ def build_bundle(output: Path, manifest: Path | None) -> None:
         f"Project version: `{version}`.",
         _git_summary(),
         "",
-        "> This file is generated. Update the source documents in `docs/context/` and "
-        "`context/project_state.yaml`, not this bundle.",
+        "> This file is generated. Update `CONTEXT.md`, `docs/ROADMAP.md`, "
+        "`docs/CURRENT_ARCHITECTURE.md` and `context/project_state.yaml`, not this bundle.",
     ]
 
     for relative in CONTEXT_FILES:
@@ -155,15 +157,6 @@ def build_bundle(output: Path, manifest: Path | None) -> None:
             ]
         )
 
-    release = ROOT / "docs" / "releases" / f"{version}.md"
-    if release.exists():
-        sections.extend(
-            [
-                "",
-                f"---\n\n## Source: `docs/releases/{version}.md`\n",
-                _redact(release.read_text(encoding="utf-8").strip()),
-            ]
-        )
 
     if manifest is not None:
         manifest_path = manifest if manifest.is_absolute() else ROOT / manifest

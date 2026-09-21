@@ -12,8 +12,12 @@ from grandgousier.archive.auto_process import (
     _catalog_precondition_ok,
     _classify_science_status,
     _default_auto_catalog_name,
+    _effective_auto_catalog_max_radius_deg,
+    _effective_auto_catalog_mag_limit,
     _format_calibration_prefix,
+    _inspect_existing_catalog,
     _merge_current_series_ids,
+    _prepare_auto_catalog,
     discover_fits_files,
     scan_archive_path,
 )
@@ -43,6 +47,9 @@ class FakeSession:
 
     def query(self, *_args, **_kwargs):
         return FakeQuery(False)
+
+    def scalar(self, *_args, **_kwargs):
+        return None
 
     def add(self, obj):
         self.added.append(obj)
@@ -143,7 +150,9 @@ def test_default_auto_prefix_contains_instrument_date_field_filter_and_series_id
         },
     )
 
-    assert prefix == "auto_master_20230920_TIC420268415_01_WEST_203_B_s12_v1"
+    # Auto-processing names use the canonical UTC series date.  The input
+    # instant is 2023-09-19T22:13:14Z even though its source offset is +05:00.
+    assert prefix == "auto_master_20230919_TIC420268415_01_WEST_203_B_s12_v1"
 
 
 
@@ -157,6 +166,21 @@ def test_default_auto_catalog_name_uses_detected_group_metadata(tmp_path):
     assert _default_auto_catalog_name(groups, root=tmp_path) == "auto_catalog_robophot_20240101_RoboPhotTarget_i"
 
 
+def test_auto_catalog_mag_limit_inherits_working_limit_unless_explicit():
+    assert _effective_auto_catalog_mag_limit(explicit=None, working=19.0) == pytest.approx(19.0)
+    assert _effective_auto_catalog_mag_limit(explicit=18.0, working=19.0) == pytest.approx(18.0)
+    assert _effective_auto_catalog_mag_limit(explicit=None, working=None) is None
+
+
+def test_auto_catalog_radius_default_is_master_aware():
+    master = [SimpleNamespace(profile_name="MASTER", instrument="MASTER")]
+    robophot = [SimpleNamespace(profile_name="RoboPhot", instrument="APM-RoboPhot")]
+
+    assert _effective_auto_catalog_max_radius_deg(master, explicit=None) == pytest.approx(1.6)
+    assert _effective_auto_catalog_max_radius_deg(robophot, explicit=None) == pytest.approx(1.0)
+    assert _effective_auto_catalog_max_radius_deg(master, explicit=2.5) == pytest.approx(2.5)
+
+
 def test_merge_current_series_ids_keeps_only_explicitly_supplied_series():
     assert _merge_current_series_ids([4, 4], [4, 9]) == [4, 9]
     assert _merge_current_series_ids([], []) == []
@@ -167,6 +191,56 @@ def test_classify_science_status_distinguishes_empty_science_products():
     assert _classify_science_status(10, 0, 1) == "WARNING_NO_ACCEPTED_POINTS"
     assert _classify_science_status(10, 3, 1) == "OK"
 
+
+
+def test_prepare_auto_catalog_reuses_populated_exact_name_without_gaia(monkeypatch):
+    calls = {"gaia": 0}
+
+    monkeypatch.setattr(
+        "grandgousier.archive.auto_process._inspect_existing_catalog",
+        lambda _session, *, catalog_name: {
+            "mode": "explicit_existing",
+            "catalog_name": catalog_name,
+            "status": "DONE",
+            "inserted_or_updated": 123,
+            "n_sources": 123,
+        },
+    )
+
+    # Importing/querying Gaia must never be reached when the preserved catalog
+    # is already populated.  Patching the query symbol gives the test a clear
+    # failure mode if that contract regresses.
+    import grandgousier.catalogs.gaia_query as gaia_query
+
+    def _unexpected_gaia(*_args, **_kwargs):
+        calls["gaia"] += 1
+        raise AssertionError("Gaia query should not run for a populated preserved catalog")
+
+    monkeypatch.setattr(gaia_query, "query_gaia_for_frames", _unexpected_gaia)
+
+    row = _prepare_auto_catalog(
+        object(),
+        catalog_name="auto_catalog_master_20230916_TIC13533330_01_V",
+        frame_ids=[1, 2, 3],
+        enabled=True,
+        margin_arcmin=10.0,
+        mag_limit=None,
+        max_rows_per_frame=50000,
+        query_mode="frame_union",
+        max_radius_deg=1.0,
+        timeout_sec=120.0,
+        warnings=[],
+    )
+
+    assert calls["gaia"] == 0
+    assert row["mode"] == "auto_existing_reuse"
+    assert row["status"] == "DONE"
+    assert row["reused_existing"] is True
+    assert row["n_sources"] == 123
+    assert row["inserted_or_updated"] == 123
+    assert row["queried_frames"] == 0
+    assert row["queried_cones"] == 0
+    assert _catalog_precondition_ok(row, allow_empty_catalog=False)
 
 
 def test_catalog_precondition_blocks_failed_or_empty_auto_catalogs():
@@ -185,6 +259,18 @@ def test_combine_gaia_cones_keeps_union_radius_reasonable():
     assert 19.9 < dec < 20.1
     assert radius > 0.1
     assert radius < 0.3
+
+
+def test_gaia_union_fallback_clusters_repeated_pointings():
+    from grandgousier.catalogs.gaia_query import _cluster_cones
+
+    clusters, oversized = _cluster_cones(
+        [(10.0, 20.0, 1.50), (10.01, 20.0, 1.50), (40.0, 20.0, 1.50)],
+        max_radius_deg=1.6,
+    )
+
+    assert oversized == []
+    assert sorted(len(cluster) for cluster in clusters) == [1, 2]
 
 
 def test_gaia_frame_cone_falls_back_to_indexed_center_and_pixel_scale(tmp_path):
@@ -294,3 +380,104 @@ def test_gaia_frame_cone_prefers_db_center_over_crval_reference_point(tmp_path):
     assert ra == pytest.approx(22.4256125702872)
     assert dec == pytest.approx(67.25190793092416)
     assert 0.28 < radius < 0.35
+
+
+class _ScalarResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar_one(self):
+        return self.value
+
+
+class _CatalogCountSession:
+    def __init__(self, count):
+        self.count = count
+
+    def execute(self, _statement):
+        return _ScalarResult(self.count)
+
+
+def test_inspect_existing_catalog_reports_ready_and_empty_namespaces():
+    ready = _inspect_existing_catalog(_CatalogCountSession(42), catalog_name="catalog_ready")
+    empty = _inspect_existing_catalog(_CatalogCountSession(0), catalog_name="catalog_empty")
+
+    assert ready == {
+        "mode": "explicit_existing",
+        "catalog_name": "catalog_ready",
+        "status": "DONE",
+        "inserted_or_updated": 42,
+        "n_sources": 42,
+    }
+    assert empty["status"] == "EMPTY"
+    assert empty["n_sources"] == 0
+    assert not _catalog_precondition_ok(empty, allow_empty_catalog=False)
+    assert _catalog_precondition_ok(empty, allow_empty_catalog=True)
+
+
+class _FakeTapJob:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def get_results(self):
+        return self._rows
+
+
+class _FailingTapClient:
+    def launch_job(self, _query, **_kwargs):
+        raise ConnectionError("provider unavailable")
+
+
+class _WorkingTapClient:
+    def __init__(self):
+        self.queries = []
+
+    def launch_job(self, query, **_kwargs):
+        self.queries.append(query)
+        return _FakeTapJob([{"source_id": 1}])
+
+
+def test_gaia_query_falls_back_to_next_public_tap_provider():
+    from grandgousier.catalogs.gaia_query import _GaiaTapProvider, _query_gaia_cone
+
+    working = _WorkingTapClient()
+    rows, provider_name, failures = _query_gaia_cone(
+        [
+            _GaiaTapProvider(name="first", client=_FailingTapClient()),
+            _GaiaTapProvider(name="second", client=working),
+        ],
+        center_ra_deg=10.0,
+        center_dec_deg=20.0,
+        radius_deg=0.25,
+        mag_limit=19.0,
+        max_rows=2000,
+    )
+
+    assert rows == [{"source_id": 1}]
+    assert provider_name == "second"
+    assert failures["first"].startswith("ConnectionError:")
+    assert "FROM gaiadr3.gaia_source" in working.queries[0]
+    assert "phot_g_mean_mag <= 19.000000" in working.queries[0]
+
+
+def test_gaia_query_reports_all_provider_failures():
+    from grandgousier.catalogs.gaia_query import (
+        _GaiaAllProvidersFailed,
+        _GaiaTapProvider,
+        _query_gaia_cone,
+    )
+
+    with pytest.raises(_GaiaAllProvidersFailed) as excinfo:
+        _query_gaia_cone(
+            [
+                _GaiaTapProvider(name="first", client=_FailingTapClient()),
+                _GaiaTapProvider(name="second", client=_FailingTapClient()),
+            ],
+            center_ra_deg=10.0,
+            center_dec_deg=20.0,
+            radius_deg=0.25,
+            mag_limit=19.0,
+            max_rows=2000,
+        )
+
+    assert set(excinfo.value.failures) == {"first", "second"}

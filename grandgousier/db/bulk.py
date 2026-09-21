@@ -8,7 +8,7 @@ T = TypeVar("T")
 POSTGRESQL_MAX_BIND_PARAMETERS = 65535
 # Keep headroom for dialect-generated bind parameters and future extra columns.
 POSTGRESQL_SAFE_BIND_PARAMETERS = 60000
-DEFAULT_BULK_INSERT_BATCH_SIZE = 1000
+DEFAULT_BULK_INSERT_BATCH_SIZE = 3000
 
 
 def validated_batch_size(batch_size: int | None) -> int:

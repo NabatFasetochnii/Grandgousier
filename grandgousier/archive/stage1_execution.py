@@ -1,0 +1,767 @@
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import os
+import shutil
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+from grandgousier import __version__
+from grandgousier.archive.manifest import extract_numeric_frame_id
+from grandgousier.archive.master_reduction import (
+    REDUCTION_ALGORITHM,
+    MasterReductionResult,
+    MasterReductionTask,
+    reduce_master_task,
+)
+from grandgousier.archive.stage1_contract import (
+    AssetProvider,
+    AssetRef,
+    CalibrationPlan,
+    CalibrationPlanItem,
+    LocalAsset,
+    ProductRef,
+    ProductStore,
+)
+
+STAGE1_EXECUTION_SCHEMA = "grandgousier.stage1.execution.v1"
+STAGE1_PROVENANCE_SCHEMA = "grandgousier.stage1.product-provenance.v1"
+SOURCE_PROCESSED_COPY_RECIPE = "SOURCE_PROCESSED_COPY_V1"
+_SUCCESS_STATUSES = {"REDUCED", "IMPORTED", "SKIPPED_EXISTING", "ADOPTED_EXISTING"}
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(chunk_size)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _fingerprint(payload: Mapping[str, Any]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _provenance_path(product_path: Path) -> Path:
+    return product_path.with_name(product_path.name + ".provenance.json")
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".part")
+    if temp.exists():
+        temp.unlink()
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+
+
+def _read_json(path: Path) -> Mapping[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializedInput:
+    ref: AssetRef
+    path: Path
+    checksum_sha256: str
+    size_bytes: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ref": self.ref.to_dict(),
+            "checksum_sha256": self.checksum_sha256,
+            "size_bytes": self.size_bytes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Stage1ExecutionItemResult:
+    source_observation_uid: str | None
+    native_observation_id: str | None
+    observation_uid: str | None
+    action: str
+    status: str
+    product: ProductRef | None
+    product_path: str | None = None
+    product_checksum_sha256: str | None = None
+    provenance_path: str | None = None
+    fingerprint: str | None = None
+    error: str | None = None
+
+    @property
+    def successful(self) -> bool:
+        return self.status in _SUCCESS_STATUSES
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_observation_uid": self.source_observation_uid,
+            "native_observation_id": self.native_observation_id,
+            "observation_uid": self.observation_uid,
+            "action": self.action,
+            "status": self.status,
+            "product": self.product.to_dict() if self.product else None,
+            "product_path": self.product_path,
+            "product_checksum_sha256": self.product_checksum_sha256,
+            "provenance_path": self.provenance_path,
+            "fingerprint": self.fingerprint,
+            "error": self.error,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Stage1ExecutionReport:
+    source_id: str
+    generated_at_utc: str
+    plan_schema: str
+    plan_status: str
+    results: tuple[Stage1ExecutionItemResult, ...]
+    schema: str = STAGE1_EXECUTION_SCHEMA
+
+    @property
+    def failed_items(self) -> int:
+        return sum(item.status == "FAILED" for item in self.results)
+
+    @property
+    def blocked_items(self) -> int:
+        return sum(item.status == "BLOCKED" for item in self.results)
+
+    @property
+    def successful_items(self) -> int:
+        return sum(item.successful for item in self.results)
+
+    @property
+    def status(self) -> str:
+        if self.failed_items:
+            return "FAILED"
+        if self.blocked_items:
+            return "BLOCKED"
+        return "READY"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "generated_at_utc": self.generated_at_utc,
+            "status": self.status,
+            "source_id": self.source_id,
+            "plan_schema": self.plan_schema,
+            "plan_status": self.plan_status,
+            "summary": {
+                "items": len(self.results),
+                "successful_items": self.successful_items,
+                "blocked_items": self.blocked_items,
+                "failed_items": self.failed_items,
+                "reduced": sum(item.status == "REDUCED" for item in self.results),
+                "imported": sum(item.status == "IMPORTED" for item in self.results),
+                "skipped_existing": sum(item.status == "SKIPPED_EXISTING" for item in self.results),
+                "adopted_existing": sum(item.status == "ADOPTED_EXISTING" for item in self.results),
+            },
+            "items": [item.to_dict() for item in self.results],
+        }
+
+    def to_json(self, *, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
+
+
+class _ExecutionContext:
+    def __init__(self, asset_provider: AssetProvider) -> None:
+        self.asset_provider = asset_provider
+        self.materialized: dict[str, MaterializedInput] = {}
+
+    def materialize(self, ref: AssetRef) -> MaterializedInput:
+        cached = self.materialized.get(ref.ref_uid)
+        if cached is not None:
+            return cached
+        local = self.asset_provider.materialize(ref)
+        if not isinstance(local, LocalAsset):
+            raise TypeError("AssetProvider.materialize() must return LocalAsset")
+        if local.ref.ref_uid != ref.ref_uid:
+            raise ValueError("AssetProvider returned a LocalAsset for a different AssetRef")
+        path = Path(local.path)
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise FileNotFoundError(f"Materialized asset is missing or empty: {path}")
+        checksum = _sha256_file(path)
+        if ref.checksum_sha256 and checksum.casefold() != ref.checksum_sha256.casefold():
+            raise ValueError(
+                f"Asset checksum mismatch for {ref.role}: expected={ref.checksum_sha256}, actual={checksum}"
+            )
+        item = MaterializedInput(
+            ref=ref,
+            path=path,
+            checksum_sha256=checksum,
+            size_bytes=int(path.stat().st_size),
+        )
+        self.materialized[ref.ref_uid] = item
+        return item
+
+
+def _input_fingerprint_payload(
+    item: CalibrationPlanItem,
+    inputs: Sequence[MaterializedInput],
+    *,
+    recipe: str,
+    parameters: Mapping[str, Any],
+) -> dict[str, Any]:
+    obs = item.observation
+    ordered = sorted(inputs, key=lambda value: (value.ref.role, value.ref.ref_uid))
+    return {
+        "schema": STAGE1_PROVENANCE_SCHEMA,
+        "source_id": obs.source_id,
+        "native_observation_id": obs.native_observation_id,
+        "source_observation_uid": obs.source_observation_uid,
+        "observation_uid": obs.observation_uid,
+        "identity_scheme": obs.identity_scheme,
+        "action": item.action,
+        "recipe": recipe,
+        "parameters": dict(parameters),
+        "inputs": [
+            {
+                "role": value.ref.role,
+                "ref_uid": value.ref.ref_uid,
+                "checksum_sha256": value.checksum_sha256,
+            }
+            for value in ordered
+        ],
+    }
+
+
+def _build_provenance(
+    item: CalibrationPlanItem,
+    inputs: Sequence[MaterializedInput],
+    *,
+    recipe: str,
+    parameters: Mapping[str, Any],
+    fingerprint: str,
+    product: ProductRef,
+    product_path: Path,
+    product_checksum_sha256: str,
+    execution_status: str,
+) -> dict[str, Any]:
+    obs = item.observation
+    return {
+        "schema": STAGE1_PROVENANCE_SCHEMA,
+        "generated_at_utc": _utc_now(),
+        "grandgousier_version": __version__,
+        "execution_status": execution_status,
+        "fingerprint": fingerprint,
+        "observation": {
+            "source_id": obs.source_id,
+            "native_observation_id": obs.native_observation_id,
+            "source_observation_uid": obs.source_observation_uid,
+            "identity_scheme": obs.identity_scheme,
+            "p4_native_identity": obs.p4_native_identity,
+            "observation_uid": obs.observation_uid,
+            "instrument": obs.instrument,
+            "camera": obs.camera,
+            "filter_name": obs.filter_name,
+            "observed_at": obs.observed_at,
+        },
+        "recipe": {"name": recipe, "parameters": dict(parameters)},
+        "inputs": [value.to_dict() for value in sorted(inputs, key=lambda v: (v.ref.role, v.ref.ref_uid))],
+        "product": {
+            **product.to_dict(),
+            "checksum_sha256": product_checksum_sha256,
+            "size_bytes": int(product_path.stat().st_size),
+        },
+    }
+
+
+def _validate_existing_sidecar(
+    *,
+    sidecar: Mapping[str, Any],
+    expected_fingerprint: str,
+    product_path: Path,
+) -> tuple[bool, str | None, str | None]:
+    if sidecar.get("schema") != STAGE1_PROVENANCE_SCHEMA:
+        return False, None, "existing provenance schema is missing or incompatible"
+    if str(sidecar.get("fingerprint") or "") != expected_fingerprint:
+        return False, None, "existing provenance fingerprint does not match current inputs/recipe"
+    product = sidecar.get("product")
+    if not isinstance(product, Mapping):
+        return False, None, "existing provenance product section is missing"
+    recorded_checksum = str(product.get("checksum_sha256") or "").strip()
+    if not recorded_checksum:
+        return False, None, "existing provenance product checksum is missing"
+    actual_checksum = _sha256_file(product_path)
+    if actual_checksum.casefold() != recorded_checksum.casefold():
+        return False, actual_checksum, "existing product checksum differs from provenance"
+    return True, actual_checksum, None
+
+
+def _master_task_from_item(
+    item: CalibrationPlanItem,
+    materialized: Mapping[str, MaterializedInput],
+    output_path: Path,
+) -> MasterReductionTask:
+    obs = item.observation
+
+    def one(role: str) -> MaterializedInput:
+        value = materialized.get(role)
+        if value is None:
+            raise ValueError(f"MASTER execution requires asset role {role!r}")
+        return value
+
+    raw = one("science_raw")
+    header = one("processing_header")
+    dark = one("dark")
+    flat = one("flat")
+    raw_id = None
+    raw_id_text = str(obs.metadata.get("raw_id") or "").strip()
+    if raw_id_text:
+        try:
+            raw_id = int(raw_id_text)
+        except ValueError:
+            raw_id = None
+    if raw_id is None:
+        raw_id = extract_numeric_frame_id(raw.ref.locator)
+    if raw_id is None:
+        raise ValueError(f"Cannot determine MASTER raw_id from {raw.ref.locator!r}")
+    return MasterReductionTask(
+        processed_frame_id=str(obs.metadata.get("processed_frame_id") or "").strip() or None,
+        raw_id=int(raw_id),
+        raw_remote_path=raw.ref.locator,
+        header_remote_path=header.ref.locator,
+        dark_remote_path=dark.ref.locator,
+        flat_remote_path=flat.ref.locator,
+        raw_local_path=raw.path,
+        header_local_path=header.path,
+        dark_local_path=dark.path,
+        flat_local_path=flat.path,
+        output_path=output_path,
+    )
+
+
+def _result_for_item(
+    item: CalibrationPlanItem,
+    *,
+    status: str,
+    product: ProductRef | None = None,
+    product_path: Path | None = None,
+    checksum: str | None = None,
+    provenance_path: Path | None = None,
+    fingerprint: str | None = None,
+    error: str | None = None,
+) -> Stage1ExecutionItemResult:
+    obs = item.observation
+    return Stage1ExecutionItemResult(
+        source_observation_uid=obs.source_observation_uid,
+        native_observation_id=obs.native_observation_id,
+        observation_uid=obs.observation_uid,
+        action=item.action,
+        status=status,
+        product=product,
+        product_path=str(product_path) if product_path is not None else None,
+        product_checksum_sha256=checksum,
+        provenance_path=str(provenance_path) if provenance_path is not None else None,
+        fingerprint=fingerprint,
+        error=error,
+    )
+
+
+def _execute_item(
+    item: CalibrationPlanItem,
+    *,
+    context: _ExecutionContext,
+    product_store: ProductStore,
+    overwrite: bool,
+    max_dark_temperature_delta_c: float | None,
+) -> Stage1ExecutionItemResult:
+    if item.status != "READY" or item.product is None:
+        return _result_for_item(
+            item,
+            status="BLOCKED",
+            product=item.product,
+            error="; ".join(item.issues) or "Stage-1 plan item is not READY",
+        )
+
+    product = item.product
+    output_path = product_store.resolve(product)
+    provenance_path = _provenance_path(output_path)
+
+    if item.action == "IMPORT_PROCESSED":
+        processed_ref = item.observation.asset("processed")
+        if processed_ref is None:
+            return _result_for_item(
+                item,
+                status="FAILED",
+                product=product,
+                product_path=output_path,
+                error="IMPORT_PROCESSED requires a processed asset",
+            )
+        try:
+            inputs = [context.materialize(processed_ref)]
+            parameters: dict[str, Any] = {"copy_mode": "byte_preserving"}
+            payload = _input_fingerprint_payload(
+                item, inputs, recipe=SOURCE_PROCESSED_COPY_RECIPE, parameters=parameters
+            )
+            fingerprint = _fingerprint(payload)
+            if output_path.is_file() and not overwrite:
+                sidecar = _read_json(provenance_path)
+                if sidecar is not None:
+                    valid, checksum, reason = _validate_existing_sidecar(
+                        sidecar=sidecar,
+                        expected_fingerprint=fingerprint,
+                        product_path=output_path,
+                    )
+                    if valid:
+                        return _result_for_item(
+                            item,
+                            status="SKIPPED_EXISTING",
+                            product=product,
+                            product_path=output_path,
+                            checksum=checksum,
+                            provenance_path=provenance_path,
+                            fingerprint=fingerprint,
+                        )
+                    return _result_for_item(
+                        item,
+                        status="FAILED",
+                        product=product,
+                        product_path=output_path,
+                        checksum=checksum,
+                        provenance_path=provenance_path,
+                        fingerprint=fingerprint,
+                        error=f"Existing product is not safely reusable: {reason}; use --overwrite after review",
+                    )
+                source_checksum = inputs[0].checksum_sha256
+                output_checksum = _sha256_file(output_path)
+                if source_checksum.casefold() == output_checksum.casefold():
+                    provenance = _build_provenance(
+                        item,
+                        inputs,
+                        recipe=SOURCE_PROCESSED_COPY_RECIPE,
+                        parameters=parameters,
+                        fingerprint=fingerprint,
+                        product=product,
+                        product_path=output_path,
+                        product_checksum_sha256=output_checksum,
+                        execution_status="ADOPTED_EXISTING",
+                    )
+                    _atomic_write_json(provenance_path, provenance)
+                    return _result_for_item(
+                        item,
+                        status="ADOPTED_EXISTING",
+                        product=product,
+                        product_path=output_path,
+                        checksum=output_checksum,
+                        provenance_path=provenance_path,
+                        fingerprint=fingerprint,
+                    )
+                return _result_for_item(
+                    item,
+                    status="FAILED",
+                    product=product,
+                    product_path=output_path,
+                    checksum=output_checksum,
+                    provenance_path=provenance_path,
+                    fingerprint=fingerprint,
+                    error="Existing product has no provenance sidecar and differs from source; use --overwrite after review",
+                )
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            temp = output_path.with_name(output_path.name + ".part")
+            if temp.exists():
+                temp.unlink()
+            if inputs[0].path.resolve(strict=False) == output_path.resolve(strict=False):
+                output_checksum = inputs[0].checksum_sha256
+            else:
+                shutil.copy2(inputs[0].path, temp)
+                os.replace(temp, output_path)
+                output_checksum = _sha256_file(output_path)
+                if output_checksum.casefold() != inputs[0].checksum_sha256.casefold():
+                    raise ValueError("Imported processed FITS checksum changed during copy")
+            provenance = _build_provenance(
+                item,
+                inputs,
+                recipe=SOURCE_PROCESSED_COPY_RECIPE,
+                parameters=parameters,
+                fingerprint=fingerprint,
+                product=product,
+                product_path=output_path,
+                product_checksum_sha256=output_checksum,
+                execution_status="IMPORTED",
+            )
+            _atomic_write_json(provenance_path, provenance)
+            return _result_for_item(
+                item,
+                status="IMPORTED",
+                product=product,
+                product_path=output_path,
+                checksum=output_checksum,
+                provenance_path=provenance_path,
+                fingerprint=fingerprint,
+            )
+        except Exception as exc:
+            return _result_for_item(
+                item,
+                status="FAILED",
+                product=product,
+                product_path=output_path,
+                provenance_path=provenance_path,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    if item.action != "REDUCE_RAW":
+        return _result_for_item(
+            item,
+            status="FAILED",
+            product=product,
+            product_path=output_path,
+            error=f"Unsupported Stage-1 action {item.action!r}",
+        )
+    if item.observation.instrument != "MASTER":
+        return _result_for_item(
+            item,
+            status="FAILED",
+            product=product,
+            product_path=output_path,
+            error=(
+                f"raw Stage-1 execution currently supports MASTER only; instrument={item.observation.instrument!r}. "
+                "Use processed import for other sources until an instrument-specific reducer is registered."
+            ),
+        )
+
+    try:
+        materialized_by_role: dict[str, MaterializedInput] = {}
+        for role in ("science_raw", "processing_header", "dark", "flat"):
+            ref = item.observation.asset(role)
+            if ref is None:
+                raise ValueError(f"MASTER execution requires asset role {role!r}")
+            materialized_by_role[role] = context.materialize(ref)
+        inputs = list(materialized_by_role.values())
+        parameters = {"max_dark_temperature_delta_c": max_dark_temperature_delta_c}
+        payload = _input_fingerprint_payload(
+            item, inputs, recipe=REDUCTION_ALGORITHM, parameters=parameters
+        )
+        fingerprint = _fingerprint(payload)
+        task = _master_task_from_item(item, materialized_by_role, output_path)
+
+        if output_path.is_file() and not overwrite:
+            sidecar = _read_json(provenance_path)
+            if sidecar is not None:
+                valid, checksum, reason = _validate_existing_sidecar(
+                    sidecar=sidecar,
+                    expected_fingerprint=fingerprint,
+                    product_path=output_path,
+                )
+                if valid:
+                    return _result_for_item(
+                        item,
+                        status="SKIPPED_EXISTING",
+                        product=product,
+                        product_path=output_path,
+                        checksum=checksum,
+                        provenance_path=provenance_path,
+                        fingerprint=fingerprint,
+                    )
+                return _result_for_item(
+                    item,
+                    status="FAILED",
+                    product=product,
+                    product_path=output_path,
+                    checksum=checksum,
+                    provenance_path=provenance_path,
+                    fingerprint=fingerprint,
+                    error=f"Existing product is not safely reusable: {reason}; use --overwrite after review",
+                )
+            return _result_for_item(
+                item,
+                status="FAILED",
+                product=product,
+                product_path=output_path,
+                provenance_path=provenance_path,
+                fingerprint=fingerprint,
+                error=(
+                    "Existing MASTER product has no canonical checksum provenance sidecar. "
+                    "Legacy FITS provenance cards identify source paths but cannot prove the exact input bytes; "
+                    "use --overwrite after review to rebuild and stamp canonical provenance"
+                ),
+            )
+
+        reduction: MasterReductionResult = reduce_master_task(
+            task,
+            overwrite=overwrite,
+            max_dark_temperature_delta_c=max_dark_temperature_delta_c,
+        )
+        if reduction.status == "FAILED":
+            return _result_for_item(
+                item,
+                status="FAILED",
+                product=product,
+                product_path=output_path,
+                provenance_path=provenance_path,
+                fingerprint=fingerprint,
+                error=reduction.error or "MASTER reduction failed",
+            )
+        checksum = _sha256_file(output_path)
+        if reduction.status != "REDUCED":
+            return _result_for_item(
+                item,
+                status="FAILED",
+                product=product,
+                product_path=output_path,
+                provenance_path=provenance_path,
+                fingerprint=fingerprint,
+                error=(
+                    f"MASTER reducer returned unexpected status {reduction.status!r} without a prevalidated "
+                    "canonical provenance sidecar; rerun after review or use --overwrite"
+                ),
+            )
+        execution_status = "REDUCED"
+        provenance = _build_provenance(
+            item,
+            inputs,
+            recipe=REDUCTION_ALGORITHM,
+            parameters=parameters,
+            fingerprint=fingerprint,
+            product=product,
+            product_path=output_path,
+            product_checksum_sha256=checksum,
+            execution_status=execution_status,
+        )
+        _atomic_write_json(provenance_path, provenance)
+        return _result_for_item(
+            item,
+            status=execution_status,
+            product=product,
+            product_path=output_path,
+            checksum=checksum,
+            provenance_path=provenance_path,
+            fingerprint=fingerprint,
+        )
+    except Exception as exc:
+        return _result_for_item(
+            item,
+            status="FAILED",
+            product=product,
+            product_path=output_path,
+            provenance_path=provenance_path,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def execute_stage1_plan(
+    plan: CalibrationPlan,
+    *,
+    asset_provider: AssetProvider,
+    product_store: ProductStore,
+    overwrite: bool = False,
+    max_dark_temperature_delta_c: float | None = 5.0,
+) -> Stage1ExecutionReport:
+    """Materialize and execute a canonical plan without writing Grandgousier DB state."""
+    plan_store = dict(plan.product_store)
+    actual_store = dict(product_store.public_descriptor)
+    for key in ("store_id", "backend"):
+        if plan_store.get(key) != actual_store.get(key):
+            raise ValueError(
+                f"CalibrationPlan product_store {key}={plan_store.get(key)!r} does not match "
+                f"execution ProductStore {actual_store.get(key)!r}"
+            )
+
+    context = _ExecutionContext(asset_provider)
+    if plan.status == "BLOCKED":
+        results = tuple(
+            _result_for_item(
+                item,
+                status="BLOCKED",
+                product=item.product,
+                error=(
+                    "; ".join(item.issues)
+                    if item.status != "READY"
+                    else "Plan contains blocked items; no partial Stage-1 execution was performed"
+                ),
+            )
+            for item in plan.items
+        )
+    else:
+        results = tuple(
+            _execute_item(
+                item,
+                context=context,
+                product_store=product_store,
+                overwrite=bool(overwrite),
+                max_dark_temperature_delta_c=max_dark_temperature_delta_c,
+            )
+            for item in plan.items
+        )
+    return Stage1ExecutionReport(
+        source_id=plan.source.source_id,
+        generated_at_utc=_utc_now(),
+        plan_schema=plan.schema,
+        plan_status=plan.status,
+        results=results,
+    )
+
+
+def write_stage1_execution_json(report: Stage1ExecutionReport, path: str | Path) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(report.to_json(indent=2) + "\n", encoding="utf-8")
+    return target
+
+
+def write_stage1_execution_csv(report: Stage1ExecutionReport, path: str | Path) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    columns = [
+        "native_observation_id",
+        "source_observation_uid",
+        "observation_uid",
+        "action",
+        "status",
+        "product_locator",
+        "product_path",
+        "product_checksum_sha256",
+        "provenance_path",
+        "fingerprint",
+        "error",
+    ]
+    with target.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for item in report.results:
+            writer.writerow(
+                {
+                    "native_observation_id": item.native_observation_id,
+                    "source_observation_uid": item.source_observation_uid,
+                    "observation_uid": item.observation_uid,
+                    "action": item.action,
+                    "status": item.status,
+                    "product_locator": item.product.locator if item.product else "",
+                    "product_path": item.product_path,
+                    "product_checksum_sha256": item.product_checksum_sha256,
+                    "provenance_path": item.provenance_path,
+                    "fingerprint": item.fingerprint,
+                    "error": item.error,
+                }
+            )
+    return target
+
+
+__all__ = [
+    "SOURCE_PROCESSED_COPY_RECIPE",
+    "STAGE1_EXECUTION_SCHEMA",
+    "STAGE1_PROVENANCE_SCHEMA",
+    "Stage1ExecutionItemResult",
+    "Stage1ExecutionReport",
+    "execute_stage1_plan",
+    "write_stage1_execution_csv",
+    "write_stage1_execution_json",
+]

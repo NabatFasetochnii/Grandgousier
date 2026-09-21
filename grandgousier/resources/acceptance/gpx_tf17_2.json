@@ -1,0 +1,92 @@
+{
+  "format": "grandgousier_acceptance_v1",
+  "dataset": "gpx_tf17_2",
+  "description": "Frozen GPX_TF17_2 field-33 scientific acceptance baseline after P4 and provenance-aware Stage-2 readiness.",
+  "field_id": 33,
+  "catalog_name": "auto_catalog_master_20180907_GPX_TF17_2_mixed",
+  "required_stage2_recipe": "stage3_scale_v1",
+  "min_points_per_object": 5,
+  "min_common_objects": 20,
+  "database": {
+    "frames": 7323,
+    "observations": 7230,
+    "field_series_frames": 7271,
+    "field_series_for_field": 20,
+    "multiple_observation_representatives": 41,
+    "interseries_generations_for_field": 12,
+    "max_generation_id": 21
+  },
+  "stage2": {
+    "status": "READY",
+    "plan_status": "READY_FOR_GRAPH_VALIDATION",
+    "n_series": 20,
+    "n_ready_series": 18,
+    "n_eligible_pairs": 72,
+    "largest_component_size": 9,
+    "recipe_compatibility_counts": {
+      "MISSING_PROVENANCE": 2,
+      "READY_STAGE3_RECIPE": 18
+    },
+    "connected_components": [
+      [76, 78, 79, 82, 84, 86, 88, 90, 92],
+      [77, 80, 81, 83, 85, 87, 89, 91, 93]
+    ]
+  },
+  "stage3": [
+    {
+      "filter_name": "V",
+      "instrument_unit_id": 7,
+      "interseries_generation_id": 20,
+      "reference_series_id": 88,
+      "verification_status": "OK",
+      "reliability_status": "REDUNDANT_GRAPH_OK",
+      "n_series": 9,
+      "n_edges": 35,
+      "graph_dof": 27,
+      "reduced_chi2": 1.3814557112577586,
+      "reduced_chi2_abs_tol": 1e-12,
+      "source_scope_matches": true,
+      "source_series_ids": [76, 78, 79, 82, 84, 86, 88, 90, 92]
+    },
+    {
+      "filter_name": "R",
+      "instrument_unit_id": 8,
+      "interseries_generation_id": 21,
+      "reference_series_id": 89,
+      "verification_status": "OK",
+      "reliability_status": "REDUNDANT_GRAPH_OK",
+      "n_series": 9,
+      "n_edges": 36,
+      "graph_dof": 28,
+      "reduced_chi2": 3.4106354601814393,
+      "reduced_chi2_abs_tol": 1e-12,
+      "source_scope_matches": true,
+      "source_series_ids": [77, 80, 81, 83, 85, 87, 89, 91, 93]
+    }
+  ],
+  "m5": [
+    {
+      "object_id": 29786,
+      "status": "READY",
+      "generation_ids": [20, 21],
+      "rows_source_exact_m4": 2640,
+      "accepted_rows": 2578,
+      "rejected_rows": 62,
+      "rejection_reasons": {
+        "NO_VALID_MAG": 22,
+        "SATURATED_OR_NEAR_SATURATED": 40
+      }
+    },
+    {
+      "object_id": 30112,
+      "status": "READY",
+      "generation_ids": [20, 21],
+      "rows_source_exact_m4": 2640,
+      "accepted_rows": 2618,
+      "rejected_rows": 22,
+      "rejection_reasons": {
+        "NO_VALID_MAG": 22
+      }
+    }
+  ]
+}

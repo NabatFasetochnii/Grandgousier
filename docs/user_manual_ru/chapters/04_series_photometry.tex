@@ -1,0 +1,1280 @@
+\chapter{Фотометрия одной серии}
+\label{chap:series-photometry}
+
+Это текущая основная рабочая стадия \program{}. В этой главе описана не только последовательность действий, но и математическая модель, которая фактически реализована в коде версии \manualversion. Формулы ниже следует рассматривать как описание текущей реализации: если общепринятый литературный алгоритм отличается от неё, это отмечено явно.
+
+\section{Последовательность этапов}
+
+Типовая цепочка обработки одной серии имеет вид:
+
+\begin{enumerate}
+  \item индексирование и чтение FITS metadata;
+  \item проверка WCS;
+  \item pre-photometry frame QC;
+  \item построение или выбор рабочего каталога;
+  \item сопоставление catalog sources с кадрами;
+  \item source detection и сопоставление detections с каталогом;
+  \item forced aperture photometry;
+  \item small-to-large aperture correction;
+  \item preliminary frame zero point;
+  \item internal ensemble calibration;
+  \item object QC и field QC;
+  \item optional reference/color calibration;
+  \item validation random-error model;
+  \item materialization финальных science measurements;
+  \item публикация candidate и диагностических продуктов.
+\end{enumerate}
+
+Общая логика похожа на классическую CCD aperture/differential photometry: измерить поток в апертуре, оценить локальный фон, перевести поток в инструментальную звёздную величину, после чего убрать покадровые общие сдвиги по ансамблю звёзд. Общие принципы aperture photometry и локальной оценки фона обсуждаются, например, у Howell~\cite{howell1989} и Stetson~\cite{stetson1987}; современный практический пример круговой апертуры и локального annulus background приведён также в документации Photutils~\cite{photutils_aperture}. При этом \program{} не вызывает Photutils в основном forced-photometry kernel: текущая реализация использует собственные NumPy-маски.
+
+\section{Обозначения}
+
+В дальнейшем индекс $i$ обозначает кадр, индекс $j$ --- объект. Для одного кадра используются следующие величины:
+
+\begin{description}
+  \item[$I_{pq}$] значение пикселя с целочисленными координатами $(p,q)$, в ADU;
+  \item[$t_i$] время экспозиции кадра;
+  \item[$g$] gain, $e^-/\mathrm{ADU}$;
+  \item[$R$] read noise, $e^-$ на пиксель;
+  \item[$F_{ij}$] background-subtracted aperture flux объекта $j$ на кадре $i$, в ADU;
+  \item[$m^{\mathrm{inst}}_{ij}$] инструментальная звёздная величина;
+  \item[$m^{\mathrm{ref}}_j$] каталожная reference magnitude;
+  \item[$Z_i$] preliminary aperture zero point кадра;
+  \item[$E_i$] внутренний ensemble frame offset;
+  \item[$c_j$] цветовой индекс объекта;
+  \item[$c_0$] pivot color, используемый в абсолютном color transform.
+\end{description}
+
+\section{Детекционная ветвь}
+\label{sec:detection-math}
+
+Forced photometry не требует самостоятельной детекции источника: основная позиция берётся из сопоставления рабочего каталога с WCS кадра. Однако параллельно существует detection branch, используемая как независимое evidence для кандидатов, blend diagnostics и QC.
+
+\subsection{Глобальный фон и порог детекции}
+
+Для всех конечных пикселей кадра вычисляется глобальная медиана
+\begin{equation}
+  B_{\mathrm{glob}} = \operatorname{median}(I_{pq}),
+\end{equation}
+а затем median absolute deviation
+\begin{equation}
+  \operatorname{MAD}_{\mathrm{glob}}
+  = \operatorname{median}\left|I_{pq}-B_{\mathrm{glob}}\right|.
+\end{equation}
+
+При нормальном распределении робастная оценка масштаба берётся как
+\begin{equation}
+  \sigma_{\mathrm{glob}} = 1.4826\,\operatorname{MAD}_{\mathrm{glob}}.
+\end{equation}
+Если эта оценка вырождается, используется обычное стандартное отклонение конечных пикселей.
+
+Порог кандидата:
+\begin{equation}
+  T = B_{\mathrm{glob}} + k\,\sigma_{\mathrm{glob}},
+\end{equation}
+где $k$ задаётся параметром \texttt{threshold\_sigma}. Пиксель считается начальным кандидатом, если $I_{pq}>T$ и он не ниже каждого из восьми соседей в окрестности $3\times3$.
+
+Для ранжирования применяется именно peak-based, а не aperture-based S/N:
+\begin{equation}
+  \mathrm{SNR}_{\mathrm{peak}} =
+  \frac{I_{\mathrm{peak}}-B_{\mathrm{glob}}}{\sigma_{\mathrm{glob}}}.
+\end{equation}
+После сортировки по $\mathrm{SNR}_{\mathrm{peak}}$ применяется минимальное допустимое расстояние между принятыми кандидатами. Оптимизированная реализация использует spatial hash, но сохраняет прежнюю greedy-семантику.
+
+\subsection{Уточнение центра}
+
+В небольшой квадратной области вокруг local maximum берутся только положительные после вычитания глобального фона веса
+\begin{equation}
+  w_{pq}=\max(I_{pq}-B_{\mathrm{glob}},0).
+\end{equation}
+Центр определяется как центр масс
+\begin{equation}
+  x_c=\frac{\sum w_{pq}x_{pq}}{\sum w_{pq}},
+  \qquad
+  y_c=\frac{\sum w_{pq}y_{pq}}{\sum w_{pq}}.
+\end{equation}
+Если сумма весов неположительна, остаётся исходная координата local maximum. Эта детекционная центровка не заменяет catalog-forced position в основной ветви фотометрии.
+
+\section{Forced aperture photometry одного объекта}
+\label{sec:forced-aperture-math}
+
+Основной численный kernel находится в модуле
+\texttt{grandgousier/photometry/forced\_aperture.py}. Для каждого catalog-frame link известна позиция $(x,y)$ в пиксельных координатах массива FITS. В текущем алгоритме измерение выполняется в этой позиции без обязательного повторного centroid fit.
+
+По умолчанию рабочая апертура имеет радиус $r_{\rm ap}=3$ pix, а локальный фон оценивается в кольце $8\le r\le12$ pix. Это параметры, а не фундаментальные константы: instrument profile или CLI может задавать другие значения.
+
+\subsection{Геометрия апертуры}
+
+Пиксель относится к aperture set $A$, если его центр удовлетворяет условию
+\begin{equation}
+  (p-x)^2+(q-y)^2 \le r_{\rm ap}^2.
+\end{equation}
+Для sky annulus $S$ используется
+\begin{equation}
+  r_{\rm in}^2 \le (p-x)^2+(q-y)^2 \le r_{\rm out}^2.
+\end{equation}
+
+Таким образом, текущая реализация использует бинарное включение пикселя по положению его центра. Это важно отличать, например, от fractional/exact aperture weighting, доступного в Photutils~\cite{photutils_aperture}. Для временных рядов \program{} приоритетом является одинаковая и воспроизводимая геометрия для всех кадров одной серии.
+
+\subsection{Локальный фон}
+
+Локальный фон на пиксель оценивается медианой annulus:
+\begin{equation}
+  B_{ij}=\operatorname{median}_{(p,q)\in S} I_{pq}.
+\end{equation}
+
+Разброс пикселей annulus:
+\begin{equation}
+  \sigma_{\rm ann}
+  =1.4826\,\operatorname{median}_{(p,q)\in S}|I_{pq}-B_{ij}|.
+\end{equation}
+Если робастная оценка не конечна или равна нулю, используется стандартное отклонение annulus. Если конечных пикселей в annulus меньше пяти, включается fallback на median/std всего локального cutout и выставляется диагностический flag.
+
+Использование локального annulus вместо единственного глобального background является стандартным подходом aperture photometry и особенно важно при пространственно неоднородном фоне~\cite{howell1989,photutils_aperture}.
+
+\subsection{Поток}
+
+Пусть $N_A$ --- число конечных пикселей внутри рабочей апертуры. Суммарный background-subtracted поток равен
+\begin{equation}
+  F_{ij}
+  = \sum_{(p,q)\in A}I_{pq}-N_A B_{ij}.
+  \label{eq:aperture-flux}
+\end{equation}
+
+Если $F_{ij}\le0$, измерение сохраняется с соответствующим QC flag, но инструментальная magnitude не вычисляется.
+
+\subsection{Инструментальная звёздная величина}
+
+При $F_{ij}>0$ определяется count rate
+\begin{equation}
+  f_{ij}=\begin{cases}
+  F_{ij}/t_i, & t_i>0,\\
+  F_{ij}, & \text{если корректная экспозиция отсутствует},
+  \end{cases}
+\end{equation}
+и инструментальная величина
+\begin{equation}
+  m^{\rm inst}_{ij}
+  =-2.5\log_{10}f_{ij}+Z_0.
+  \label{eq:instrumental-mag}
+\end{equation}
+В основном pipeline $Z_0$ является произвольной инструментальной константой, обычно нулём: физический zero point определяется позднее по reference stars.
+
+Логарифмическая форма звёздной величины и использование counts per second являются обычной практикой CCD photometry~\cite{howell1989}.
+
+\section{Модель случайной ошибки aperture measurement}
+\label{sec:random-error-model}
+
+Текущая модель \texttt{physical\_aperture\_v1} хранит вклад разных источников шума раздельно. Все дисперсии ниже выражены в $\mathrm{ADU}^2$.
+
+\subsection{Пуассоновский шум источника}
+
+При gain $g$ в $e^-/\mathrm{ADU}$ дисперсия source shot noise после обратного перевода из электронов в ADU равна
+\begin{equation}
+  \sigma^2_{\rm src}=\frac{\max(F_{ij},0)}{g}.
+\end{equation}
+Если gain неизвестен, текущий fallback равен $g=1\ e^-/\mathrm{ADU}$ и это явно отмечается в provenance.
+
+\subsection{Шум фона и read noise}
+
+Из detector parameters получается предсказание дисперсии одного background pixel:
+\begin{equation}
+  \sigma^2_{\rm sky,det}=\frac{\max(B_{ij},0)}{g},
+\end{equation}
+\begin{equation}
+  \sigma^2_{\rm read}=\left(\frac{R}{g}\right)^2,
+\end{equation}
+\begin{equation}
+  \sigma^2_{\rm bg,det}=\sigma^2_{\rm sky,det}+\sigma^2_{\rm read}.
+\end{equation}
+
+Одновременно из самого annulus получается эмпирическая дисперсия
+\begin{equation}
+  \sigma^2_{\rm bg,emp}=\sigma_{\rm ann}^2.
+\end{equation}
+
+При включённом empirical background floor программа выбирает
+\begin{equation}
+  \sigma^2_{\rm bg}=\max\left(
+  \sigma^2_{\rm bg,emp},\sigma^2_{\rm bg,det}
+  \right).
+\end{equation}
+Это не позволяет формальной detector model занизить ошибку, если реальные пиксели annulus демонстрируют больший scatter из-за flat-field residuals, неоднородного неба или других эффектов. Необходимость учитывать одновременно source, sky и detector noise является центральной частью классической CCD equation~\cite{howell1989}.
+
+\subsection{Фон внутри апертуры}
+
+Шум background pixels, попавших внутрь aperture sum:
+\begin{equation}
+  \sigma^2_{\rm ap,bg}=N_A\sigma^2_{\rm bg}.
+\end{equation}
+
+Кроме того, сам $B_{ij}$ является оценённой величиной. Для медианы и приблизительно Gaussian background текущий pipeline использует variance factor $\pi/2$:
+\begin{equation}
+  \sigma^2_{\widehat B}
+  =\frac{\pi}{2}\,\frac{N_A^2}{N_S}\,\sigma^2_{\rm bg},
+\end{equation}
+где $N_S$ --- число конечных annulus pixels. Множитель $N_A^2$ возникает потому, что ошибка оценки background level вычитается из каждого из $N_A$ aperture pixels совместно, а не независимо.
+
+\subsection{Дополнительный fractional floor}
+
+Если instrument policy задаёт относительный floor $f_{\rm floor}$, он записывается как flux-proportional variance
+\begin{equation}
+  \sigma^2_{\rm floor}=(\max(F_{ij},0)f_{\rm floor})^2.
+\end{equation}
+По умолчанию этот член равен нулю.
+
+\subsection{Сцинтилляция}
+
+Если известны диаметр телескопа, высота площадки, airmass и время экспозиции, используется Young-type approximation
+\begin{equation}
+  s_{\rm scint}
+  =0.09\,D_{\rm cm}^{-2/3}X^{1.75}
+  \exp\left(-\frac{h}{8000\ \mathrm{m}}\right)
+  (2t_i)^{-1/2},
+  \label{eq:scintillation}
+\end{equation}
+где $s_{\rm scint}$ --- относительный RMS. Тогда
+\begin{equation}
+  \sigma^2_{\rm scint}=(\max(F_{ij},0)s_{\rm scint})^2.
+\end{equation}
+
+Это приближённая модель: реальная scintillation зависит от вертикального профиля турбулентности и ветра. Теория и масштабирование scintillation с telescope aperture подробно обсуждаются Dravins et al.~\cite{dravins1998}; поэтому этот член следует трактовать как физически мотивированную оценку, а не как точное описание конкретной ночи.
+
+\subsection{Итоговая ошибка}
+
+Полная случайная дисперсия flux:
+\begin{equation}
+  \sigma_F^2=
+  \sigma^2_{\rm src}
+  +\sigma^2_{\rm ap,bg}
+  +\sigma^2_{\widehat B}
+  +\sigma^2_{\rm floor}
+  +\sigma^2_{\rm scint}.
+  \label{eq:flux-error-total}
+\end{equation}
+
+Для положительного потока magnitude uncertainty получается линейным распространением ошибки через $m=-2.5\log_{10}F$:
+\begin{equation}
+  \sigma_m=\frac{2.5}{\ln 10}\frac{\sigma_F}{F}
+  \simeq1.085736\frac{\sigma_F}{F}.
+  \label{eq:mag-error}
+\end{equation}
+
+Параллельно для provenance вычисляется legacy-модель
+\begin{equation}
+  \sigma^2_{F,\rm legacy}
+  =\max(F,0)+N_A\sigma_{\rm ann}^2,
+\end{equation}
+но в нормальном режиме она используется только для A/B diagnostics, а не как основная физическая ошибка.
+
+\section{Что означает ``фотометрия одного кадра''}
+
+Для одного кадра предыдущие вычисления повторяются для всех catalog-frame links. Поэтому результат кадра можно представить как набор
+\begin{equation}
+  \mathcal{M}_i=
+  \left\{
+  x_{ij},y_{ij},F_{ij},\sigma_{F,ij},
+  m^{\rm inst}_{ij},\sigma_{m,ij},B_{ij},\mathrm{flags}_{ij}
+  \right\}_{j=1}^{N_i}.
+\end{equation}
+
+Важно, что forced measurement и detection measurement --- разные сущности. Detection branch отвечает на вопрос ``есть ли здесь самостоятельный local maximum и насколько он убедителен'', а forced branch --- ``какой поток измеряется в известной позиции catalog object''. Поэтому слабый объект может иметь корректное forced measurement даже без отдельной detection.
+
+\section{Small-to-large aperture correction}
+\label{sec:aperture-correction-math}
+
+Малая рабочая апертура выгодна по S/N, особенно для слабых объектов, но её доля enclosed PSF flux может изменяться по кадру и между кадрами. Идея corrections по growth curve/large aperture является стандартной для aperture photometry~\cite{howell1989}. В \program{} correction строится отдельно для каждого кадра.
+
+\subsection{Измерение calibrators}
+
+Из ярких, несатурированных и достаточно точных measurements выбирается набор calibrators. Каждый calibrator повторно измеряется большой reference aperture. Для него вычисляется
+\begin{equation}
+  d_{ij}=m^{\rm large}_{ij}-m^{\rm small}_{ij}.
+  \label{eq:aperture-delta}
+\end{equation}
+
+Перед fit выполняется iterative clipping по $d$: если $\widetilde d$ --- медиана, а $\operatorname{MAD}(d)$ --- median absolute deviation, сохраняются точки
+\begin{equation}
+  |d_{ij}-\widetilde d|
+  \le k_{\rm clip}\,1.4826\,\operatorname{MAD}(d).
+\end{equation}
+
+\subsection{Constant model}
+
+Самая простая модель:
+\begin{equation}
+  C_i(x,y)=c_i,
+\end{equation}
+где
+\begin{equation}
+  c_i=\operatorname{median}(d_{ij}).
+\end{equation}
+
+\subsection{Spatial plane}
+
+Для учёта положения на detector координаты нормируются в диапазон примерно $[-1,1]$:
+\begin{equation}
+  x_n=2\frac{x}{W-1}-1,
+  \qquad
+  y_n=2\frac{y}{H-1}-1.
+\end{equation}
+
+Альтернативная модель:
+\begin{equation}
+  C_i(x,y)=c_i+a_i x_n+b_i y_n.
+  \label{eq:aperture-plane}
+\end{equation}
+Коэффициенты $(c_i,a_i,b_i)$ определяются обычным linear least squares по clipped calibrators.
+
+\subsection{Выбор constant или plane}
+
+Для residuals $r_k$ вычисляются
+\begin{equation}
+  \mathrm{RMS}=\sqrt{\frac{1}{n}\sum_{k=1}^{n}r_k^2},
+\end{equation}
+\begin{equation}
+  \mathrm{MAD}=\operatorname{median}|r_k-\operatorname{median}(r)|,
+\end{equation}
+и Bayesian Information Criterion
+\begin{equation}
+  \mathrm{BIC}=n\ln\left(\frac{\mathrm{SSE}}{n}\right)+k\ln n,
+  \qquad
+  \mathrm{SSE}=\sum r_k^2,
+  \label{eq:bic}
+\end{equation}
+где $k=1$ для constant model и $k=3$ для plane. Это стандартная форма Schwarz criterion~\cite{schwarz1978}.
+
+Plane принимается только если одновременно выполнены статистические и safety gates. В текущей реализации по умолчанию, среди прочего, требуется
+\begin{equation}
+  \mathrm{BIC}_{\rm const}-\mathrm{BIC}_{\rm plane}\ge6,
+\end{equation}
+минимальный spatial peak-to-peak effect, отсутствие ухудшения residual MAD и ограничения на максимальную пространственную/полную correction. Если условия не выполнены, используется constant model или identity fallback.
+
+\subsection{Применение correction}
+
+К каждому small-aperture measurement прибавляется
+\begin{equation}
+  m^{\rm ap}_{ij}
+  =m^{\rm inst}_{ij}+C_i(x_{ij},y_{ij}).
+  \label{eq:aperture-apply}
+\end{equation}
+Эквивалентный пересчёт flux:
+\begin{equation}
+  F^{\rm ap}_{ij}
+  =F_{ij}\,10^{-0.4C_i(x_{ij},y_{ij})}.
+\end{equation}
+
+Постоянная часть $c_i$ позднее поглощается frame zero point. Поэтому в per-object random error переносится только неопределённость пространственной части plane. Если $\Sigma_i$ --- covariance matrix коэффициентов $(c_i,a_i,b_i)$, а $(\bar x_n,\bar y_n)$ --- средняя позиция aperture calibrators, используется вектор
+\begin{equation}
+  \mathbf v=
+  \begin{bmatrix}
+  0 & x_n-\bar x_n & y_n-\bar y_n
+  \end{bmatrix}^{\!T},
+\end{equation}
+и
+\begin{equation}
+  \sigma^2_{\rm ap,diff}=\mathbf v^T\Sigma_i\mathbf v.
+\end{equation}
+Итоговая random magnitude error после aperture correction:
+\begin{equation}
+  \sigma^2_{m,\rm ap}
+  =\sigma_m^2+\sigma^2_{\rm ap,diff}.
+\end{equation}
+Для constant model этот дополнительный дифференциальный член равен нулю.
+
+\section{Preliminary aperture zero point}
+\label{sec:aperture-zp-math}
+
+После aperture correction каждый кадр предварительно привязывается к reference magnitudes. Для пригодной reference star $j$ на кадре $i$ вычисляется
+\begin{equation}
+  z_{ij}=m^{\rm ref}_j-m^{\rm ap}_{ij}.
+  \label{eq:zp-candidate}
+\end{equation}
+
+Из выборки исключаются, в частности, saturated measurements и measurements с недопустимой magnitude error. Затем выполняется iterative robust clipping относительно медианы:
+\begin{equation}
+  |z_{ij}-\widetilde z_i|
+  \le k_{\rm clip}\,1.4826\,\operatorname{MAD}(z_i).
+\end{equation}
+
+Если после clipping осталось достаточно reference stars и frame-MAD проходит quality gate, zero point равен
+\begin{equation}
+  Z_i=\operatorname{median}_{j}(z_{ij}).
+  \label{eq:frame-zp}
+\end{equation}
+После чего
+\begin{equation}
+  m^{\rm zp}_{ij}=m^{\rm ap}_{ij}+Z_i.
+  \label{eq:zp-apply}
+\end{equation}
+
+Эта стадия называется preliminary, поскольку reference catalog задаёт приблизительную абсолютную шкалу, но ещё не устранены остаточные frame-common offsets и color mismatch.
+
+\section{Ансамблевая дифференциальная фотометрия}
+\label{sec:ensemble-math}
+
+Классическая идея ensemble photometry состоит в том, чтобы использовать одновременно множество comparison stars вместо одной пары target/comparison. Это уменьшает чувствительность к случайной проблеме отдельной comparison star и позволяет работать с неоднородными наборами наблюдений. Один из основных классических источников --- Honeycutt~\cite{honeycutt1992}.
+
+Следует, однако, различать общую идею и конкретный алгоритм. Honeycutt описывает глобальное least-squares ensemble solution. Текущая реализация \program{} --- \emph{не} прямое воспроизведение этого least-squares решения; она использует устойчивую итеративную схему на медианах frame residuals.
+
+\subsection{Начальная статистика объектов}
+
+Для каждого объекта вычисляются по всем доступным кадрам:
+\begin{equation}
+  M_j^{(0)}=\operatorname{median}_{i}m^{\rm zp}_{ij},
+\end{equation}
+sample RMS
+\begin{equation}
+  \mathrm{RMS}_j
+  =\sqrt{\frac{1}{N_j-1}
+  \sum_i\left(m^{\rm zp}_{ij}-\bar m_j\right)^2},
+\end{equation}
+и
+\begin{equation}
+  \mathrm{MAD}_j
+  =\operatorname{median}_{i}
+  \left|m^{\rm zp}_{ij}-M_j^{(0)}\right|.
+\end{equation}
+
+Reference ensemble $\mathcal R$ формируется по числу measurements, диапазону magnitude, максимальному RMS/MAD и явным exclusions. Target/candidate objects могут быть исключены из reference ensemble, чтобы собственная переменность кандидата не участвовала в нормировке.
+
+\subsection{Frame offset}
+
+На итерации $q$ для каждого кадра берутся residuals reference stars относительно их текущих object medians:
+\begin{equation}
+  r_{ij}^{(q)}=m^{\rm zp}_{ij}-M_j^{(q)},
+  \qquad j\in\mathcal R.
+\end{equation}
+
+Frame-common offset:
+\begin{equation}
+  E_i^{(q)}=
+  \operatorname{median}_{j\in\mathcal R}r_{ij}^{(q)}.
+  \label{eq:ensemble-frame-offset}
+\end{equation}
+Кадр получает offset только при достаточном числе reference stars. Если пользовательский минимум
+обозначить $N_{\min}$, то необходимое условие для кадра имеет вид
+\begin{equation}
+  N_{\mathrm{ref},i} \ge N_{\min}.
+  \label{eq:ensemble-min-ref}
+\end{equation}
+Начиная с 0.5.45.1 обычный field pipeline явно завершает такой случай статусом
+\path{FAILED_PRECONDITION_ENSEMBLE}, если conventional ensemble не смог сформировать ни одного
+полного frame solution. Это предотвращает вторичное падение downstream QC на несуществующей
+calibration generation. Параметр \texttt{process-archive-path --ensemble-min-ref-stars-per-frame}
+делает $N_{\min}$ доступным из one-command workflow; его default остаётся 30 для сохранения прежней
+семантики.
+
+\subsection{Обновление ensemble}
+
+После вычисления offsets reference-star medians пересчитываются:
+\begin{equation}
+  M_j^{(q+1)}=
+  \operatorname{median}_{i}
+  \left(m^{\rm zp}_{ij}-E_i^{(q)}\right),
+  \qquad j\in\mathcal R.
+  \label{eq:ensemble-object-update}
+\end{equation}
+
+Шаги~\eqref{eq:ensemble-frame-offset}--\eqref{eq:ensemble-object-update} повторяются заданное число внутренних итераций. Затем offset последней итерации применяется ко всем объектам кадра:
+\begin{equation}
+  m^{\rm ens}_{ij}=m^{\rm zp}_{ij}-E_i.
+  \label{eq:ensemble-apply}
+\end{equation}
+
+Таким образом, $E_i$ описывает общий additive shift кадра. Его scatter по reference stars сохраняется как QC diagnostic. В текущей error semantics неопределённость frame-common ensemble offset не складывается непосредственно с независимой per-epoch random error каждого объекта: frame-common и independent contributions намеренно не смешиваются.
+
+\section{Candidate-excluded ensemble convergence}
+
+Если включён режим исключения кандидатов из ensemble, после первичной калибровки программа строит список candidate/reference exclusions и может повторять ensemble calibration до сходимости. Внешняя итерация отличается от внутренних итераций формул~\eqref{eq:ensemble-frame-offset}--\eqref{eq:ensemble-object-update}: внешняя итерация может менять само множество $\mathcal R$, тогда как внутренняя фиксирует reference membership и уточняет $M_j$ и $E_i$.
+
+Это различие важно при интерпретации provenance: число внутренних ensemble iterations и число candidate-exclusion convergence iterations являются разными параметрами.
+
+\section{Object QC и field QC}
+
+После ensemble calibration программа вычисляет статистики временного ряда каждого объекта. Основные используемые величины имеют стандартный вид:
+\begin{equation}
+  \widetilde m_j=\operatorname{median}_i m^{\rm ens}_{ij},
+\end{equation}
+\begin{equation}
+  \mathrm{MAD}_j=\operatorname{median}_i
+  |m^{\rm ens}_{ij}-\widetilde m_j|,
+\end{equation}
+\begin{equation}
+  \sigma_{\rm robust,j}=1.4826\,\mathrm{MAD}_j,
+\end{equation}
+а также sample RMS. Эти величины сопоставляются с magnitude, количеством measurements, detection support и crowding/blend diagnostics. Поэтому QC flag --- результат совокупности критериев, а не просто порога по одному RMS.
+
+Field QC агрегирует object/frame statistics и используется как контроль качества серии целиком. Конкретные пороги относятся к policy/configuration и не являются универсальными астрономическими константами.
+
+\section{Абсолютная reference/color calibration}
+\label{sec:color-calibration-math}
+
+Ensemble calibration хорошо сохраняет относительную форму light curve, но её шкала ещё может отличаться от выбранной стандартной/reference системы из-за общего offset и несовпадения spectral response. Стандартная photometric calibration поэтому часто содержит zero point и color term; примеры таких преобразований приведены в руководстве AAVSO по CCD photometry~\cite{aavso_ccd}.
+
+В \program{} absolute transform строится на уровне объектов, а не отдельных эпох. Это сделано специально для сохранения формы временного ряда.
+
+\subsection{Object-level residual}
+
+Для каждого calibrator object сначала вычисляется median ensemble magnitude
+\begin{equation}
+  S_j=\operatorname{median}_i m^{\rm ens}_{ij}.
+\end{equation}
+Пусть $m^{\rm ref}_j$ --- reference magnitude в выбранном band, а $c_j$ --- reference color. Pivot color определяется робастно по calibrators:
+\begin{equation}
+  c_0=\operatorname{median}_j c_j.
+\end{equation}
+
+Фитируется уравнение
+\begin{equation}
+  m^{\rm ref}_j-S_j=A+C(c_j-c_0),
+  \label{eq:color-transform-fit}
+\end{equation}
+где $A$ --- общий transform offset, $C$ --- color term.
+
+Коэффициенты находятся ordinary linear least squares с intercept. После каждого fit residuals робастно clip-ятся и fit повторяется. Параллельно строится offset-only model ($C=0$).
+
+\subsection{Выбор модели}
+
+Для offset-only и offset+color models вычисляются residual RMS, MAD и BIC по формуле~\eqref{eq:bic}. Кроме того, для color slope вычисляется significance
+\begin{equation}
+  S_C=\frac{|C|}{\sigma_C}.
+\end{equation}
+
+Color model принимается консервативно: должны одновременно пройти минимальная significance, улучшение BIC и residual-MAD criterion. Если evidence недостаточно, применяется offset-only transform. Такой выбор защищает от добавления слабого color term только потому, что более сложная модель формально имеет ещё один свободный параметр.
+
+\subsection{Применение к light curve}
+
+Для объекта $j$ одна и та же correction применяется ко всем его эпохам:
+\begin{equation}
+  \Delta^{\rm color}_j=A+C(c_j-c_0),
+\end{equation}
+\begin{equation}
+  m^{\rm col}_{ij}=m^{\rm ens}_{ij}+\Delta^{\rm color}_j.
+  \label{eq:color-apply}
+\end{equation}
+
+Поскольку $\Delta^{\rm color}_j$ не зависит от $i$, внутриобъектные RMS, MAD и peak-to-peak не должны изменяться. Это проверяется отдельным shape-preservation quality gate.
+
+Если reference color отсутствует, используется $c_j=c_0$, то есть color contribution к nominal correction равен нулю, но uncertainty расширяется.
+
+\subsection{Систематическая ошибка абсолютного преобразования}
+
+Пусть $x_j=c_j-c_0$. Текущая модель systematic uncertainty абсолютного transform имеет вид
+\begin{equation}
+\begin{split}
+  \sigma^2_{\rm sys,j}={}&
+  \sigma^2_{\rm model}
+  +\sigma_A^2
+  +x_j^2\sigma_C^2\\
+  &+2x_j\operatorname{Cov}(A,C)
+  +C^2\sigma_{c,j}^2.
+\end{split}
+\label{eq:color-systematic}
+\end{equation}
+
+Эта ошибка хранится как \texttt{mag\_err\_systematic} и является в основном коррелированной между эпохами одного объекта. Она принципиально отделяется от \texttt{mag\_err\_random}.
+
+\section{Полная формула science magnitude}
+\label{sec:science-composite-formula}
+
+Если все стадии доступны и приняты quality gates, цепочку для одной точки удобно записать одной формулой:
+\begin{equation}
+\boxed{
+  m^{\rm science}_{ij}
+  =m^{\rm inst}_{ij}
+  +C^{\rm ap}_i(x_{ij},y_{ij})
+  +Z_i
+  -E_i
+  +A
+  +C(c_j-c_0)
+  }
+  \label{eq:science-full}
+\end{equation}
+
+Здесь:
+\begin{itemize}
+  \item $C^{\rm ap}_i$ --- small-to-large aperture correction;
+  \item $Z_i$ --- preliminary reference zero point;
+  \item $E_i$ --- robust ensemble frame offset;
+  \item $A+C(c_j-c_0)$ --- object-constant absolute reference transform.
+\end{itemize}
+
+Формула~\eqref{eq:science-full} полезна для понимания физического смысла pipeline, но в БД эти слагаемые намеренно хранятся как отдельные immutable/normalized calibration terms. Это позволяет восстановить science product, проверить provenance и не переписывать десятки тысяч промежуточных measurements при каждой новой calibration generation.
+
+Поле \texttt{local\_zp\_correction} после ensemble stage соответствует покадровой части $Z_i-E_i$. Color transform туда не входит, поскольку он object-level, а не frame-level.
+
+Следует также помнить, что финальный \texttt{flux} остаётся instrumental aperture flux, скорректированным только на aperture correction. Zero point, ensemble offset и color transform применяются к magnitude representation; \program{} не объявляет \texttt{flux} физически откалиброванным flux density.
+
+\section{Семантика ошибок в science layer}
+
+В текущем science product различаются как минимум три уровня:
+
+\begin{description}
+  \item[\texttt{mag\_err\_random}] независимая per-epoch uncertainty из aperture error budget плюс дифференциальная неопределённость spatial aperture correction;
+  \item[\texttt{mag\_err\_systematic}] object-level uncertainty абсолютного reference/color transform по формуле~\eqref{eq:color-systematic};
+  \item[QC/noise-floor diagnostics] дополнительные empirical residual floors и frame-common components, которые могут храниться в provenance/flags и не обязаны автоматически складываться с \texttt{mag\_err\_random}.
+\end{description}
+
+Поле \texttt{mag\_err} в настоящее время сохраняется как backward-compatible представление random per-epoch uncertainty. Поэтому при научной работе, требующей covariance-aware анализа, нельзя механически считать все ошибки независимыми и складывать \texttt{mag\_err\_random} с \texttt{mag\_err\_systematic} для каждой эпохи как будто это независимые Gaussian draws.
+
+\section{Что является литературным методом, а что спецификой Grandgousier}
+
+Для корректной интерпретации полезно разделять общие идеи и конкретные инженерные решения:
+
+\begin{itemize}
+  \item circular aperture photometry, local sky estimation, CCD noise budget и growth/aperture corrections имеют классические аналоги в литературе~\cite{howell1989,stetson1987};
+  \item ensemble differential photometry основана на общей идее множества comparison stars~\cite{honeycutt1992}, но текущая реализация \program{} использует iterative robust frame medians, а не глобальную least-squares систему Honeycutt;
+  \item BIC применяется в стандартном смысле Schwarz~\cite{schwarz1978}, но конкретные пороги принятия plane/color models являются policy проекта;
+  \item scintillation term использует приближённое масштабирование Young-type; реальные атмосферные условия сложнее~\cite{dravins1998};
+  \item color equation является обычным линейным photometric transform, но \program{} специально делает correction object-constant, чтобы не менять форму ensemble light curve.
+\end{itemize}
+
+Поэтому ссылки в приложении~\ref{app:references} объясняют научный контекст методов, а точной спецификацией вычислений для воспроизводимости остаются формулы этой главы, provenance в БД и соответствующая версия исходного кода.
+
+\section{BASE и final SCIENCE storage в 0.7}
+
+В clean schema 0.7 таблица \texttt{measurements} содержит только immutable BASE
+photometry. Низкоуровневые writers проверяют, что target calibration имеет
+\texttt{product\_kind=BASE\_PHOTOMETRY}, \texttt{product\_role=BASE} и
+\texttt{materialization\_kind=FULL\_MEASUREMENTS}; derived full-copy rows в
+canonical \texttt{measurements} не допускаются.
+
+Промежуточные calibration stages сохраняются normalized terms. Финальный SCIENCE
+product хранится в durable narrow \texttt{science\_photometry}, связанной с BASE
+через \texttt{base\_measurement\_id}. В ней сохраняются только calibration-changing
+скаляры; extraction geometry и identity не дублируются.
+
+Legacy wide SCIENCE materialization, rebuildable cache и historical flag-override
+workflow 0.6 не входят в новую schema и не доступны как штатные CLI-команды 0.7.
+Frozen production DB 0.6.4.5.1 используется только как reference corpus для
+последующего old/new scientific acceptance.
+
+\subsection{Диагностическая политика выбора spatial plane}
+\label{sec:aperture-plane-policy}
+
+По умолчанию Grandgousier использует политику \texttt{evidence}: пространственная плоскость
+для aperture correction выбирается только при достаточном числе калибраторов, достаточном
+улучшении BIC, ненулевой пространственной амплитуде, residual MAD не хуже constant-модели
+и прохождении safety-ограничений по максимальной пространственной и полной поправке.
+
+Для контролируемой диагностики инструментальной систематики доступен режим
+\texttt{--aperture-correction-plane-policy safety\_only}. В нём статистические предпочтения
+между constant и plane не блокируют плоскость: если plane построен и проходит safety-gates,
+он используется. При этом общий порог \texttt{--aperture-correction-max-residual-mad}
+остаётся активным и может отвергнуть модель целиком. Режим предназначен для A/B-тестов,
+а не для безусловного production-применения.
+
+Пример:
+\begin{verbatim}
+python -m grandgousier.cli process-archive-path `
+  --path C:\\master\\gpx\\stage2\\20180907_1704_R `
+  --execute `
+  --aperture-correction-plane-policy safety_only
+\end{verbatim}
+
+При сравнении с baseline следует проверять не только число кандидатов, но и долю кадров
+с моделями plane/constant/identity, spatial coefficients, detector-coordinate correlations
+кандидатных light curves и common-mode корреляции между кандидатами.
+
+\section{Диагностика PSF по полю кадра}
+\label{sec:psf-field-diagnostics}
+
+Начиная с версии 0.5.44.0 \program{} имеет отдельный диагностический слой для анализа формы
+изображений звёзд по полю. Он предназначен прежде всего для широкопольных систем и архивных
+данных, где качество изображения может зависеть от положения на детекторе вследствие coma,
+astigmatism, field curvature, tilt/decenter, defocus, tracking errors или других оптических и
+механических эффектов. На этом этапе диагностика \emph{не изменяет} science flux и не переводит
+кадр автоматически в BAD-состояние.
+
+Для каждой подходящей source detection используется компактная окрестность источника. После
+вычитания локального фона отрицательные веса обнуляются, затем вычисляются centroid и матрица
+вторых моментов
+\begin{equation}
+  \mathbf{M}=
+  \frac{1}{\sum_p w_p}
+  \sum_p w_p
+  \begin{pmatrix}
+    (x_p-\bar{x})^2 & (x_p-\bar{x})(y_p-\bar{y})\\
+    (x_p-\bar{x})(y_p-\bar{y}) & (y_p-\bar{y})^2
+  \end{pmatrix}.
+\end{equation}
+
+Если собственные значения матрицы равны $\lambda_{\rm min}$ и $\lambda_{\rm max}$, диагностические
+размеры PSF определяются как
+\begin{equation}
+  {\rm FWHM}_{\rm minor}=2\sqrt{2\ln2}\sqrt{\lambda_{\rm min}},\qquad
+  {\rm FWHM}_{\rm major}=2\sqrt{2\ln2}\sqrt{\lambda_{\rm max}},
+\end{equation}
+а эллиптичность --- как
+\begin{equation}
+  e=1-\sqrt{\frac{\lambda_{\rm min}}{\lambda_{\rm max}}}.
+\end{equation}
+Ориентация главной оси хранится отдельно; из-за $180^\circ$-периодичности дополнительно
+сохраняются $\cos 2\theta$ и $\sin 2\theta$.
+
+Чтобы параметры разных детекторов можно было сравнивать, координаты нормируются:
+\begin{equation}
+  x'=2\frac{x}{N_x-1}-1,\qquad
+  y'=2\frac{y}{N_y-1}-1.
+\end{equation}
+
+Для FWHM, ellipticity и curve-of-growth diagnostic по каждому кадру независимо строятся три
+robust spatial models:
+\begin{align}
+  q(x',y') &= c_0,\\
+  q(x',y') &= c_0+c_xx'+c_yy',\\
+  q(x',y') &= c_0+c_xx'+c_yy'+c_{xx}x'^2+c_{xy}x'y'+c_{yy}y'^2.
+\end{align}
+Fit использует iterative MAD clipping. Для каждой модели сохраняются число использованных
+звёзд, коэффициенты, residual MAD, BIC и predicted detector-wide peak-to-peak amplitude.
+Quadratic model в 0.5.44.0 является только диагностикой и не применяется автоматически к
+фотометрии.
+
+В pipeline режим включается параметром
+\texttt{--enable-psf-field-diagnostics}. По умолчанию используются только достаточно яркие,
+ненасыщенные, удалённые от края и изолированные detections. Source-level результаты записываются
+в \texttt{psf\_sources.csv}, а компактные frame-level coefficients --- в
+\texttt{psf\_frames.csv}. Дополнительно создаются \texttt{psf\_summary.json}, карта residual PSF
+по полю и временной график spatial coefficients.
+
+Отдельная команда \texttt{psf-field-diagnostics} позволяет выполнить тот же анализ для уже
+проиндексированной серии без повторного запуска aperture/ensemble photometry. Это основной
+режим для ретроспективной диагностики существующих архивных данных.
+
+Важно отличать качество изображения от пригодности фотометрии. Большой FWHM или высокая
+эллиптичность сами по себе не означают, что кадр следует удалить: последующие версии
+\program{} должны уметь использовать adaptive elliptical/elongated aperture и PSF/model fitting,
+если поток остаётся измеримым. Версия 0.5.44.0 только измеряет морфологию и spatial structure,
+чтобы дальнейшие correction policies опирались на наблюдаемую инструментальную причину.
+
+\section{Adaptive elliptical aperture diagnostics}
+\label{sec:adaptive-aperture-diagnostics}
+
+Начиная с версии 0.5.44.1 Grandgousier умеет параллельно с базовой circular aperture
+фотометрией вычислять экспериментальную adaptive elliptical aperture. В этой версии результат
+остаётся диагностическим artifact и не записывается в таблицу \texttt{measurements}; следовательно,
+он не может незаметно заменить science calibration. Цель этапа --- проверить переносимую
+геометрию апертуры на реальных широкопольных данных прежде, чем вводить постоянное хранение
+нескольких flux estimators.
+
+Локальная форма PSF интерполируется по ярким изолированным звёздам. Для каждой reference star
+используется матрица вторых моментов из раздела~\ref{sec:psf-field-diagnostics}. Для произвольной
+позиции $(x,y)$ берутся ближайшие PSF references и выполняется inverse-distance weighted
+интерполяция компонент covariance matrix. Из интерполированной матрицы снова находятся
+${\rm FWHM}_{\rm major}$, ${\rm FWHM}_{\rm minor}$ и угол $\theta$.
+
+Эквивалентный радиус adaptive aperture определяется как
+\begin{equation}
+ r_{\rm eq}=\max\left(r_0,\;k_{\rm FWHM}{\rm FWHM}_{\rm geom}\right),
+\end{equation}
+после чего ограничивается safety-порогом
+$r_{\rm eq}\le r_0 s_{\rm max}$. Здесь $r_0$ --- базовый circular radius, а по умолчанию
+$k_{\rm FWHM}=1$. Пусть
+\begin{equation}
+ q=\frac{{\rm FWHM}_{\rm major}}{{\rm FWHM}_{\rm minor}}.
+\end{equation}
+После ограничения $q$ параметром \texttt{--max-axis-ratio} полуоси равны
+\begin{equation}
+ a=r_{\rm eq}\sqrt{q},\qquad b=\frac{r_{\rm eq}}{\sqrt{q}}.
+\end{equation}
+Таким образом, апертура одновременно увеличивается при локальном уширении PSF и вытягивается
+вдоль наблюдаемой главной оси. Площадь эллипса равна площади круговой апертуры радиуса
+$r_{\rm eq}$.
+
+Для вытянутых изображений background annulus автоматически сдвигается наружу, если большая
+полуось приближается к исходной внутренней границе annulus. Это позволяет измерять умеренно
+trailed/elongated stellar images без немедленного исключения кадра. При этом существуют safety
+clamps по axis ratio и размеру; их срабатывание сохраняется в диагностических флагах.
+
+Команда \texttt{adaptive-aperture-diagnostics} вычисляет на одних и тех же catalog-frame links
+две оценки потока: существующую circular aperture и adaptive ellipse. Экспортируются
+\texttt{adaptive\_aperture\_measurements.csv}, frame-level summary,
+\texttt{adaptive\_aperture\_objects.csv}, JSON summary и диагностические PNG. Для object-level
+сравнения из обеих instrumental magnitude series удаляются constant object median и robust
+frame common mode; после этого сравниваются RMS, MAD и robust peak-to-peak. Это не заменяет
+полную ensemble calibration, но позволяет проверить, уменьшает ли shape-aware aperture
+пространственно-зависимую ложную переменность.
+
+Ключевой safety-принцип версии 0.5.44.1: circular estimator остаётся эталонным science path,
+а adaptive estimator применяется только как A/B диагностика. Переход к постоянному хранению
+AP/adaptive-AP/PSF estimators и выбору \texttt{primary\_method} запланирован на последующие
+версии после проверки на MASTER и других инструментах.
+
+\section{Adaptive aperture как альтернативный science estimator}
+\label{sec:adaptive-aperture-stage2}
+
+Начиная с версии 0.5.44.2 adaptive elliptical aperture может использоваться не только для
+диагностического CSV-сравнения, но и как отдельный источник базовой фотометрии полного Stage~2.
+Режим выбирается параметром
+\texttt{--photometry-estimator adaptive\_ellipse}. По умолчанию по-прежнему используется
+\texttt{circular}; поэтому существующий workflow и имена circular calibration generations не
+изменяются.
+
+При adaptive-режиме source detection является обязательным внутренним prerequisite: из ярких
+изолированных detections строится local PSF covariance field. Для каждого forced catalog source
+интерполируется геометрия из раздела~\ref{sec:adaptive-aperture-diagnostics}, после чего поток
+измеряется в ориентированном эллипсе. Если надёжный local PSF model построить нельзя, по умолчанию
+используется circular fallback. Такой fallback не является скрытым: он отмечается в measurement
+flags. Для строгого A/B fallback можно отключить параметром
+\texttt{--no-adaptive-circular-fallback}.
+
+Adaptive measurement использует ту же модель случайной ошибки, что и circular aperture:
+source Poisson noise, background variance, неопределённость оценки background и опциональные
+fractional/scintillation terms. Для эллипса число пикселей $N_{\rm ap}$ и размер background annulus
+вычисляются из фактической геометрии. Поэтому
+\begin{equation}
+ \sigma_F^2 = \sigma_{\rm source}^2 + N_{\rm ap}\sigma_{\rm sky}^2
+ + \sigma_{\rm sky\,estimate}^2 + \sigma_{\rm frac}^2 + \sigma_{\rm scint}^2
+\end{equation}
+применяется к реальной площади adaptive aperture, а не к площади исходного круга.
+
+Существующая схема БД в 0.5.44.2 не расширяется. Поле
+\texttt{measurements.aperture\_radius\_pix} хранит радиус круга той же площади
+$r_{\rm eq}=\sqrt{ab}$, а реальные $a$, $b$, $\theta$, local FWHM, ellipticity, PSF-neighbor
+coverage и границы dynamic annulus сохраняются в JSON flags. Это обеспечивает совместимость
+существующих readers при полном provenance формы апертуры.
+
+Adaptive BASE photometry получает отдельную immutable calibration generation. Далее над ней без
+изменения алгоритмов выполняются обычные этапы:
+\begin{equation}
+\begin{aligned}
+ \text{adaptive BASE}&\rightarrow\text{aperture correction}\rightarrow\text{aperture ZP}
+ \rightarrow\text{ensemble}\rightarrow\text{object QC}\rightarrow{}\\
+ &\qquad\text{candidate selection}\rightarrow\text{science materialization}.
+\end{aligned}
+\end{equation}
+Таким образом, circular и adaptive варианты можно сравнивать после одной и той же downstream
+calibration chain, а не только на уровне instrumental magnitudes.
+
+Для контролируемого A/B следует задавать отдельный calibration prefix и output directory. Например:
+\begin{lstlisting}
+python -m grandgousier.cli process-archive-path `
+  --path "C:\master\gpx\stage2\20180907_1704" `
+  --execute `
+  --instrument-profile MASTER `
+  --photometry-estimator adaptive_ellipse `
+  --calibration-prefix-template "ab_adaptive_{instrument_lower}_{date_yyyymmdd}_{field_name}_{tube}_{camera}_{filter_name}_s{series_id}_v1" `
+  --out-root "exports_ab_adaptive"
+\end{lstlisting}
+Остальные science/QC параметры в A/B должны совпадать с circular baseline. Начиная с
+версии 0.5.44.3 итоговая таблица \texttt{process-archive-path} явно печатает строку
+\texttt{photometry\_estimator} для каждой pipeline-серии. Перед интерпретацией A/B результата
+следует убедиться, что для adaptive-прогона там указано \texttt{adaptive\_ellipse}; это
+быстрая проверка фактически применённого estimator и его provenance. Само использование
+adaptive estimator не является основанием автоматически считать кадр хорошим или плохим:
+морфология изображения и пригодность фотометрии остаются раздельными понятиями.
+
+\section{Пространственно меняющаяся PSF-фотометрия}
+\label{sec:spatial-psf-photometry}
+
+Начиная с версии 0.5.44.4 полный Stage~2 поддерживает третий экспериментальный базовый
+estimator: \texttt{--photometry-estimator spatial\_psf}. Значение \texttt{circular} остаётся
+стандартным, а \texttt{adaptive\_ellipse} --- проверенным альтернативным aperture estimator.
+Режим \texttt{spatial\_psf} предназначен прежде всего для широких полей, сложной формы PSF,
+умеренного elongation и областей, где фиксированная или adaptive aperture всё ещё оставляет
+пространственно-временную систематику.
+
+Как и adaptive aperture, PSF estimator использует яркие изолированные detections для построения
+локального covariance field. Для forced source в точке $(x,y)$ интерполируются
+$\mathrm{FWHM}_{\rm major}$, $\mathrm{FWHM}_{\rm minor}$ и угол $\theta$. В первой реализации
+используется эллиптический профиль Moffat
+\begin{equation}
+ P(u,v)=\frac{\beta-1}{\pi\alpha_a\alpha_b}
+ \left[1+\left(\frac{u}{\alpha_a}\right)^2+
+ \left(\frac{v}{\alpha_b}\right)^2\right]^{-\beta},
+\end{equation}
+где $u,v$ --- координаты вдоль главных осей локальной PSF. Параметры $\alpha_a,\alpha_b$
+получаются из локальных FWHM при фиксированном $\beta$; стандартное значение
+\texttt{--psf-moffat-beta} равно 2.5. Для диагностических сравнений доступен также
+\texttt{--psf-profile gaussian}.
+
+Положение звезды не освобождается полностью: вокруг forced catalog position выполняется небольшой
+двумерный grid search centroid. Для каждой trial position поток $F$ оценивается matched-profile
+least squares
+\begin{equation}
+ F=\frac{\sum_k P_k(D_k-B)}{\sum_k P_k^2},
+\end{equation}
+где $B$ --- robust median background из annulus. Центр выбирается до residual clipping по полной
+PSF core; это не позволяет плохому centroid искусственно выиграть за счёт исключения центральных
+пикселей. После выбора центра допускается robust clipping отдельных загрязнённых wing pixels,
+причём core PSF защищён от clipping.
+
+Для background noise используется noise-equivalent area matched filter
+\begin{equation}
+ N_{\rm eff}=\frac{1}{\sum_k P_k^2}.
+\end{equation}
+В существующую physical random-error decomposition вместо геометрического $N_{\rm ap}$
+подставляется $N_{\rm eff}$. Source Poisson, uncertainty background estimate, fractional floor и
+scintillation сохраняют прежнюю семантику. В поле
+\texttt{measurements.aperture\_radius\_pix} для совместимости записывается
+$r_{\rm noise}=\sqrt{N_{\rm eff}/\pi}$; фактическая PSF model, fit radius, centroid offsets,
+residual MAD, capture fraction и $N_{\rm eff}$ сохраняются в flags. Centroid offsets также
+заполняют нормализованные поля \texttt{centroid\_dx\_pix}/\texttt{centroid\_dy\_pix}.
+
+Если профиль конкретного источника не удаётся измерить, стандартный fallback ---
+adaptive ellipse с той же локальной геометрией. Его можно отключить параметром
+\texttt{--no-psf-adaptive-fallback}. Если невозможно построить само PSF field, последним
+совместимым fallback остаётся circular aperture, если не указан
+\texttt{--no-adaptive-circular-fallback}. Каждый fallback явно сохраняется в provenance.
+
+PSF BASE является отдельной immutable calibration generation. Обычный aperture-correction этап
+при этом не считается логически лишним: для PSF photometry он играет роль стандартной
+profile-to-reference-aperture correction и компенсирует возможную ошибку нормировки wings или
+несовпадение аналитического профиля с реальной PSF. После этого используются те же aperture-ZP,
+ensemble, object-QC, candidate selection и science materialization, что и для circular/adaptive
+A/B.
+
+Первый контрольный тест выполняется на синхронных MASTER series 76 EAST/V и 77 WEST/R. Circular
+baseline дал 9/143 финальных candidates, а полный adaptive Stage~2 --- 7/30 при одновременном
+росте accepted science points. Цель spatial-PSF A/B --- проверить, уменьшится ли остаточная
+сильно коррелированная R candidate population без ухудшения V и без потери большого числа
+science measurements.
+
+\section{Эмпирическая пространственная PSF-фотометрия}
+\label{sec:empirical-psf-photometry}
+
+Реальный A/B-тест аналитического \texttt{spatial\_psf} на MASTER GPX\_TF17 показал, что
+эллиптический Moffat с фиксированным $\beta=2.5$ не является достаточно точной моделью широкого
+поля WEST/R. По сравнению с проверенным \texttt{adaptive\_ellipse} число финальных R-candidates
+изменилось с 30 до 144, accepted science points уменьшились с 29312 до 26637, а median
+RMS/MAD ухудшились с 0.05240/0.01302 до 0.06118/0.02167 mag. Характерная
+profile-to-reference aperture correction около $+0.46\ldots+0.47$ mag показывает, что аналитическая
+нормировка wings не соответствует реальной PSF. Поэтому начиная с 0.5.44.5 добавлен отдельный
+экспериментальный estimator
+\begin{lstlisting}
+--photometry-estimator empirical_psf
+\end{lstlisting}
+который не предполагает аналитическую форму PSF.
+
+На каждом кадре выбираются яркие, изолированные и ненасыщенные detections. Для каждой reference
+star вычисляется субпиксельный centroid, после чего изображение звезды пересэмплируется на общую
+сетку offsets $(\Delta x,\Delta y)$ билинейной интерполяцией. Из stamp вычитается robust local
+background. Затем stamp нормируется не к бесконечному total flux, а к потоку внутри большой
+reference aperture радиуса $r_{\rm ref}$:
+\begin{equation}
+ P_j(\Delta x,\Delta y)=\frac{I_j(\Delta x,\Delta y)-B_j}
+ {\sum_{r\le r_{\rm ref}}[I_j-B_j]}.
+\end{equation}
+По умолчанию $r_{\rm ref}=5$ pix, то есть совпадает со стандартным reference radius downstream
+aperture-correction слоя.
+
+В поле detector создаётся регулярная сетка PSF nodes, по умолчанию $3\times3$. Каждый node строится
+из ближайших reference stars, а не только из источников внутри жёсткой прямоугольной ячейки. Это
+уменьшает риск пустых corner nodes. Для каждого pixel узловой template определяется robust
+median/clip комбинацией зарегистрированных нормированных stamps. Между четырьмя соседними nodes
+интерполируется уже полный двумерный template
+\begin{equation}
+ P(x,y;\Delta x,\Delta y),
+\end{equation}
+а не только FWHM, ellipticity или orientation.
+
+Для forced source сохраняется небольшой centroid grid search. При заданном локальном template
+поток оценивается matched-profile выражением
+\begin{equation}
+ F=\frac{\sum_k P_k(D_k-B)}{\sum_k P_k^2}.
+\end{equation}
+Так как template нормирован к reference aperture, $F$ непосредственно оценивает поток на той же
+фотометрической шкале. Поэтому downstream aperture correction должна быть мала и в основном
+диагностировать residual mismatch, а не компенсировать систематическую ошибку порядка 0.5 mag,
+как в неудачном аналитическом Moffat A/B.
+
+Для random-error model используется noise-equivalent area
+\begin{equation}
+ N_{\rm eff}=\frac{1}{\sum_k P_k^2},
+\end{equation}
+после чего применяются те же source Poisson, measured/detector background, uncertainty background
+estimate, fractional floor и scintillation terms, что и для других BASE estimators.
+
+По умолчанию fallback hierarchy имеет вид
+\begin{equation}
+ \text{empirical PSF}\rightarrow\text{adaptive ellipse}\rightarrow\text{circular aperture}.
+\end{equation}
+Первый переход можно запретить параметром
+\texttt{--no-empirical-psf-adaptive-fallback}, последний --- существующим
+\texttt{--no-adaptive-circular-fallback}. Каждый fallback сохраняется в measurement flags.
+
+Основные empirical параметры:
+\begin{lstlisting}
+--empirical-psf-grid-size 3
+--empirical-psf-stamp-radius-pix 8
+--empirical-psf-reference-radius-pix 5.0
+--empirical-psf-references-per-node 48
+--empirical-psf-min-references-per-node 12
+\end{lstlisting}
+Centroid и residual clipping используют общие PSF controls
+\texttt{--psf-centroid-search-radius-pix}, \texttt{--psf-centroid-grid-steps},
+\texttt{--psf-residual-clip-sigma} и \texttt{--psf-residual-clip-iterations}.
+
+Для MASTER acceptance gate empirical PSF сравнивается прежде всего с adaptive baseline:
+7/30 финальных V/R candidates, 30995/29312 accepted points и R median RMS/MAD
+0.05240/0.01302 mag. Простое превосходство circular estimator недостаточно: новый estimator должен
+как минимум не ухудшать adaptive result и желательно уменьшать остаточную detector-Y/common-mode
+структуру 30 R-candidates.
+
+
+\section{Пространственная ensemble-калибровка}
+\label{sec:spatial-ensemble}
+
+Начиная с версии 0.5.44.8 внутренний conventional-ensemble base перед пространственной коррекцией обязательно материализуется и публикуется как отдельная immutable generation с полным набором измерений. Это устраняет неоднозначность при повторном использовании calibration prefix: spatial stage всегда читает только что построенную base-generation, а не старый normalized-only head. Финальный spatial product имеет provenance suffix \texttt{spatial\_v2}; пользовательские параметры и математическая модель при этом не изменились.
+
+
+После реальных A/B-тестов MASTER предпочтительным BASE estimator остаётся
+\texttt{adaptive\_ellipse}. Аналитический и empirical PSF fitting не превзошли его, поэтому
+начиная с 0.5.44.6 остаточная широкопольная систематика корректируется на уровне ensemble, а не
+путём дальнейшего усложнения модели отдельной звезды.
+
+Обычная ensemble-калибровка сначала определяет reference stars и frame-common offset $Z_j$.
+Затем для reference residuals оценивается
+\begin{equation}
+ m_{ij}=M_i+Z_j+S_j(x_i,y_i)+\epsilon_{ij}.
+\end{equation}
+Здесь $S_j$ --- только дифференциальная пространственная часть. В fit присутствует nuisance
+intercept, однако он не применяется к science measurements. Пространственные basis functions
+центрируются по reference stars каждого кадра, поэтому weighted mean применяемой поправки равен
+нулю и новый слой не дублирует обычный frame zero point.
+
+Рассматриваются identity, plane и quadratic модели. Выбор выполняется по BIC, минимальной
+spatial peak-to-peak amplitude и safety limit на максимальную поправку по полю. Используется
+iterative robust clipping. Начиная с 0.5.44.9 добавлен обязательный по умолчанию robust
+non-degradation gate: предложенная plane/quadratic модель применяется только если её residual MAD
+не превышает residual MAD identity-модели более чем на
+\texttt{--spatial-ensemble-max-residual-mad-degradation}. Default равен 0 mag, то есть увеличение
+MAD запрещено. Отрицательное значение CLI отключает этот gate для диагностического воспроизведения
+старого поведения. Провал этого локального gate не делает кадр плохим и не уменьшает
+\texttt{good\_frame\_fraction}: кадр остаётся валидным, но получает identity correction. При
+недостатке reference stars или провале frame quality также применяется identity. Если доля пригодных
+кадров ниже global threshold, вся final spatial calibration становится identity-copy исходного
+ensemble product.
+
+В 0.5.44.6 random-error columns намеренно не увеличиваются uncertainty spatial model: uncertainty
+сохраняется только в flags. Это делает A/B проверку консервативной --- уменьшение candidate
+population должно происходить за счёт исправления light curves, а не за счёт увеличения
+$\sigma_m$.
+
+Для включения:
+\begin{lstlisting}
+--enable-spatial-ensemble
+--spatial-ensemble-max-order 2
+--spatial-ensemble-min-ref-stars-per-frame 30
+--spatial-ensemble-min-bic-improvement 6
+--spatial-ensemble-min-spatial-peak-to-peak 0.003
+--spatial-ensemble-max-residual-mad-degradation 0.0
+--spatial-ensemble-max-abs-spatial-deviation 0.15
+\end{lstlisting}
+При candidate-excluded ensemble iterations spatial surface строится заново после каждого нового
+набора reference stars. Диагностика записывается в каталог \texttt{spatial\_ensemble/}.
+
+Диагностика сохраняется раздельно по ensemble-итерациям в каталогах
+\texttt{spatial\_ensemble/iter1}, \texttt{iter2}, ... . Это важно при
+candidate-excluded convergence: результаты предыдущей spatial-модели не
+перезаписываются последующими итерациями. В 0.5.44.9 frame CSV/JSON дополнительно сохраняют
+\texttt{proposed\_model}, proposed/selected $\Delta\mathrm{MAD}$, fractional MAD improvement,
+$\Delta\mathrm{RMS}$ и \texttt{fallback\_reason}. Это позволяет отличить обычный identity выбор
+от spatial-модели, отвергнутой именно robust non-degradation gate. Новая spatial generation имеет
+suffix \texttt{spatial\_v3} и algorithm provenance
+\texttt{robust\_zero\_mean\_spatial\_residual\_v3}.
+
+
+Начиная с версии 0.5.44.10 spatial-ensemble продукты, создаваемые основным pipeline,
+подчиняются общему механизму неизменяемых поколений калибровок. Поэтому повторный запуск
+с тем же логическим именем безопасен: завершённый продукт получает новое физическое поколение,
+а незавершённый продукт от прерванного запуска может быть повторно материализован до публикации.
+Это изменение не затрагивает математическую модель spatial correction.Начиная с версии 0.5.44.11 spatial-ensemble слой также записывает компактное нормализованное
+представление своей модели. Для каждого кадра сохраняется \texttt{CalibrationFrameTerm} с
+типом \texttt{SPATIAL\_ENSEMBLE}: константа и линейные коэффициенты используют штатные поля
+frame term, quadratic коэффициенты и границы детектора хранятся в существующем JSON
+\texttt{details}/parameters. Это не изменяет science correction и не требует миграции схемы.
+Dual-write нужен для immutable calibration reconstruction: downstream-код может воспроизвести
+пространственную поправку как
+\begin{equation}
+ m_{\mathrm{out}} = m_{\mathrm{source}} - S_j(x_n,y_n),
+\end{equation}
+при этом \texttt{mag\_err}, \texttt{mag\_err\_random} и \texttt{mag\_err\_systematic} остаются
+неизменными. Полные \texttt{Measurement} rows пока сохраняются для контролируемого A/B, поэтому
+0.5.44.11 является исправлением provenance/reconstruction contract, а не новой научной моделью.
+
+\section{Консервативный post-ensemble photometric frame QC}
+\label{sec:photometric-frame-qc}
+
+Начиная с версии 0.5.44.12 доступен режим
+\begin{lstlisting}
+--enable-photometric-frame-qc
+\end{lstlisting}
+Его задача --- не исправлять неизвестную инструментальную систематику сложной моделью, а автоматически
+оценивать надёжность фотометрии каждого кадра после обычной ensemble-калибровки. Режим взаимоисключающий
+с \texttt{--enable-spatial-ensemble}: spatial ensemble изменяет величины, тогда как photometric frame QC
+использует пространственную модель только как диагностический признак.
+
+Для reference stars обычного ensemble определяется residual
+\begin{equation}
+ r_{ij}=m_{ij}-\widetilde m_i,
+\end{equation}
+где $\widetilde m_i$ --- robust центральная величина reference star по серии. Для каждого кадра
+вычисляется
+\begin{equation}
+ R_j=1.4826\,\operatorname{MAD}(r_{ij}),
+\end{equation}
+а характерный уровень серии
+\begin{equation}
+ R_0=\operatorname{median}_j R_j.
+\end{equation}
+
+\subsection{Политика 0.5.44.14: QC не подменяет модель ошибки}
+
+Реальный A/B 0.5.44.13 подтвердил, что hard-reject-only классификация сохраняет значительно больше
+эпох: EAST/V получил 17 GOOD, 6 SUSPECT и 2 BAD кадра, WEST/R --- 13 GOOD, 10 SUSPECT и 2 BAD.
+Accepted science points восстановились до 29964 и 29589. Однако добавление одной и той же
+frame-specific величины ошибки всем звёздам SUSPECT-кадра увеличило final candidates до 39 и 49
+при adaptive-only baseline 7 и 30. Поэтому начиная с 0.5.44.14 QC не изменяет ошибки GOOD/SUSPECT
+измерений.
+
+Каждый кадр сохраняет один из статусов:
+\begin{description}
+  \item[GOOD] действие \texttt{KEEP}; величина и все компоненты ошибки сохраняются;
+  \item[SUSPECT] действие \texttt{KEEP\_FLAGGED}; magnitude и
+  \texttt{mag\_err}, \texttt{mag\_err\_random}, \texttt{mag\_err\_systematic} не изменяются;
+  \item[BAD] действие \texttt{REJECT}; исходная фотометрия остаётся в базе, но производная QC-калибровка
+  выставляет \texttt{mag\_cal=NULL}. BAD разрешён только для hard failures.
+\end{description}
+
+К hard failures относятся невозможность получить residual scatter, катастрофически большой абсолютный
+robust scatter (в текущей policy $R_j\ge0.10$ mag) и критически малое число reference stars
+(менее пяти). Relative outlier внутри серии, недостаточное, но не критическое число references и
+пространственная residual structure сами по себе дают максимум SUSPECT.
+
+\subsection{Frame-specific scatter как диагностическая величина}
+
+По-прежнему вычисляется
+\begin{equation}
+ \sigma_{\mathrm{frame},j}
+ =\sqrt{\max\left(R_j^2-R_0^2,0\right)}.
+ \label{eq:frame-qc-uncertainty}
+\end{equation}
+Но эта величина является характеристикой residual population кадра, а не доказанной одинаковой
+неопределённостью каждой отдельной звезды. Поэтому в 0.5.44.14 она сохраняется только как
+\texttt{photometric\_frame\_qc\_sigma\_frame\_diagnostic\_mag} и не складывается ни с одной
+measurement-error component. Такая политика избегает статистической подгонки коэффициента error inflation.
+
+\subsection{Подтверждение кандидатов по GOOD-эпохам}
+
+Для автоматического candidate search используется уже существующий field-QC/candidate evaluator, но
+после обычного анализа всех пригодных эпох он повторно запускается на подмножестве кадров со статусом
+GOOD. Новая статистическая модель не вводится: используются те же RMS/MAD/intrinsic criteria и те же
+пороги.
+
+Автоматический кандидат остаётся \texttt{ACCEPTED}, только если он принят в обоих анализах:
+\begin{description}
+  \item[GOOD\_FRAME\_CONFIRMED] accepted на всех usable epochs и на GOOD epochs;
+  \item[SYSTEMATICS\_SENSITIVE] accepted только при участии SUSPECT epochs; строка переводится в
+  \texttt{BORDERLINE}, но сохраняется как диагностический объект;
+  \item[INSUFFICIENT\_GOOD\_FRAME\_SUPPORT] GOOD-кадров меньше минимального числа, необходимого обычному
+  object/candidate evaluator; автоматический кандидат переводится в \texttt{BORDERLINE};
+  \item[TARGET\_PRESERVED] явно заданный target не удаляется автоматическим confirmation gate.
+\end{description}
+
+Confirmation выполняется до candidate-excluded ensemble. Поэтому объект, который выглядит переменным
+только из-за SUSPECT-эпох, не исключается из reference ensemble и не создаёт положительную обратную связь
+между ложным кандидатом и следующей итерацией калибровки. Тот же подтверждённый набор используется при
+финальном экспорте candidate light curves. Raw all-usable triage сохраняется в JSON provenance для A/B.
+
+Начиная с 0.5.44.15 для уже \texttt{GOOD\_FRAME\_CONFIRMED} кандидата флаг Object QC
+\texttt{HIGH\_RMS} сохраняется как диагностический признак, но больше не является причиной отклонить
+все точки его candidate light curve. Это узкое исключение устраняет логический цикл ``объект подтверждён
+как переменный по повышенному scatter, затем тот же повышенный scatter удаляет его кривую''. Все остальные
+science reject flags сохраняются без изменений; для обычных объектов и неподтверждённых candidates
+\texttt{HIGH\_RMS} по-прежнему действует как штатный reject flag. В candidate export явно записывается
+\texttt{HIGH\_RMS\_DIAGNOSTIC\_ONLY\_FOR\_GOOD\_FRAME\_CONFIRMED}.
+
+CSV \texttt{field\_qc\_candidate\_triage.csv} также сохраняет статус GOOD-frame confirmation и
+GOOD-only RMS/MAD/robust diagnostics, поэтому distinction между подтверждённой и
+systematics-sensitive переменностью доступно без разбора JSON provenance.
+
+
+\subsection{Корреляция кандидатов внутри полос детектора (0.5.44.16--0.5.44.17)}
+
+После \texttt{GOOD\_FRAME\_CONFIRMED} Grandgousier дополнительно выполняет диагностическую проверку,
+не меняющую статус кандидата. Цель --- заметить случай, когда несколько кандидатов в одной полосе CCD
+синхронно меняют блеск даже на кадрах, которые глобальный frame QC считает GOOD.
+
+Для каждого accepted confirmed candidate по GOOD-эпохам определяется медианное положение
+$(\widetilde x_i,\widetilde y_i)$ и центрированная величина
+\begin{equation}
+ \Delta m_i(t)=m_i(t)-\operatorname{median}_{t\in GOOD}m_i(t).
+\end{equation}
+Каждая ось детектора независимо делится на 16 bins. Чтобы близкая пара не перестала сравниваться только
+из-за случайного попадания по разные стороны границы bin, параллельно используется вторая разметка тех же
+16 bins, сдвинутая на половину ширины. Пара кандидатов сравнивается по X или Y, если она находится в
+одном bin хотя бы одной из двух разметок соответствующей оси.
+
+Для минимум восьми общих GOOD-эпох начиная с 0.5.44.17 параллельно вычисляются два коэффициента:
+\begin{equation}
+ \rho_{S,ij}=\rho_S\left(\Delta m_i(t),\Delta m_j(t)\right),
+\end{equation}
+\begin{equation}
+ r_{P,ij}=r_P\left(\Delta m_i(t),\Delta m_j(t)\right).
+\end{equation}
+Spearman $\rho_S$ чувствителен к устойчивому сходству формы/рангов световых кривых, тогда как Pearson
+$r_P$ дополнительно чувствителен к синхронным высокоамплитудным всплескам или провалам, даже если остальные
+эпохи слабо согласованы. Пара считается диагностически коррелированной, если
+\begin{equation}
+ |\rho_{S,ij}|\ge0.8 \quad \text{или} \quad |r_{P,ij}|\ge0.8.
+\end{equation}
+Добавляется флаг соответствующей оси:
+\begin{itemize}
+  \item \texttt{CANDIDATE\_CORRELATED\_X};
+  \item \texttt{CANDIDATE\_CORRELATED\_Y}.
+\end{itemize}
+Знаки обоих коэффициентов сохраняются. Антикорреляция также информативна для
+blending/PSF/flux-redistribution artefacts. Для каждой пары и кандидата сохраняется режим
+\texttt{SPEARMAN}, \texttt{PEARSON}, \texttt{BOTH} или \texttt{NONE}. Флаг не переводит кандидат в
+BORDERLINE/REJECTED и не влияет на candidate-excluded ensemble.
+
+В candidate triage и final candidate summary сохраняются detector X/Y, primary и half-shifted bins,
+наиболее сильные signed Spearman/Pearson coefficients, object/source ID соответствующих партнёров,
+число общих GOOD-эпох, число коррелирующих соседей по каждой метрике и итоговый correlation mode.
+Полный список проверенных пар экспортируется в
+\texttt{candidate\_axis\_correlation/candidate\_axis\_pairs.csv}, summary --- в соседний
+\texttt{summary.json}.
+
+Реальный 0.5.44.16 A/B подтвердил wiring исходной Spearman-диагностики: 0/5 confirmed V и 17/25
+confirmed R candidates получили axis-correlation flag при неизменных science photometry и candidate
+acceptance. Разбор тех же кривых показал, что общий одиночный всплеск может иметь слабый Spearman, но
+очень сильный Pearson. Поэтому 0.5.44.17 расширяет только диагностическую метрику; фотометрия, frame QC,
+GOOD-frame confirmation и candidate acceptance не меняются.
+
+\subsection{Spatial diagnostics без изменения magnitude}
+
+Существующий robust fitter residual surface plane/quadratic переиспользуется только для обнаружения
+\texttt{SPATIAL\_SYSTEMATIC}. Найденная поверхность $S_j(x,y)$ не вычитается из magnitude. Таким
+образом изменение механики, юстировки, камеры или оптики не требует заранее известной epoch-dependent
+instrument map и не создаёт произвольную frame-to-frame spatial correction.
+
+\subsection{PSF-параметры в QC}
+
+Повторное чтение FITS не выполняется. QC объединяет два уже существующих источника:
+aperture/PSF context и покадровый экспорт \texttt{psf\_frames.csv} команды PSF field diagnostics.
+В \texttt{frames.quality\_flags} сохраняется компактный \texttt{frame\_psf\_summary\_v1}, содержащий
+число PSF sources, median geometric FWHM (pix и, когда доступно, arcsec), major/minor FWHM,
+ellipticity, axial position angle, а также spatial peak-to-peak для FWHM и ellipticity. Начиная с
+0.5.44.15 dedicated \texttt{psf\_frames.csv} читается по его реальным полям
+\texttt{fwhm\_geom\_*} и \texttt{ellipticity\_*}; отдельно для FWHM и ellipticity выбирается успешная
+constant/plane/quadratic модель с минимальным BIC. В summary сохраняются и имя выбранной модели, и её
+spatial peak-to-peak. Эти величины остаются исключительно диагностическими.
+
+PSF сам по себе не является reject criterion: необычная форма PSF может быть корректно обработана
+\texttt{adaptive\_ellipse}. PSF-параметры нужны для физической интерпретации причин деградации и
+последующего анализа архива.
+
+\subsection{Хранение и provenance}
+
+Photometric QC записывается как normalized immutable stage \texttt{CalibrationIteration};
+тип итерации равен \texttt{PHOTOMETRIC\_FRAME\_QC}. В 0.5.44.14 новая logical generation имеет
+suffix \texttt{photqc\_v3}; алгоритм называется
+\texttt{post\_ensemble\_photometric\_frame\_qc\_v3}. Совместимые блоки
+\texttt{frame\_photometric\_qc\_v1} и \texttt{frame\_psf\_summary\_v1} остаются в
+\texttt{frames.quality\_flags}. Миграция БД не требуется.
+
+Режим остаётся opt-in до повторного MASTER A/B. Production acceptance требует одновременно сохранить
+почти весь набор не-BAD эпох и существенно уменьшить число автоматических candidates, зависящих от
+SUSPECT-кадров, без изменения photometric error model.

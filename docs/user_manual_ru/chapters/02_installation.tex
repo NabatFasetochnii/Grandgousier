@@ -1,0 +1,116 @@
+\chapter{Установка и конфигурация}
+
+\section{Требования}
+
+Основная среда проекта --- Python 3.11 или новее и PostgreSQL. На Windows рекомендуется отдельное виртуальное окружение в каталоге проекта.
+
+\section{Установка пакета}
+
+\begin{lstlisting}
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
+.\.venv\Scripts\python.exe -m pip install -e ".[photometry]"
+\end{lstlisting}
+
+Editable installation рекомендуется для разработки. Production/installability gate следует выполнять на собранном wheel из каталога вне checkout. Начиная с версии \manualversion{} wheel/sdist включают штатные \texttt{master.yaml}, \texttt{robophot.yaml} и SQL migrations как package resources; runtime больше не вычисляет их через корень репозитория. Явно переданный путь к custom instrument profile по-прежнему имеет приоритет.
+
+Публичные wheel/sdist намеренно не содержат site-specific remote archive adapters: адреса закрытых серверов, credentials, private database endpoints и внутренние URL/storage conventions не являются частью публичного runtime. Такие инструменты могут оставаться только в repository-local developer tooling и не входят в установленный пакет. Публичный pipeline принимает уже доступные локальные FITS либо подготовленные deployment-окружением manifests.
+
+\section{Конфигурация БД}
+
+Основной источник конфигурации --- переменная окружения \cli{GRANDGOUSIER\_DATABASE\_URL}. Пароль не следует сохранять в документации, manifests и context bundles.
+
+
+Начиная с 0.5.56.0 общие несекретные параметры можно хранить в одном YAML/JSON-файле. Шаблон поставляется внутри wheel/sdist:
+
+\begin{lstlisting}
+python -m grandgousier.cli config-example --out grandgousier.yaml
+\end{lstlisting}
+
+Поддерживаются секции \texttt{database}, \texttt{logging}, \texttt{paths} и \texttt{field\_archive}. Старый плоский формат \cli{--job-config} остаётся совместимым. Для M8 один и тот же файл можно передать так:
+
+\begin{lstlisting}
+python -m grandgousier.cli process-field-archive `
+  --config grandgousier.yaml `
+  --plan-only
+\end{lstlisting}
+
+Явные CLI-параметры имеют приоритет над значениями job-конфигурации. Секрет database URL предпочтительно не записывать в YAML, а задавать через environment.
+
+\begin{lstlisting}
+$env:GRANDGOUSIER_DATABASE_URL="postgresql+psycopg://USER:PASSWORD@localhost:5432/grandgousier"
+\end{lstlisting}
+
+\section{Схема и migrations}
+
+Новая установка начинается с \cli{init-db}: команда создаёт полный текущий ORM/schema contract и baseline migration ledger. Проверка выполняется штатной командой:
+
+\begin{lstlisting}
+python -m grandgousier.cli init-db
+python -m grandgousier.cli schema-status
+\end{lstlisting}
+
+Для существующей БД используйте:
+
+\begin{lstlisting}
+python -m grandgousier.cli schema-status
+python -m grandgousier.cli migrate-db --dry-run
+python -m grandgousier.cli migrate-db
+\end{lstlisting}
+
+Historical pre-ledger database нельзя автоматически считать совместимой: для неё \cli{--adopt-legacy} допустим только после встроенной структурной проверки. SQL-файлы managed runner берутся из package resources; корневой \texttt{scripts/} сохраняется как developer/compatibility copy, а не как обязательный installed-package path.
+
+\section{Проверка установки}
+
+\begin{lstlisting}
+python -c "import grandgousier; print(grandgousier.__version__)"
+python -m grandgousier.cli doctor --config grandgousier.yaml
+python -m grandgousier.cli schema-status
+python -m compileall grandgousier
+pytest -q
+\end{lstlisting}
+
+Operational exit codes новых self-service команд: 0 --- success/ready, 2 --- ошибка использования, 3 --- failed precondition, 4 --- внешний ресурс, 5 --- БД/schema, 6 --- processing failure. Исторические специализированные команды могут сохранять прежние коды до отдельной совместимой миграции CLI.
+
+\section{Воспроизводимая среда и release-check}
+
+Начиная с 0.5.57.0 файл \texttt{Pipfile.lock} считается историческим и не является источником production-зависимостей. Точный baseline следует снимать на реально проверенной машине:
+
+\begin{lstlisting}
+python tools\snapshot_environment.py `
+  --out-dir "release\validated_windows_py311"
+\end{lstlisting}
+
+По умолчанию фиксируется dependency closure основных зависимостей. Для установленной и реально проверенной optional-группы можно добавить \cli{--extra photometry} и/или \cli{--extra gaia}. Результат содержит \texttt{environment\_snapshot.json} и точный \texttt{constraints.txt}; snapshot не изменяет окружение.
+
+Проверка release-артефактов выполняется из source checkout:
+
+\begin{lstlisting}
+python -m pip install -r requirements-release.txt
+python tools\release_check.py `
+  --constraints "release\validated_windows_py311\constraints.txt" `
+  --snapshot "release\validated_windows_py311\environment_snapshot.json"
+\end{lstlisting}
+
+Release-check сверяет версии package metadata, собирает wheel и sdist через PEP~517 backend без build isolation, проверяет package resources и отсутствие внутренних/private путей, устанавливает wheel во временный target и выполняет import smoke. В \texttt{dist/} создаются \texttt{SHA256SUMS.txt} и \texttt{release\_check.json}. Точный constraints-файл нельзя заменять snapshot с другой ОС/версии Python и считать эквивалентным Windows production baseline.
+
+
+\section{Full-science acceptance}
+
+Начиная с 0.5.58.0 в wheel/sdist входит frozen acceptance specification для поля GPX\_TF17\_2. Это не unit-test и не повторный Stage~2/Stage~3: команда только читает PostgreSQL, пересчитывает M5 control-объекты во временный каталог и сравнивает результат с зафиксированным scientific baseline.
+
+После установки полного optional stack:
+
+\begin{lstlisting}
+grandgousier doctor --config grandgousier.yaml --strict-optional
+
+grandgousier acceptance-check `
+  --dataset gpx_tf17_2 `
+  --config grandgousier.yaml `
+  --report-out reports\acceptance_gpx_tf17_2.json
+\end{lstlisting}
+
+Для статуса \texttt{READY} должны одновременно совпасть frozen DB counters, Stage~2 readiness/components, exact source scope и graph statistics M4, M5 control counts/rejection reasons, а DB counters до и после проверки должны быть идентичны. По умолчанию M5 CSV/summary создаются во временном каталоге и удаляются; \cli{--out-root} сохраняет их только по явному запросу.
+
+\paragraph{Изоляция wheel install smoke (0.5.58.1).}
+Release-check запускает import smoke из временного \texttt{--target} через изолированный интерпретатор \cli{-I -S} и принудительную установку \cli{--ignore-installed}. Это исключает ложное использование уже установленной предыдущей версии Grandgousier из активного venv. При ошибке отчёт теперь содержит фактические import/resource paths и version mismatch вместо безымянного \texttt{AssertionError}.

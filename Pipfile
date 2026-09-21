@@ -13,6 +13,7 @@ pydantic-settings = ">=2.1"
 pyyaml = ">=6.0"
 tqdm = ">=4.66"
 matplotlib = ">=3.8"
+certifi = ">=2024.2.2"
 psycopg = {extras = ["binary"], version = ">=3.1"}
 pandas-stubs = "~=3.0.3"
 

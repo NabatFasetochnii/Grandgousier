@@ -1,0 +1,596 @@
+\chapter{Краткий справочник команд}
+
+\section{Версия}
+
+\begin{lstlisting}
+python -c "import grandgousier; print(grandgousier.__version__)"
+\end{lstlisting}
+
+\section{Проверка Python-кода}
+
+\begin{lstlisting}
+python -m compileall grandgousier
+pytest -q
+\end{lstlisting}
+
+
+\section{Canonical Stage 1 plan (0.6.0)}
+
+Metadata-only план без скачивания science pixels и без записи в БД:
+
+\begin{lstlisting}
+python -m grandgousier.cli stage1-plan `
+  --config grandgousier.yaml `
+  --source robophot-local `
+  --filter i `
+  --out reports\stage1_plan.json `
+  --csv-out reports\stage1_plan.csv
+\end{lstlisting}
+
+Source задаётся в секции \texttt{archives} application config, а derived products --- отдельно в \texttt{products}.
+
+\section{Canonical Stage 1 execute (0.6.1.x)}
+
+Явная materialization/reduction в ProductStore без автоматического Stage~2:
+
+\begin{lstlisting}
+python -m grandgousier.cli stage1-execute `
+  --config grandgousier.yaml `
+  --source master-prepared `
+  --limit 1 `
+  --plan-out reports\stage1_execute_plan.json `
+  --report-out reports\stage1_execution.json `
+  --csv-out reports\stage1_execution.csv
+\end{lstlisting}
+
+\cli{--overwrite} разрешает заменить существующий product только явным действием оператора. Без него существующий canonical product переиспользуется лишь при совпадении fingerprint и checksum. Legacy MASTER output без sidecar не принимается автоматически: его path-valued provenance cards не доказывают неизменность байтов raw/header/dark/flat, поэтому требуется явная пересборка с \cli{--overwrite}. Byte-identical processed import можно безопасно принять сравнением checksum. Plan с любым \cli{BLOCKED} item не выполняется частично.
+
+\section{Stage 1 -> Stage 2 exact handoff (0.6.2.x)}
+
+Read-only preflight по exact products одного execution report:
+
+\begin{lstlisting}
+python -m grandgousier.cli stage1-handoff `
+  --config grandgousier.yaml `
+  --execution-report reports\stage1_execution.json `
+  --report-out reports\stage1_handoff.json
+\end{lstlisting}
+
+После проверки:
+
+\begin{lstlisting}
+python -m grandgousier.cli stage1-handoff `
+  --config grandgousier.yaml `
+  --execution-report reports\stage1_execution.json `
+  --execute `
+  --stage2-manifest-out reports\stage1_handoff_stage2.json `
+  --report-out reports\stage1_handoff_execute.json
+\end{lstlisting}
+
+Команда не сканирует ProductStore. Она валидирует product/provenance checksum, выполняет P4 preflight до индексации и передаёт Stage~2 только exact paths со статусом \texttt{SELECTED\_FOR\_STAGE2}. \texttt{ALREADY\_REPRESENTED} не создаёт новый Frame и не запускает Stage~2. В 0.6.2.1 исторический \texttt{EXISTING\_MULTIPLE\_REPRESENTATIVES} также сохраняется как handoff no-op: diagnostic P4 action остаётся в отчёте, существующие representatives не меняются, новый Frame не создаётся.
+
+\section{Stage 1A: найти наблюдения в MASTER}
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-search `
+  --search-transport http `
+  --http-user "googlov" `
+  --ra 327.60625 `
+  --dec 72.1686111 `
+  --radius-deg 0.8 `
+  --out "C:\master\gpx\inventory.csv"
+\end{lstlisting}
+
+HTTPS discovery использует штатный spatial search MASTER; для \cli{--search-transport http} сейчас требуется \cli{--radius-deg <= 0.95}.
+
+\section{Stage 1A: скачать raw/header/dark/flat}
+
+Plan-only:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-fetch `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --out-root "C:\master\gpx"
+\end{lstlisting}
+
+Execution:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-fetch `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --out-root "C:\master\gpx" `
+  --http-user "MASTER_USER" `
+  --execute
+\end{lstlisting}
+
+
+\section{Показать provisional серии MASTER до скачивания}
+
+\begin{verbatim}
+python -m grandgousier.cli master-archive-series `
+  --manifest "C:\master\gpx\full_inventory.csv" `
+  --max-field-separation-arcmin 30 `
+  --max-series-gap-minutes 60
+\end{verbatim}
+
+\section{Stage 1B: построить processed MASTER FITS}
+
+Plan-only:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-reduce `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --cache-root "C:\master\gpx"
+\end{lstlisting}
+
+Execution:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-reduce `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --cache-root "C:\master\gpx" `
+  --execute
+\end{lstlisting}
+
+Для smoke test можно добавить \cli{--limit 1}. По умолчанию выходной root --- \cli{<cache-root>/processed}; существующие processed FITS не перезаписываются без \cli{--overwrite}.
+
+Компактировать legacy uint16 DQ и удалять raw после подтверждённого Stage~1B:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-reduce `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --cache-root "C:\master\gpx" `
+  --compact-existing `
+  --delete-raw-after-success `
+  --execute
+\end{lstlisting}
+
+Безопасная очистка уже обработанных файлов сначала запускается plan-only:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-prune `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --cache-root "C:\master\gpx" `
+  --scope raw
+
+python -m grandgousier.cli master-archive-prune `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --cache-root "C:\master\gpx" `
+  --scope processed
+\end{lstlisting}
+
+Фактическое удаление требует одновременно \cli{--execute --yes}.
+
+\section{Планирование series processing}
+
+\begin{lstlisting}
+python -m grandgousier.cli process-archive-path --path "D:\archive\series"
+\end{lstlisting}
+
+\section{Обработка series}
+
+\begin{lstlisting}
+python -m grandgousier.cli process-archive-path `
+  --path "D:\archive\series" `
+  --execute `
+  --manifest-out reports\series.json
+\end{lstlisting}
+
+\subsection{Selective rerun и conventional ensemble threshold (0.5.45.1)}
+
+Для повторной обработки только существующей series среди кадров указанного пути:
+\begin{lstlisting}
+python -m grandgousier.cli process-archive-path `
+  --path "D:\archive\night" `
+  --execute `
+  --series-id 78 `
+  --ensemble-min-ref-stars-per-frame 20
+\end{lstlisting}
+\texttt{--series-id} допускается несколько раз. В этом режиме новые field series не строятся.
+Default \texttt{--ensemble-min-ref-stars-per-frame} равен 30 и не был изменён в 0.5.45.1.
+Если conventional ensemble не создаёт usable frame offsets, pipeline завершает run как
+\path{FAILED_PRECONDITION_ENSEMBLE} и сохраняет base-ensemble telemetry.
+
+\section{Сборка переносного developer context}
+
+\begin{lstlisting}
+python scripts\build_context_bundle.py
+\end{lstlisting}
+
+Эта команда относится к сопровождению проекта, а не к научной обработке данных, но полезна при переносе разработки в новый чат.
+
+\section{Stage 3: проверить готовность поля к межсерийной калибровке}
+
+\begin{lstlisting}
+python -m grandgousier.cli plan-interseries-calibration `
+  --field-id 12 `
+  --min-points-per-object 5 `
+  --min-common-objects 20 `
+  --required-stage2-recipe stage3_scale_v1
+\end{lstlisting}
+
+Команда read-only: она выбирает опубликованные SCIENCE generations, считает common objects и строит граф совместимых series, но ещё не вычисляет и не записывает photometric offsets. Опциональный \texttt{--required-stage2-recipe} дополнительно проверяет persisted producing-run provenance и исключает \texttt{RECIPE\_MISMATCH}/\texttt{MISSING\_PROVENANCE} из READY-графа.
+
+\section{SCIENCE storage в clean schema 0.7}
+
+Legacy maintenance commands для \texttt{science\_measurements}, rebuildable
+\texttt{science\_photometry\_cache} и historical flag overrides в 0.7 удалены.
+Новые SCIENCE products штатно записываются в durable
+\texttt{science\_photometry}; отдельный backfill/retirement workflow для новой
+БД не требуется. Frozen 0.6 reference database не должна обслуживаться CLI 0.7.
+
+\section{Stage 3: read-only M1--M3 межсерийная калибровка}
+
+\begin{lstlisting}
+python -m grandgousier.cli analyze-interseries-calibration `
+  --field-id 12 `
+  --filter V `
+  --min-points-per-object 5 `
+  --min-common-objects 20 `
+  --out-root reports\stage3_field12_V
+\end{lstlisting}
+
+Для неоднозначного поля можно дополнительно указать \texttt{--instrument-unit-id}, \texttt{--catalog-name} или \texttt{--reference-series-id}. Команда read-only и не создаёт Stage~3 rows в БД.
+
+\section{Stage 3 M4: persist immutable graph generation}
+
+\begin{lstlisting}
+python -m grandgousier.cli persist-interseries-calibration `
+  --field-id 33 `
+  --filter R `
+  --catalog-name "auto_catalog_master_20180907_GPX_TF17_2_mixed" `
+  --reference-series-id 77 `
+  --min-points-per-object 5 `
+  --min-common-objects 20
+\end{lstlisting}
+
+Перед первым запуском требуется \texttt{migrate-db}. Повтор той же команды idempotent. Для connected tree без closure требуется явный \texttt{--allow-sparse-graph}.
+
+\section{Stage 3 M4: show/verify persisted generation}
+
+\begin{lstlisting}
+python -m grandgousier.cli show-interseries-calibration --field-id 33
+python -m grandgousier.cli show-interseries-calibration --generation-id 1
+python -m grandgousier.cli verify-interseries-calibration --generation-id 1
+\end{lstlisting}
+
+\section{Stage 3 M5: export global object light curve + plots}
+
+\begin{lstlisting}
+python -m grandgousier.cli export-global-object-light-curve `
+  --object-id 12345 `
+  --field-id 33 `
+  --generation-id 1 `
+  --generation-id 2 `
+  --out-root reports\object_12345_global
+\end{lstlisting}
+
+По умолчанию основной CSV содержит exact accepted Stage~2 SCIENCE rows на M4 global scale. Plot строится отдельно для каждого filter и консервативно переключается на биннинг, когда exact linked source-row count до QC превышает 5000. Полезные опции:
+
+\begin{lstlisting}
+--plot-max-points 5000
+--plot-reduction auto|bin|none
+--plot-bin-minutes 5
+--plot-time-axis auto|continuous|compressed
+--plot-format png|pdf|svg
+--include-rejected
+--include-rejected-debug
+--allow-partial
+--no-plots
+\end{lstlisting}
+
+\texttt{--allow-partial} не применяет offset к несовместимым series: он только разрешает исключить их из export с явным warning. \texttt{--include-rejected-debug} пишет отдельный diagnostic CSV. При exact-linked source rows, но нуле accepted rows, M5 0.5.47.1 возвращает status \texttt{NO\_ACCEPTED\_POINTS\_AFTER\_QC} и exit code 2. Начиная с 0.5.47.2 \texttt{--plot-max-points} является hard cap на filter, а \texttt{--plot-time-axis auto} по умолчанию визуально сокращает большие пустые gaps между series, не изменяя MJD в CSV. При числе series больше 12 включается archive-overview без per-series legend.
+
+Начиная с 0.5.47.3 default M5 saturation veto является epoch-level: \texttt{SATURATED\_OR\_NEAR\_SATURATED} отвергает конкретную measurement, а object-level \texttt{SATURATED\_LIKE} остаётся diagnostic-only для M5. Общий Stage~2/Object-QC policy не меняется. При необходимости strict series-level rejection можно вернуть явно: \texttt{--extra-reject-flags SATURATED\_LIKE}.
+
+
+\section{M8: resumable processing всего processed-архива поля}
+
+\begin{lstlisting}
+python -m grandgousier.cli process-field-archive `
+  --processed-root "C:\master\gpx\smoke\processed" `
+  --field-id 33 `
+  --catalog-name "auto_catalog_master_20180907_GPX_TF17_2_mixed" `
+  --stage3-policy "V:15:88" `
+  --stage3-policy "R:20:89" `
+  --control-object-id 30112 `
+  --control-object-id 29786 `
+  --resume `
+  --execute `
+  --out-root reports\gpx_tf17_final
+\end{lstlisting}
+
+Начиная с 0.5.51.0 эта команда проходит через service layer. Дополнительно поддерживаются \texttt{--job-config FILE}, \texttt{--plan-only} и diagnostic-only \texttt{--no-preflight}. До M8 выполняются readiness checks и PostgreSQL advisory lock для field/catalog/root scope. Machine-readable job metadata сохраняется в \texttt{<out-root>/\_jobs/<job-id>}.
+
+Отдельная deployment-проверка:
+
+\begin{lstlisting}
+python -m grandgousier.cli field-archive-readiness `
+  --processed-root "C:\master\gpx\smoke\processed" `
+  --instrument-profile MASTER `
+  --out-root reports\gpx_tf17_final
+\end{lstlisting}
+
+Без \texttt{--execute} выполняется plan-only. Policy задаётся явно и повторяется для каждого filter/system; M8 v1 требует одну policy на filter. Базовая форма --- \texttt{FILTER:MIN\_COMMON}; после неё можно добавить reference series ID и instrument unit ID. \texttt{--include-date} задаёт allow-list, \texttt{--exclude-date} --- deny-list; оба параметра повторяемые. \texttt{--no-resume} запрещает повторное использование уже индексированных/incomplete batches. Начиная с 0.5.54.3 resume readiness для P4-linked данных проверяет representation physical Observation в READY series целевого field, поэтому alternate Frame products не вызывают ложный \texttt{RESUME\_INCOMPLETE}; genuinely unrepresented Observation и legacy NULL identity остаются blocking. Leaf batch с несколькими календарными датами останавливается как conflict. Начиная с 0.5.48.1 заведомо короткий новый/incomplete batch, где максимальная series-like группа содержит менее 10 FITS, помечается \texttt{SKIP\_TOO\_SMALL} и не передаётся в Stage~2.
+
+\section{Audit и очистка derived Stage 2 данных}
+
+Dry-run:
+
+\begin{lstlisting}
+python -m grandgousier.cli reset-derived-data `
+  --scope stage2 `
+  --all-series
+\end{lstlisting}
+
+Destructive execution:
+
+\begin{lstlisting}
+python -m grandgousier.cli reset-derived-data `
+  --scope stage2 `
+  --all-series `
+  --execute `
+  --yes
+\end{lstlisting}
+
+\section{Stage 3: audit catalog identity}
+
+\begin{lstlisting}
+python -m grandgousier.cli audit-field-catalog-identity `
+  --field-id 2
+\end{lstlisting}
+
+Для первого same-system Stage~3 MVP повторные series должны иметь общий catalog namespace.
+
+
+\paragraph{Экспериментальная политика aperture correction.}
+Для \texttt{process-archive-path} и \texttt{run-field-pipeline} доступен диагностический параметр:
+\begin{lstlisting}
+--aperture-correction-plane-policy evidence
+--aperture-correction-plane-policy safety_only
+\end{lstlisting}
+Значение \texttt{evidence} является стандартным; \texttt{safety\_only} предназначено только для контролируемого A/B-теста пространственной модели.
+
+\section{PSF field diagnostics}
+
+Диагностика уже существующей серии без повторной фотометрии:
+\begin{lstlisting}
+python -m grandgousier.cli psf-field-diagnostics `
+  --series-id 77 `
+  --out-dir "exports_psf\series77"
+\end{lstlisting}
+
+Основные параметры отбора:
+\begin{lstlisting}
+--max-sources-per-frame 500
+--min-snr 20
+--cutout-radius-pix 7
+--min-isolation-pix 12
+--clip-sigma 4
+--n-iterations 3
+\end{lstlisting}
+
+В обычном \texttt{process-archive-path} диагностический шаг включается так:
+\begin{lstlisting}
+--enable-psf-field-diagnostics
+\end{lstlisting}
+Для этой команды PSF diagnostics автоматически требует source detection, но не включает
+обязательное detection-to-catalog matching, если отдельно не указан
+\texttt{--enable-detection-branch}. Science photometry и calibration semantics от включения
+PSF diagnostics в версии 0.5.44.0 не меняются.
+
+\subsection{adaptive-aperture-diagnostics}
+Экспериментальная A/B фотометрия circular versus local-PSF adaptive ellipse для существующей
+field series. Команда не изменяет science measurements и не пишет новый calibration product.
+
+\begin{verbatim}
+python -m grandgousier.cli adaptive-aperture-diagnostics `
+  --series-id 77 `
+  --out-dir exports_adaptive\series77_R
+\end{verbatim}
+
+Наиболее важные параметры: \texttt{--base-aperture-radius-pix},
+\texttt{--aperture-fwhm-factor}, \texttt{--interpolation-neighbors},
+\texttt{--max-axis-ratio}, \texttt{--max-radius-scale}. Для синхронного A/B сравнения MASTER
+следует отдельно запускать EAST/V и WEST/R series и сравнивать object-level RMS/MAD versus
+normalized detector Y.
+
+\section{Выбор базового flux estimator Stage 2}
+
+Для \texttt{process-archive-path}, \texttt{run-field-pipeline} и прямого \texttt{run-forced-photometry}:
+\begin{lstlisting}
+--photometry-estimator circular
+--photometry-estimator adaptive_ellipse
+--photometry-estimator spatial_psf
+--photometry-estimator empirical_psf
+\end{lstlisting}
+Значение \texttt{circular} является стандартным и сохраняет прежнее поведение. Начиная с
+0.5.44.3 summary команды \texttt{process-archive-path} дополнительно показывает effective
+\texttt{photometry\_estimator} для каждой pipeline-серии. Режим
+\texttt{adaptive\_ellipse} автоматически требует source detection и строит локальную PSF-модель
+по bright isolated detections. Основные параметры настройки:
+\begin{lstlisting}
+--adaptive-min-psf-snr 20
+--adaptive-max-psf-sources-per-frame 500
+--adaptive-psf-cutout-radius-pix 7
+--adaptive-psf-min-isolation-pix 12
+--adaptive-interpolation-neighbors 24
+--adaptive-min-psf-references 20
+--adaptive-aperture-fwhm-factor 1.0
+--adaptive-max-axis-ratio 3.0
+--adaptive-max-radius-scale 2.5
+--no-adaptive-circular-fallback
+\end{lstlisting}
+Последний параметр предназначен прежде всего для строгих A/B-тестов: без него при невозможности
+построить adaptive geometry используется явно отмеченная circular fallback photometry.
+
+\subsection{Spatial PSF estimator}
+Для полного Stage~2 пространственно меняющаяся profile-fit фотометрия включается так:
+\begin{lstlisting}
+--photometry-estimator spatial_psf
+\end{lstlisting}
+Основные параметры:
+\begin{lstlisting}
+--psf-profile moffat
+--psf-moffat-beta 2.5
+--psf-fit-radius-fwhm 2.5
+--psf-min-fit-radius-pix 5
+--psf-max-fit-radius-pix 14
+--psf-centroid-search-radius-pix 0.75
+--psf-centroid-grid-steps 3
+--psf-residual-clip-sigma 5
+--psf-residual-clip-iterations 2
+--no-psf-adaptive-fallback
+\end{lstlisting}
+По умолчанию при локальной неудаче PSF fit используется adaptive ellipse; при отсутствии local
+PSF field возможен явно помеченный circular fallback. Для строгого A/B оба fallback можно
+отключить соответствующими параметрами.
+
+
+\subsection{Empirical spatial PSF estimator}
+Для A/B без предположения аналитической формы PSF:
+\begin{lstlisting}
+--photometry-estimator empirical_psf
+--empirical-psf-grid-size 3
+--empirical-psf-stamp-radius-pix 8
+--empirical-psf-reference-radius-pix 5.0
+--empirical-psf-references-per-node 48
+--empirical-psf-min-references-per-node 12
+--no-empirical-psf-adaptive-fallback
+\end{lstlisting}
+Шаблоны строятся из зарегистрированных реальных stellar stamps и нормируются к указанной
+reference aperture. По умолчанию локальная неудача empirical fit переходит в adaptive ellipse,
+а затем при необходимости в явно отмеченный circular fallback.
+
+
+\subsection{Spatial ensemble calibration}
+Для experimental residual field correction после обычного ensemble:
+\begin{lstlisting}
+--enable-spatial-ensemble
+--spatial-ensemble-max-order 2
+--spatial-ensemble-min-ref-stars-per-frame 30
+--spatial-ensemble-clip-sigma 3.5
+--spatial-ensemble-n-iterations 3
+--spatial-ensemble-min-bic-improvement 6
+--spatial-ensemble-min-spatial-peak-to-peak 0.003
+--spatial-ensemble-max-residual-mad 0.05
+--spatial-ensemble-max-residual-mad-degradation 0.0
+--spatial-ensemble-max-abs-spatial-deviation 0.15
+--spatial-ensemble-min-good-frame-fraction 0.8
+\end{lstlisting}
+Параметр экспериментальный и по умолчанию выключен. Значение
+\texttt{--spatial-ensemble-max-residual-mad-degradation 0.0} запрещает принимать spatial surface,
+если её robust residual MAD хуже identity; отрицательное значение отключает только этот локальный
+non-degradation gate.
+
+\subsection*{Post-ensemble photometric frame QC и candidate axis correlation (0.5.44.16)}
+
+Для консервативного контроля инструментальной систематики без изменения величин и ошибок SUSPECT-эпох:
+\begin{lstlisting}
+python -m grandgousier.cli process-archive-path ... \
+  --photometry-estimator adaptive_ellipse \
+  --enable-photometric-frame-qc
+\end{lstlisting}
+Параметр нельзя одновременно использовать с \texttt{--enable-spatial-ensemble}. Relative residual и
+spatial anomalies дают SUSPECT/\texttt{KEEP\_FLAGGED}; только hard failures становятся BAD и
+исключаются из standard science. Оценка excess frame scatter сохраняется как diagnostic-only и не
+изменяет \texttt{mag\_err}, \texttt{mag\_err\_random} или \texttt{mag\_err\_systematic}.
+
+Accepted automatic candidates дополнительно проверяются обычным candidate evaluator только на GOOD
+кадрах. Используются четыре класса confirmation:
+\begin{itemize}
+  \item \texttt{GOOD\_FRAME\_CONFIRMED};
+  \item \texttt{SYSTEMATICS\_SENSITIVE};
+  \item \texttt{INSUFFICIENT\_GOOD\_FRAME\_SUPPORT};
+  \item \texttt{TARGET\_PRESERVED}.
+\end{itemize}
+Диагностика сохраняется в \texttt{photometric\_frame\_qc/iterN} и в summary GOOD-frame
+confirmation; PSF summary записывается в \texttt{frames.quality\_flags}.
+
+Для \texttt{GOOD\_FRAME\_CONFIRMED} candidate final export не использует \texttt{HIGH\_RMS} как
+point-level reject reason; сам флаг сохраняется в Object QC. Остальные reject flags не ослабляются.
+Начиная с 0.5.44.15 candidate-triage CSV содержит GOOD-frame confirmation diagnostics, а PSF summary
+сохраняет BIC-selected spatial model и peak-to-peak для geometric FWHM и ellipticity.
+
+В 0.5.44.16 тот же режим автоматически добавляет diagnostic-only корреляцию accepted
+\texttt{GOOD\_FRAME\_CONFIRMED} candidates внутри X/Y detector bins: 16 primary bins плюс
+half-bin-shifted разметка и минимум 8 общих GOOD epochs. Начиная с 0.5.44.17 параллельно считаются
+Spearman и Pearson; диагностический axis flag ставится при $|\rho_S|\ge0.8$ или $|r_P|\ge0.8$.
+Обе signed-метрики и режим \texttt{SPEARMAN/PEARSON/BOTH/NONE} сохраняются в export.
+Результат не меняет candidate status. Pair table: \texttt{candidate\_axis\_correlation/candidate\_axis\_pairs.csv}.
+
+
+\section{P4a: stable physical-observation identity}
+
+Read-only plan:
+
+\begin{lstlisting}
+python -m grandgousier.cli backfill-observation-identity `
+  --instrument MASTER `
+  --instrument RoboPhot `
+  --out-root reports\observation_identity_055200
+\end{lstlisting}
+
+После проверки \texttt{collisions=0}, \texttt{invalid=0}, \texttt{link\_conflicts=0} и \texttt{can\_execute=YES} выполните ту же команду с \texttt{--execute}. MASTER identity v1 основана на \texttt{UNIQNUM}; RoboPhot identity v1 --- на \texttt{SERNUM + DATE-OBS}, где \texttt{DATE-OBS} уже является UTC. Backfill не объединяет и не удаляет строки \texttt{frames}.
+
+\section{P4c: plan-only observation science-input guard}
+
+Перед обработкой каталога, который может содержать копии уже известных observations, используйте обычный \texttt{process-archive-path} без \texttt{--execute} и сохраните manifest:
+
+\begin{lstlisting}
+python -m grandgousier.cli process-archive-path `
+  --path "D:\archive\candidate_block" `
+  --instrument-profile MASTER `
+  --catalog-name "existing_shared_catalog" `
+  --manifest-out "reports\p4c_plan.json"
+\end{lstlisting}
+
+Помимо JSON создаётся \texttt{reports\textbackslash p4c\_plan\_observation\_selection.csv}. Проверьте actions \texttt{ALREADY\_REPRESENTED}, \texttt{AMBIGUOUS\_MULTIPLE\_PRODUCTS}, \texttt{EXISTING\_MULTIPLE\_REPRESENTATIVES}, \texttt{MISSING\_OBSERVATION\_ID} и \texttt{IDENTITY\_CONFLICT} до запуска с \texttt{--execute}.
+
+Начиная с 0.5.54.1 повторный обычный \texttt{process-archive-path --execute}, для которого guard не выбрал ни одного нового Frame, не перезапускает series, найденные только через уже представленные products. Для преднамеренного rerun существующей series используйте \texttt{--series-id}.
+
+
+\section{Operational self-service: config, doctor, status}
+
+Создать шаблон общего конфига:
+\begin{lstlisting}
+python -m grandgousier.cli config-example --out grandgousier.yaml
+\end{lstlisting}
+
+Проверить installation/deployment:
+\begin{lstlisting}
+python -m grandgousier.cli doctor --config grandgousier.yaml
+python -m grandgousier.cli doctor --config grandgousier.yaml --strict-optional
+\end{lstlisting}
+
+Показать read-only состояние поля:
+\begin{lstlisting}
+python -m grandgousier.cli status `
+  --config grandgousier.yaml `
+  --field-id 33 `
+  --catalog-name "auto_catalog_master_20180907_GPX_TF17_2_mixed" `
+  --verbose
+\end{lstlisting}
+
+Опция \cli{--config} допустима и перед bootstrap subcommand: \cli{python -m grandgousier.cli --config grandgousier.yaml doctor}. Для \cli{process-field-archive} новый общий config использует вложенную секцию \texttt{field\_archive}; legacy \cli{--job-config} не удалён.
+
+
+\section{Run-bundle diagnostics}
+
+\begin{lstlisting}
+grandgousier diagnose-run reports\field_archive\_jobs\<job_id>
+grandgousier diagnose-run reports\field_archive\_jobs\<job_id>\job_summary.json --format json
+\end{lstlisting}
+
+Команда только читает локальные JSON/JSONL artifacts, не подключается к БД и не меняет processing state. Для bundle 0.5.59+ выводятся status, stable recovery code и рекомендуемые действия; legacy bundle также поддерживается.
+
+\section{Scientific acceptance}
+
+\begin{lstlisting}
+grandgousier acceptance-check `
+  --dataset gpx_tf17_2 `
+  --config grandgousier.yaml `
+  --report-out reports\acceptance_gpx_tf17_2.json
+\end{lstlisting}
+
+Команда read-only по PostgreSQL. Без \cli{--out-root} временные M5 products удаляются после сравнения; JSON report содержит все checks и фактически измеренные значения.

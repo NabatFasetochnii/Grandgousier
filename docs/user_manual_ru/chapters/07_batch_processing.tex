@@ -1,0 +1,141 @@
+\chapter{Массовая обработка}
+
+Grandgousier содержит DB-native batch orchestration и вспомогательные PowerShell runners для обработки многих серий.
+
+\section{Рекомендуемый порядок}
+
+Перед массовым запуском:
+
+\begin{enumerate}
+  \item проверить schema/migrations;
+  \item выполнить одну контрольную серию текущей версией;
+  \item убедиться в science status и количестве measurements;
+  \item проверить manifest и pipeline steps;
+  \item только после этого запускать batch.
+\end{enumerate}
+
+\section{Почему контрольная серия не заменяет batch validation}
+
+Оптимизация и корректность на одном поле не гарантируют одинаковое поведение на плотных, бедных, коротких, длинных или проблемных сериях. Для оценки production-производительности следует агрегировать timings по всем series и анализировать median/p90/p95 по каждому step.
+
+\section{Повторные запуски}
+
+Calibration generations immutable: повторная обработка должна создавать новое поколение результата, а не уничтожать предыдущее. Batch orchestration хранит jobs/attempts и позволяет отделять retry от уже завершённых попыток.
+
+\section{Контролируемый reset вычисляемых данных}
+
+Перед первым production-подобным запуском Stage~3 может быть полезно удалить накопленные тестовые продукты Stage~2 и пересчитать архив одной современной версией pipeline. Для этого существует более узкая команда, чем \texttt{reset-db}: она сохраняет индекс архива и слой идентичности, но удаляет вычисляемые результаты.
+
+Перед destructive запуском рекомендуется сделать резервную копию PostgreSQL:
+
+\begin{lstlisting}
+pg_dump -U grandgousier -h localhost `
+  -Fc `
+  -f "grandgousier_before_stage3_reset.dump" `
+  grandgousier
+\end{lstlisting}
+
+Сначала выполняется обязательный dry-run audit:
+
+\begin{lstlisting}
+python -m grandgousier.cli reset-derived-data `
+  --scope stage2 `
+  --all-series
+\end{lstlisting}
+
+Команда показывает число строк, которые будут удалены, и отдельный список таблиц, которые будут сохранены. В границу сохранения входят \texttt{frames}, \texttt{fields}, \texttt{field\_series}, \texttt{field\_series\_frames}, instrument units, catalog sources, reference photometry, \texttt{objects}, event registry и migration ledger.
+
+При подтверждённом audit reset запускается явно:
+
+\begin{lstlisting}
+python -m grandgousier.cli reset-derived-data `
+  --scope stage2 `
+  --all-series `
+  --execute `
+  --yes
+\end{lstlisting}
+
+Операция выполняет один PostgreSQL \texttt{TRUNCATE} над явным списком derived tables и затем сбрасывает runtime-состояние series/frames. \texttt{CASCADE} не используется. Identity sequences не перезапускаются, чтобы новые numeric IDs не столкнулись со старыми log/manifests, которые могли остаться на диске. PostgreSQL выполняет \texttt{TRUNCATE} транзакционно: при ошибке последующей части операции вызывается rollback.
+
+Для кадров, уже принадлежащих observing series, возвращаются \texttt{processing\_status=HEADER\_READ} и \texttt{wcs\_status=NOT\_CHECKED}; из \texttt{quality\_flags} удаляются только известные Stage~2/WCS-QC keys. FITS paths, header metadata, center coordinates, instrument metadata и исходные reference-file statuses не меняются.
+
+\subsection{Fresh rebuild batch}
+
+После reset старый \texttt{state.csv} и старые manifests не должны заставлять batch runner считать jobs завершёнными. Начиная с Grandgousier~\texttt{0.5.41.1}, runner \texttt{process\_all\_tess\_observations\_v1\_5.ps1} имеет ключ \texttt{-FreshStart}. Он запрещает импорт legacy \texttt{state.csv} и recovery старых успешных manifests.
+
+Для полного пересчёта рекомендуется отдельное новое имя batch:
+
+\begin{lstlisting}
+.\process_all_tess_observations_v1_5.ps1 `
+  -Execute `
+  -FreshStart `
+  -RetryCompleted `
+  -ForceRecomputePhotometry `
+  -BatchName "tess_stage3_rebuild_20260823"
+\end{lstlisting}
+
+\texttt{-FreshStart} относится только к operational resume state. Он не удаляет файлы manifests/logs с диска и не заменяет предварительный database reset.
+
+
+\subsection{Повторное использование сохранённого auto-catalog при clean rebuild}
+
+Команда \texttt{reset-derived-data --scope stage2} намеренно сохраняет \texttt{catalog\_sources}. Поэтому повторный Stage~2 rebuild не должен зависеть от доступности внешнего сервиса Gaia для тех полей, чей auto-catalog уже был успешно построен ранее.
+
+Начиная с Grandgousier~\texttt{0.5.41.2}, \texttt{process-archive-path} перед удалённым Gaia-запросом проверяет точное auto-generated имя каталога. Если в этом namespace уже есть источники, каталог используется непосредственно и удалённый запрос не выполняется. В manifest это отражается как
+
+\begin{lstlisting}
+mode = auto_existing_reuse
+status = DONE
+reused_existing = true
+queried_frames = 0
+queried_cones = 0
+\end{lstlisting}
+
+Это поведение одновременно уменьшает сетевую зависимость clean rebuild и сохраняет уже установленную catalog/object identity. Для нового поля, для которого соответствующего каталога в БД ещё нет, Gaia query по-прежнему необходим. Поэтому сетевой сбой внешнего сервиса может блокировать только действительно новые catalog namespaces, но не пересчёт уже известных полей.
+
+
+\subsection{Защита от копий каталогов наблюдений}
+
+Архивы, собранные вручную в течение разработки, могут содержать полные копии одного и того же наблюдения в разных каталогах, например \texttt{3988} и \texttt{3988\_1}. До версии~\texttt{0.5.41.3} такие копии были опасны для clean rebuild: идентификатор кадра исторически включает путь к FITS, поэтому одна и та же физическая экспозиция, скопированная в другой каталог, могла индексироваться как новый кадр и образовывать отдельную \texttt{field\_series}.
+
+Batch runner~v1.5.2 вычисляет для каждого каталога быстрый metadata-signature по полному набору имён FITS и размеров файлов. Если внутри одного объекта и одного канала найден каталог с тем же числом файлов, суммарным размером и тем же filename/size signature, первая по сортировке директория считается канонической, а последующая копия получает
+
+\begin{lstlisting}
+Classification = EXCLUDED
+ExcludeReason  = duplicate_directory:<canonical relative path>
+Selected       = False
+\end{lstlisting}
+
+Содержимое многогигабайтных FITS для этой проверки не хэшируется: это preflight-защита от очевидных полных копий директорий, а не универсальная content-addressed identity. Колонки \texttt{FitsBytes}, \texttt{ContentSignature} и \texttt{DuplicateOf} сохраняются в \texttt{inventory.csv} для аудита.
+
+Начиная с версии~0.5.54.0 эта directory-level защита дополняется DB-level physical-observation guard перед новой science-series membership. Даже если копия не распознана по directory signature, alternate Frame с уже представленным \texttt{observation\_id} не должен образовать вторую science epoch. Если несколько products одной observation ещё нигде не представлены, программа блокирует их как неоднозначные вместо неявного выбора одного файла.
+
+Если копии уже были проиндексированы в БД старой версией batch runner после clean reset, не следует удалять связанные кадры и series вручную. При наличии сделанного перед reset дампа безопаснее восстановить этот baseline, повторить \texttt{reset-derived-data} и начать rebuild с новой защитой.
+
+\subsection{Резервные Gaia TAP endpoints}
+
+Для нового поля, которого ещё нет в локальном \texttt{catalog\_sources}, всё равно необходим исходный Gaia DR3 identity catalog. Начиная с Grandgousier~\texttt{0.5.41.3}, такой запрос не привязан к единственному TAP endpoint. Используется последовательность публичных провайдеров:
+
+\begin{enumerate}
+  \item Gaia@AIP: \texttt{https://gaia.aip.de/tap};
+  \item ARI Heidelberg: \texttt{https://gaia.ari.uni-heidelberg.de/tap};
+  \item основной ESA/ESAC endpoint, используемый \texttt{astroquery.gaia.Gaia}.
+\end{enumerate}
+
+Для batch-запроса выбирается не более \texttt{max-working-sources-per-frame} самых ярких источников; поэтому выполняется короткий synchronous TAP query. Если endpoint отвечает ошибкой соединения, следующий provider пробуется автоматически. Использованный источник записывается в manifest как \texttt{query\_provider}; ошибки предыдущих endpoints сохраняются в \texttt{query\_provider\_failures}. Научная identity не меняется: во всех случаях используются Gaia DR3 \texttt{source\_id} и таблица \texttt{gaiadr3.gaia\_source}.
+
+
+\subsection{TAP/CSV transport для Gaia mirrors}
+
+В версии~\texttt{0.5.41.3} резервные AIP/ARI endpoints первоначально использовались через универсальный \texttt{astroquery.utils.tap.Tap}. На Windows это выявило две независимые проблемы совместимости клиента и сервиса: Gaia@AIP мог отвечать HTTP~406 на автоматически сформированный \texttt{Accept} header, а ARI мог успешно вернуть VOTable, после чего Astropy/astroquery падал при разборе 64-битного \texttt{source\_id} через платформенный C~\texttt{long}.
+
+Начиная с версии~\texttt{0.5.41.4}, AIP и ARI запрашиваются через стандартный synchronous TAP endpoint \texttt{/sync} с явным \texttt{FORMAT=csv}. Поле Gaia \texttt{source\_id} разбирается как точная десятичная строка, а не как платформенный целый тип. Это не изменяет identity: в БД остаётся тот же официальный Gaia DR3 \texttt{source\_id}; меняется только транспорт удалённого ответа.
+
+Порядок fallback остаётся таким:
+\begin{enumerate}
+  \item Gaia@AIP через TAP/CSV;
+  \item ARI Heidelberg через TAP/CSV;
+  \item ESA/ESAC через \texttt{astroquery.gaia.Gaia}.
+\end{enumerate}
+
+В manifest имена провайдеров для первых двух вариантов имеют суффикс \texttt{\_csv}: \texttt{gaia\_aip\_csv} и \texttt{gaia\_ari\_csv}. Ошибка одного mirror не является ошибкой всего job, если следующий provider успешно вернул каталог.

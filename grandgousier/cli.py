@@ -10,9 +10,6 @@ from pathlib import Path
 
 from grandgousier.db.init_db import init_db, reset_db
 from grandgousier.db.session import make_session_factory
-from grandgousier.instruments.base import InstrumentProfile
-from grandgousier.io.archive_indexer import index_archive
-from grandgousier.astrometry.wcs_check import WcsStatus, check_frames_wcs
 from grandgousier.logging_config import configure_logging
 from grandgousier.settings import get_settings
 
@@ -26,6 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--database-url", default=None, help="SQLAlchemy PostgreSQL URL")
     parser.add_argument("--log-level", default=None, help="DEBUG, INFO, WARNING, ERROR")
+    parser.add_argument(
+        "--config",
+        dest="config_file",
+        default=None,
+        help="Optional Grandgousier YAML/JSON application config (place before the subcommand, or use the command-local alias where available)",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -36,6 +39,282 @@ def build_parser() -> argparse.ArgumentParser:
     p_reset.add_argument("--yes", action="store_true", help="Confirm destructive reset")
     p_reset.set_defaults(func=cmd_reset_db)
 
+    p_reset_derived = sub.add_parser(
+        "reset-derived-data",
+        help="Audit or reset derived Stage-2/operational data while preserving archive identity",
+    )
+    p_reset_derived.add_argument(
+        "--scope",
+        choices=("stage2",),
+        required=True,
+        help="Derived-data scope; currently only stage2 is supported",
+    )
+    p_reset_derived.add_argument(
+        "--all-series",
+        action="store_true",
+        help="Required safety acknowledgement that every observing series is in scope",
+    )
+    p_reset_derived.add_argument(
+        "--execute",
+        action="store_true",
+        help="Execute the reset; without this flag the command is read-only",
+    )
+    p_reset_derived.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm destructive execution together with --execute",
+    )
+    p_reset_derived.add_argument(
+        "--format", choices=("table", "json"), default="table", help="Audit/result output format"
+    )
+    p_reset_derived.set_defaults(func=cmd_reset_derived_data)
+
+    p_schema_status = sub.add_parser(
+        "schema-status", help="Show schema migration ledger and checksum status"
+    )
+    p_schema_status.set_defaults(func=cmd_schema_status)
+
+    p_config_example = sub.add_parser(
+        "config-example",
+        help="Write the packaged self-service Grandgousier YAML configuration template",
+    )
+    p_config_example.add_argument("--out", default="grandgousier.yaml", help="Destination YAML path")
+    p_config_example.add_argument("--force", action="store_true", help="Overwrite an existing destination")
+    p_config_example.set_defaults(func=cmd_config_example)
+
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="Run a non-destructive installation, package, PostgreSQL, schema and path preflight",
+    )
+    p_doctor.add_argument(
+        "--config", dest="config_file", default=argparse.SUPPRESS,
+        help="Grandgousier YAML/JSON application config (may also be specified before the subcommand)",
+    )
+    p_doctor.add_argument("--processed-root", default=None, help="Optional processed FITS root to validate")
+    p_doctor.add_argument("--out-root", default=None, help="Optional output root to validate for writability")
+    p_doctor.add_argument("--instrument-profile", default=None, help="auto, MASTER or RoboPhot; defaults to config/auto")
+    p_doctor.add_argument("--strict-optional", action="store_true", help="Treat missing optional photometry/Gaia dependencies as failure")
+    p_doctor.add_argument("--format", choices=("table", "json"), default="table")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_diagnose_run = sub.add_parser(
+        "diagnose-run",
+        help="Inspect a field-archive run bundle and print normalized recovery guidance",
+    )
+    p_diagnose_run.add_argument(
+        "path",
+        help="Path to a _jobs/<job_id> directory or its job_summary.json",
+    )
+    p_diagnose_run.add_argument("--format", choices=("table", "json"), default="table")
+    p_diagnose_run.set_defaults(func=cmd_diagnose_run)
+
+    p_operational_status = sub.add_parser(
+        "status",
+        help="Show compact read-only field, Stage-2 provenance and latest Stage-3 operational status",
+    )
+    p_operational_status.add_argument(
+        "--config", dest="config_file", default=argparse.SUPPRESS,
+        help="Grandgousier YAML/JSON application config (may also be specified before the subcommand)",
+    )
+    p_operational_status.add_argument("--field-id", type=int, default=None, help="Field id; defaults to field_archive.field_id in config")
+    p_operational_status.add_argument("--catalog-name", default=None, help="Catalog namespace; defaults to field_archive.catalog_name in config")
+    p_operational_status.add_argument(
+        "--required-stage2-recipe", choices=("stage3_scale_v1",), default=None,
+        help="Stage-2 provenance contract; defaults to field_archive.stage2_recipe/current production recipe",
+    )
+    p_operational_status.add_argument("--min-points-per-object", type=int, default=5)
+    p_operational_status.add_argument("--min-common-objects", type=int, default=20)
+    p_operational_status.add_argument("--verbose", action="store_true", help="Also print per-series readiness rows")
+    p_operational_status.add_argument("--format", choices=("table", "json"), default="table")
+    p_operational_status.set_defaults(func=cmd_operational_status)
+
+    p_acceptance = sub.add_parser(
+        "acceptance-check",
+        help="Run frozen read-only scientific acceptance checks against a validated dataset",
+    )
+    p_acceptance.add_argument(
+        "--config", dest="config_file", default=argparse.SUPPRESS,
+        help="Grandgousier YAML/JSON application config (may also be specified before the subcommand)",
+    )
+    p_acceptance.add_argument("--dataset", default="gpx_tf17_2", help="Packaged dataset name or acceptance JSON path")
+    p_acceptance.add_argument("--out-root", default=None, help="Keep temporary M5 acceptance products under this directory")
+    p_acceptance.add_argument("--report-out", default=None, help="Optional machine-readable JSON report")
+    p_acceptance.add_argument("--format", choices=("table", "json"), default="table")
+    p_acceptance.set_defaults(func=cmd_acceptance_check)
+
+    p_migrate = sub.add_parser(
+        "migrate-db", help="Apply pending managed database migrations"
+    )
+    p_migrate.add_argument(
+        "--adopt-legacy",
+        action="store_true",
+        help="Validate and baseline the pre-0.5.39.1 migration history without re-running it",
+    )
+    p_migrate.add_argument(
+        "--dry-run", action="store_true", help="Show the managed migrations that would be applied"
+    )
+    p_migrate.set_defaults(func=cmd_migrate_db)
+
+    p_observation_identity = sub.add_parser(
+        "backfill-observation-identity",
+        help="Plan or execute path-independent physical-observation identity backfill",
+    )
+    p_observation_identity.add_argument(
+        "--instrument",
+        action="append",
+        choices=("MASTER", "RoboPhot"),
+        default=None,
+        help="Instrument to include; repeatable; default MASTER and RoboPhot",
+    )
+    p_observation_identity.add_argument(
+        "--execute",
+        action="store_true",
+        help="Create observations and link frames; default is read-only plan",
+    )
+    p_observation_identity.add_argument(
+        "--out-root",
+        default="reports/observation_identity_backfill",
+        help="Directory for summary.json and CSV diagnostics",
+    )
+    p_observation_identity.add_argument(
+        "--format", choices=("table", "json"), default="table", help="Console output format"
+    )
+    p_observation_identity.set_defaults(func=cmd_backfill_observation_identity)
+
+    p_stage1_plan = sub.add_parser(
+        "stage1-plan",
+        help="Build a canonical metadata-only Stage-1 archive/product plan",
+    )
+    p_stage1_plan.add_argument(
+        "--config", dest="config_file", default=argparse.SUPPRESS,
+        help="Grandgousier YAML/JSON config containing archives/products sections",
+    )
+    p_stage1_plan.add_argument("--source", required=True, help="Configured archives.<source-id>")
+    p_stage1_plan.add_argument(
+        "--filter", dest="stage1_filters", action="append", default=[],
+        help="Normalized filter; repeatable",
+    )
+    p_stage1_plan.add_argument(
+        "--datetime-start", default=None, help="Optional inclusive observation-time lower bound"
+    )
+    p_stage1_plan.add_argument(
+        "--datetime-end", default=None, help="Optional exclusive observation-time upper bound"
+    )
+    p_stage1_plan.add_argument(
+        "--object", dest="stage1_object_name", default=None, help="Optional exact normalized object name"
+    )
+    p_stage1_plan.add_argument("--ra", type=float, default=None, help="Optional ICRS search center RA in degrees")
+    p_stage1_plan.add_argument("--dec", type=float, default=None, help="Optional ICRS search center Dec in degrees")
+    p_stage1_plan.add_argument(
+        "--radius-deg", type=float, default=None, help="Optional angular radius in degrees; requires --ra/--dec"
+    )
+    p_stage1_plan.add_argument(
+        "--limit", type=int, default=None, help="Optional maximum number of matching metadata records"
+    )
+    p_stage1_plan.add_argument(
+        "--out", default="reports/stage1_plan.json", help="Canonical plan JSON output"
+    )
+    p_stage1_plan.add_argument("--csv-out", default=None, help="Optional CSV summary; default alongside JSON")
+    p_stage1_plan.add_argument("--format", choices=("table", "json"), default="table")
+    p_stage1_plan.set_defaults(func=cmd_stage1_plan)
+
+    p_stage1_execute = sub.add_parser(
+        "stage1-execute",
+        help="Execute a canonical Stage-1 plan into ProductStore without Stage-2 DB writes",
+    )
+    p_stage1_execute.add_argument(
+        "--config", dest="config_file", default=argparse.SUPPRESS,
+        help="Grandgousier YAML/JSON config containing archives/products sections",
+    )
+    p_stage1_execute.add_argument("--source", required=True, help="Configured archives.<source-id>")
+    p_stage1_execute.add_argument(
+        "--filter", dest="stage1_filters", action="append", default=[],
+        help="Normalized filter; repeatable",
+    )
+    p_stage1_execute.add_argument(
+        "--datetime-start", default=None, help="Optional inclusive observation-time lower bound"
+    )
+    p_stage1_execute.add_argument(
+        "--datetime-end", default=None, help="Optional exclusive observation-time upper bound"
+    )
+    p_stage1_execute.add_argument(
+        "--object", dest="stage1_object_name", default=None, help="Optional exact normalized object name"
+    )
+    p_stage1_execute.add_argument("--ra", type=float, default=None, help="Optional ICRS search center RA in degrees")
+    p_stage1_execute.add_argument("--dec", type=float, default=None, help="Optional ICRS search center Dec in degrees")
+    p_stage1_execute.add_argument(
+        "--radius-deg", type=float, default=None, help="Optional angular radius in degrees; requires --ra/--dec"
+    )
+    p_stage1_execute.add_argument(
+        "--limit", type=int, default=None, help="Optional maximum number of matching metadata records"
+    )
+    p_stage1_execute.add_argument(
+        "--plan-out", default="reports/stage1_execute_plan.json",
+        help="Exact canonical plan JSON executed by this command",
+    )
+    p_stage1_execute.add_argument(
+        "--report-out", default="reports/stage1_execution.json",
+        help="Execution report JSON output",
+    )
+    p_stage1_execute.add_argument(
+        "--csv-out", default=None, help="Optional execution CSV; default alongside report JSON"
+    )
+    p_stage1_execute.add_argument(
+        "--overwrite", action="store_true",
+        help="Replace an existing ProductStore product after current inputs have been materialized and fingerprinted",
+    )
+    p_stage1_execute.add_argument(
+        "--max-dark-temperature-delta-c", type=float, default=5.0,
+        help="MASTER only: maximum allowed |science-dark| CCD temperature difference in C; default 5",
+    )
+    p_stage1_execute.add_argument("--format", choices=("table", "json"), default="table")
+    p_stage1_execute.set_defaults(func=cmd_stage1_execute)
+
+    p_stage1_handoff = sub.add_parser(
+        "stage1-handoff",
+        help="Handoff only products from one Stage-1 execution report to the existing Stage-2 pipeline",
+    )
+    p_stage1_handoff.add_argument(
+        "--config", dest="config_file", default=argparse.SUPPRESS,
+        help="Grandgousier YAML/JSON application config; field_archive values provide safe Stage-2 defaults",
+    )
+    p_stage1_handoff.add_argument(
+        "--execution-report", required=True,
+        help="Stage-1 execution JSON whose exact ProductStore FITS products are eligible for handoff",
+    )
+    p_stage1_handoff.add_argument(
+        "--execute", action="store_true",
+        help="Index/select exact products and run existing Stage 2; default is read-only P4 preflight",
+    )
+    p_stage1_handoff.add_argument(
+        "--catalog-name", default=None,
+        help="Existing catalog namespace; defaults to field_archive.catalog_name, otherwise Stage 2 keeps auto-catalog behavior",
+    )
+    p_stage1_handoff.add_argument(
+        "--instrument-profile", default=None, choices=("auto", "MASTER", "RoboPhot"),
+        help="FITS profile selection; defaults to field_archive.instrument_profile or auto",
+    )
+    p_stage1_handoff.add_argument("--master-profile", default=None, help="Override MASTER YAML profile path")
+    p_stage1_handoff.add_argument("--robophot-profile", default=None, help="Override RoboPhot YAML profile path")
+    p_stage1_handoff.add_argument("--min-frames-per-series", type=int, default=10)
+    p_stage1_handoff.add_argument("--max-field-separation-arcmin", type=float, default=30.0)
+    p_stage1_handoff.add_argument("--max-series-gap-minutes", type=float, default=60.0)
+    p_stage1_handoff.add_argument(
+        "--out-root", default=None,
+        help="Stage-2 output root; defaults to field_archive/paths out_root or exports",
+    )
+    p_stage1_handoff.add_argument("--log-dir", default="logs", help="Stage-2 pipeline log root")
+    p_stage1_handoff.add_argument(
+        "--stage2-manifest-out", default=None,
+        help="Optional nested process-archive-path manifest for selected products",
+    )
+    p_stage1_handoff.add_argument(
+        "--report-out", default="reports/stage1_handoff.json",
+        help="Stage-1 -> Stage-2 handoff report JSON",
+    )
+    p_stage1_handoff.add_argument("--format", choices=("table", "json"), default="table")
+    p_stage1_handoff.set_defaults(func=cmd_stage1_handoff)
+
     p_index = sub.add_parser("index-archive", help="Index FITS archive into frames table")
     p_index.add_argument("--root", required=True, help="Root directory with raw FITS files")
     p_index.add_argument("--instrument", required=True, help="Instrument YAML profile")
@@ -45,6 +324,80 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--limit", type=int, default=None, help="Limit number of discovered files")
     p_index.set_defaults(func=cmd_index_archive)
 
+    p_master_reduce = sub.add_parser(
+        "master-archive-reduce",
+        help="Build calibrated MASTER FITS as (raw-SDARK)/SFLAT using downloaded Stage 1A files",
+    )
+    p_master_reduce.add_argument("--manifest", required=True, help="Prepared local reduction manifest CSV")
+    p_master_reduce.add_argument(
+        "--cache-root", default="archive_cache", help="Local prepared-data cache root; default ./archive_cache"
+    )
+    p_master_reduce.add_argument(
+        "--out-root", default=None, help="Processed FITS root; default <cache-root>/processed"
+    )
+    p_master_reduce.add_argument("--limit", type=int, default=None, help="Optional number of unique science frames for smoke tests")
+    p_master_reduce.add_argument("--execute", action="store_true", help="Actually write processed FITS; default is plan-only")
+    p_master_reduce.add_argument("--overwrite", action="store_true", help="Replace existing processed FITS")
+    p_master_reduce.add_argument(
+        "--compact-existing",
+        action="store_true",
+        help="Rewrite validated legacy processed FITS with uint8 DQ without recalibrating science pixels",
+    )
+    p_master_reduce.add_argument(
+        "--delete-raw-after-success",
+        action="store_true",
+        help="Delete each science raw after a validated processed FITS exists; header/SDARK/SFLAT are retained",
+    )
+    p_master_reduce.add_argument(
+        "--max-dark-temperature-delta-c",
+        type=float,
+        default=5.0,
+        help="Maximum allowed |science-dark| CCD temperature difference in C; default 5",
+    )
+    p_master_reduce.add_argument(
+        "--report-out", default=None, help="Reduction report CSV; default <out-root>/master_reduction_report.csv"
+    )
+    p_master_reduce.add_argument(
+        "--format", choices=("table", "json"), default="table", help="Console plan/result format"
+    )
+    p_master_reduce.set_defaults(func=cmd_master_archive_reduce)
+
+    p_master_prune = sub.add_parser(
+        "master-archive-prune",
+        help="Safely remove local MASTER raw or processed FITS after downstream products are verified",
+    )
+    p_master_prune.add_argument("--manifest", required=True, help="Prepared local reduction manifest CSV")
+    p_master_prune.add_argument(
+        "--cache-root", default="archive_cache", help="Local prepared-data cache root; default ./archive_cache"
+    )
+    p_master_prune.add_argument(
+        "--out-root", default=None, help="Processed FITS root; default <cache-root>/processed"
+    )
+    p_master_prune.add_argument(
+        "--scope", choices=("raw", "processed", "all"), required=True,
+        help="raw: require valid Stage-1B output; processed: require PHOTOMETRY_DONE + compact science cache or legacy science_measurements; all: both",
+    )
+    p_master_prune.add_argument("--limit", type=int, default=None, help="Optional number of unique science frames")
+    p_master_prune.add_argument("--execute", action="store_true", help="Actually delete eligible files; default plan-only")
+    p_master_prune.add_argument("--yes", action="store_true", help="Required together with --execute")
+    p_master_prune.add_argument(
+        "--report-out", default=None, help="Prune report CSV; default <cache-root>/master_prune_report.csv"
+    )
+    p_master_prune.add_argument("--format", choices=("table", "json"), default="table")
+    p_master_prune.set_defaults(func=cmd_master_archive_prune)
+
+    # Repository-local archive transport plugin. It is intentionally excluded from
+    # wheel/sdist builds; public installations therefore do not expose private
+    # archive discovery/fetch commands or site topology.
+    try:
+        from internal_tools.master_cli import register_master_remote_commands
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"internal_tools", "internal_tools.master_cli"}:
+            raise
+        register_master_remote_commands = None
+    if register_master_remote_commands is not None:
+        register_master_remote_commands(sub)
+
 
     p_wcs = sub.add_parser("check-wcs", help="Validate header WCS for indexed FITS frames")
     p_wcs.add_argument("--frame-id", type=int, action="append", help="Specific frame_id; may be repeated")
@@ -52,7 +405,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_wcs.add_argument("--instrument-unit-id", type=int, default=None, help="Filter by instrument_units.instrument_unit_id")
     p_wcs.add_argument(
         "--status",
-        default=WcsStatus.NOT_CHECKED.value,
+        default="NOT_CHECKED",
         help="Only check frames with this current wcs_status; use --all-statuses to ignore",
     )
     p_wcs.add_argument("--all-statuses", action="store_true", help="Ignore current wcs_status and re-check all selected frames")
@@ -267,11 +620,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_apply_color.add_argument("--include-flagged-calibrators", action="store_true", help="Do not reject calibrators with bad object_qc flags")
     p_apply_color.add_argument("--exclude-object-id", type=int, action="append", default=[], help="Explicit object_id to exclude from calibrators; may be repeated")
     p_apply_color.add_argument("--exclude-object-ids", default="", help="Comma-separated object_id list to exclude from calibrators")
-    p_apply_color.add_argument("--clip-sigma", type=float, default=4.0, help="Robust clipping threshold for frame/color model")
-    p_apply_color.add_argument("--n-iterations", type=int, default=5, help="Maximum frame/color model iterations")
+    p_apply_color.add_argument("--clip-sigma", type=float, default=4.0, help="Robust clipping threshold for object-level color transform")
+    p_apply_color.add_argument("--n-iterations", type=int, default=5, help="Maximum object-level color-transform iterations")
+    p_apply_color.add_argument("--min-calibrator-objects", type=int, default=20, help="Minimum calibrator objects required to write the target calibration")
+    p_apply_color.add_argument("--min-color-span", type=float, default=0.3, help="Minimum calibrator color span")
+    p_apply_color.add_argument("--max-transform-residual-mad", type=float, default=0.10, help="Maximum transform residual MAD; use negative to disable")
+    p_apply_color.add_argument("--max-pivot-color-fraction", type=float, default=0.25, help="Maximum pivot-color measurement fraction; use negative to disable")
+    p_apply_color.add_argument("--max-shape-metric-delta", type=float, default=1e-10, help="Maximum allowed RMS/MAD/robust-amplitude change")
+    p_apply_color.add_argument("--min-color-term-significance", type=float, default=2.0, help="Minimum |C|/sigma(C) required to select the color model")
+    p_apply_color.add_argument("--min-color-model-bic-improvement", type=float, default=6.0, help="Minimum BIC improvement required to select the color model")
+    p_apply_color.add_argument("--min-color-model-mad-improvement", type=float, default=0.0, help="Minimum residual-MAD improvement required to select the color model")
     p_apply_color.add_argument("--include-saturated", action="store_true", help="Do not reject saturated_or_near_saturated measurement flags")
     p_apply_color.add_argument("--limit", type=int, default=None, help="Limit loaded measurements for debugging")
     p_apply_color.add_argument("--dry-run", action="store_true", help="Fit model and count rows without writing target calibration")
+    p_apply_color.add_argument("--diagnose-performance", action="store_true", help="Collect detailed color-calibration phase timing diagnostics")
     p_apply_color.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
     p_apply_color.set_defaults(func=cmd_apply_color_calibration)
 
@@ -293,11 +655,61 @@ def build_parser() -> argparse.ArgumentParser:
     p_phot.add_argument("--instrument", default=None, help="Filter frames by instrument")
     p_phot.add_argument("--instrument-unit-id", type=int, default=None, help="Filter frames by instrument unit")
     p_phot.add_argument("--all-wcs-statuses", action="store_true", help="Do not require wcs_status=HEADER_WCS_OK")
-    p_phot.add_argument("--aperture-radius-pix", type=float, default=3.0, help="Circular aperture radius in pixels")
+    p_phot.add_argument("--aperture-radius-pix", type=float, default=3.0, help="Circular aperture radius in pixels; floor/equal-area baseline for adaptive_ellipse")
+    p_phot.add_argument("--photometry-estimator", choices=("circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"), default="circular", help="Base flux estimator")
+    p_phot.add_argument("--adaptive-min-psf-snr", type=float, default=20.0, help="Minimum detection S/N for adaptive-aperture PSF references")
+    p_phot.add_argument("--adaptive-max-psf-sources-per-frame", type=int, default=500, help="Maximum PSF references used per frame")
+    p_phot.add_argument("--adaptive-psf-cutout-radius-pix", type=int, default=7, help="PSF second-moment cutout radius used by adaptive photometry")
+    p_phot.add_argument("--adaptive-psf-min-isolation-pix", type=float, default=12.0, help="Minimum PSF-reference isolation distance")
+    p_phot.add_argument("--adaptive-interpolation-neighbors", type=int, default=24, help="Nearest PSF references used for local covariance interpolation")
+    p_phot.add_argument("--adaptive-min-psf-references", type=int, default=20, help="Minimum PSF references required per frame")
+    p_phot.add_argument("--adaptive-aperture-fwhm-factor", type=float, default=1.0, help="Equal-area adaptive radius in local geometric FWHM units, with --aperture-radius-pix as floor")
+    p_phot.add_argument("--adaptive-max-axis-ratio", type=float, default=3.0, help="Safety clamp for adaptive ellipse axis ratio")
+    p_phot.add_argument("--adaptive-max-radius-scale", type=float, default=2.5, help="Safety clamp for adaptive equivalent radius relative to --aperture-radius-pix")
+    p_phot.add_argument("--no-adaptive-circular-fallback", dest="adaptive_fallback_to_circular", action="store_false", help="Fail instead of falling back to circular photometry when local PSF geometry is unavailable")
+    p_phot.set_defaults(adaptive_fallback_to_circular=True)
+    p_phot.add_argument("--psf-profile", choices=("moffat", "gaussian"), default="moffat", help="Spatial-PSF profile family")
+    p_phot.add_argument("--psf-moffat-beta", type=float, default=2.5, help="Fixed Moffat beta for spatial_psf")
+    p_phot.add_argument("--psf-fit-radius-fwhm", type=float, default=2.5, help="PSF fit radius in local major-axis FWHM units")
+    p_phot.add_argument("--psf-min-fit-radius-pix", type=float, default=5.0, help="Minimum spatial-PSF fit radius")
+    p_phot.add_argument("--psf-max-fit-radius-pix", type=float, default=14.0, help="Maximum spatial-PSF fit radius")
+    p_phot.add_argument("--psf-centroid-search-radius-pix", type=float, default=0.75, help="Half-width of forced-position centroid grid search")
+    p_phot.add_argument("--psf-centroid-grid-steps", type=int, default=3, help="Centroid grid steps per axis for spatial_psf")
+    p_phot.add_argument("--psf-residual-clip-sigma", type=float, default=5.0, help="Residual clipping threshold after centroid selection")
+    p_phot.add_argument("--psf-residual-clip-iterations", type=int, default=2, help="Residual clipping iterations for spatial_psf")
+    p_phot.add_argument("--no-psf-adaptive-fallback", dest="psf_fallback_to_adaptive", action="store_false", help="Do not fall back from spatial_psf to adaptive ellipse when profile fitting cannot be used")
+    p_phot.set_defaults(psf_fallback_to_adaptive=True)
+    p_phot.add_argument("--empirical-psf-grid-size", type=int, default=3, help="Spatial empirical PSF grid size per axis")
+    p_phot.add_argument("--empirical-psf-stamp-radius-pix", type=int, default=8, help="Half-size of registered empirical PSF stamps")
+    p_phot.add_argument("--empirical-psf-reference-radius-pix", type=float, default=5.0, help="Reference-aperture radius used to normalize empirical PSF templates")
+    p_phot.add_argument("--empirical-psf-references-per-node", type=int, default=48, help="Nearest PSF stars combined into each grid-node template")
+    p_phot.add_argument("--empirical-psf-min-references-per-node", type=int, default=12, help="Minimum usable reference stars required per empirical PSF node")
+    p_phot.add_argument("--no-empirical-psf-adaptive-fallback", dest="empirical_psf_fallback_to_adaptive", action="store_false", help="Do not fall back from empirical_psf to adaptive ellipse when empirical fitting cannot be used")
+    p_phot.set_defaults(empirical_psf_fallback_to_adaptive=True)
     p_phot.add_argument("--annulus-inner-pix", type=float, default=8.0, help="Background annulus inner radius in pixels")
     p_phot.add_argument("--annulus-outer-pix", type=float, default=12.0, help="Background annulus outer radius in pixels")
     p_phot.add_argument("--zero-point", type=float, default=0.0, help="Instrumental magnitude additive zero point")
     p_phot.add_argument("--saturation-level-adu", type=float, default=None, help="Override saturation threshold")
+    p_phot.add_argument(
+        "--random-error-model",
+        choices=("physical_aperture_v1", "legacy_aperture_v1"),
+        default="physical_aperture_v1",
+        help="Random per-epoch aperture-photometry error model",
+    )
+    p_phot.add_argument("--gain-e-per-adu", type=float, default=None, help="Override detector gain; otherwise use frame/instrument metadata")
+    p_phot.add_argument("--read-noise-e", type=float, default=None, help="Override detector read noise; otherwise use frame/instrument metadata")
+    p_phot.add_argument("--background-estimator-variance-factor", type=float, default=1.5707963267948966, help="Variance multiplier for the annulus-median background estimator")
+    p_phot.add_argument("--no-empirical-background-floor", dest="empirical_background_floor", action="store_false", help="Use only detector-predicted sky/read variance instead of flooring it by measured annulus scatter")
+    p_phot.set_defaults(empirical_background_floor=True)
+    p_phot.add_argument("--fractional-flux-floor", type=float, default=0.0, help="Optional flat/intrapixel fractional flux-noise floor")
+    p_phot.add_argument("--enable-scintillation", dest="scintillation_enabled", action="store_true", help="Enable Young-type scintillation variance when telescope/site metadata are available")
+    p_phot.add_argument("--disable-scintillation", dest="scintillation_enabled", action="store_false", help="Disable the scintillation variance term")
+    p_phot.set_defaults(scintillation_enabled=True)
+    p_phot.add_argument("--scintillation-coefficient", type=float, default=0.09, help="Coefficient in the Young-type fractional scintillation approximation")
+    p_phot.add_argument("--telescope-aperture-m", type=float, default=None, help="Telescope clear-aperture diameter in metres for scintillation")
+    p_phot.add_argument("--site-altitude-m", type=float, default=None, help="Observatory altitude in metres for scintillation")
+    p_phot.add_argument("--diagnostics-out-dir", default=None, help="Optional directory for random-error summary JSON and per-frame CSV")
+    p_phot.add_argument("--diagnose-performance", action="store_true", help="Collect detailed forced-photometry phase timing and throughput diagnostics")
     p_phot.add_argument("--calibration-name", default=None, help="CalibrationVersion name; default generated from aperture settings")
     p_phot.add_argument("--limit-frames", type=int, default=None, help="Limit selected frames")
     p_phot.add_argument("--limit-links", type=int, default=None, help="Limit catalog links per frame")
@@ -492,6 +904,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_triage.add_argument("--format", choices=("table", "csv", "json"), default="table", help="Output format")
     p_triage.set_defaults(func=cmd_candidate_triage_summary)
 
+    p_evidence = sub.add_parser(
+        "candidate-evidence-report",
+        help="Combine exported candidate products across series and measure repeatability/coherence",
+    )
+    p_evidence.add_argument(
+        "--series-dir",
+        action="append",
+        required=True,
+        help="Series export directory (or its candidates directory); repeat for each series",
+    )
+    p_evidence.add_argument("--out-prefix", required=True, help="Output prefix for JSON and CSV products")
+    p_evidence.add_argument("--max-time-separation-sec", type=float, default=120.0, help="Maximum separation for paired simultaneous epochs")
+    p_evidence.add_argument("--min-pairs", type=int, default=10, help="Minimum paired epochs for coherence evidence")
+    p_evidence.add_argument("--min-correlation", type=float, default=0.25, help="Minimum Pearson and Spearman correlation for coherence evidence")
+    p_evidence.add_argument("--max-fdr-q", type=float, default=0.05, help="Maximum Benjamini-Hochberg q for significant correlation diagnostics")
+    p_evidence.add_argument("--min-repeat-series", type=int, default=2, help="Minimum accepted series for repeatability evidence")
+    p_evidence.add_argument(
+        "--target-source-id",
+        action="append",
+        default=[],
+        help="Explicit target source ID; repeat for multiple targets",
+    )
+    p_evidence.add_argument("--limit", type=int, default=50, help="Maximum displayed candidate rows")
+    p_evidence.add_argument("--format", choices=("table", "csv", "json"), default="table", help="Console output format")
+    p_evidence.set_defaults(func=cmd_candidate_evidence_report)
+
     p_blend_diag = sub.add_parser("blend-diagnostic-summary", help="Show dynamic-separation and blend diagnostics from object_qc")
     p_blend_diag.add_argument("--calibration-name", required=True, help="CalibrationVersion name")
     p_blend_diag.add_argument("--catalog-name", default=None, help="Filter by catalog source namespace")
@@ -658,8 +1096,53 @@ def build_parser() -> argparse.ArgumentParser:
     p_field_pipeline.add_argument("--out-dir", default=None, help="Optional directory for field QC JSON/CSV outputs")
     p_field_pipeline.add_argument("--margin-pix", type=float, default=2.0, help="Catalog-to-frame footprint margin")
     p_field_pipeline.add_argument("--aperture-radius-pix", type=float, default=3.0, help="Forced-photometry aperture radius")
+    p_field_pipeline.add_argument("--photometry-estimator", choices=("circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"), default="circular", help="Base science flux estimator; adaptive_ellipse uses a local PSF-aligned elliptical aperture and keeps circular as fallback")
+    p_field_pipeline.add_argument("--adaptive-min-psf-snr", type=float, default=20.0, help="Minimum detection S/N for adaptive-aperture PSF references")
+    p_field_pipeline.add_argument("--adaptive-max-psf-sources-per-frame", type=int, default=500, help="Maximum PSF reference detections used per frame by adaptive photometry")
+    p_field_pipeline.add_argument("--adaptive-psf-cutout-radius-pix", type=int, default=7, help="PSF second-moment cutout radius used by adaptive photometry")
+    p_field_pipeline.add_argument("--adaptive-psf-min-isolation-pix", type=float, default=12.0, help="Minimum isolation of PSF reference stars for adaptive photometry")
+    p_field_pipeline.add_argument("--adaptive-interpolation-neighbors", type=int, default=24, help="Nearest PSF references interpolated for each adaptive aperture")
+    p_field_pipeline.add_argument("--adaptive-min-psf-references", type=int, default=20, help="Minimum PSF references required per frame before adaptive photometry is trusted")
+    p_field_pipeline.add_argument("--adaptive-aperture-fwhm-factor", type=float, default=1.0, help="Equal-area adaptive aperture radius in units of local geometric FWHM, with --aperture-radius-pix as a floor")
+    p_field_pipeline.add_argument("--adaptive-max-axis-ratio", type=float, default=3.0, help="Safety cap for adaptive aperture semi-major/semi-minor ratio")
+    p_field_pipeline.add_argument("--adaptive-max-radius-scale", type=float, default=2.5, help="Safety cap for adaptive equal-area radius relative to --aperture-radius-pix")
+    p_field_pipeline.add_argument("--no-adaptive-circular-fallback", dest="adaptive_fallback_to_circular", action="store_false", help="Fail adaptive frames/measurements instead of falling back to circular aperture when a PSF model is unavailable")
+    p_field_pipeline.set_defaults(adaptive_fallback_to_circular=True)
+    p_field_pipeline.add_argument("--psf-profile", choices=("moffat", "gaussian"), default="moffat", help="Spatial-PSF profile family")
+    p_field_pipeline.add_argument("--psf-moffat-beta", type=float, default=2.5, help="Fixed Moffat beta for spatial_psf")
+    p_field_pipeline.add_argument("--psf-fit-radius-fwhm", type=float, default=2.5, help="PSF fit radius in local major-axis FWHM units")
+    p_field_pipeline.add_argument("--psf-min-fit-radius-pix", type=float, default=5.0, help="Minimum spatial-PSF fit radius")
+    p_field_pipeline.add_argument("--psf-max-fit-radius-pix", type=float, default=14.0, help="Maximum spatial-PSF fit radius")
+    p_field_pipeline.add_argument("--psf-centroid-search-radius-pix", type=float, default=0.75, help="Half-width of forced-position centroid grid search")
+    p_field_pipeline.add_argument("--psf-centroid-grid-steps", type=int, default=3, help="Centroid grid steps per axis for spatial_psf")
+    p_field_pipeline.add_argument("--psf-residual-clip-sigma", type=float, default=5.0, help="Residual clipping threshold after centroid selection")
+    p_field_pipeline.add_argument("--psf-residual-clip-iterations", type=int, default=2, help="Residual clipping iterations for spatial_psf")
+    p_field_pipeline.add_argument("--no-psf-adaptive-fallback", dest="psf_fallback_to_adaptive", action="store_false", help="Do not fall back from spatial_psf to adaptive ellipse when profile fitting cannot be used")
+    p_field_pipeline.set_defaults(psf_fallback_to_adaptive=True)
+    p_field_pipeline.add_argument("--empirical-psf-grid-size", type=int, default=3, help="Spatial empirical PSF grid size per axis")
+    p_field_pipeline.add_argument("--empirical-psf-stamp-radius-pix", type=int, default=8, help="Half-size of registered empirical PSF stamps")
+    p_field_pipeline.add_argument("--empirical-psf-reference-radius-pix", type=float, default=5.0, help="Reference-aperture radius used to normalize empirical PSF templates")
+    p_field_pipeline.add_argument("--empirical-psf-references-per-node", type=int, default=48, help="Nearest PSF stars combined into each grid-node template")
+    p_field_pipeline.add_argument("--empirical-psf-min-references-per-node", type=int, default=12, help="Minimum usable reference stars required per empirical PSF node")
+    p_field_pipeline.add_argument("--no-empirical-psf-adaptive-fallback", dest="empirical_psf_fallback_to_adaptive", action="store_false", help="Do not fall back from empirical_psf to adaptive ellipse when empirical fitting cannot be used")
+    p_field_pipeline.set_defaults(empirical_psf_fallback_to_adaptive=True)
     p_field_pipeline.add_argument("--annulus-inner-pix", type=float, default=8.0, help="Background annulus inner radius")
     p_field_pipeline.add_argument("--annulus-outer-pix", type=float, default=12.0, help="Background annulus outer radius")
+    p_field_pipeline.add_argument("--aperture-correction-reference-radius-pix", type=float, default=5.0, help="Large-aperture radius used to derive the spatial aperture correction")
+    p_field_pipeline.add_argument("--aperture-correction-max-calibrator-mag-err", type=float, default=0.05, help="Maximum random mag_err for aperture-correction calibrators; use negative to disable")
+    p_field_pipeline.add_argument("--aperture-correction-min-calibrators-per-frame", type=int, default=20, help="Minimum usable stars required for a frame aperture model")
+    p_field_pipeline.add_argument("--aperture-correction-min-plane-calibrators", type=int, default=30, help="Minimum usable stars required to consider a spatial plane")
+    p_field_pipeline.add_argument("--aperture-correction-clip-sigma", type=float, default=3.5, help="Robust clipping threshold for small-to-large aperture differences")
+    p_field_pipeline.add_argument("--aperture-correction-n-iterations", type=int, default=3, help="Aperture-correction clipping iterations")
+    p_field_pipeline.add_argument("--aperture-correction-min-plane-bic-improvement", type=float, default=6.0, help="Minimum BIC improvement required to select a spatial plane")
+    p_field_pipeline.add_argument("--aperture-correction-min-spatial-peak-to-peak", type=float, default=0.005, help="Minimum predicted detector-wide spatial correction amplitude in mag")
+    p_field_pipeline.add_argument("--aperture-correction-plane-policy", choices=["evidence", "safety_only"], default="evidence", help="Plane selection policy: evidence uses BIC/spatial/MAD preference; safety_only is an experimental diagnostic mode that selects any available plane passing safety gates")
+    p_field_pipeline.add_argument("--aperture-correction-max-residual-mad", type=float, default=0.05, help="Maximum per-frame residual MAD; use negative to disable")
+    p_field_pipeline.add_argument("--aperture-correction-max-abs-correction", type=float, default=0.5, help="Maximum absolute calibrator/constant correction and legacy combined plane-edge threshold in mag")
+    p_field_pipeline.add_argument("--aperture-correction-max-abs-spatial-deviation", type=float, default=0.15, help="Maximum absolute plane deviation from the calibrator pivot across detector corners in mag")
+    p_field_pipeline.add_argument("--aperture-correction-max-abs-total-correction", type=float, default=0.75, help="Emergency maximum absolute total plane correction at detector corners in mag")
+    p_field_pipeline.add_argument("--aperture-correction-min-good-frame-fraction", type=float, default=0.8, help="Minimum fraction of frames with accepted aperture models")
+    p_field_pipeline.add_argument("--aperture-correction-max-global-median-residual-mad", type=float, default=0.05, help="Maximum median frame residual MAD; use negative to disable")
     p_field_pipeline.add_argument("--raw-calibration-name", default=None, help="Override generated raw aperture calibration name")
     p_field_pipeline.add_argument("--aperture-zp-calibration-name", default=None, help="Override generated aperture-ZP calibration name")
     p_field_pipeline.add_argument("--ensemble-calibration-name", default=None, help="Override generated ensemble calibration name")
@@ -667,6 +1150,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_field_pipeline.add_argument("--detection-max-sources-per-frame", type=int, default=2000, help="Maximum detections per frame")
     p_field_pipeline.add_argument("--detection-min-separation-pix", type=float, default=5.0, help="Minimum source-detection separation")
     p_field_pipeline.add_argument("--detection-match-radius-arcsec", type=float, default=2.0, help="Detection-to-catalog matching radius")
+    p_field_pipeline.add_argument("--enable-psf-field-diagnostics", action="store_true", help="Measure diagnostic PSF morphology and spatial field models without changing science flux")
+    p_field_pipeline.add_argument("--psf-diagnostics-max-sources-per-frame", type=int, default=500, help="Maximum isolated high-S/N detections used for PSF diagnostics per frame")
+    p_field_pipeline.add_argument("--psf-diagnostics-min-snr", type=float, default=20.0, help="Minimum detection S/N for PSF diagnostics")
+    p_field_pipeline.add_argument("--psf-diagnostics-cutout-radius-pix", type=int, default=7, help="Radius of the PSF second-moment cutout in pixels")
+    p_field_pipeline.add_argument("--psf-diagnostics-min-isolation-pix", type=float, default=12.0, help="Minimum distance to any other detection for PSF diagnostic stars")
+    p_field_pipeline.add_argument("--psf-diagnostics-clip-sigma", type=float, default=4.0, help="Robust clipping threshold for spatial PSF models")
+    p_field_pipeline.add_argument("--psf-diagnostics-n-iterations", type=int, default=3, help="Robust spatial-model clipping iterations")
+    p_field_pipeline.add_argument("--no-psf-diagnostic-plots", dest="psf_diagnostics_render_plots", action="store_false", help="Write CSV/JSON PSF diagnostics without PNG plots")
+    p_field_pipeline.set_defaults(psf_diagnostics_render_plots=True)
     p_field_pipeline.add_argument("--bulk-insert-batch-size", type=int, default=1000, help="Rows per batched DB INSERT/UPSERT; capped automatically by PostgreSQL bind limit")
     p_field_pipeline.add_argument("--mag-key", default="G", help="Reference magnitude key in objects.ref_mags")
     p_field_pipeline.add_argument("--aperture-zp-min-ref-stars-per-frame", type=int, default=30, help="Aperture-ZP minimum reference stars per frame")
@@ -676,9 +1168,41 @@ def build_parser() -> argparse.ArgumentParser:
     p_field_pipeline.add_argument("--ensemble-min-measurements", type=int, default=10, help="Ensemble object-stat minimum measurements")
     p_field_pipeline.add_argument("--ensemble-min-ref-measurements", type=int, default=10, help="Ensemble reference candidate minimum measurements")
     p_field_pipeline.add_argument("--ensemble-min-ref-stars-per-frame", type=int, default=30, help="Minimum ensemble references per frame")
+    p_field_pipeline.add_argument("--enable-spatial-ensemble", action="store_true", help="Apply zero-mean per-frame spatial residual calibration after each conventional ensemble pass")
+    p_field_pipeline.add_argument("--enable-photometric-frame-qc", action="store_true", help="Enable conservative post-ensemble frame QC: relative/spatial anomalies become SUSPECT diagnostic flags without changing measurement errors; BAD is reserved for hard failures; accepted candidates are rechecked on GOOD epochs")
+    p_field_pipeline.add_argument("--spatial-ensemble-max-order", type=int, choices=(1, 2), default=2, help="Maximum spatial polynomial order: 1=plane, 2=quadratic")
+    p_field_pipeline.add_argument("--spatial-ensemble-min-ref-stars-per-frame", type=int, default=30, help="Minimum reference stars required to fit a spatial ensemble frame model")
+    p_field_pipeline.add_argument("--spatial-ensemble-clip-sigma", type=float, default=3.5, help="Robust clipping threshold for spatial ensemble residual fits")
+    p_field_pipeline.add_argument("--spatial-ensemble-n-iterations", type=int, default=3, help="Robust spatial ensemble fit iterations")
+    p_field_pipeline.add_argument("--spatial-ensemble-min-bic-improvement", type=float, default=6.0, help="Minimum BIC improvement over identity required to apply a spatial model")
+    p_field_pipeline.add_argument("--spatial-ensemble-min-spatial-peak-to-peak", type=float, default=0.003, help="Minimum detector-wide spatial amplitude in mag")
+    p_field_pipeline.add_argument("--spatial-ensemble-max-residual-mad", type=float, default=0.05, help="Maximum reference residual MAD per frame; use negative to disable")
+    p_field_pipeline.add_argument("--spatial-ensemble-max-residual-mad-degradation", type=float, default=0.0, help="Maximum allowed residual-MAD increase for a spatial model versus identity; 0 requires non-degradation, negative disables")
+    p_field_pipeline.add_argument("--spatial-ensemble-max-abs-spatial-deviation", type=float, default=0.15, help="Maximum absolute zero-mean spatial correction across the detector")
+    p_field_pipeline.add_argument("--spatial-ensemble-min-good-frame-fraction", type=float, default=0.8, help="Minimum valid-frame fraction; below this the stage becomes an identity copy")
     p_field_pipeline.add_argument("--ensemble-max-ref-rms", type=float, default=0.08, help="Maximum RMS for ensemble reference candidates; use negative to disable")
     p_field_pipeline.add_argument("--ensemble-max-ref-mad", type=float, default=0.05, help="Maximum MAD for ensemble reference candidates; use negative to disable")
     p_field_pipeline.add_argument("--ensemble-n-iterations", type=int, default=3, help="Ensemble iterations")
+    p_field_pipeline.add_argument("--enable-color-calibration", action="store_true", help="Create a final reference-band color-calibrated science CalibrationVersion")
+    p_field_pipeline.add_argument("--color-identity-catalog-name", default=None, help="Identity catalog for source IDs; defaults to --catalog-name")
+    p_field_pipeline.add_argument("--color-reference-catalog-name", default=None, help="Imported reference-photometry catalog, e.g. panstarrs_dr2")
+    p_field_pipeline.add_argument("--color-reference-band", default=None, help="Reference magnitude band, e.g. i")
+    p_field_pipeline.add_argument("--color-index", default=None, help="Reference color index, e.g. r-i")
+    p_field_pipeline.add_argument("--color-target-calibration-name", default=None, help="Override generated final color-calibration name")
+    p_field_pipeline.add_argument("--color-min-measurements-per-object", type=int, default=5, help="Minimum measurements per color calibrator")
+    p_field_pipeline.add_argument("--color-min-stars-per-frame", type=int, default=20, help="Minimum color calibrators per frame")
+    p_field_pipeline.add_argument("--color-max-measurement-mag-err", type=float, default=None, help="Maximum instrumental mag_err for color calibrators")
+    p_field_pipeline.add_argument("--color-max-reference-mag-err", type=float, default=None, help="Maximum reference-band error for color calibrators")
+    p_field_pipeline.add_argument("--color-clip-sigma", type=float, default=4.0, help="Robust clipping threshold for object-level color transform")
+    p_field_pipeline.add_argument("--color-n-iterations", type=int, default=5, help="Maximum object-level color-transform iterations")
+    p_field_pipeline.add_argument("--color-min-calibrator-objects", type=int, default=20, help="Minimum calibrator objects required to publish the color transform")
+    p_field_pipeline.add_argument("--color-min-span", type=float, default=0.3, help="Minimum calibrator color span required to publish the transform")
+    p_field_pipeline.add_argument("--color-max-transform-residual-mad", type=float, default=0.10, help="Maximum object-level transform residual MAD; use negative to disable")
+    p_field_pipeline.add_argument("--color-max-pivot-fraction", type=float, default=0.25, help="Maximum fraction of measurements using pivot color; use negative to disable")
+    p_field_pipeline.add_argument("--color-max-shape-metric-delta", type=float, default=1e-10, help="Maximum allowed change in RMS/MAD/robust amplitude")
+    p_field_pipeline.add_argument("--color-min-term-significance", type=float, default=2.0, help="Minimum |C|/sigma(C) required to select the color model")
+    p_field_pipeline.add_argument("--color-min-bic-improvement", type=float, default=6.0, help="Minimum BIC improvement required to select the color model")
+    p_field_pipeline.add_argument("--color-min-mad-improvement", type=float, default=0.0, help="Minimum residual-MAD improvement required to select the color model")
     p_field_pipeline.add_argument("--object-qc-min-measurements", type=int, default=10, help="Object-QC minimum measurements")
     p_field_pipeline.add_argument("--crowded-arcsec", type=float, default=10.0, help="Object-QC crowded threshold")
     p_field_pipeline.add_argument("--blended-arcsec", type=float, default=5.0, help="Object-QC blend threshold")
@@ -721,6 +1245,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_field_pipeline.add_argument("--skip-detection", action="store_true", help="Skip source detection")
     p_field_pipeline.add_argument("--skip-detection-catalog-match", action="store_true", help="Skip detection-to-catalog matching/frame QC")
     p_field_pipeline.add_argument("--skip-forced-photometry", action="store_true", help="Skip forced aperture photometry")
+    p_field_pipeline.add_argument("--skip-aperture-correction", action="store_true", help="Skip small-to-large spatial aperture correction")
     p_field_pipeline.add_argument("--skip-aperture-zp", action="store_true", help="Skip aperture-ZP calibration")
     p_field_pipeline.add_argument("--skip-ensemble", action="store_true", help="Skip ensemble calibration")
     p_field_pipeline.add_argument("--skip-object-qc", action="store_true", help="Skip object QC")
@@ -734,6 +1259,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_field_pipeline.add_argument("--candidate-ensemble-max-iterations", type=int, default=2, help="Maximum total ensemble iterations for fixed candidate-excluded mode; 2 means one candidate-excluded pass")
     p_field_pipeline.add_argument("--candidate-ensemble-until-converged", action="store_true", help="Iterate candidate-excluded ensemble calibration until no new accepted candidates appear, up to --candidate-ensemble-convergence-max-iterations")
     p_field_pipeline.add_argument("--candidate-ensemble-convergence-max-iterations", type=int, default=10, help="Safety cap for --candidate-ensemble-until-converged; counts the initial ensemble as iteration 1")
+    p_field_pipeline.add_argument("--candidate-ensemble-growth-policy", choices=("initial_only", "all"), default="initial_only", help="Whether later ensemble iterations may add newly appearing candidates; initial_only prevents exclusion cascades")
     p_field_pipeline.add_argument(
         "--replace-detections",
         dest="replace_detections",
@@ -760,6 +1286,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Keep existing detection_catalog_matches and rely only on upserts",
     )
+    p_field_pipeline.add_argument("--diagnose-forced-photometry", action="store_true", help="Collect detailed forced-photometry phase timing and throughput diagnostics")
+    p_field_pipeline.add_argument("--diagnose-calibration-performance", action="store_true", help="Collect detailed aperture-correction and color-calibration phase timing diagnostics")
     p_field_pipeline.add_argument("--dry-run", action="store_true", help="Run stages in dry-run mode; pipeline metadata is still recorded")
     p_field_pipeline.add_argument("--no-record", dest="record_run", action="store_false", help="Do not write pipeline_runs/pipeline_run_steps metadata")
     p_field_pipeline.set_defaults(record_run=True)
@@ -778,8 +1306,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_idem.add_argument("--field-series-name", default=None, help="Restrict checks to one field_series identifier/pipeline/calibration prefix")
     p_idem.add_argument("--frame-id", type=int, action="append", default=[], help="Explicit frame_id restriction; may be repeated")
     p_idem.add_argument("--object-qc-algorithm", default="object_qc_v1", help="object_qc.algorithm")
-    p_idem.add_argument("--detection-algorithm", default="numpy_localmax_v1", help="source_detections.algorithm")
-    p_idem.add_argument("--detection-match-algorithm", default="nearest_sky_v1", help="detection_catalog_matches.algorithm")
+    p_idem.add_argument("--detection-algorithm", default="numpy_localmax_v1", help="detection_runs.algorithm for source-detection runs")
+    p_idem.add_argument("--detection-match-algorithm", default="nearest_sky_v1", help="detection_runs.algorithm for catalog-match runs")
     p_idem.add_argument("--frame-qc-algorithm", default="detection_catalog_qc_v1", help="frame_qc.algorithm")
     p_idem.add_argument("--example-limit", type=int, default=10, help="Maximum duplicate examples per check in JSON output")
     p_idem.add_argument("--out", default=None, help="Optional JSON report path")
@@ -810,6 +1338,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="One-command path processing: auto-detect instrument, index FITS, build series, run pipeline",
     )
     p_process_path.add_argument("--path", required=True, help="Directory with FITS files")
+    p_process_path.add_argument("--series-id", dest="series_ids", type=int, action="append", help="Execute only this existing field_series among frames under --path; may be repeated; selective mode does not create new series")
     p_process_path.add_argument("--catalog-name", default=None, help="Catalog namespace already imported; omitted means auto_catalog_* with Gaia DR3 fetch")
     p_process_path.add_argument("--execute", action="store_true", help="Write to DB and run pipelines; omitted means plan-only")
     p_process_path.add_argument("--plan-only", action="store_true", help="Alias for the default non-writing planning mode")
@@ -831,13 +1360,83 @@ def build_parser() -> argparse.ArgumentParser:
     p_process_path.add_argument("--file-log-level", default="INFO", help="File log level")
     p_process_path.add_argument("--no-file-log", action="store_true", help="Do not write run.log/run.jsonl/errors.log")
     p_process_path.add_argument("--aperture-radius-pix", type=float, default=3.0, help="Forced-photometry aperture radius")
+    p_process_path.add_argument("--photometry-estimator", choices=("circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"), default="circular", help="Base science flux estimator; adaptive_ellipse runs the complete Stage-2 chain from a local PSF-aligned elliptical aperture")
+    p_process_path.add_argument("--adaptive-min-psf-snr", type=float, default=20.0, help="Minimum detection S/N for adaptive-aperture PSF references")
+    p_process_path.add_argument("--adaptive-max-psf-sources-per-frame", type=int, default=500, help="Maximum PSF reference detections used per frame by adaptive photometry")
+    p_process_path.add_argument("--adaptive-psf-cutout-radius-pix", type=int, default=7, help="PSF second-moment cutout radius used by adaptive photometry")
+    p_process_path.add_argument("--adaptive-psf-min-isolation-pix", type=float, default=12.0, help="Minimum isolation of PSF reference stars for adaptive photometry")
+    p_process_path.add_argument("--adaptive-interpolation-neighbors", type=int, default=24, help="Nearest PSF references interpolated for each adaptive aperture")
+    p_process_path.add_argument("--adaptive-min-psf-references", type=int, default=20, help="Minimum PSF references required per frame before adaptive photometry is trusted")
+    p_process_path.add_argument("--adaptive-aperture-fwhm-factor", type=float, default=1.0, help="Equal-area adaptive aperture radius in units of local geometric FWHM, with --aperture-radius-pix as a floor")
+    p_process_path.add_argument("--adaptive-max-axis-ratio", type=float, default=3.0, help="Safety cap for adaptive aperture axis ratio")
+    p_process_path.add_argument("--adaptive-max-radius-scale", type=float, default=2.5, help="Safety cap for adaptive equal-area radius relative to --aperture-radius-pix")
+    p_process_path.add_argument("--no-adaptive-circular-fallback", dest="adaptive_fallback_to_circular", action="store_false", help="Do not substitute circular flux if the adaptive PSF model is unavailable")
+    p_process_path.set_defaults(adaptive_fallback_to_circular=True)
+    p_process_path.add_argument("--psf-profile", choices=("moffat", "gaussian"), default="moffat", help="Spatial-PSF profile family")
+    p_process_path.add_argument("--psf-moffat-beta", type=float, default=2.5, help="Fixed Moffat beta for spatial_psf")
+    p_process_path.add_argument("--psf-fit-radius-fwhm", type=float, default=2.5, help="PSF fit radius in local major-axis FWHM units")
+    p_process_path.add_argument("--psf-min-fit-radius-pix", type=float, default=5.0, help="Minimum spatial-PSF fit radius")
+    p_process_path.add_argument("--psf-max-fit-radius-pix", type=float, default=14.0, help="Maximum spatial-PSF fit radius")
+    p_process_path.add_argument("--psf-centroid-search-radius-pix", type=float, default=0.75, help="Half-width of forced-position centroid grid search")
+    p_process_path.add_argument("--psf-centroid-grid-steps", type=int, default=3, help="Centroid grid steps per axis for spatial_psf")
+    p_process_path.add_argument("--psf-residual-clip-sigma", type=float, default=5.0, help="Residual clipping threshold after centroid selection")
+    p_process_path.add_argument("--psf-residual-clip-iterations", type=int, default=2, help="Residual clipping iterations for spatial_psf")
+    p_process_path.add_argument("--no-psf-adaptive-fallback", dest="psf_fallback_to_adaptive", action="store_false", help="Do not fall back from spatial_psf to adaptive ellipse when profile fitting cannot be used")
+    p_process_path.set_defaults(psf_fallback_to_adaptive=True)
+    p_process_path.add_argument("--empirical-psf-grid-size", type=int, default=3, help="Spatial empirical PSF grid size per axis")
+    p_process_path.add_argument("--empirical-psf-stamp-radius-pix", type=int, default=8, help="Half-size of registered empirical PSF stamps")
+    p_process_path.add_argument("--empirical-psf-reference-radius-pix", type=float, default=5.0, help="Reference-aperture radius used to normalize empirical PSF templates")
+    p_process_path.add_argument("--empirical-psf-references-per-node", type=int, default=48, help="Nearest PSF stars combined into each grid-node template")
+    p_process_path.add_argument("--empirical-psf-min-references-per-node", type=int, default=12, help="Minimum usable reference stars required per empirical PSF node")
+    p_process_path.add_argument("--no-empirical-psf-adaptive-fallback", dest="empirical_psf_fallback_to_adaptive", action="store_false", help="Do not fall back from empirical_psf to adaptive ellipse when empirical fitting cannot be used")
+    p_process_path.set_defaults(empirical_psf_fallback_to_adaptive=True)
     p_process_path.add_argument("--annulus-inner-pix", type=float, default=8.0, help="Background annulus inner radius")
     p_process_path.add_argument("--annulus-outer-pix", type=float, default=12.0, help="Background annulus outer radius")
+    p_process_path.add_argument(
+        "--random-error-model",
+        choices=("physical_aperture_v1", "legacy_aperture_v1"),
+        default="physical_aperture_v1",
+        help="Random per-epoch aperture-photometry error model; physical_aperture_v1 is the 0.5.37 default",
+    )
+    p_process_path.add_argument("--photometry-gain-e-per-adu", type=float, default=None, help="Override detector gain; otherwise use frame/instrument metadata")
+    p_process_path.add_argument("--photometry-read-noise-e", type=float, default=None, help="Override detector read noise; otherwise use frame/instrument metadata")
+    p_process_path.add_argument("--background-estimator-variance-factor", type=float, default=1.5707963267948966, help="Variance multiplier for annulus-median background estimation")
+    p_process_path.add_argument("--no-empirical-background-floor", dest="empirical_background_floor", action="store_false", help="Do not floor detector-predicted background variance by measured annulus scatter")
+    p_process_path.set_defaults(empirical_background_floor=True)
+    p_process_path.add_argument("--photometry-fractional-flux-floor", type=float, default=None, help="Override profile flat/intrapixel fractional flux-noise floor")
+    p_process_path.add_argument("--enable-photometry-scintillation", dest="photometry_scintillation_enabled", action="store_true", help="Enable scintillation term instead of the instrument-profile default")
+    p_process_path.add_argument("--disable-photometry-scintillation", dest="photometry_scintillation_enabled", action="store_false", help="Disable scintillation term instead of the instrument-profile default")
+    p_process_path.set_defaults(photometry_scintillation_enabled=None)
+    p_process_path.add_argument("--photometry-scintillation-coefficient", type=float, default=None, help="Override profile Young-type scintillation coefficient")
+    p_process_path.add_argument("--photometry-telescope-aperture-m", type=float, default=None, help="Override telescope aperture diameter in metres")
+    p_process_path.add_argument("--photometry-site-altitude-m", type=float, default=None, help="Override site altitude in metres")
+    p_process_path.add_argument("--aperture-correction-reference-radius-pix", type=float, default=5.0, help="Large-aperture radius used to derive the spatial aperture correction")
+    p_process_path.add_argument("--aperture-correction-max-calibrator-mag-err", type=float, default=0.05, help="Maximum random mag_err for aperture-correction calibrators; use negative to disable")
+    p_process_path.add_argument("--aperture-correction-min-calibrators-per-frame", type=int, default=20, help="Minimum usable stars required for a frame aperture model")
+    p_process_path.add_argument("--aperture-correction-min-plane-calibrators", type=int, default=30, help="Minimum usable stars required to consider a spatial plane")
+    p_process_path.add_argument("--aperture-correction-min-plane-bic-improvement", type=float, default=6.0, help="Minimum BIC improvement required to select a spatial plane")
+    p_process_path.add_argument("--aperture-correction-min-spatial-peak-to-peak", type=float, default=0.005, help="Minimum detector-wide spatial correction amplitude in mag")
+    p_process_path.add_argument("--aperture-correction-plane-policy", choices=["evidence", "safety_only"], default="evidence", help="Plane selection policy: evidence uses BIC/spatial/MAD preference; safety_only is an experimental diagnostic mode that selects any available plane passing safety gates")
+    p_process_path.add_argument("--aperture-correction-max-residual-mad", type=float, default=0.05, help="Maximum per-frame residual MAD; use negative to disable")
+    p_process_path.add_argument("--aperture-correction-max-abs-correction", type=float, default=0.5, help="Maximum absolute calibrator/constant correction and legacy combined plane-edge threshold in mag")
+    p_process_path.add_argument("--aperture-correction-max-abs-spatial-deviation", type=float, default=0.15, help="Maximum absolute plane deviation from the calibrator pivot across detector corners in mag")
+    p_process_path.add_argument("--aperture-correction-max-abs-total-correction", type=float, default=0.75, help="Emergency maximum absolute total plane correction at detector corners in mag")
+    p_process_path.add_argument("--aperture-correction-min-good-frame-fraction", type=float, default=0.8, help="Minimum fraction of frames with accepted aperture models")
+    p_process_path.add_argument("--skip-aperture-correction", action="store_true", help="Skip small-to-large spatial aperture correction")
     p_process_path.add_argument("--bulk-insert-batch-size", type=int, default=1000, help="Rows per batched DB INSERT/UPSERT inside the field pipeline")
     p_process_path.add_argument("--working-catalog-mag-limit", type=float, default=19.0, help="Gaia/reference magnitude cutoff for the forced-photometry working set; use negative to disable")
     p_process_path.add_argument("--max-working-sources-per-frame", type=int, default=2000, help="Maximum brightest catalog sources linked/measured per frame; use 0 to disable")
     p_process_path.add_argument("--catalog-edge-margin-pix", type=float, default=20.0, help="Reject working catalog sources closer than this to frame edges")
     p_process_path.add_argument("--enable-detection-branch", action="store_true", help="Run source detection and detection-catalog matching; disabled by default for large forced-photometry runs")
+    p_process_path.add_argument("--enable-psf-field-diagnostics", action="store_true", help="Measure diagnostic PSF morphology/spatial models after source detection; science photometry is unchanged")
+    p_process_path.add_argument("--psf-diagnostics-max-sources-per-frame", type=int, default=500, help="Maximum isolated high-S/N detections used for PSF diagnostics per frame")
+    p_process_path.add_argument("--psf-diagnostics-min-snr", type=float, default=20.0, help="Minimum detection S/N for PSF diagnostics")
+    p_process_path.add_argument("--psf-diagnostics-cutout-radius-pix", type=int, default=7, help="Radius of the PSF second-moment cutout in pixels")
+    p_process_path.add_argument("--psf-diagnostics-min-isolation-pix", type=float, default=12.0, help="Minimum distance to any other detection for PSF diagnostic stars")
+    p_process_path.add_argument("--psf-diagnostics-clip-sigma", type=float, default=4.0, help="Robust clipping threshold for spatial PSF models")
+    p_process_path.add_argument("--psf-diagnostics-n-iterations", type=int, default=3, help="Robust spatial-model clipping iterations")
+    p_process_path.add_argument("--no-psf-diagnostic-plots", dest="psf_diagnostics_render_plots", action="store_false", help="Write CSV/JSON PSF diagnostics without PNG plots")
+    p_process_path.set_defaults(psf_diagnostics_render_plots=True)
     p_process_path.add_argument("--require-detection-support", dest="require_detection_support", action="store_true", default=None, help="Reject weak/no detection-support objects in science light curves and candidate triage")
     p_process_path.add_argument("--no-require-detection-support", dest="require_detection_support", action="store_false", help="Treat weak/no detection support as diagnostic only, not as a science-light-curve rejection flag")
     p_process_path.add_argument("--target-source-id", default=None, help="Explicit external source_id/Gaia DR3 source_id for the field target")
@@ -854,9 +1453,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_process_path.add_argument("--candidate-ensemble-max-iterations", type=int, default=2, help="Maximum total ensemble iterations for fixed candidate-excluded mode; 2 means one candidate-excluded pass")
     p_process_path.add_argument("--candidate-ensemble-until-converged", action="store_true", help="Iterate candidate-excluded ensemble calibration until no new accepted candidates appear, up to --candidate-ensemble-convergence-max-iterations")
     p_process_path.add_argument("--candidate-ensemble-convergence-max-iterations", type=int, default=10, help="Safety cap for --candidate-ensemble-until-converged; counts the initial ensemble as iteration 1")
+    p_process_path.add_argument("--candidate-ensemble-growth-policy", choices=("initial_only", "all"), default="initial_only", help="Whether later ensemble iterations may add newly appearing candidates; initial_only prevents exclusion cascades")
+    p_process_path.add_argument("--ensemble-min-ref-stars-per-frame", type=int, default=30, help="Minimum conventional ensemble reference stars required per frame; default preserves prior process-archive-path behavior")
+    p_process_path.add_argument("--enable-spatial-ensemble", action="store_true", help="Apply zero-mean per-frame spatial residual calibration after each conventional ensemble pass")
+    p_process_path.add_argument("--enable-photometric-frame-qc", action="store_true", help="Enable conservative post-ensemble frame QC: relative/spatial anomalies become SUSPECT diagnostic flags without changing measurement errors; BAD is reserved for hard failures; accepted candidates are rechecked on GOOD epochs")
+    p_process_path.add_argument("--spatial-ensemble-max-order", type=int, choices=(1, 2), default=2, help="Maximum spatial polynomial order: 1=plane, 2=quadratic")
+    p_process_path.add_argument("--spatial-ensemble-min-ref-stars-per-frame", type=int, default=30, help="Minimum reference stars required per frame")
+    p_process_path.add_argument("--spatial-ensemble-clip-sigma", type=float, default=3.5, help="Robust clipping threshold")
+    p_process_path.add_argument("--spatial-ensemble-n-iterations", type=int, default=3, help="Robust spatial fit iterations")
+    p_process_path.add_argument("--spatial-ensemble-min-bic-improvement", type=float, default=6.0, help="Minimum BIC improvement over identity")
+    p_process_path.add_argument("--spatial-ensemble-min-spatial-peak-to-peak", type=float, default=0.003, help="Minimum detector-wide spatial amplitude in mag")
+    p_process_path.add_argument("--spatial-ensemble-max-residual-mad", type=float, default=0.05, help="Maximum reference residual MAD per frame; use negative to disable")
+    p_process_path.add_argument("--spatial-ensemble-max-residual-mad-degradation", type=float, default=0.0, help="Maximum allowed residual-MAD increase versus identity; 0 requires non-degradation, negative disables")
+    p_process_path.add_argument("--spatial-ensemble-max-abs-spatial-deviation", type=float, default=0.15, help="Maximum absolute zero-mean spatial correction")
+    p_process_path.add_argument("--spatial-ensemble-min-good-frame-fraction", type=float, default=0.8, help="Minimum valid-frame fraction before global identity fallback")
     p_process_path.add_argument("--enable-aperture-stability-qc", action="store_true", help="Run expensive aperture-radius stability sweep; disabled by default in process-archive-path")
     p_process_path.add_argument("--exclude-bad-pre-qc-frames", action="store_true", help="Exclude frames marked BAD by pre-photometry QC from downstream photometry/calibration")
     p_process_path.add_argument("--force-recompute-photometry", action="store_true", help="Recompute raw forced photometry even if the target calibration already has measurements")
+    p_process_path.add_argument("--diagnose-forced-photometry", action="store_true", help="Collect detailed forced-photometry phase timing and throughput diagnostics")
+    p_process_path.add_argument("--diagnose-calibration-performance", action="store_true", help="Collect detailed aperture-correction and color-calibration phase timing diagnostics")
+    p_process_path.add_argument("--enable-color-calibration", action="store_true", help="Apply the instrument-profile color policy as the final science calibration")
+    p_process_path.add_argument("--no-auto-reference-photometry", dest="auto_reference_photometry", action="store_false", help="Do not fetch/import missing Pan-STARRS reference photometry automatically")
+    p_process_path.set_defaults(auto_reference_photometry=True)
+    p_process_path.add_argument("--color-reference-catalog-name", default=None, help="Override profile reference catalog, e.g. panstarrs_dr2")
+    p_process_path.add_argument("--color-reference-band", default=None, help="Override profile reference band")
+    p_process_path.add_argument("--color-index", default=None, help="Override profile color index, e.g. r-i")
     p_process_path.add_argument("--disable-intrinsic-variability-candidates", dest="enable_intrinsic_variability_candidates", action="store_false", help="Disable intrinsic-variability candidate channel in field QC")
     p_process_path.set_defaults(enable_intrinsic_variability_candidates=True)
     p_process_path.add_argument("--field-report-min-intrinsic-rms", type=float, default=0.03, help="Intrinsic candidate minimum RMS in field QC; use negative to disable")
@@ -876,15 +1497,64 @@ def build_parser() -> argparse.ArgumentParser:
     p_process_path.add_argument("--no-auto-catalog-query", dest="auto_catalog_query", action="store_false", help="When --catalog-name is omitted, generate an auto catalog name but do not query Gaia DR3")
     p_process_path.set_defaults(auto_catalog_query=True)
     p_process_path.add_argument("--auto-catalog-margin-arcmin", type=float, default=2.0, help="Gaia cone margin for auto catalog generation")
-    p_process_path.add_argument("--auto-catalog-mag-limit", type=float, default=None, help="Optional Gaia G magnitude limit for auto catalog generation")
+    p_process_path.add_argument("--auto-catalog-mag-limit", type=float, default=None, help="Gaia G limit for auto catalog generation; default inherits --working-catalog-mag-limit")
     p_process_path.add_argument("--auto-catalog-max-rows-per-frame", type=int, default=50000, help="Maximum Gaia rows in the auto catalog query")
     p_process_path.add_argument("--auto-catalog-query-mode", choices=("frame_union", "per_frame"), default="frame_union", help="Gaia query strategy for auto catalogs; frame_union queries one cone for the whole input field")
-    p_process_path.add_argument("--auto-catalog-max-radius-deg", type=float, default=1.0, help="Abort auto Gaia query if the computed cone radius exceeds this value")
+    p_process_path.add_argument("--auto-catalog-max-radius-deg", type=float, default=None, help="Gaia cone safety radius; default 1.6 deg for MASTER and 1.0 deg otherwise; oversized frame_union falls back to spatial clusters")
     p_process_path.add_argument("--auto-catalog-timeout-sec", type=float, default=120.0, help="Best-effort astroquery timeout for auto Gaia query")
     p_process_path.add_argument("--allow-empty-catalog", action="store_true", help="Debug only: continue pipeline even if auto catalog query fails or inserts zero sources")
     p_process_path.add_argument("--manifest-out", default=None, help="Optional JSON manifest path")
     p_process_path.add_argument("--format", choices=("table", "json"), default="table", help="Console output format")
     p_process_path.set_defaults(func=cmd_process_archive_path)
+
+    p_field_archive = sub.add_parser(
+        "process-field-archive",
+        help="Run a production field-archive job through the server/service layer and validated M8 workflow",
+    )
+    p_field_archive.add_argument("--job-config", default=None, help="Optional legacy/field-specific YAML/JSON job config. When present, it supplies field-archive job settings instead of the field_archive section from --config; application database/logging settings from --config still apply.")
+    p_field_archive.add_argument(
+        "--config", dest="config_file", default=argparse.SUPPRESS,
+        help="Grandgousier application config; field_archive section is used (may also be specified before the subcommand)",
+    )
+    p_field_archive.add_argument("--processed-root", default=None, help="Root containing processed FITS batches; required unless supplied by job config/environment")
+    p_field_archive.add_argument("--field-id", type=int, default=None, help="Target fields.field_id; required unless supplied by job config/environment")
+    p_field_archive.add_argument("--catalog-name", default=None, help="Explicit shared catalog namespace; required unless supplied by job config/environment")
+    p_field_archive.add_argument("--instrument-profile", default=None, help="Instrument profile mode; default MASTER after source merging")
+    p_field_archive.add_argument("--execute", dest="execute", action="store_true", default=None, help="Execute Stage 2 and Stage 3")
+    p_field_archive.add_argument("--plan-only", dest="execute", action="store_false", help="Force read-only orchestration plan even if config/environment requests execution")
+    p_field_archive.add_argument("--resume", dest="resume", action="store_true", default=None, help="Skip READY batches and resume incomplete work; default enabled")
+    p_field_archive.add_argument("--no-resume", dest="resume", action="store_false", help="Refuse already-indexed or incomplete batches")
+    p_field_archive.add_argument(
+        "--stage2-recipe",
+        choices=("stage3_scale_v1",),
+        default=None,
+        help="Frozen Stage-2 scientific recipe; default stage3_scale_v1 after source merging",
+    )
+    p_field_archive.add_argument(
+        "--stage3-policy",
+        dest="stage3_policies",
+        action="append",
+        default=None,
+        help="Explicit FILTER:MIN_COMMON[:REFERENCE_SERIES_ID[:INSTRUMENT_UNIT_ID]] policy; repeat per filter/system. Required unless supplied by job config/environment.",
+    )
+    p_field_archive.add_argument("--control-object-id", dest="control_object_ids", action="append", type=int, default=None, help="M5 control object; may be repeated")
+    p_field_archive.add_argument("--exclude-date", dest="exclude_dates", action="append", default=None, help="Observing date YYYY-MM-DD to skip explicitly; may be repeated")
+    p_field_archive.add_argument("--include-date", dest="include_dates", action="append", default=None, help="Optional allow-list date YYYY-MM-DD; may be repeated")
+    p_field_archive.add_argument("--out-root", default=None, help="Consolidated report/output directory; default reports/field_archive")
+    p_field_archive.add_argument("--plot-max-points", type=int, default=None, help="M5 control plot hard cap per filter; default 200")
+    p_field_archive.add_argument("--no-preflight", action="store_true", help="Skip service readiness checks; intended only for controlled diagnostics/tests")
+    p_field_archive.add_argument("--format", choices=("table", "json", "job-json"), default="table", help="Console result format; json preserves the legacy M8 payload when M8 runs, job-json returns the service wrapper")
+    p_field_archive.set_defaults(func=cmd_process_field_archive)
+
+    p_field_archive_ready = sub.add_parser(
+        "field-archive-readiness",
+        help="Check package resources, processed/output roots, PostgreSQL connectivity and migration readiness without running M8",
+    )
+    p_field_archive_ready.add_argument("--processed-root", required=True, help="Processed FITS root that the service must be able to read")
+    p_field_archive_ready.add_argument("--instrument-profile", default="MASTER", help="Instrument profile mode: auto, MASTER or RoboPhot")
+    p_field_archive_ready.add_argument("--out-root", default="reports/field_archive", help="Output root that the service must be able to write")
+    p_field_archive_ready.add_argument("--format", choices=("table", "json"), default="table", help="Console result format")
+    p_field_archive_ready.set_defaults(func=cmd_field_archive_readiness)
 
     p_show_pipeline_runs = sub.add_parser("show-pipeline-runs", help="Show recorded field pipeline runs")
     p_show_pipeline_runs.add_argument("--limit", type=int, default=20, help="Maximum rows")
@@ -911,6 +1581,108 @@ def build_parser() -> argparse.ArgumentParser:
     p_show_pipeline_logs.add_argument("--limit", type=int, default=100, help="Maximum rows")
     p_show_pipeline_logs.add_argument("--format", choices=("table", "csv", "json"), default="table", help="Output format")
     p_show_pipeline_logs.set_defaults(func=cmd_show_pipeline_log_events)
+
+    p_show_calibration_iterations = sub.add_parser(
+        "show-calibration-iterations",
+        help="Show compact normalized calibration iterations for one product",
+    )
+    p_show_calibration_iterations.add_argument("--calibration-name", default=None)
+    p_show_calibration_iterations.add_argument("--calibration-version-id", type=int, default=None)
+    p_show_calibration_iterations.add_argument("--format", choices=("table", "csv", "json"), default="table")
+    p_show_calibration_iterations.set_defaults(func=cmd_show_calibration_iterations)
+
+    p_verify_calibration_terms = sub.add_parser(
+        "verify-calibration-terms",
+        help="Compare normalized calibration terms with the legacy materialized layer",
+    )
+    p_verify_calibration_terms.add_argument("--calibration-name", default=None)
+    p_verify_calibration_terms.add_argument("--calibration-version-id", type=int, default=None)
+    p_verify_calibration_terms.add_argument("--tolerance", type=float, default=1e-10)
+    p_verify_calibration_terms.add_argument("--format", choices=("table", "json"), default="table")
+    p_verify_calibration_terms.set_defaults(func=cmd_verify_calibration_terms)
+
+    p_verify_calibration_reconstruction = sub.add_parser(
+        "verify-calibration-reconstruction",
+        help="Reconstruct a calibration from base photometry + normalized terms and compare it with the materialized layer",
+    )
+    p_verify_calibration_reconstruction.add_argument("--calibration-name", default=None)
+    p_verify_calibration_reconstruction.add_argument("--calibration-version-id", type=int, default=None)
+    p_verify_calibration_reconstruction.add_argument("--tolerance", type=float, default=1e-10)
+    p_verify_calibration_reconstruction.add_argument("--format", choices=("table", "json"), default="table")
+    p_verify_calibration_reconstruction.set_defaults(func=cmd_verify_calibration_reconstruction)
+
+    p_show_artifacts = sub.add_parser("show-artifacts", help="Show registered immutable file artifacts")
+    p_show_artifacts.add_argument("--pipeline-run-id", type=int, default=None, help="Filter by pipeline run")
+    p_show_artifacts.add_argument("--batch-run-id", type=int, default=None, help="Filter by batch run")
+    p_show_artifacts.add_argument("--batch-job-attempt-id", type=int, default=None, help="Filter by batch job attempt")
+    p_show_artifacts.add_argument("--series-id", type=int, default=None, help="Filter by field series")
+    p_show_artifacts.add_argument("--artifact-type", default=None, help="Filter by artifact type")
+    p_show_artifacts.add_argument("--limit", type=int, default=100, help="Maximum rows")
+    p_show_artifacts.add_argument("--format", choices=("table", "csv", "json"), default="table", help="Output format")
+    p_show_artifacts.set_defaults(func=cmd_show_artifacts)
+
+    p_verify_artifacts = sub.add_parser("verify-artifacts", help="Verify registered artifact size and SHA-256")
+    p_verify_artifacts.add_argument("--pipeline-run-id", type=int, default=None, help="Verify artifacts for one pipeline run")
+    p_verify_artifacts.add_argument("--batch-run-id", type=int, default=None, help="Verify artifacts for one batch run")
+    p_verify_artifacts.add_argument("--batch-job-attempt-id", type=int, default=None, help="Verify artifacts for one batch job attempt")
+    p_verify_artifacts.add_argument("--artifact-id", type=int, default=None, help="Verify one artifact")
+    p_verify_artifacts.add_argument("--limit", type=int, default=1000, help="Maximum artifacts to verify")
+    p_verify_artifacts.add_argument("--format", choices=("table", "csv", "json"), default="table", help="Output format")
+    p_verify_artifacts.set_defaults(func=cmd_verify_artifacts)
+
+    p_batch_sync = sub.add_parser("batch-sync-plan", help="Synchronize a scanned batch plan into PostgreSQL")
+    p_batch_sync.add_argument("--batch-name", required=True)
+    p_batch_sync.add_argument("--root", required=True, help="Archive root path")
+    p_batch_sync.add_argument("--inventory-csv", required=True)
+    p_batch_sync.add_argument("--queue-csv", required=True)
+    p_batch_sync.add_argument("--legacy-state-csv", default=None, help="Optional pre-B3 state.csv to import once")
+    p_batch_sync.add_argument("--script-name", default=None)
+    p_batch_sync.add_argument("--script-version", default=None)
+    p_batch_sync.add_argument("--config-json-file", default=None)
+    p_batch_sync.set_defaults(func=cmd_batch_sync_plan)
+
+    p_batch_start = sub.add_parser("batch-start-attempt", help="Create a RUNNING attempt for one batch job")
+    p_batch_start.add_argument("--batch-run-id", type=int, required=True)
+    p_batch_start.add_argument("--job-id", required=True)
+    p_batch_start.add_argument("--attempt-kind", default="EXECUTION")
+    p_batch_start.add_argument("--manifest-path", default=None)
+    p_batch_start.add_argument("--console-log-path", default=None)
+    p_batch_start.add_argument("--metadata-json-file", default=None)
+    p_batch_start.set_defaults(func=cmd_batch_start_attempt)
+
+    p_batch_finish = sub.add_parser("batch-finish-attempt", help="Finalize one DB-owned batch job attempt")
+    p_batch_finish.add_argument("--batch-job-attempt-id", type=int, required=True)
+    p_batch_finish.add_argument("--exit-code", type=int, default=None)
+    p_batch_finish.add_argument("--status", required=True)
+    p_batch_finish.add_argument("--health", required=True)
+    p_batch_finish.add_argument("--science-status", default=None)
+    p_batch_finish.add_argument("--catalog-name", default=None)
+    p_batch_finish.add_argument("--catalog-sources", type=int, default=0)
+    p_batch_finish.add_argument("--pipeline-count", type=int, default=0)
+    p_batch_finish.add_argument("--total-points", type=int, default=0)
+    p_batch_finish.add_argument("--accepted-points", type=int, default=0)
+    p_batch_finish.add_argument("--elapsed-sec", type=float, default=0.0)
+    p_batch_finish.add_argument("--manifest-path", default=None)
+    p_batch_finish.add_argument("--console-log-path", default=None)
+    p_batch_finish.add_argument("--message", default=None)
+    p_batch_finish.add_argument("--pipeline-run-id", type=int, default=None)
+    p_batch_finish.set_defaults(func=cmd_batch_finish_attempt)
+
+    p_batch_export = sub.add_parser("batch-export-state", help="Export DB-owned batch state to compatibility CSV files")
+    p_batch_export.add_argument("--batch-run-id", type=int, required=True)
+    p_batch_export.add_argument("--state-csv", required=True)
+    p_batch_export.add_argument("--summary-csv", required=True)
+    p_batch_export.set_defaults(func=cmd_batch_export_state)
+
+    p_show_batches = sub.add_parser("show-batch-runs", help="Show database-owned batch queues")
+    p_show_batches.add_argument("--limit", type=int, default=50)
+    p_show_batches.add_argument("--format", choices=("table", "csv", "json"), default="table")
+    p_show_batches.set_defaults(func=cmd_show_batch_runs)
+
+    p_show_batch_jobs = sub.add_parser("show-batch-jobs", help="Show current jobs in one database-owned batch queue")
+    p_show_batch_jobs.add_argument("--batch-run-id", type=int, required=True)
+    p_show_batch_jobs.add_argument("--format", choices=("table", "csv", "json"), default="table")
+    p_show_batch_jobs.set_defaults(func=cmd_show_batch_jobs)
 
     p_ap_sweep = sub.add_parser("aperture-radius-sweep", help="Run/compare one object across several aperture radii")
     p_ap_sweep.add_argument("--catalog-name", required=True, help="Catalog namespace in measurement flags")
@@ -1058,6 +1830,208 @@ def build_parser() -> argparse.ArgumentParser:
     p_export_lc.add_argument("--limit", type=int, default=None, help="Maximum rows")
     p_export_lc.set_defaults(func=cmd_export_lightcurve)
 
+    p_interseries_plan = sub.add_parser(
+        "plan-interseries-calibration",
+        help="Inspect Stage-3 readiness and pairwise overlap for one field",
+    )
+    field_scope = p_interseries_plan.add_mutually_exclusive_group(required=True)
+    field_scope.add_argument("--field-id", type=int, default=None, help="fields.field_id")
+    field_scope.add_argument("--field-name", default=None, help="Exact fields.field_name, case-insensitive")
+    p_interseries_plan.add_argument(
+        "--instrument-unit-id", type=int, default=None, help="Optionally restrict candidate series to one instrument unit"
+    )
+    p_interseries_plan.add_argument(
+        "--filter", dest="filter_name", default=None, help="Optionally restrict candidate series to one filter"
+    )
+    p_interseries_plan.add_argument(
+        "--catalog-name", default=None, help="Optionally restrict selected SCIENCE generations to one catalog namespace"
+    )
+    p_interseries_plan.add_argument(
+        "--min-points-per-object", type=int, default=5, help="Minimum science points in each series for an object to count toward overlap"
+    )
+    p_interseries_plan.add_argument(
+        "--min-common-objects", type=int, default=20, help="Minimum common usable objects for an eligible pair"
+    )
+    p_interseries_plan.add_argument(
+        "--required-stage2-recipe",
+        choices=("stage3_scale_v1",),
+        default=None,
+        help="Require persisted Stage-2 provenance compatible with this recipe contract",
+    )
+    p_interseries_plan.add_argument("--out", default=None, help="Optional JSON plan path")
+    p_interseries_plan.add_argument(
+        "--format", choices=("table", "json"), default="table", help="Console output format"
+    )
+    p_interseries_plan.set_defaults(func=cmd_plan_interseries_calibration)
+
+    p_interseries_analyze = sub.add_parser(
+        "analyze-interseries-calibration",
+        help="Run read-only Stage-3 M1-M3 representative-state, pairwise-offset and graph analysis",
+    )
+    analyze_scope = p_interseries_analyze.add_mutually_exclusive_group(required=True)
+    analyze_scope.add_argument("--field-id", type=int, default=None, help="fields.field_id")
+    analyze_scope.add_argument("--field-name", default=None, help="Exact fields.field_name, case-insensitive")
+    p_interseries_analyze.add_argument(
+        "--instrument-unit-id", type=int, default=None, help="Restrict analysis to one instrument unit"
+    )
+    p_interseries_analyze.add_argument(
+        "--filter", dest="filter_name", default=None, help="Restrict analysis to one filter"
+    )
+    p_interseries_analyze.add_argument(
+        "--catalog-name", default=None, help="Restrict selected SCIENCE generations to one catalog namespace"
+    )
+    p_interseries_analyze.add_argument(
+        "--reference-series-id", type=int, default=None, help="Explicit graph gauge/reference series"
+    )
+    p_interseries_analyze.add_argument(
+        "--min-points-per-object", type=int, default=5, help="Minimum science points per object inside each series"
+    )
+    p_interseries_analyze.add_argument(
+        "--min-common-objects", type=int, default=20, help="Minimum common reference objects required for a pair"
+    )
+    p_interseries_analyze.add_argument(
+        "--clip-sigma", type=float, default=4.0, help="MAD-sigma clipping threshold for pairwise calibrators"
+    )
+    p_interseries_analyze.add_argument(
+        "--max-clip-iterations", type=int, default=5, help="Maximum robust clipping iterations per pair"
+    )
+    p_interseries_analyze.add_argument(
+        "--out-root", default="reports/interseries_analysis", help="Directory for Stage-3 diagnostic CSV/JSON files"
+    )
+    p_interseries_analyze.add_argument(
+        "--format", choices=("table", "json"), default="table", help="Console output format"
+    )
+    p_interseries_analyze.set_defaults(func=cmd_analyze_interseries_calibration)
+
+    p_interseries_persist = sub.add_parser(
+        "persist-interseries-calibration",
+        help="Persist one immutable Stage-3 M4 graph-calibration generation",
+    )
+    persist_scope = p_interseries_persist.add_mutually_exclusive_group(required=True)
+    persist_scope.add_argument("--field-id", type=int, default=None, help="fields.field_id")
+    persist_scope.add_argument("--field-name", default=None, help="Exact fields.field_name, case-insensitive")
+    p_interseries_persist.add_argument("--instrument-unit-id", type=int, default=None)
+    p_interseries_persist.add_argument("--filter", dest="filter_name", default=None)
+    p_interseries_persist.add_argument("--catalog-name", default=None)
+    p_interseries_persist.add_argument("--reference-series-id", type=int, default=None)
+    p_interseries_persist.add_argument("--min-points-per-object", type=int, default=5)
+    p_interseries_persist.add_argument("--min-common-objects", type=int, default=20)
+    p_interseries_persist.add_argument("--clip-sigma", type=float, default=4.0)
+    p_interseries_persist.add_argument("--max-clip-iterations", type=int, default=5)
+    p_interseries_persist.add_argument(
+        "--allow-sparse-graph", action="store_true",
+        help="Explicitly allow persistence of a connected tree with graph_dof=0 and no closure test",
+    )
+    p_interseries_persist.add_argument("--format", choices=("table", "json"), default="table")
+    p_interseries_persist.set_defaults(func=cmd_persist_interseries_calibration)
+
+    p_interseries_show = sub.add_parser(
+        "show-interseries-calibration",
+        help="Show persisted immutable Stage-3 M4 generations",
+    )
+    p_interseries_show.add_argument("--generation-id", type=int, default=None)
+    p_interseries_show.add_argument("--field-id", type=int, default=None)
+    p_interseries_show.add_argument("--filter", dest="filter_name", default=None)
+    p_interseries_show.add_argument("--limit", type=int, default=50)
+    p_interseries_show.add_argument("--format", choices=("table", "json"), default="table")
+    p_interseries_show.set_defaults(func=cmd_show_interseries_calibration)
+
+    p_interseries_verify = sub.add_parser(
+        "verify-interseries-calibration",
+        help="Verify fingerprint, exact Stage-2 SCIENCE provenance and stored graph equations for one M4 generation",
+    )
+    p_interseries_verify.add_argument("--generation-id", type=int, required=True)
+    p_interseries_verify.add_argument("--format", choices=("table", "json"), default="table")
+    p_interseries_verify.set_defaults(func=cmd_verify_interseries_calibration)
+
+    p_global_object_lc = sub.add_parser(
+        "export-global-object-light-curve",
+        help="Export read-only M5 global object light curve from exact Stage-2 SCIENCE + persisted M4 generations",
+    )
+    p_global_object_lc.add_argument("--object-id", type=int, required=True, help="Internal objects.object_id")
+    p_global_object_lc.add_argument("--field-id", type=int, required=True, help="Field whose persisted M4 generations define the global scale")
+    p_global_object_lc.add_argument(
+        "--generation-id",
+        dest="generation_ids",
+        type=int,
+        action="append",
+        default=[],
+        help="Explicit M4 generation id; repeat for multiple filters/systems. Without this, auto-selection requires one unambiguous generation per scope.",
+    )
+    p_global_object_lc.add_argument(
+        "--out-root",
+        required=True,
+        help="Output root without suffix; writes .csv, _summary.json, per-filter plot CSV and PNG/PDF/SVG",
+    )
+    p_global_object_lc.add_argument(
+        "--include-rejected", action="store_true",
+        help="Include Stage-2 rejected rows in the main CSV; plots always use accepted points only",
+    )
+    p_global_object_lc.add_argument(
+        "--include-rejected-debug", action="store_true",
+        help="Write a separate *_rejections.csv with rejected rows and their QC reasons",
+    )
+    p_global_object_lc.add_argument(
+        "--allow-partial", action="store_true",
+        help="Allow export of only exact M4-linked series when the object also has current SCIENCE points in unlinked/stale series",
+    )
+    p_global_object_lc.add_argument(
+        "--no-require-detection-support",
+        dest="require_detection_support",
+        action="store_false",
+        help="Treat NO/WEAK detection support as diagnostic rather than an M5 rejection flag",
+    )
+    p_global_object_lc.set_defaults(require_detection_support=True)
+    p_global_object_lc.add_argument(
+        "--extra-reject-flags", default=None,
+        help="Comma-separated additional science rejection flags",
+    )
+    p_global_object_lc.add_argument(
+        "--no-plots", action="store_true",
+        help="Write only the main CSV and summary JSON",
+    )
+    p_global_object_lc.add_argument(
+        "--plot-reduction",
+        choices=("auto", "bin", "none"),
+        default="auto",
+        help="Plot-layer reduction: auto uses raw points below the limit and time bins above it; default auto",
+    )
+    p_global_object_lc.add_argument(
+        "--plot-max-points", type=int, default=5000,
+        help="Hard maximum plot points per filter in binned plotting; main CSV is not downsampled",
+    )
+    p_global_object_lc.add_argument(
+        "--plot-bin-minutes", type=float, default=None,
+        help="Requested minimum per-series time-bin width in minutes; M5 may coarsen it to respect --plot-max-points",
+    )
+    p_global_object_lc.add_argument(
+        "--plot-format", choices=("png", "pdf", "svg"), default="png",
+        help="Per-filter plot format; default png",
+    )
+    p_global_object_lc.add_argument(
+        "--plot-time-axis",
+        choices=("auto", "continuous", "compressed"),
+        default="auto",
+        help="Time-axis display: auto shortens large empty gaps between series; continuous keeps physical spacing; compressed forces gap shortening when possible",
+    )
+    p_global_object_lc.add_argument("--plot-dpi", type=int, default=160, help="Raster plot DPI")
+    p_global_object_lc.add_argument("--format", choices=("table", "json"), default="table")
+    p_global_object_lc.set_defaults(func=cmd_export_global_object_light_curve)
+
+    p_catalog_identity = sub.add_parser(
+        "audit-field-catalog-identity",
+        help="Check whether repeated series of one field share a catalog/object identity namespace",
+    )
+    catalog_identity_scope = p_catalog_identity.add_mutually_exclusive_group(required=True)
+    catalog_identity_scope.add_argument("--field-id", type=int, default=None, help="fields.field_id")
+    catalog_identity_scope.add_argument(
+        "--field-name", default=None, help="Exact fields.field_name, case-insensitive"
+    )
+    p_catalog_identity.add_argument(
+        "--format", choices=("table", "json"), default="table", help="Console output format"
+    )
+    p_catalog_identity.set_defaults(func=cmd_audit_field_catalog_identity)
+
     p_list_science_lc = sub.add_parser("list-light-curve-objects", help="List objects with science light-curve coverage")
     _add_science_lc_scope_arguments(p_list_science_lc)
     p_list_science_lc.add_argument("--min-points", type=int, default=1, help="Minimum points per object")
@@ -1166,6 +2140,44 @@ def build_parser() -> argparse.ArgumentParser:
     p_detect.add_argument("--dry-run", action="store_true", help="Detect without writing source_detections")
     p_detect.set_defaults(func=cmd_detect_sources)
 
+    p_psf_diag = sub.add_parser("psf-field-diagnostics", help="Analyze PSF morphology and spatial field trends from stored source detections without changing science photometry")
+    p_psf_diag.add_argument("--series-id", type=int, default=None, help="Analyze all frames assigned to this field_series")
+    p_psf_diag.add_argument("--frame-id", type=int, action="append", help="Specific frame_id; may be repeated")
+    p_psf_diag.add_argument("--instrument-unit-id", type=int, default=None, help="Optional instrument-unit filter")
+    p_psf_diag.add_argument("--detection-algorithm", default="numpy_localmax_v1", help="Stored source-detection run algorithm")
+    p_psf_diag.add_argument("--out-dir", required=True, help="Output directory for psf_sources.csv, psf_frames.csv, JSON and plots")
+    p_psf_diag.add_argument("--max-sources-per-frame", type=int, default=500, help="Maximum isolated high-S/N diagnostic stars per frame")
+    p_psf_diag.add_argument("--min-snr", type=float, default=20.0, help="Minimum source-detection S/N")
+    p_psf_diag.add_argument("--cutout-radius-pix", type=int, default=7, help="PSF second-moment cutout radius")
+    p_psf_diag.add_argument("--min-isolation-pix", type=float, default=12.0, help="Minimum distance to any other stored detection")
+    p_psf_diag.add_argument("--clip-sigma", type=float, default=4.0, help="Robust clipping threshold for spatial models")
+    p_psf_diag.add_argument("--n-iterations", type=int, default=3, help="Spatial-model clipping iterations")
+    p_psf_diag.add_argument("--no-plots", dest="render_plots", action="store_false", help="Skip diagnostic PNG rendering")
+    p_psf_diag.set_defaults(render_plots=True, func=cmd_psf_field_diagnostics)
+
+    p_adaptive_ap = sub.add_parser(
+        "adaptive-aperture-diagnostics",
+        help="Compare circular and local-PSF adaptive elliptical aperture photometry without changing science measurements",
+    )
+    p_adaptive_ap.add_argument("--series-id", type=int, required=True, help="Field series to analyze")
+    p_adaptive_ap.add_argument("--catalog-name", default=None, help="Optional catalog_sources catalog_name filter")
+    p_adaptive_ap.add_argument("--detection-algorithm", default="numpy_localmax_v1", help="Stored source-detection run algorithm used to build the local PSF field")
+    p_adaptive_ap.add_argument("--out-dir", required=True, help="Output directory for adaptive-aperture CSV/JSON/PNG diagnostics")
+    p_adaptive_ap.add_argument("--base-aperture-radius-pix", type=float, default=3.0, help="Baseline circular aperture radius in pixels")
+    p_adaptive_ap.add_argument("--annulus-inner-pix", type=float, default=8.0, help="Baseline local-background annulus inner radius")
+    p_adaptive_ap.add_argument("--annulus-outer-pix", type=float, default=12.0, help="Baseline local-background annulus outer radius")
+    p_adaptive_ap.add_argument("--min-psf-snr", type=float, default=20.0, help="Minimum detection S/N for local PSF reference stars")
+    p_adaptive_ap.add_argument("--max-psf-sources-per-frame", type=int, default=500, help="Maximum isolated PSF reference stars per frame")
+    p_adaptive_ap.add_argument("--psf-cutout-radius-pix", type=int, default=7, help="Second-moment PSF cutout radius")
+    p_adaptive_ap.add_argument("--psf-min-isolation-pix", type=float, default=12.0, help="Minimum isolation of PSF reference detections")
+    p_adaptive_ap.add_argument("--interpolation-neighbors", type=int, default=24, help="Nearest PSF references used for local covariance interpolation")
+    p_adaptive_ap.add_argument("--min-psf-references", type=int, default=20, help="Minimum successful PSF references required per frame")
+    p_adaptive_ap.add_argument("--aperture-fwhm-factor", type=float, default=1.0, help="Adaptive equivalent radius is max(base radius, factor * local geometric FWHM)")
+    p_adaptive_ap.add_argument("--max-axis-ratio", type=float, default=3.0, help="Safety clamp on adaptive semi-major/semi-minor ratio")
+    p_adaptive_ap.add_argument("--max-radius-scale", type=float, default=2.5, help="Safety clamp on adaptive equivalent radius relative to the base radius")
+    p_adaptive_ap.add_argument("--no-plots", dest="render_plots", action="store_false", help="Skip diagnostic PNG rendering")
+    p_adaptive_ap.set_defaults(render_plots=True, func=cmd_adaptive_aperture_diagnostics)
+
     p_det_summary = sub.add_parser("source-detection-summary", help="Print source detection counts by instrument unit and status")
     p_det_summary.add_argument("--format", choices=("table", "csv", "json"), default="table", help="Output format")
     p_det_summary.set_defaults(func=cmd_source_detection_summary)
@@ -1206,7 +2218,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_match_det.add_argument("--instrument", default=None, help="Filter frames by instrument")
     p_match_det.add_argument("--instrument-unit-id", type=int, default=None, help="Filter frames by instrument unit")
     p_match_det.add_argument("--all-wcs-statuses", action="store_true", help="Do not require wcs_status=HEADER_WCS_OK")
-    p_match_det.add_argument("--detection-algorithm", default="numpy_localmax_v1", help="source_detections.algorithm to use")
+    p_match_det.add_argument("--detection-algorithm", default="numpy_localmax_v1", help="source-detection run algorithm to use")
     p_match_det.add_argument("--radius-arcsec", type=float, default=2.0, help="Maximum sky separation for match")
     p_match_det.add_argument("--mag-key", default="G", help="Reference magnitude key in catalog_sources.ref_mags")
     p_match_det.add_argument("--min-snr", type=float, default=None, help="Optional minimum detection S/N")
@@ -1292,7 +2304,459 @@ def cmd_reset_db(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reset_derived_data(args: argparse.Namespace) -> int:
+    from grandgousier.db.derived_reset import audit_stage2_reset, reset_stage2_derived_data
+
+    if args.scope != "stage2":
+        raise SystemExit(f"Unsupported derived-data scope: {args.scope}")
+    if not args.all_series:
+        print("Refusing global Stage-2 reset without --all-series.")
+        return 2
+    if args.execute and not args.yes:
+        print("Refusing destructive reset without --yes.")
+        return 2
+
+    Session = make_session_factory(args.database_url)
+    if not args.execute:
+        with Session() as session:
+            audit = audit_stage2_reset(session)
+        payload = audit.to_dict()
+        if args.format == "json":
+            print(json.dumps({"executed": False, **payload}, ensure_ascii=False, indent=2))
+            return 0
+        print(
+            "Derived-data reset audit: scope=stage2, mode=all_series, "
+            f"derived_rows={audit.total_derived_rows}, frames={audit.n_frames_to_reset}, "
+            f"series={audit.n_series_to_reset}, fields={audit.n_fields_to_reset}"
+        )
+        print("Would truncate (transactional; identity sequences continue):")
+        _print_rows(
+            [row.to_dict() for row in audit.derived],
+            ["table_name", "rows_before", "action"],
+            "table",
+        )
+        print("Would preserve:")
+        _print_rows(
+            [row.to_dict() for row in audit.preserved],
+            ["table_name", "rows"],
+            "table",
+        )
+        print("DRY RUN: no database rows were changed.")
+        return 0
+
+    with Session() as session:
+        try:
+            result = reset_stage2_derived_data(session)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+
+    if args.format == "json":
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    print(
+        "Derived-data reset completed: scope=stage2, mode=all_series, "
+        f"truncated_rows={result.audit.total_derived_rows}, frames_reset={result.frames_reset}, "
+        f"series_reset={result.series_reset}, fields_reset={result.fields_reset}"
+    )
+    print("Preserved archive/catalog/object identity and schema migration ledger.")
+    return 0
+
+
+def cmd_schema_status(args: argparse.Namespace) -> int:
+    from grandgousier.db.migrations import status, summarize_status
+    from grandgousier.db.session import make_engine
+
+    engine = make_engine(args.database_url)
+    items = status(engine)
+    summary = summarize_status(items)
+    print(
+        "schema migrations: "
+        f"total={summary['total']}, applied={summary['applied']}, "
+        f"baselined={summary['baselined']}, pending={summary['pending']}, "
+        f"checksum_drift={summary['checksum_drift']}"
+    )
+    for item in items:
+        print(
+            f"  {item.migration_id}: state={item.state}, checksum={item.checksum_status}, "
+            f"file={item.filename}"
+        )
+    return 0 if summary["pending"] == 0 and summary["checksum_drift"] == 0 else 2
+
+
+def cmd_migrate_db(args: argparse.Namespace) -> int:
+    from grandgousier.db.migrations import MigrationError, apply_pending, status, summarize_status
+    from grandgousier.db.session import make_engine
+
+    engine = make_engine(args.database_url)
+    try:
+        applied = apply_pending(
+            engine, adopt_legacy=bool(args.adopt_legacy), dry_run=bool(args.dry_run)
+        )
+    except MigrationError as exc:
+        print(f"Migration error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.dry_run:
+        if applied:
+            print("Pending managed migrations:")
+            for migration_id in applied:
+                print(f"  {migration_id}")
+        else:
+            print("No pending managed migrations.")
+        return 0
+
+    if applied:
+        print("Applied migrations:")
+        for migration_id in applied:
+            print(f"  {migration_id}")
+    else:
+        print("No managed migrations were applied.")
+    summary = summarize_status(status(engine))
+    print(
+        "schema migrations: "
+        f"applied={summary['applied']}, baselined={summary['baselined']}, "
+        f"pending={summary['pending']}, checksum_drift={summary['checksum_drift']}"
+    )
+    return 0 if summary["pending"] == 0 and summary["checksum_drift"] == 0 else 2
+
+
+def cmd_backfill_observation_identity(args: argparse.Namespace) -> int:
+    from collections import Counter
+
+    from grandgousier.identity.backfill import (
+        SUPPORTED_IDENTITY_INSTRUMENTS,
+        ObservationIdentityBackfillError,
+        ObservationIdentitySchemaError,
+        build_observation_identity_plan,
+        execute_observation_identity_backfill,
+        write_observation_identity_report,
+    )
+
+    instruments = tuple(args.instrument or SUPPORTED_IDENTITY_INSTRUMENTS)
+    Session = make_session_factory(args.database_url)
+    result = None
+    try:
+        with Session() as session:
+            plan = build_observation_identity_plan(session, instruments=instruments)
+            if args.execute:
+                if not plan.can_execute:
+                    session.rollback()
+                else:
+                    try:
+                        result = execute_observation_identity_backfill(session, plan)
+                        session.commit()
+                    except Exception:
+                        session.rollback()
+                        raise
+            else:
+                session.rollback()
+    except (ObservationIdentitySchemaError, ObservationIdentityBackfillError) as exc:
+        print(f"Observation identity error: {exc}", file=sys.stderr)
+        return 2
+
+    write_observation_identity_report(plan, out_root=args.out_root, result=result)
+
+    if args.format == "json":
+        payload = {"plan": plan.to_dict(), "result": result.to_dict() if result is not None else {"executed": False}}
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        mode = "EXECUTED" if result is not None else "PLAN_ONLY"
+        print(
+            "Observation identity backfill: "
+            f"mode={mode}, frames={plan.frames_scanned}, candidates={plan.candidate_frames}, "
+            f"observations={plan.observation_groups}, missing={plan.missing_identity_frames}, "
+            f"invalid={plan.invalid_identity_frames}, collisions={plan.collision_groups}, "
+            f"can_execute={'YES' if plan.can_execute else 'NO'}"
+        )
+        by_instrument = Counter(group.instrument for group in plan.groups)
+        frame_counts = Counter()
+        for group in plan.groups:
+            frame_counts[group.instrument] += group.n_frames
+        for instrument in instruments:
+            print(
+                f"  {instrument}: frames={frame_counts[instrument]}, "
+                f"observations={by_instrument[instrument]}"
+            )
+        print(
+            "  groups: "
+            f"single={plan.single_frame_groups}, copy_like={plan.copy_like_groups}, "
+            f"product_variant={plan.product_variant_groups}, collision={plan.collision_groups}"
+        )
+        print(
+            "  links: "
+            f"existing_observations={plan.existing_observations}, "
+            f"already_linked={plan.already_linked_frames}, "
+            f"unlinked_candidates={plan.unlinked_candidate_frames}, "
+            f"link_conflicts={plan.link_conflict_frames}"
+        )
+        if result is not None:
+            print(
+                "  written: "
+                f"observations_created={result.observations_created}, "
+                f"observations_reused={result.observations_reused}, "
+                f"frames_linked={result.frames_linked}, "
+                f"frames_already_linked={result.frames_already_linked}"
+            )
+        elif args.execute and not plan.can_execute:
+            print("REFUSED: plan contains blocking conflicts; database was not changed.")
+        else:
+            print("DRY RUN: database was not changed. Re-run with --execute after reviewing reports.")
+        print(f"Report: {args.out_root}")
+
+    if args.execute and not plan.can_execute:
+        return 2
+    return 0
+
+
+def cmd_stage1_plan(args: argparse.Namespace) -> int:
+    from grandgousier.archive.stage1_adapters import (
+        build_archive_source_runtime,
+        build_product_store,
+    )
+    from grandgousier.archive.stage1_contract import ArchiveRequest
+    from grandgousier.archive.stage1_planner import (
+        build_stage1_plan,
+        write_stage1_plan_csv,
+        write_stage1_plan_json,
+    )
+    from grandgousier.config import read_config_file
+    from grandgousier.exit_codes import OK, PRECONDITION, USAGE
+
+    config_file = getattr(args, "config_file", None)
+    if not config_file:
+        print("stage1-plan requires --config with archives/products sections", file=sys.stderr)
+        return USAGE
+    try:
+        payload = read_config_file(config_file)
+        runtime = build_archive_source_runtime(payload, args.source)
+        product_store = build_product_store(payload)
+        request = ArchiveRequest(
+            source_id=args.source,
+            filters=tuple(args.stage1_filters or ()),
+            datetime_start=args.datetime_start,
+            datetime_end=args.datetime_end,
+            object_name=args.stage1_object_name,
+            ra_deg=args.ra,
+            dec_deg=args.dec,
+            radius_deg=args.radius_deg,
+            limit=args.limit,
+        )
+        plan = build_stage1_plan(
+            request=request,
+            source=runtime.descriptor,
+            metadata_provider=runtime.metadata_provider,
+            asset_provider=runtime.asset_provider,
+            product_store=product_store,
+        )
+        json_path = write_stage1_plan_json(plan, args.out)
+        csv_path = write_stage1_plan_csv(
+            plan,
+            args.csv_out or str(Path(args.out).with_suffix(".csv")),
+        )
+    except Exception as exc:
+        print(f"Stage 1 planning failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return USAGE
+
+    if args.format == "json":
+        print(plan.to_json(indent=2))
+    else:
+        summary = plan.to_dict()["summary"]
+        print(
+            "Stage 1 plan: "
+            f"status={plan.status}, source={args.source}, "
+            f"discovered={summary['discovered_records']}, science={summary['science_items']}, "
+            f"ready={summary['ready_items']}, blocked={summary['blocked_items']}"
+        )
+        for item in plan.items:
+            if item.status == "READY":
+                continue
+            obs = item.observation
+            label = obs.native_observation_id or obs.metadata.get("raw_id") or "?"
+            print(f"  BLOCKED {label}: {'; '.join(item.issues)}", file=sys.stderr)
+        print(f"Plan JSON: {json_path}")
+        print(f"Plan CSV: {csv_path}")
+        print("Plan-only: no source assets were materialized and no database writes were performed.")
+
+    return OK if plan.status in {"READY", "EMPTY"} else PRECONDITION
+
+
+def cmd_stage1_execute(args: argparse.Namespace) -> int:
+    from grandgousier.archive.stage1_adapters import (
+        build_archive_source_runtime,
+        build_product_store,
+    )
+    from grandgousier.archive.stage1_contract import ArchiveRequest
+    from grandgousier.archive.stage1_execution import (
+        execute_stage1_plan,
+        write_stage1_execution_csv,
+        write_stage1_execution_json,
+    )
+    from grandgousier.archive.stage1_planner import build_stage1_plan, write_stage1_plan_json
+    from grandgousier.config import read_config_file
+    from grandgousier.exit_codes import OK, PRECONDITION, PROCESSING, USAGE
+
+    config_file = getattr(args, "config_file", None)
+    if not config_file:
+        print("stage1-execute requires --config with archives/products sections", file=sys.stderr)
+        return USAGE
+    try:
+        payload = read_config_file(config_file)
+        runtime = build_archive_source_runtime(payload, args.source)
+        product_store = build_product_store(payload)
+        request = ArchiveRequest(
+            source_id=args.source,
+            filters=tuple(args.stage1_filters or ()),
+            datetime_start=args.datetime_start,
+            datetime_end=args.datetime_end,
+            object_name=args.stage1_object_name,
+            ra_deg=args.ra,
+            dec_deg=args.dec,
+            radius_deg=args.radius_deg,
+            limit=args.limit,
+        )
+        plan = build_stage1_plan(
+            request=request,
+            source=runtime.descriptor,
+            metadata_provider=runtime.metadata_provider,
+            asset_provider=runtime.asset_provider,
+            product_store=product_store,
+        )
+        plan_path = write_stage1_plan_json(plan, args.plan_out)
+        try:
+            report = execute_stage1_plan(
+                plan,
+                asset_provider=runtime.asset_provider,
+                product_store=product_store,
+                overwrite=bool(args.overwrite),
+                max_dark_temperature_delta_c=args.max_dark_temperature_delta_c,
+            )
+        finally:
+            close_provider = getattr(runtime.asset_provider, "close", None)
+            if callable(close_provider):
+                close_provider()
+        report_path = write_stage1_execution_json(report, args.report_out)
+        csv_path = write_stage1_execution_csv(
+            report,
+            args.csv_out or str(Path(args.report_out).with_suffix(".csv")),
+        )
+    except Exception as exc:
+        print(f"Stage 1 execution failed before item processing: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return USAGE
+
+    if args.format == "json":
+        print(report.to_json(indent=2))
+    else:
+        summary = report.to_dict()["summary"]
+        print(
+            "Stage 1 execution: "
+            f"status={report.status}, source={args.source}, items={summary['items']}, "
+            f"successful={summary['successful_items']}, blocked={summary['blocked_items']}, "
+            f"failed={summary['failed_items']}, reduced={summary['reduced']}, "
+            f"imported={summary['imported']}, skipped_existing={summary['skipped_existing']}, "
+            f"adopted_existing={summary['adopted_existing']}"
+        )
+        for item in report.results:
+            label = item.native_observation_id or item.source_observation_uid or "?"
+            target = item.product_path or (item.product.locator if item.product else "-")
+            print(f"  {item.status}: {label} -> {target}")
+            if item.error:
+                print(f"    {item.error}", file=sys.stderr)
+        print(f"Executed plan: {plan_path}")
+        print(f"Execution JSON: {report_path}")
+        print(f"Execution CSV: {csv_path}")
+        print("Stage 1 execution does not write Grandgousier DB state or invoke Stage 2.")
+
+    if report.status == "READY":
+        return OK
+    if report.status == "BLOCKED":
+        return PRECONDITION
+    return PROCESSING
+
+
+def cmd_stage1_handoff(args: argparse.Namespace) -> int:
+    from grandgousier.archive.stage1_handoff import (
+        handoff_stage1_execution,
+        write_stage1_handoff_json,
+    )
+    from grandgousier.config import field_archive_mapping, read_config_file
+    from grandgousier.exit_codes import OK, PRECONDITION, PROCESSING, USAGE
+
+    field_config: dict = {}
+    config_file = getattr(args, "config_file", None)
+    try:
+        if config_file:
+            field_config = field_archive_mapping(read_config_file(config_file))
+        catalog_name = args.catalog_name or field_config.get("catalog_name")
+        instrument_profile = args.instrument_profile or field_config.get("instrument_profile") or "auto"
+        out_root = args.out_root or field_config.get("out_root") or "exports"
+        Session = make_session_factory(args.database_url)
+        with Session() as session:
+            report = handoff_stage1_execution(
+                session,
+                execution_report_path=args.execution_report,
+                execute=bool(args.execute),
+                catalog_name=catalog_name,
+                instrument_profile=instrument_profile,
+                master_profile=args.master_profile,
+                robophot_profile=args.robophot_profile,
+                min_frames_per_series=args.min_frames_per_series,
+                max_field_separation_arcmin=args.max_field_separation_arcmin,
+                max_series_gap_minutes=args.max_series_gap_minutes,
+                out_root=out_root,
+                log_dir=args.log_dir,
+                manifest_out=args.stage2_manifest_out,
+            )
+        report_path = write_stage1_handoff_json(report, args.report_out)
+    except Exception as exc:
+        print(f"Stage 1 handoff failed before Stage-2 invocation: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return USAGE
+
+    if args.format == "json":
+        print(report.to_json(indent=2))
+    else:
+        summary = report.to_dict()["summary"]
+        print(
+            "Stage 1 handoff: "
+            f"status={report.status}, execute={bool(args.execute)}, items={summary['items']}, "
+            f"selected_for_stage2={summary['selected_for_stage2']}, "
+            f"already_represented={summary['already_represented']}, "
+            f"blocked={summary['blocked']}, stage2_invoked={summary['stage2_invoked']}"
+        )
+        for item in report.items:
+            label = item.product.native_observation_id or item.product.observation_uid or "?"
+            print(f"  {item.status}: {label} [{item.p4_action}] -> {item.product.product_path}")
+            if item.reason:
+                print(f"    {item.reason}")
+        if report.stage2_result is not None:
+            stage2 = report.stage2_result
+            print(
+                "Stage 2: "
+                f"status={stage2.get('status')}, discovered={stage2.get('discovered_files')}, "
+                f"indexed={len(stage2.get('indexed_frame_ids') or [])}, "
+                f"created_series={len(stage2.get('created_series_ids') or [])}, "
+                f"processed_series={len(stage2.get('processed_series_ids') or [])}"
+            )
+        for error in report.errors:
+            print(f"  ERROR: {error}", file=sys.stderr)
+        print(f"Handoff JSON: {report_path}")
+        if not args.execute:
+            print("Plan-only: no Stage-2 DB writes were performed.")
+        elif summary["selected_for_stage2"] == 0:
+            print("No new physical observations were selected; Stage 2 was not invoked and no DB writes were needed.")
+
+    if report.status == "READY":
+        return OK
+    if report.status == "BLOCKED":
+        return PRECONDITION
+    return PROCESSING
+
+
 def cmd_index_archive(args: argparse.Namespace) -> int:
+    from grandgousier.instruments.base import InstrumentProfile
+    from grandgousier.io.archive_indexer import index_archive
+
     profile = InstrumentProfile.from_yaml(args.instrument)
     Session = make_session_factory(args.database_url)
     with Session() as session:
@@ -1314,7 +2778,194 @@ def cmd_index_archive(args: argparse.Namespace) -> int:
 
 
 
+def cmd_master_archive_reduce(args: argparse.Namespace) -> int:
+    from grandgousier.archive.manifest import read_archive_manifest_csv
+    from grandgousier.archive.master_reduction import (
+        attach_raw_cleanup,
+        build_master_reduction_tasks,
+        compact_existing_master_output,
+        reduce_master_task,
+        write_master_reduction_report,
+    )
+
+    if args.overwrite and args.compact_existing:
+        print("MASTER archive reduction planning failed: --overwrite and --compact-existing are mutually exclusive", file=sys.stderr)
+        return 2
+    try:
+        rows = read_archive_manifest_csv(args.manifest)
+        output_root = Path(args.out_root) if args.out_root else Path(args.cache_root) / "processed"
+        tasks = build_master_reduction_tasks(
+            rows,
+            cache_root=args.cache_root,
+            output_root=output_root,
+            limit=args.limit,
+        )
+    except Exception as exc:
+        print(f"MASTER archive reduction planning failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+    print(
+        "MASTER archive reduction plan: "
+        f"manifest_rows={len(rows)}, unique_science={len(tasks)}, cache_root={Path(args.cache_root)}, "
+        f"out_root={output_root}, compact_existing={bool(args.compact_existing)}, "
+        f"delete_raw_after_success={bool(args.delete_raw_after_success)}"
+    )
+    plan_rows = [
+        {
+            "raw_id": task.raw_id,
+            "raw": str(task.raw_local_path),
+            "dark": str(task.dark_local_path),
+            "flat": str(task.flat_local_path),
+            "header": str(task.header_local_path),
+            "output": str(task.output_path),
+        }
+        for task in tasks
+    ]
+    if args.format == "json":
+        _print_rows(plan_rows, ["raw_id", "raw", "dark", "flat", "header", "output"], "json")
+    else:
+        _print_rows(plan_rows[:50], ["raw_id", "raw", "dark", "flat", "header", "output"], "table")
+        if len(plan_rows) > 50:
+            print(f"... {len(plan_rows) - 50} additional science frames omitted from console plan")
+
+    if not args.execute:
+        print("Plan-only: no processed FITS written. Add --execute to run Stage 1B reduction.")
+        return 0
+
+    results = []
+    raw_freed_bytes = 0
+    for index, task in enumerate(tasks, start=1):
+        if args.compact_existing and task.output_path.exists() and task.output_path.stat().st_size > 0:
+            result = compact_existing_master_output(task)
+        else:
+            result = reduce_master_task(
+                task,
+                overwrite=args.overwrite,
+                max_dark_temperature_delta_c=args.max_dark_temperature_delta_c,
+            )
+        if args.delete_raw_after_success:
+            result = attach_raw_cleanup(result)
+            raw_freed_bytes += int(result.raw_deleted_bytes or 0)
+        results.append(result)
+        detail = ""
+        if result.status in {"REDUCED", "SKIPPED_EXISTING", "COMPACTED_EXISTING"} and result.calibrated_median_adu is not None:
+            detail = (
+                f" median={result.calibrated_median_adu:.3f} ADU"
+                f" invalid_flat={result.n_invalid_flat} saturated={result.n_saturated}"
+            )
+        elif result.status == "SKIPPED_EXISTING":
+            detail = " metrics=legacy_missing (run once with --overwrite to stamp 0.5.42.2 metrics)"
+        if result.raw_deleted:
+            detail += f" raw_deleted={int(result.raw_deleted_bytes or 0)}B"
+        print(f"[{index}/{len(tasks)}] {result.status}: raw_id={task.raw_id} -> {task.output_path}{detail}")
+        if result.error:
+            print(f"  {result.error}", file=sys.stderr)
+
+    report_path = Path(args.report_out) if args.report_out else output_root / "master_reduction_report.csv"
+    write_master_reduction_report(results, report_path)
+    counts: dict[str, int] = {}
+    for result in results:
+        counts[result.status] = counts.get(result.status, 0) + 1
+    print(
+        "MASTER archive reduction result: "
+        f"science={len(results)}, reduced={counts.get('REDUCED', 0)}, "
+        f"compacted_existing={counts.get('COMPACTED_EXISTING', 0)}, "
+        f"skipped_existing={counts.get('SKIPPED_EXISTING', 0)}, failed={counts.get('FAILED', 0)}, "
+        f"raw_deleted={sum(1 for r in results if r.raw_deleted)}, raw_freed_gib={raw_freed_bytes / (1024**3):.3f}, "
+        f"report={report_path}"
+    )
+    return 0 if counts.get("FAILED", 0) == 0 else 2
+
+
+def cmd_master_archive_prune(args: argparse.Namespace) -> int:
+    from grandgousier.archive.manifest import read_archive_manifest_csv
+    from grandgousier.archive.master_reduction import build_master_reduction_tasks
+    from grandgousier.archive.master_storage import (
+        execute_processed_prune,
+        execute_raw_prune,
+        plan_processed_prune,
+        plan_raw_prune,
+        write_master_prune_report,
+    )
+
+    if args.execute and not args.yes:
+        print("MASTER archive prune refused: --execute requires --yes", file=sys.stderr)
+        return 2
+    try:
+        rows = read_archive_manifest_csv(args.manifest)
+        output_root = Path(args.out_root) if args.out_root else Path(args.cache_root) / "processed"
+        tasks = build_master_reduction_tasks(
+            rows,
+            cache_root=args.cache_root,
+            output_root=output_root,
+            limit=args.limit,
+        )
+    except Exception as exc:
+        print(f"MASTER archive prune planning failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+    results = []
+    if args.scope in {"raw", "all"}:
+        try:
+            raw_results = execute_raw_prune(tasks) if args.execute else plan_raw_prune(tasks)
+        except Exception as exc:
+            print(f"MASTER raw prune failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+        results.extend(raw_results)
+
+    if args.scope in {"processed", "all"}:
+        Session = make_session_factory(args.database_url)
+        try:
+            with Session() as session:
+                processed_results = (
+                    execute_processed_prune(tasks, session=session)
+                    if args.execute
+                    else plan_processed_prune(tasks, session=session)
+                )
+        except Exception as exc:
+            print(f"MASTER processed prune failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+        results.extend(processed_results)
+
+    report_path = Path(args.report_out) if args.report_out else Path(args.cache_root) / "master_prune_report.csv"
+    write_master_prune_report(results, report_path)
+    counts: dict[str, int] = {}
+    bytes_freed = 0
+    for result in results:
+        counts[result.status] = counts.get(result.status, 0) + 1
+        if result.status == "DELETED":
+            bytes_freed += int(result.bytes_freed or 0)
+
+    preview = [
+        {
+            "raw_id": item.raw_id,
+            "scope": item.scope,
+            "status": item.status,
+            "bytes": item.bytes_freed,
+            "frame_id": item.frame_id,
+            "path": str(item.path),
+            "reason": item.reason or "",
+        }
+        for item in results
+    ]
+    _print_rows(preview[:50], ["raw_id", "scope", "status", "bytes", "frame_id", "path", "reason"], args.format)
+    if len(preview) > 50 and args.format != "json":
+        print(f"... {len(preview) - 50} additional prune rows omitted from console")
+
+    eligible_or_deleted = counts.get("ELIGIBLE", 0) + counts.get("DELETED", 0)
+    blocked = counts.get("BLOCKED", 0) + counts.get("FAILED", 0)
+    print(
+        "MASTER archive prune result: "
+        f"scope={args.scope}, tasks={len(tasks)}, eligible_or_deleted={eligible_or_deleted}, "
+        f"already_missing={counts.get('ALREADY_MISSING', 0)}, blocked_or_failed={blocked}, "
+        f"freed_gib={bytes_freed / (1024**3):.3f}, report={report_path}"
+    )
+    return 0 if blocked == 0 else 2
+
+
 def cmd_check_wcs(args: argparse.Namespace) -> int:
+    from grandgousier.astrometry.wcs_check import check_frames_wcs
+
     Session = make_session_factory(args.database_url)
     with Session() as session:
         result = check_frames_wcs(
@@ -1581,20 +3232,12 @@ def cmd_show_catalog_sources(args: argparse.Namespace) -> int:
         if args.limit is not None:
             stmt = stmt.limit(args.limit)
         rows = []
-        if args.calibration_name:
-            stmt = stmt.where(CalibrationVersion.name == args.calibration_name)
-        if args.instrument_unit_id is not None:
-            stmt = stmt.where(InstrumentUnit.instrument_unit_id == int(args.instrument_unit_id))
 
         for row in session.execute(stmt).all():
             d = dict(row._mapping)
             d["ra_deg"] = _round_float(d.get("ra_deg"), 8)
             d["dec_deg"] = _round_float(d.get("dec_deg"), 8)
             rows.append(d)
-        if args.offset:
-            rows = rows[int(args.offset):]
-        if args.limit is not None:
-            rows = rows[: int(args.limit)]
     columns = [
         "catalog_source_id",
         "catalog_name",
@@ -1870,16 +3513,18 @@ def cmd_compute_color_calibration(args: argparse.Namespace) -> int:
             "n_candidate_obj": result.n_calibrator_candidate_objects,
             "n_excl_qc": result.n_excluded_by_object_qc,
             "n_excl_total": result.n_excluded_objects,
-            "n_used_meas": result.n_used_measurements,
-            "n_used_obj": result.n_used_objects,
-            "n_used_frames": result.n_used_frames,
+            "n_transform_obj": result.ensemble_transform_used_objects,
+            "n_transform_meas": result.ensemble_transform_used_measurements,
+            "n_transform_clipped": result.ensemble_transform_clipped_objects,
             "color0": _round_float(result.color0, 5),
-            "current_slope": _round_float(result.current_color_slope, 6),
-            "current_rms_before": _round_float(result.current_residual_rms, 6),
-            "current_rms_after": _round_float(result.current_residual_after_color_rms, 6),
-            "frame_color_term": _round_float(result.frame_model_color_term, 6),
-            "frame_model_rms": _round_float(result.frame_model_residual_rms, 6),
-            "frame_model_mad": _round_float(result.frame_model_residual_mad, 6),
+            "transform_offset": _round_float(result.ensemble_transform_offset, 6),
+            "transform_color_term": _round_float(result.ensemble_transform_color_term, 6),
+            "transform_rms": _round_float(result.ensemble_transform_residual_rms, 6),
+            "transform_mad": _round_float(result.ensemble_transform_residual_mad, 6),
+            "frame_diag_obj": result.n_used_objects,
+            "frame_diag_frames": result.n_used_frames,
+            "frame_diag_color_term": _round_float(result.frame_model_color_term, 6),
+            "frame_diag_rms": _round_float(result.frame_model_residual_rms, 6),
             "summary_json": result.summary_json,
         }
     ]
@@ -1896,16 +3541,18 @@ def cmd_compute_color_calibration(args: argparse.Namespace) -> int:
             "n_candidate_obj",
             "n_excl_qc",
             "n_excl_total",
-            "n_used_meas",
-            "n_used_obj",
-            "n_used_frames",
+            "n_transform_obj",
+            "n_transform_meas",
+            "n_transform_clipped",
             "color0",
-            "current_slope",
-            "current_rms_before",
-            "current_rms_after",
-            "frame_color_term",
-            "frame_model_rms",
-            "frame_model_mad",
+            "transform_offset",
+            "transform_color_term",
+            "transform_rms",
+            "transform_mad",
+            "frame_diag_obj",
+            "frame_diag_frames",
+            "frame_diag_color_term",
+            "frame_diag_rms",
             "summary_json",
         ],
         "table",
@@ -1955,9 +3602,18 @@ def cmd_apply_color_calibration(args: argparse.Namespace) -> int:
             exclude_object_ids=exclude_object_ids,
             clip_sigma=args.clip_sigma,
             n_iterations=args.n_iterations,
+            min_calibrator_objects=args.min_calibrator_objects,
+            min_color_span=args.min_color_span,
+            max_transform_residual_mad=(None if args.max_transform_residual_mad is not None and args.max_transform_residual_mad < 0 else args.max_transform_residual_mad),
+            max_pivot_color_fraction=(None if args.max_pivot_color_fraction is not None and args.max_pivot_color_fraction < 0 else args.max_pivot_color_fraction),
+            max_shape_metric_delta=args.max_shape_metric_delta,
+            min_color_term_significance=args.min_color_term_significance,
+            min_color_model_bic_improvement=args.min_color_model_bic_improvement,
+            min_color_model_mad_improvement=args.min_color_model_mad_improvement,
             exclude_saturated=not args.include_saturated,
             limit=args.limit,
             dry_run=args.dry_run,
+            diagnose_performance=args.diagnose_performance,
         )
 
     payload = result.summary_dict()
@@ -1976,7 +3632,9 @@ def cmd_apply_color_calibration(args: argparse.Namespace) -> int:
             "target_cv_id": result.target_calibration_version_id,
             "n_calib_meas": result.n_used_calibrator_measurements,
             "n_calib_obj": result.n_used_calibrator_objects,
-            "n_frames_zp": result.n_frames_with_zp,
+            "quality_gate": result.quality_gate_passed,
+            "transform_model": result.selected_transform_model,
+            "model_reason": result.model_selection_reason,
             "checked": result.checked_measurements,
             "calibrated": result.calibrated,
             "inserted_or_updated": result.inserted_or_updated,
@@ -1984,9 +3642,16 @@ def cmd_apply_color_calibration(args: argparse.Namespace) -> int:
             "skipped_no_color": result.skipped_no_color,
             "skipped_no_zp": result.skipped_no_frame_zp,
             "color0": _round_float(result.color0, 5),
+            "transform_offset": _round_float(result.transform_offset, 6),
             "color_term": _round_float(result.color_term, 6),
-            "model_rms": _round_float(result.frame_model_residual_rms, 6),
-            "model_mad": _round_float(result.frame_model_residual_mad, 6),
+            "fitted_color_term": _round_float(result.fitted_color_term, 6),
+            "term_significance": _round_float(result.color_term_significance, 3),
+            "bic_improvement": _round_float(result.color_model_bic_improvement, 3),
+            "transform_rms": _round_float(result.transform_residual_rms, 6),
+            "transform_mad": _round_float(result.transform_residual_mad, 6),
+            "pivot_fraction": _round_float(result.pivot_color_fraction, 5),
+            "sys_err_median": _round_float(result.systematic_error_median, 6),
+            "max_rms_delta": _round_float(result.max_abs_rms_delta, 12),
             "dry_run": result.dry_run,
         }
     ]
@@ -2002,7 +3667,9 @@ def cmd_apply_color_calibration(args: argparse.Namespace) -> int:
             "target_cv_id",
             "n_calib_meas",
             "n_calib_obj",
-            "n_frames_zp",
+            "quality_gate",
+            "transform_model",
+            "model_reason",
             "checked",
             "calibrated",
             "inserted_or_updated",
@@ -2010,9 +3677,16 @@ def cmd_apply_color_calibration(args: argparse.Namespace) -> int:
             "skipped_no_color",
             "skipped_no_zp",
             "color0",
+            "transform_offset",
             "color_term",
-            "model_rms",
-            "model_mad",
+            "fitted_color_term",
+            "term_significance",
+            "bic_improvement",
+            "transform_rms",
+            "transform_mad",
+            "pivot_fraction",
+            "sys_err_median",
+            "max_rms_delta",
             "dry_run",
         ],
         "table",
@@ -2069,6 +3743,33 @@ def cmd_run_forced_photometry(args: argparse.Namespace) -> int:
             instrument_unit_id=args.instrument_unit_id,
             only_wcs_ok=not args.all_wcs_statuses,
             aperture_radius_pix=args.aperture_radius_pix,
+            photometry_estimator=args.photometry_estimator,
+            adaptive_min_psf_snr=args.adaptive_min_psf_snr,
+            adaptive_max_psf_sources_per_frame=args.adaptive_max_psf_sources_per_frame,
+            adaptive_psf_cutout_radius_pix=args.adaptive_psf_cutout_radius_pix,
+            adaptive_psf_min_isolation_pix=args.adaptive_psf_min_isolation_pix,
+            adaptive_interpolation_neighbors=args.adaptive_interpolation_neighbors,
+            adaptive_min_psf_references=args.adaptive_min_psf_references,
+            adaptive_aperture_fwhm_factor=args.adaptive_aperture_fwhm_factor,
+            adaptive_max_axis_ratio=args.adaptive_max_axis_ratio,
+            adaptive_max_radius_scale=args.adaptive_max_radius_scale,
+            adaptive_fallback_to_circular=args.adaptive_fallback_to_circular,
+            psf_profile=args.psf_profile,
+            psf_moffat_beta=args.psf_moffat_beta,
+            psf_fit_radius_fwhm=args.psf_fit_radius_fwhm,
+            psf_min_fit_radius_pix=args.psf_min_fit_radius_pix,
+            psf_max_fit_radius_pix=args.psf_max_fit_radius_pix,
+            psf_centroid_search_radius_pix=args.psf_centroid_search_radius_pix,
+            psf_centroid_grid_steps=args.psf_centroid_grid_steps,
+            psf_residual_clip_sigma=args.psf_residual_clip_sigma,
+            psf_residual_clip_iterations=args.psf_residual_clip_iterations,
+            psf_fallback_to_adaptive=args.psf_fallback_to_adaptive,
+            empirical_psf_grid_size=args.empirical_psf_grid_size,
+            empirical_psf_stamp_radius_pix=args.empirical_psf_stamp_radius_pix,
+            empirical_psf_reference_radius_pix=args.empirical_psf_reference_radius_pix,
+            empirical_psf_references_per_node=args.empirical_psf_references_per_node,
+            empirical_psf_min_references_per_node=args.empirical_psf_min_references_per_node,
+            empirical_psf_fallback_to_adaptive=args.empirical_psf_fallback_to_adaptive,
             annulus_inner_pix=args.annulus_inner_pix,
             annulus_outer_pix=args.annulus_outer_pix,
             zero_point=args.zero_point,
@@ -2079,6 +3780,20 @@ def cmd_run_forced_photometry(args: argparse.Namespace) -> int:
             update_processing_status=args.update_processing_status,
             dry_run=args.dry_run,
             insert_batch_size=args.bulk_insert_batch_size,
+            random_error_model=args.random_error_model,
+            gain_e_per_adu=args.gain_e_per_adu,
+            read_noise_e=args.read_noise_e,
+            background_estimator_variance_factor=(
+                args.background_estimator_variance_factor
+            ),
+            empirical_background_floor=args.empirical_background_floor,
+            fractional_flux_floor=args.fractional_flux_floor,
+            scintillation_enabled=args.scintillation_enabled,
+            scintillation_coefficient=args.scintillation_coefficient,
+            telescope_aperture_m=args.telescope_aperture_m,
+            site_altitude_m=args.site_altitude_m,
+            diagnostics_out_dir=args.diagnostics_out_dir,
+            diagnose_performance=args.diagnose_performance,
         )
     print(
         "Forced photometry result: "
@@ -2088,7 +3803,9 @@ def cmd_run_forced_photometry(args: argparse.Namespace) -> int:
         f"skipped_missing_file={result.skipped_missing_file}, failed_frames={result.failed_frames}, "
         f"failed_measurements={result.failed_measurements}, "
         f"calibration_version_id={result.calibration_version_id}, "
-        f"calibration_name={result.calibration_name}, dry_run={result.dry_run}"
+        f"calibration_name={result.calibration_name}, random_error_model={result.random_error_model}, "
+        f"physical_to_legacy_ratio_median={result.physical_to_legacy_mag_err_ratio_median}, "
+        f"dry_run={result.dry_run}"
     )
     return 0 if result.failed_frames == 0 else 2
 
@@ -2941,8 +4658,57 @@ def cmd_candidate_triage_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_candidate_evidence_report(args: argparse.Namespace) -> int:
+    from grandgousier.quality.candidate_evidence import (
+        CANDIDATE_EVIDENCE_COLUMNS,
+        build_candidate_evidence_report,
+        export_candidate_evidence_report,
+    )
 
+    report = build_candidate_evidence_report(
+        args.series_dir,
+        max_time_separation_sec=args.max_time_separation_sec,
+        min_pairs=args.min_pairs,
+        min_correlation=args.min_correlation,
+        max_fdr_q=args.max_fdr_q,
+        min_repeat_series=args.min_repeat_series,
+        target_source_ids=args.target_source_id,
+    )
+    outputs = export_candidate_evidence_report(report, out_prefix=args.out_prefix)
+    if args.format == "json":
+        print(json.dumps({"outputs": outputs, **report.to_dict()}, ensure_ascii=False, indent=2))
+        return 0
 
+    rows = [dict(row) for row in report.rows[: int(args.limit) if args.limit is not None else None]]
+    for row in rows:
+        for key, nd in (
+            ("best_pair_pearson_r", 4),
+            ("best_pair_pearson_p", 5),
+            ("best_pair_pearson_fdr_q", 5),
+            ("best_pair_spearman_rho", 4),
+            ("best_pair_spearman_p", 5),
+            ("best_pair_spearman_fdr_q", 5),
+            ("best_pair_max_time_separation_sec", 3),
+            ("same_filter_max_median_delta", 5),
+            ("all_filter_median_range", 5),
+            ("median_mag_range", 5),
+        ):
+            row[key] = _round_float(row.get(key), nd)
+    if args.format == "table":
+        summary = report.to_dict()["summary"]
+        print(
+            "Candidate evidence report: "
+            f"series={summary['series_count']}, sources={summary['candidate_sources']}, "
+            f"multi_filter_coherent={summary['multi_filter_coherent_sources']}, "
+            f"repeated_accepted={summary['repeated_accepted_sources']}"
+        )
+        print(
+            "Outputs: "
+            f"json={outputs['json']}, candidates_csv={outputs['candidates_csv']}, "
+            f"pairs_csv={outputs['pairs_csv']}"
+        )
+    _print_rows(rows, list(CANDIDATE_EVIDENCE_COLUMNS), args.format)
+    return 0
 
 
 def cmd_import_events(args: argparse.Namespace) -> int:
@@ -3210,7 +4976,17 @@ def cmd_build_field_series(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
         )
     if args.format == "json":
-        print(json.dumps({"summary": result.summary(), "series": result.rows}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {
+                    "summary": result.summary(),
+                    "observation_selection": result.observation_selection_rows,
+                    "series": result.rows,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     else:
         print(
             "Field/series build result: "
@@ -3218,6 +4994,8 @@ def cmd_build_field_series(args: argparse.Namespace) -> int:
             f"created_series={result.created_series}, linked_frames={result.linked_frames}, "
             f"dry_run={result.dry_run}"
         )
+        if result.observation_selection:
+            print(f"Observation science-input guard: {result.observation_selection}")
         if result.selected_frames == 0 and result.frame_selection_diagnostics:
             print(f"Frame selection diagnostics: {result.frame_selection_diagnostics}")
         _print_rows(result.rows, FIELD_SERIES_BUILD_COLUMNS, args.format)
@@ -3280,12 +5058,66 @@ def cmd_run_field_pipeline(args: argparse.Namespace) -> int:
         out_dir=args.out_dir,
         margin_pix=args.margin_pix,
         aperture_radius_pix=args.aperture_radius_pix,
+        photometry_estimator=args.photometry_estimator,
+        adaptive_min_psf_snr=args.adaptive_min_psf_snr,
+        adaptive_max_psf_sources_per_frame=args.adaptive_max_psf_sources_per_frame,
+        adaptive_psf_cutout_radius_pix=args.adaptive_psf_cutout_radius_pix,
+        adaptive_psf_min_isolation_pix=args.adaptive_psf_min_isolation_pix,
+        adaptive_interpolation_neighbors=args.adaptive_interpolation_neighbors,
+        adaptive_min_psf_references=args.adaptive_min_psf_references,
+        adaptive_aperture_fwhm_factor=args.adaptive_aperture_fwhm_factor,
+        adaptive_max_axis_ratio=args.adaptive_max_axis_ratio,
+        adaptive_max_radius_scale=args.adaptive_max_radius_scale,
+        adaptive_fallback_to_circular=args.adaptive_fallback_to_circular,
+        psf_profile=args.psf_profile,
+        psf_moffat_beta=args.psf_moffat_beta,
+        psf_fit_radius_fwhm=args.psf_fit_radius_fwhm,
+        psf_min_fit_radius_pix=args.psf_min_fit_radius_pix,
+        psf_max_fit_radius_pix=args.psf_max_fit_radius_pix,
+        psf_centroid_search_radius_pix=args.psf_centroid_search_radius_pix,
+        psf_centroid_grid_steps=args.psf_centroid_grid_steps,
+        psf_residual_clip_sigma=args.psf_residual_clip_sigma,
+        psf_residual_clip_iterations=args.psf_residual_clip_iterations,
+        psf_fallback_to_adaptive=args.psf_fallback_to_adaptive,
+        empirical_psf_grid_size=args.empirical_psf_grid_size,
+        empirical_psf_stamp_radius_pix=args.empirical_psf_stamp_radius_pix,
+        empirical_psf_reference_radius_pix=args.empirical_psf_reference_radius_pix,
+        empirical_psf_references_per_node=args.empirical_psf_references_per_node,
+        empirical_psf_min_references_per_node=args.empirical_psf_min_references_per_node,
+        empirical_psf_fallback_to_adaptive=args.empirical_psf_fallback_to_adaptive,
         annulus_inner_pix=args.annulus_inner_pix,
         annulus_outer_pix=args.annulus_outer_pix,
+        aperture_correction_reference_radius_pix=args.aperture_correction_reference_radius_pix,
+        aperture_correction_max_calibrator_mag_err=_none_if_negative(args.aperture_correction_max_calibrator_mag_err),
+        aperture_correction_min_calibrators_per_frame=args.aperture_correction_min_calibrators_per_frame,
+        aperture_correction_min_plane_calibrators=args.aperture_correction_min_plane_calibrators,
+        aperture_correction_clip_sigma=args.aperture_correction_clip_sigma,
+        aperture_correction_n_iterations=args.aperture_correction_n_iterations,
+        aperture_correction_min_plane_bic_improvement=args.aperture_correction_min_plane_bic_improvement,
+        aperture_correction_min_spatial_peak_to_peak=args.aperture_correction_min_spatial_peak_to_peak,
+        aperture_correction_plane_policy=args.aperture_correction_plane_policy,
+        aperture_correction_max_residual_mad=_none_if_negative(args.aperture_correction_max_residual_mad),
+        aperture_correction_max_abs_correction=args.aperture_correction_max_abs_correction,
+        aperture_correction_max_abs_spatial_deviation=(
+            args.aperture_correction_max_abs_spatial_deviation
+        ),
+        aperture_correction_max_abs_total_correction=(
+            args.aperture_correction_max_abs_total_correction
+        ),
+        aperture_correction_min_good_frame_fraction=args.aperture_correction_min_good_frame_fraction,
+        aperture_correction_max_global_median_residual_mad=_none_if_negative(args.aperture_correction_max_global_median_residual_mad),
         detection_threshold_sigma=args.detection_threshold_sigma,
         detection_max_sources_per_frame=args.detection_max_sources_per_frame,
         detection_min_separation_pix=args.detection_min_separation_pix,
         detection_match_radius_arcsec=args.detection_match_radius_arcsec,
+        enable_psf_field_diagnostics=args.enable_psf_field_diagnostics,
+        psf_diagnostics_max_sources_per_frame=args.psf_diagnostics_max_sources_per_frame,
+        psf_diagnostics_min_snr=args.psf_diagnostics_min_snr,
+        psf_diagnostics_cutout_radius_pix=args.psf_diagnostics_cutout_radius_pix,
+        psf_diagnostics_min_isolation_pix=args.psf_diagnostics_min_isolation_pix,
+        psf_diagnostics_clip_sigma=args.psf_diagnostics_clip_sigma,
+        psf_diagnostics_n_iterations=args.psf_diagnostics_n_iterations,
+        psf_diagnostics_render_plots=args.psf_diagnostics_render_plots,
         bulk_insert_batch_size=args.bulk_insert_batch_size,
         mag_key=args.mag_key,
         aperture_zp_min_ref_stars_per_frame=args.aperture_zp_min_ref_stars_per_frame,
@@ -3295,9 +5127,41 @@ def cmd_run_field_pipeline(args: argparse.Namespace) -> int:
         ensemble_min_measurements=args.ensemble_min_measurements,
         ensemble_min_ref_measurements=args.ensemble_min_ref_measurements,
         ensemble_min_ref_stars_per_frame=args.ensemble_min_ref_stars_per_frame,
+        enable_spatial_ensemble=args.enable_spatial_ensemble,
+        enable_photometric_frame_qc=args.enable_photometric_frame_qc,
+        spatial_ensemble_max_order=args.spatial_ensemble_max_order,
+        spatial_ensemble_min_ref_stars_per_frame=args.spatial_ensemble_min_ref_stars_per_frame,
+        spatial_ensemble_clip_sigma=args.spatial_ensemble_clip_sigma,
+        spatial_ensemble_n_iterations=args.spatial_ensemble_n_iterations,
+        spatial_ensemble_min_bic_improvement=args.spatial_ensemble_min_bic_improvement,
+        spatial_ensemble_min_spatial_peak_to_peak=args.spatial_ensemble_min_spatial_peak_to_peak,
+        spatial_ensemble_max_residual_mad=_none_if_negative(args.spatial_ensemble_max_residual_mad),
+        spatial_ensemble_max_residual_mad_degradation=_none_if_negative(args.spatial_ensemble_max_residual_mad_degradation),
+        spatial_ensemble_max_abs_spatial_deviation=args.spatial_ensemble_max_abs_spatial_deviation,
+        spatial_ensemble_min_good_frame_fraction=args.spatial_ensemble_min_good_frame_fraction,
         ensemble_max_ref_rms=_none_if_negative(args.ensemble_max_ref_rms),
         ensemble_max_ref_mad=_none_if_negative(args.ensemble_max_ref_mad),
         ensemble_n_iterations=args.ensemble_n_iterations,
+        enable_color_calibration=args.enable_color_calibration,
+        color_identity_catalog_name=args.color_identity_catalog_name,
+        color_reference_catalog_name=args.color_reference_catalog_name,
+        color_reference_band=args.color_reference_band,
+        color_index=args.color_index,
+        color_target_calibration_name=args.color_target_calibration_name,
+        color_min_measurements_per_object=args.color_min_measurements_per_object,
+        color_min_stars_per_frame=args.color_min_stars_per_frame,
+        color_max_measurement_mag_err=_none_if_negative(args.color_max_measurement_mag_err),
+        color_max_reference_mag_err=_none_if_negative(args.color_max_reference_mag_err),
+        color_clip_sigma=args.color_clip_sigma,
+        color_n_iterations=args.color_n_iterations,
+        color_min_calibrator_objects=args.color_min_calibrator_objects,
+        color_min_span=args.color_min_span,
+        color_max_transform_residual_mad=_none_if_negative(args.color_max_transform_residual_mad),
+        color_max_pivot_fraction=_none_if_negative(args.color_max_pivot_fraction),
+        color_max_shape_metric_delta=args.color_max_shape_metric_delta,
+        color_min_term_significance=args.color_min_term_significance,
+        color_min_bic_improvement=args.color_min_bic_improvement,
+        color_min_mad_improvement=args.color_min_mad_improvement,
         object_qc_min_measurements=args.object_qc_min_measurements,
         crowded_arcsec=args.crowded_arcsec,
         blended_arcsec=args.blended_arcsec,
@@ -3339,6 +5203,7 @@ def cmd_run_field_pipeline(args: argparse.Namespace) -> int:
         skip_detection=args.skip_detection,
         skip_detection_catalog_match=args.skip_detection_catalog_match,
         skip_forced_photometry=args.skip_forced_photometry,
+        skip_aperture_correction=args.skip_aperture_correction,
         skip_aperture_zp=args.skip_aperture_zp,
         skip_ensemble=args.skip_ensemble,
         skip_object_qc=args.skip_object_qc,
@@ -3351,8 +5216,13 @@ def cmd_run_field_pipeline(args: argparse.Namespace) -> int:
         candidate_ensemble_max_iterations=args.candidate_ensemble_max_iterations,
         candidate_ensemble_until_converged=args.candidate_ensemble_until_converged,
         candidate_ensemble_convergence_max_iterations=args.candidate_ensemble_convergence_max_iterations,
+        candidate_ensemble_growth_policy=args.candidate_ensemble_growth_policy,
         replace_detections=args.replace_detections,
         replace_detection_matches=args.replace_detection_matches,
+        materialize_intermediate_calibrations=False,
+        science_materialization_diagnostics=False,
+        forced_photometry_diagnostics=args.diagnose_forced_photometry,
+        calibration_performance_diagnostics=args.diagnose_calibration_performance,
         dry_run=args.dry_run,
         record_run=args.record_run,
         continue_on_error=args.continue_on_error,
@@ -3398,7 +5268,8 @@ def cmd_run_field_pipeline(args: argparse.Namespace) -> int:
             f"run_uid={result.run_uid}, pipeline_run_id={result.pipeline_run_id}, status={result.status}, "
             f"raw={result.calibration_names.get('raw')}, "
             f"aperture_zp={result.calibration_names.get('aperture_zp')}, "
-            f"ensemble={result.calibration_names.get('ensemble')}"
+            f"ensemble={result.calibration_names.get('ensemble')}, "
+            f"science={result.calibration_names.get('science') or result.calibration_names.get('ensemble')}"
         )
         if result.outputs:
             print("Outputs: " + ", ".join(f"{k}={v}" for k, v in sorted(result.outputs.items())))
@@ -3567,6 +5438,347 @@ def cmd_run_archive_pipeline(args: argparse.Namespace) -> int:
 
 
 
+def cmd_config_example(args: argparse.Namespace) -> int:
+    import shutil
+
+    from grandgousier.exit_codes import OK, PRECONDITION
+    from grandgousier.resources import application_config_example_path
+
+    destination = Path(args.out)
+    if destination.exists() and not args.force:
+        print(f"Refusing to overwrite existing config without --force: {destination}", file=sys.stderr)
+        return PRECONDITION
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(application_config_example_path(), destination)
+    print(f"Grandgousier config template written: {destination}")
+    return OK
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from grandgousier.exit_codes import DATABASE, OK, PRECONDITION
+    from grandgousier.services.operations import run_doctor
+
+    result = run_doctor(
+        database_url=args.database_url,
+        config_file=getattr(args, "config_file", None),
+        processed_root=args.processed_root,
+        out_root=args.out_root,
+        instrument_profile=args.instrument_profile,
+        strict_optional=bool(args.strict_optional),
+    )
+    if args.format == "json":
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2, default=str))
+    else:
+        print(f"Grandgousier doctor: {result.status}")
+        _print_rows([row.to_dict() for row in result.checks], ["name", "status", "detail"], "table")
+    if result.ready:
+        return OK
+    failed = {row.name for row in result.checks if row.status == "FAIL"}
+    if failed & {"database", "schema_migrations"}:
+        return DATABASE
+    return PRECONDITION
+
+
+def cmd_diagnose_run(args: argparse.Namespace) -> int:
+    from grandgousier.exit_codes import OK, PRECONDITION
+    from grandgousier.services.diagnostics import diagnose_run_bundle
+
+    try:
+        result = diagnose_run_bundle(args.path)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return PRECONDITION
+
+    payload = result.to_dict()
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    else:
+        print(
+            "Grandgousier run diagnosis: "
+            f"job_id={result.job_id}, status={result.job_status}, bundle={result.bundle_format}, "
+            f"complete={result.complete}"
+        )
+        print(
+            f"Diagnosis: {result.advice.code} [{result.advice.severity}] "
+            f"{result.advice.summary}"
+        )
+        if result.advice.actions:
+            print("Recommended actions:")
+            for index, action in enumerate(result.advice.actions, start=1):
+                print(f"  {index}. {action}")
+        if result.artifacts_missing:
+            print("Missing bundle artifacts: " + ", ".join(result.artifacts_missing))
+    return OK
+
+
+def cmd_operational_status(args: argparse.Namespace) -> int:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from grandgousier.config import field_archive_mapping, read_config_file
+    from grandgousier.exit_codes import DATABASE, OK, PRECONDITION
+    from grandgousier.pipeline.recipe_contracts import STAGE2_RECIPE_STAGE3_SCALE_V1
+    from grandgousier.services.operations import build_field_status
+
+    config_file = getattr(args, "config_file", None)
+    field_config = {}
+    if config_file is not None:
+        try:
+            field_config = field_archive_mapping(read_config_file(config_file))
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return PRECONDITION
+
+    field_id = args.field_id if args.field_id is not None else field_config.get("field_id")
+    if field_id in {None, ""}:
+        print("status requires --field-id or field_archive.field_id in --config", file=sys.stderr)
+        return PRECONDITION
+    catalog_name = args.catalog_name if args.catalog_name is not None else field_config.get("catalog_name")
+    recipe = (
+        args.required_stage2_recipe
+        or field_config.get("stage2_recipe")
+        or STAGE2_RECIPE_STAGE3_SCALE_V1
+    )
+
+    Session = make_session_factory(args.database_url)
+    try:
+        with Session() as session:
+            result = build_field_status(
+                session,
+                field_id=int(field_id),
+                catalog_name=(str(catalog_name) if catalog_name else None),
+                required_stage2_recipe=str(recipe),
+                min_points_per_object=args.min_points_per_object,
+                min_common_objects=args.min_common_objects,
+            )
+    except SQLAlchemyError as exc:
+        print(f"Database status query failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return DATABASE
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return PRECONDITION
+
+    payload = result.to_dict()
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        return OK if result.ready else PRECONDITION
+
+    field = result.field
+    stage2 = result.stage2
+    print(
+        "Grandgousier status: "
+        f"field_id={field.get('field_id')}, field_name={field.get('field_name')}, status={result.status}"
+    )
+    print(
+        "Stage 2: "
+        f"recipe={stage2.get('required_recipe')}, series={stage2.get('n_series')}, "
+        f"ready={stage2.get('n_ready_series')}, pairs={stage2.get('n_eligible_pairs')}, "
+        f"largest_component={stage2.get('largest_component_size')}, plan={stage2.get('plan_status')}"
+    )
+    recipe_counts = stage2.get("recipe_compatibility_counts") or {}
+    if recipe_counts:
+        print("Stage-2 recipe compatibility: " + ", ".join(f"{k}={v}" for k, v in recipe_counts.items()))
+    if result.stage3:
+        _print_rows(
+            list(result.stage3),
+            [
+                "filter_name", "instrument_unit_id", "interseries_generation_id", "verification_status",
+                "reliability_status", "n_series", "n_edges", "graph_dof",
+                "reduced_chi2", "source_scope_matches",
+            ],
+            "table",
+        )
+    else:
+        print("Stage 3: no persisted generations")
+    if args.verbose:
+        rows = [
+            {
+                "series_id": row.get("series_id"),
+                "filter_name": row.get("filter_name"),
+                "instrument_unit_id": row.get("instrument_unit_id"),
+                "status": row.get("status"),
+                "science_calibration_id": row.get("calibration_version_id"),
+                "recipe_compatibility": row.get("recipe_compatibility"),
+                "recipe_notes": ";".join(row.get("recipe_compatibility_notes") or []),
+            }
+            for row in result.series
+        ]
+        _print_rows(
+            rows,
+            ["series_id", "filter_name", "instrument_unit_id", "status", "science_calibration_id", "recipe_compatibility", "recipe_notes"],
+            "table",
+        )
+    return OK if result.ready else PRECONDITION
+
+
+
+def cmd_acceptance_check(args: argparse.Namespace) -> int:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from grandgousier.exit_codes import DATABASE, OK, PRECONDITION, PROCESSING
+    from grandgousier.services.acceptance import run_acceptance
+
+    try:
+        result = run_acceptance(
+            database_url=args.database_url,
+            dataset=args.dataset,
+            config_file=getattr(args, "config_file", None),
+            out_root=args.out_root,
+        )
+    except SQLAlchemyError as exc:
+        print(f"Acceptance database query failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return DATABASE
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return PRECONDITION
+    except Exception as exc:  # noqa: BLE001 - CLI converts scientific acceptance failures into an exit code.
+        print(f"Acceptance processing failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return PROCESSING
+
+    payload = result.to_dict()
+    if args.report_out:
+        report_path = Path(args.report_out)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    else:
+        print(f"Grandgousier acceptance: {result.status} dataset={result.dataset}")
+        _print_rows([row.to_dict() for row in result.checks], ["name", "status", "detail"], "table")
+        if args.report_out:
+            print(f"Report: {args.report_out}")
+    return OK if result.ready else PROCESSING
+
+def cmd_field_archive_readiness(args: argparse.Namespace) -> int:
+    from grandgousier.services.readiness import check_runtime_readiness
+
+    result = check_runtime_readiness(
+        database_url=args.database_url,
+        processed_root=args.processed_root,
+        out_root=args.out_root,
+        instrument_profile=args.instrument_profile,
+    )
+    payload = result.to_dict()
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    else:
+        print(f"Field-archive readiness: {result.status}")
+        _print_rows(
+            [check.to_dict() for check in result.checks],
+            ["name", "status", "detail"],
+            "table",
+        )
+    return 0 if result.ready else 2
+
+
+def cmd_process_field_archive(args: argparse.Namespace) -> int:
+    from grandgousier.services.field_archive_job import run_field_archive_job
+    from grandgousier.services.runtime import FieldArchiveJobConfig
+
+    overrides = {
+        "database_url": args.database_url,
+        "processed_root": args.processed_root,
+        "field_id": args.field_id,
+        "catalog_name": args.catalog_name,
+        "stage3_policies": args.stage3_policies,
+        "control_object_ids": args.control_object_ids,
+        "execute": args.execute,
+        "resume": args.resume,
+        "instrument_profile": args.instrument_profile,
+        "stage2_recipe": args.stage2_recipe,
+        "exclude_dates": args.exclude_dates,
+        "include_dates": args.include_dates,
+        "out_root": args.out_root,
+        "plot_max_points": args.plot_max_points,
+    }
+    try:
+        config = FieldArchiveJobConfig.from_sources(
+            config_file=args.job_config or getattr(args, "config_file", None),
+            overrides=overrides,
+        )
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    job = run_field_archive_job(
+        config,
+        run_preflight=not bool(args.no_preflight),
+    )
+    workflow = job.workflow_result
+    payload = job.to_dict()
+    if args.format == "job-json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    elif args.format == "json":
+        legacy_payload = workflow.to_dict() if workflow is not None else payload
+        print(json.dumps(legacy_payload, ensure_ascii=False, indent=2, default=str))
+    else:
+        print(
+            "Field-archive job: "
+            f"job_id={job.job_id}, status={job.status}, "
+            f"config_fingerprint={job.config_fingerprint[:12]}"
+        )
+        if job.readiness is not None:
+            print(f"Readiness: {job.readiness.status}")
+        if workflow is not None:
+            print(
+                "M8 field archive: "
+                f"field_id={workflow.field_id}, status={workflow.status}, execute={workflow.execute}, "
+                f"batches={len(workflow.batches)}, stage2_runs={len(workflow.stage2_runs)}, "
+                f"stage3_scopes={len(workflow.stage3)}, controls={len(workflow.control_objects)}"
+            )
+            if workflow.batches:
+                batch_rows = [
+                    {
+                        "date": row.get("observation_date"),
+                        "path": row.get("relative_path"),
+                        "files": row.get("n_files"),
+                        "db_status": row.get("db_status"),
+                        "action": row.get("action"),
+                        "series_ids": ",".join(str(v) for v in row.get("series_ids") or []),
+                        "reason": row.get("reason"),
+                    }
+                    for row in workflow.batches
+                ]
+                _print_rows(batch_rows, ["date", "path", "files", "db_status", "action", "series_ids", "reason"], "table")
+            for scope in workflow.stage3:
+                generation = scope.get("generation") or {}
+                verification = scope.get("verification") or {}
+                analysis = scope.get("analysis") or {}
+                graph = analysis.get("graph_solution") or {}
+                policy = scope.get("policy") or {}
+                print(
+                    "M8 Stage 3: "
+                    f"filter={policy.get('filter_name')}, generation_id={generation.get('interseries_generation_id')}, "
+                    f"series={graph.get('n_series')}, edges={graph.get('n_edges')}, dof={graph.get('dof')}, "
+                    f"reduced_chi2={graph.get('reduced_chi2')}, verify={verification.get('status')}"
+                )
+            for control in workflow.control_objects:
+                print(
+                    "M8 M5 control: "
+                    f"object_id={control.get('object_id')}, status={control.get('status')}, "
+                    f"source={control.get('rows_source_exact_m4')}, accepted={control.get('accepted_rows')}, "
+                    f"rejected={control.get('rejected_rows')}"
+                )
+            print(f"Final report: {workflow.outputs.get('final_report_json')}")
+            print(f"HTML report: {workflow.outputs.get('report_html')}")
+            for warning in workflow.warnings:
+                print(f"WARNING: {warning}")
+            for error in workflow.errors:
+                print(f"ERROR: {error}", file=sys.stderr)
+        if job.error_message:
+            print(f"ERROR: {job.error_type}: {job.error_message}", file=sys.stderr)
+        print(f"Run bundle: {job.artifacts.get('job_dir')}")
+        print(f"Run manifest: {job.artifacts.get('run_manifest_json')}")
+        print(f"Run diagnosis: {job.artifacts.get('diagnosis_json')}")
+        print(f"Job summary: {job.artifacts.get('job_summary_json')}")
+        print(f"Job events: {job.artifacts.get('job_events_jsonl')}")
+        if job.artifacts.get("failure_json"):
+            print(f"Failure report: {job.artifacts.get('failure_json')}")
+    return 0 if job.status in {"PLANNED", "READY", "READY_WITH_WARNINGS"} else 2
+
+
 def cmd_process_archive_path(args: argparse.Namespace) -> int:
     from grandgousier.archive.auto_process import (
         process_archive_group_columns,
@@ -3592,6 +5804,7 @@ def cmd_process_archive_path(args: argparse.Namespace) -> int:
             recursive=args.recursive,
             extensions=_parse_extensions_arg(args.extensions),
             limit=args.limit,
+            series_ids=args.series_ids,
             min_frames_per_series=args.min_frames_per_series,
             max_field_separation_arcmin=args.max_field_separation_arcmin,
             max_series_gap_minutes=args.max_series_gap_minutes,
@@ -3603,11 +5816,63 @@ def cmd_process_archive_path(args: argparse.Namespace) -> int:
             file_log_level=args.file_log_level or args.log_level or "INFO",
             no_file_log=args.no_file_log,
             aperture_radius_pix=args.aperture_radius_pix,
+            photometry_estimator=args.photometry_estimator,
+            adaptive_min_psf_snr=args.adaptive_min_psf_snr,
+            adaptive_max_psf_sources_per_frame=args.adaptive_max_psf_sources_per_frame,
+            adaptive_psf_cutout_radius_pix=args.adaptive_psf_cutout_radius_pix,
+            adaptive_psf_min_isolation_pix=args.adaptive_psf_min_isolation_pix,
+            adaptive_interpolation_neighbors=args.adaptive_interpolation_neighbors,
+            adaptive_min_psf_references=args.adaptive_min_psf_references,
+            adaptive_aperture_fwhm_factor=args.adaptive_aperture_fwhm_factor,
+            adaptive_max_axis_ratio=args.adaptive_max_axis_ratio,
+            adaptive_max_radius_scale=args.adaptive_max_radius_scale,
+            adaptive_fallback_to_circular=args.adaptive_fallback_to_circular,
+            psf_profile=args.psf_profile,
+            psf_moffat_beta=args.psf_moffat_beta,
+            psf_fit_radius_fwhm=args.psf_fit_radius_fwhm,
+            psf_min_fit_radius_pix=args.psf_min_fit_radius_pix,
+            psf_max_fit_radius_pix=args.psf_max_fit_radius_pix,
+            psf_centroid_search_radius_pix=args.psf_centroid_search_radius_pix,
+            psf_centroid_grid_steps=args.psf_centroid_grid_steps,
+            psf_residual_clip_sigma=args.psf_residual_clip_sigma,
+            psf_residual_clip_iterations=args.psf_residual_clip_iterations,
+            psf_fallback_to_adaptive=args.psf_fallback_to_adaptive,
+            empirical_psf_grid_size=args.empirical_psf_grid_size,
+            empirical_psf_stamp_radius_pix=args.empirical_psf_stamp_radius_pix,
+            empirical_psf_reference_radius_pix=args.empirical_psf_reference_radius_pix,
+            empirical_psf_references_per_node=args.empirical_psf_references_per_node,
+            empirical_psf_min_references_per_node=args.empirical_psf_min_references_per_node,
+            empirical_psf_fallback_to_adaptive=args.empirical_psf_fallback_to_adaptive,
             annulus_inner_pix=args.annulus_inner_pix,
             annulus_outer_pix=args.annulus_outer_pix,
+            aperture_correction_reference_radius_pix=args.aperture_correction_reference_radius_pix,
+            aperture_correction_max_calibrator_mag_err=None if args.aperture_correction_max_calibrator_mag_err is not None and args.aperture_correction_max_calibrator_mag_err < 0 else args.aperture_correction_max_calibrator_mag_err,
+            aperture_correction_min_calibrators_per_frame=args.aperture_correction_min_calibrators_per_frame,
+            aperture_correction_min_plane_calibrators=args.aperture_correction_min_plane_calibrators,
+            aperture_correction_min_plane_bic_improvement=args.aperture_correction_min_plane_bic_improvement,
+            aperture_correction_min_spatial_peak_to_peak=args.aperture_correction_min_spatial_peak_to_peak,
+            aperture_correction_plane_policy=args.aperture_correction_plane_policy,
+            aperture_correction_max_residual_mad=None if args.aperture_correction_max_residual_mad is not None and args.aperture_correction_max_residual_mad < 0 else args.aperture_correction_max_residual_mad,
+            aperture_correction_max_abs_correction=args.aperture_correction_max_abs_correction,
+            aperture_correction_max_abs_spatial_deviation=(
+                args.aperture_correction_max_abs_spatial_deviation
+            ),
+            aperture_correction_max_abs_total_correction=(
+                args.aperture_correction_max_abs_total_correction
+            ),
+            aperture_correction_min_good_frame_fraction=args.aperture_correction_min_good_frame_fraction,
+            skip_aperture_correction=args.skip_aperture_correction,
             bulk_insert_batch_size=args.bulk_insert_batch_size,
             make_light_curve_summary=args.make_light_curve_summary,
             enable_detection_branch=args.enable_detection_branch,
+            enable_psf_field_diagnostics=args.enable_psf_field_diagnostics,
+            psf_diagnostics_max_sources_per_frame=args.psf_diagnostics_max_sources_per_frame,
+            psf_diagnostics_min_snr=args.psf_diagnostics_min_snr,
+            psf_diagnostics_cutout_radius_pix=args.psf_diagnostics_cutout_radius_pix,
+            psf_diagnostics_min_isolation_pix=args.psf_diagnostics_min_isolation_pix,
+            psf_diagnostics_clip_sigma=args.psf_diagnostics_clip_sigma,
+            psf_diagnostics_n_iterations=args.psf_diagnostics_n_iterations,
+            psf_diagnostics_render_plots=args.psf_diagnostics_render_plots,
             enable_aperture_stability_qc=args.enable_aperture_stability_qc,
             require_detection_support=args.require_detection_support,
             target_source_id=args.target_source_id,
@@ -3621,6 +5886,30 @@ def cmd_process_archive_path(args: argparse.Namespace) -> int:
             candidate_ensemble_max_iterations=args.candidate_ensemble_max_iterations,
             candidate_ensemble_until_converged=args.candidate_ensemble_until_converged,
             candidate_ensemble_convergence_max_iterations=args.candidate_ensemble_convergence_max_iterations,
+            candidate_ensemble_growth_policy=args.candidate_ensemble_growth_policy,
+            ensemble_min_ref_stars_per_frame=args.ensemble_min_ref_stars_per_frame,
+            enable_spatial_ensemble=args.enable_spatial_ensemble,
+            enable_photometric_frame_qc=args.enable_photometric_frame_qc,
+            spatial_ensemble_max_order=args.spatial_ensemble_max_order,
+            spatial_ensemble_min_ref_stars_per_frame=args.spatial_ensemble_min_ref_stars_per_frame,
+            spatial_ensemble_clip_sigma=args.spatial_ensemble_clip_sigma,
+            spatial_ensemble_n_iterations=args.spatial_ensemble_n_iterations,
+            spatial_ensemble_min_bic_improvement=args.spatial_ensemble_min_bic_improvement,
+            spatial_ensemble_min_spatial_peak_to_peak=args.spatial_ensemble_min_spatial_peak_to_peak,
+            spatial_ensemble_max_residual_mad=(
+                None
+                if args.spatial_ensemble_max_residual_mad is not None
+                and args.spatial_ensemble_max_residual_mad < 0
+                else args.spatial_ensemble_max_residual_mad
+            ),
+            spatial_ensemble_max_residual_mad_degradation=(
+                None
+                if args.spatial_ensemble_max_residual_mad_degradation is not None
+                and args.spatial_ensemble_max_residual_mad_degradation < 0
+                else args.spatial_ensemble_max_residual_mad_degradation
+            ),
+            spatial_ensemble_max_abs_spatial_deviation=args.spatial_ensemble_max_abs_spatial_deviation,
+            spatial_ensemble_min_good_frame_fraction=args.spatial_ensemble_min_good_frame_fraction,
             enable_intrinsic_variability_candidates=args.enable_intrinsic_variability_candidates,
             field_report_min_intrinsic_rms=None if args.field_report_min_intrinsic_rms is not None and args.field_report_min_intrinsic_rms < 0 else args.field_report_min_intrinsic_rms,
             field_report_min_rms_over_mag_err=None if args.field_report_min_rms_over_mag_err is not None and args.field_report_min_rms_over_mag_err < 0 else args.field_report_min_rms_over_mag_err,
@@ -3638,6 +5927,29 @@ def cmd_process_archive_path(args: argparse.Namespace) -> int:
             max_working_sources_per_frame=None if args.max_working_sources_per_frame is not None and args.max_working_sources_per_frame <= 0 else args.max_working_sources_per_frame,
             catalog_edge_margin_pix=args.catalog_edge_margin_pix,
             force_recompute_photometry=args.force_recompute_photometry,
+            materialize_intermediate_calibrations=False,
+            science_materialization_diagnostics=False,
+            forced_photometry_diagnostics=args.diagnose_forced_photometry,
+            calibration_performance_diagnostics=args.diagnose_calibration_performance,
+            random_error_model=args.random_error_model,
+            photometry_gain_e_per_adu=args.photometry_gain_e_per_adu,
+            photometry_read_noise_e=args.photometry_read_noise_e,
+            background_estimator_variance_factor=(
+                args.background_estimator_variance_factor
+            ),
+            empirical_background_floor=args.empirical_background_floor,
+            photometry_fractional_flux_floor=args.photometry_fractional_flux_floor,
+            photometry_scintillation_enabled=args.photometry_scintillation_enabled,
+            photometry_scintillation_coefficient=(
+                args.photometry_scintillation_coefficient
+            ),
+            photometry_telescope_aperture_m=args.photometry_telescope_aperture_m,
+            photometry_site_altitude_m=args.photometry_site_altitude_m,
+            enable_color_calibration=args.enable_color_calibration,
+            auto_reference_photometry=args.auto_reference_photometry,
+            color_reference_catalog_name=args.color_reference_catalog_name,
+            color_reference_band=args.color_reference_band,
+            color_index=args.color_index,
             auto_catalog_query=args.auto_catalog_query,
             auto_catalog_margin_arcmin=args.auto_catalog_margin_arcmin,
             auto_catalog_mag_limit=args.auto_catalog_mag_limit,
@@ -3666,6 +5978,15 @@ def cmd_process_archive_path(args: argparse.Namespace) -> int:
         if summary_rows:
             print("Summary:")
             _print_rows(summary_rows, process_archive_summary_columns(), "table")
+        pipeline_failures = [
+            (index, item.get("error_message"))
+            for index, item in enumerate(result.pipeline_results, start=1)
+            if item.get("error_message")
+        ]
+        if pipeline_failures:
+            print("Pipeline failures:")
+            for index, error_message in pipeline_failures:
+                print(f"  pipeline:{index}: {error_message}")
         if result.warnings:
             print("Warnings:")
             for warning in result.warnings[:20]:
@@ -3810,6 +6131,669 @@ def cmd_show_pipeline_log_events(args: argparse.Namespace) -> int:
     _print_rows(rows, PIPELINE_LOG_EVENT_COLUMNS, args.format)
     return 0
 
+
+
+def cmd_batch_sync_plan(args: argparse.Namespace) -> int:
+    from dataclasses import asdict
+
+    from grandgousier.batch.state import sync_batch_plan
+
+    config: dict = {}
+    if args.config_json_file:
+        config = json.loads(Path(args.config_json_file).read_text(encoding="utf-8-sig"))
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        result = sync_batch_plan(
+            session,
+            batch_name=args.batch_name,
+            root_path=args.root,
+            inventory_csv=args.inventory_csv,
+            queue_csv=args.queue_csv,
+            legacy_state_csv=args.legacy_state_csv,
+            script_name=args.script_name,
+            script_version=args.script_version,
+            config=config,
+        )
+        session.commit()
+    print(json.dumps(asdict(result), ensure_ascii=False, default=str))
+    return 0
+
+
+def cmd_batch_start_attempt(args: argparse.Namespace) -> int:
+    from dataclasses import asdict
+
+    from grandgousier.batch.state import start_batch_attempt
+
+    metadata: dict = {}
+    if args.metadata_json_file:
+        metadata = json.loads(Path(args.metadata_json_file).read_text(encoding="utf-8-sig"))
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        result = start_batch_attempt(
+            session,
+            batch_run_id=args.batch_run_id,
+            job_id=args.job_id,
+            manifest_path=args.manifest_path,
+            console_log_path=args.console_log_path,
+            attempt_kind=args.attempt_kind,
+            metadata={"controller_config": metadata} if metadata else {},
+        )
+        session.commit()
+    print(json.dumps(asdict(result), ensure_ascii=False, default=str))
+    return 0
+
+
+def cmd_batch_finish_attempt(args: argparse.Namespace) -> int:
+    from grandgousier.batch.state import finish_batch_attempt
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        result = finish_batch_attempt(
+            session,
+            batch_job_attempt_id=args.batch_job_attempt_id,
+            exit_code=args.exit_code,
+            status=args.status,
+            health=args.health,
+            science_status=args.science_status,
+            catalog_name=args.catalog_name,
+            catalog_sources=args.catalog_sources,
+            pipeline_count=args.pipeline_count,
+            total_points=args.total_points,
+            accepted_points=args.accepted_points,
+            elapsed_sec=args.elapsed_sec,
+            manifest_path=args.manifest_path,
+            console_log_path=args.console_log_path,
+            message=args.message,
+            pipeline_run_id=args.pipeline_run_id,
+        )
+        session.commit()
+        try:
+            from grandgousier.batch.state import snapshot_batch_attempt_artifacts
+
+            result["artifact_ids"] = snapshot_batch_attempt_artifacts(
+                session, batch_job_attempt_id=args.batch_job_attempt_id
+            )
+            session.commit()
+        except Exception as exc:  # noqa: BLE001 - operational state is already durable.
+            session.rollback()
+            result["artifact_warning"] = f"{type(exc).__name__}: {exc}"
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    return 0
+
+
+def cmd_batch_export_state(args: argparse.Namespace) -> int:
+    from grandgousier.batch.state import export_batch_csvs
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        result = export_batch_csvs(
+            session,
+            batch_run_id=args.batch_run_id,
+            state_csv=args.state_csv,
+            summary_csv=args.summary_csv,
+        )
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    return 0
+
+
+def cmd_show_batch_runs(args: argparse.Namespace) -> int:
+    from grandgousier.batch.state import batch_run_rows
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        rows = batch_run_rows(session, limit=args.limit)
+    columns = [
+        "batch_run_id", "batch_name", "root_path", "plan_revision", "status", "jobs",
+        "completed", "healthy", "warnings", "failed", "running", "pending", "last_activity_at",
+    ]
+    _print_rows(rows, columns, args.format)
+    return 0
+
+
+def cmd_show_batch_jobs(args: argparse.Namespace) -> int:
+    from grandgousier.batch.state import batch_job_rows
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        rows = batch_job_rows(session, batch_run_id=args.batch_run_id)
+    columns = [
+        "batch_job_id", "job_id", "object_name", "relative_path", "fits_count", "attempt",
+        "status", "health", "science_status", "catalog_name", "total_points", "accepted_points",
+        "pipeline_run_id", "elapsed_sec",
+    ]
+    _print_rows(rows, columns, args.format)
+    return 0
+
+def cmd_show_calibration_iterations(args: argparse.Namespace) -> int:
+    from grandgousier.calibration.normalized_terms import list_calibration_iterations
+
+    if args.calibration_name is None and args.calibration_version_id is None:
+        raise ValueError("--calibration-name or --calibration-version-id is required")
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        rows = list_calibration_iterations(
+            session,
+            calibration_name=args.calibration_name,
+            calibration_version_id=args.calibration_version_id,
+        )
+    columns = [
+        "calibration_version_id", "calibration_name", "product_kind",
+        "calibration_iteration_id", "iteration_kind", "iteration_no",
+        "algorithm", "status", "convergence_status", "frame_terms",
+        "object_terms", "pipeline_run_id", "series_id",
+    ]
+    _print_rows(rows, columns, args.format)
+    return 0
+
+
+def cmd_verify_calibration_terms(args: argparse.Namespace) -> int:
+    from grandgousier.calibration.normalized_terms import calibration_term_parity_report
+
+    if args.calibration_name is None and args.calibration_version_id is None:
+        raise ValueError("--calibration-name or --calibration-version-id is required")
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        report = calibration_term_parity_report(
+            session,
+            calibration_name=args.calibration_name,
+            calibration_version_id=args.calibration_version_id,
+            tolerance=args.tolerance,
+        )
+    if args.format == "json":
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    else:
+        summary = [{key: value for key, value in report.items() if key != "details"}]
+        _print_rows(
+            summary,
+            [
+                "status", "calibration_version_id", "calibration_name", "product_kind",
+                "calibration_iteration_id", "iteration_no", "frame_terms", "object_terms",
+                "legacy_measurements", "checked", "mismatches",
+            ],
+            "table",
+        )
+        if report.get("details"):
+            _print_rows(
+                list(report["details"]),
+                ["scope", "id", "field", "normalized", "legacy"],
+                "table",
+            )
+    return 0 if report.get("status") == "OK" else 1
+
+
+def cmd_verify_calibration_reconstruction(args: argparse.Namespace) -> int:
+    from grandgousier.calibration.reconstruction import calibration_reconstruction_parity_report
+
+    if args.calibration_name is None and args.calibration_version_id is None:
+        raise ValueError("--calibration-name or --calibration-version-id is required")
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        report = calibration_reconstruction_parity_report(
+            session,
+            calibration_name=args.calibration_name,
+            calibration_version_id=args.calibration_version_id,
+            tolerance=args.tolerance,
+        )
+    if args.format == "json":
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    else:
+        summary = [{key: value for key, value in report.items() if key not in {"details", "stages", "chain", "max_abs_delta"}}]
+        _print_rows(
+            summary,
+            [
+                "status", "calibration_version_id", "calibration_name", "product_kind",
+                "base_calibration_version_id", "chain_length", "base_measurements",
+                "reconstructed_measurements", "materialized_measurements", "compared_measurements",
+                "field_checks", "missing_rows", "extra_rows", "scalar_mismatches", "mismatches",
+            ],
+            "table",
+        )
+        if report.get("stages"):
+            _print_rows(
+                list(report["stages"]),
+                [
+                    "calibration_version_id", "product_kind", "calibration_iteration_id",
+                    "input_rows", "output_rows", "status", "reason",
+                ],
+                "table",
+            )
+        if report.get("max_abs_delta"):
+            delta_rows = [
+                {"field": key, "max_abs_delta": value}
+                for key, value in sorted(dict(report["max_abs_delta"]).items())
+            ]
+            _print_rows(delta_rows, ["field", "max_abs_delta"], "table")
+        if report.get("details"):
+            _print_rows(
+                list(report["details"]),
+                ["scope", "id", "field", "reconstructed", "materialized"],
+                "table",
+            )
+    return 0 if report.get("status") == "OK" else 1
+
+
+def cmd_materialize_science_calibration(args: argparse.Namespace) -> int:
+    from sqlalchemy import select
+
+    from grandgousier.db.models import CalibrationVersion
+    from grandgousier.photometry.science_materialization import materialize_science_calibration
+
+    if args.calibration_name is None and args.calibration_version_id is None:
+        raise ValueError("--calibration-name or --calibration-version-id is required")
+    if args.calibration_name is not None and args.calibration_version_id is not None:
+        raise ValueError("Use only one of --calibration-name or --calibration-version-id")
+
+    Session = make_session_factory(args.database_url)
+    with Session.begin() as session:
+        if args.calibration_version_id is not None:
+            cv = session.get(CalibrationVersion, int(args.calibration_version_id))
+        else:
+            cv = session.scalar(
+                select(CalibrationVersion).where(
+                    CalibrationVersion.name == str(args.calibration_name)
+                )
+            )
+        if cv is None:
+            raise ValueError("Calibration version not found")
+        if str(cv.product_role or "").upper() != "SCIENCE":
+            raise ValueError(
+                "Refusing science backfill for a non-SCIENCE calibration: "
+                f"calibration_version_id={cv.calibration_version_id}, product_role={cv.product_role!r}"
+            )
+        if str(cv.lifecycle_status or "").upper() not in {
+            "COMPLETE_IMMUTABLE",
+            "SUPERSEDED_IMMUTABLE",
+        }:
+            raise ValueError(
+                "Refusing science backfill for a calibration that is not an immutable finalized generation: "
+                f"calibration_version_id={cv.calibration_version_id}, lifecycle_status={cv.lifecycle_status!r}"
+            )
+
+        result = materialize_science_calibration(
+            session,
+            calibration_version_id=int(cv.calibration_version_id),
+            shadow_compare_legacy=bool(args.shadow_compare_legacy),
+            diagnostics=bool(args.diagnose),
+        )
+        payload = result.to_dict()
+        payload["product_role"] = cv.product_role
+        payload["lifecycle_status"] = cv.lifecycle_status
+
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    else:
+        _print_rows(
+            [payload],
+            [
+                "status",
+                "calibration_version_id",
+                "calibration_name",
+                "product_role",
+                "lifecycle_status",
+                "base_calibration_version_id",
+                "reconstructed_rows",
+                "inserted_or_updated",
+                "deleted_stale_rows",
+                "write_strategy",
+                "reconstruction_strategy",
+                "total_sec",
+            ],
+            "table",
+        )
+    return 0 if result.status == "OK" and int(result.reconstructed_rows) > 0 else 1
+
+
+def cmd_verify_science_materialization(args: argparse.Namespace) -> int:
+    from grandgousier.photometry.science_materialization import science_materialization_parity_report
+
+    if args.calibration_name is None and args.calibration_version_id is None:
+        raise ValueError("--calibration-name or --calibration-version-id is required")
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        report = science_materialization_parity_report(
+            session,
+            calibration_name=args.calibration_name,
+            calibration_version_id=args.calibration_version_id,
+            tolerance=args.tolerance,
+        )
+    if args.format == "json":
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    else:
+        _print_rows(
+            [{key: value for key, value in report.items() if key != "max_abs_delta"}],
+            [
+                "status", "calibration_version_id", "calibration_name",
+                "science_measurements", "legacy_rows", "missing_legacy_rows",
+                "extra_legacy_rows", "scalar_mismatches", "mismatches",
+            ],
+            "table",
+        )
+        if report.get("max_abs_delta"):
+            _print_rows(
+                [
+                    {"field": key, "max_abs_delta": value}
+                    for key, value in sorted(dict(report["max_abs_delta"]).items())
+                ],
+                ["field", "max_abs_delta"],
+                "table",
+            )
+    return 0 if report.get("status") == "OK" else 1
+
+
+def cmd_backfill_science_photometry_cache(args: argparse.Namespace) -> int:
+    from grandgousier.photometry.science_cache import (
+        backfill_science_photometry_cache,
+        select_science_calibration_ids,
+    )
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        calibration_ids = select_science_calibration_ids(
+            session,
+            calibration_version_ids=args.calibration_version_id,
+            field_id=args.field_id,
+            all_materialized=bool(args.all_materialized),
+            include_superseded=bool(args.include_superseded),
+        )
+    if not calibration_ids:
+        raise ValueError("No SCIENCE calibrations matched the requested scope")
+
+    rows: list[dict[str, object]] = []
+    ok = True
+    for calibration_version_id in calibration_ids:
+        with Session.begin() as session:
+            result = backfill_science_photometry_cache(
+                session,
+                calibration_version_id=int(calibration_version_id),
+                execute=bool(args.execute),
+            )
+            rows.append(result.to_dict())
+            ok = ok and result.status in {"READY", "OK"}
+
+    if args.format == "json":
+        print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+    else:
+        _print_rows(
+            rows,
+            [
+                "calibration_version_id",
+                "calibration_name",
+                "lifecycle_status",
+                "source_rows",
+                "source_distinct_base_rows",
+                "existing_cache_rows",
+                "written_rows",
+                "cache_rows_after",
+                "scalar_mismatches",
+                "status",
+                "reason",
+            ],
+            "table",
+        )
+    return 0 if ok else 1
+
+
+def cmd_backfill_science_flag_overrides(args: argparse.Namespace) -> int:
+    from grandgousier.photometry.science_flag_overrides import (
+        backfill_science_flag_overrides,
+        select_v1_science_calibration_ids,
+    )
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        calibration_ids = select_v1_science_calibration_ids(
+            session,
+            calibration_version_ids=args.calibration_version_id,
+            field_id=args.field_id,
+            all_materialized=bool(args.all_materialized),
+            include_superseded=bool(args.include_superseded),
+        )
+    if not calibration_ids:
+        raise ValueError("No SCIENCE calibrations matched the requested scope")
+
+    rows: list[dict[str, object]] = []
+    ok = True
+    for calibration_version_id in calibration_ids:
+        with Session.begin() as session:
+            result = backfill_science_flag_overrides(
+                session,
+                calibration_version_id=int(calibration_version_id),
+                execute=bool(args.execute),
+                frame_batch_size=int(args.frame_batch_size),
+                tolerance=float(args.tolerance),
+            )
+            rows.append(result.to_dict())
+            ok = ok and result.status in {"READY", "OK"}
+
+    if args.format == "json":
+        print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+    else:
+        _print_rows(
+            rows,
+            [
+                "calibration_version_id",
+                "calibration_name",
+                "lifecycle_status",
+                "source_rows",
+                "sampled_or_checked_rows",
+                "flags_exact_without_patch",
+                "rows_requiring_patch",
+                "common_override_keys",
+                "common_removed_keys",
+                "row_override_rows",
+                "scalar_mismatches",
+                "identity_mismatches",
+                "patch_failures",
+                "written_row_overrides",
+                "status",
+                "reason",
+            ],
+            "table",
+        )
+    return 0 if ok else 1
+
+
+def cmd_verify_science_flag_overrides(args: argparse.Namespace) -> int:
+    from grandgousier.photometry.science_flag_overrides import (
+        select_v1_science_calibration_ids,
+        verify_science_flag_overrides,
+    )
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        calibration_ids = select_v1_science_calibration_ids(
+            session,
+            calibration_version_ids=args.calibration_version_id,
+            field_id=args.field_id,
+            all_materialized=bool(args.all_materialized),
+            include_superseded=bool(args.include_superseded),
+        )
+    if not calibration_ids:
+        raise ValueError("No SCIENCE calibrations matched the requested scope")
+
+    rows: list[dict[str, object]] = []
+    ok = True
+    for calibration_version_id in calibration_ids:
+        with Session() as session:
+            result = verify_science_flag_overrides(
+                session,
+                calibration_version_id=int(calibration_version_id),
+                frame_batch_size=int(args.frame_batch_size),
+                tolerance=float(args.tolerance),
+            )
+            rows.append(result.to_dict())
+            ok = ok and result.status == "OK"
+
+    if args.format == "json":
+        print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+    else:
+        _print_rows(
+            rows,
+            [
+                "calibration_version_id",
+                "calibration_name",
+                "source_rows",
+                "checked_rows",
+                "scalar_mismatches",
+                "identity_mismatches",
+                "flag_mismatches",
+                "manifest_row_override_count",
+                "actual_row_override_count",
+                "status",
+                "reason",
+            ],
+            "table",
+        )
+    return 0 if ok else 1
+
+
+def cmd_retire_science_measurements(args: argparse.Namespace) -> int:
+    from grandgousier.photometry.science_retirement import (
+        retire_science_measurements,
+        select_retirable_science_calibration_ids,
+    )
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        calibration_ids = select_retirable_science_calibration_ids(
+            session,
+            calibration_version_ids=args.calibration_version_id,
+            field_id=args.field_id,
+            all_materialized=bool(args.all_materialized),
+            include_superseded=bool(args.include_superseded),
+        )
+    if not calibration_ids:
+        raise ValueError("No legacy SCIENCE materializations matched the requested scope")
+
+    rows: list[dict[str, object]] = []
+    ok = True
+    for calibration_version_id in calibration_ids:
+        with Session.begin() as session:
+            result = retire_science_measurements(
+                session,
+                calibration_version_id=int(calibration_version_id),
+                execute=bool(args.execute),
+                frame_batch_size=int(args.frame_batch_size),
+                tolerance=float(args.tolerance),
+            )
+            rows.append(result.to_dict())
+            ok = ok and result.status in {"READY", "RETIRED", "ALREADY_RETIRED"}
+
+    if args.format == "json":
+        print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+    else:
+        _print_rows(
+            rows,
+            [
+                "calibration_version_id",
+                "calibration_name",
+                "lifecycle_status",
+                "v1_rows_before",
+                "cache_rows",
+                "manifest_source_rows",
+                "manifest_row_override_count",
+                "actual_row_override_count",
+                "verified_rows",
+                "scalar_mismatches",
+                "identity_mismatches",
+                "flag_mismatches",
+                "deleted_rows",
+                "v1_rows_after",
+                "status",
+                "reason",
+            ],
+            "table",
+        )
+    return 0 if ok else 1
+
+
+def cmd_show_artifacts(args: argparse.Namespace) -> int:
+    from sqlalchemy import text
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        where = []
+        params = {"limit": args.limit}
+        if args.pipeline_run_id is not None:
+            where.append("a.pipeline_run_id = :pipeline_run_id")
+            params["pipeline_run_id"] = args.pipeline_run_id
+        if args.batch_run_id is not None:
+            where.append("a.batch_run_id = :batch_run_id")
+            params["batch_run_id"] = args.batch_run_id
+        if args.batch_job_attempt_id is not None:
+            where.append("a.batch_job_attempt_id = :batch_job_attempt_id")
+            params["batch_job_attempt_id"] = args.batch_job_attempt_id
+        if args.series_id is not None:
+            where.append("a.series_id = :series_id")
+            params["series_id"] = args.series_id
+        if args.artifact_type:
+            where.append("a.artifact_type = :artifact_type")
+            params["artifact_type"] = args.artifact_type
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        rows = [dict(row._mapping) for row in session.execute(text(f"""
+            SELECT
+                a.artifact_id,
+                a.pipeline_run_id,
+                a.batch_run_id,
+                a.batch_job_attempt_id,
+                a.series_id,
+                a.calibration_version_id,
+                a.artifact_type,
+                a.artifact_role,
+                a.artifact_format,
+                a.size_bytes,
+                a.sha256,
+                a.uri,
+                a.publication_uri,
+                a.lifecycle_status,
+                a.created_at
+            FROM artifacts a
+            {where_sql}
+            ORDER BY a.artifact_id DESC
+            LIMIT :limit
+        """), params).all()]
+    _print_rows(rows, ARTIFACT_COLUMNS, args.format)
+    return 0
+
+
+def cmd_verify_artifacts(args: argparse.Namespace) -> int:
+    from sqlalchemy import select
+    from grandgousier.artifacts.registry import verify_registered_artifact
+    from grandgousier.db.models import Artifact
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        stmt = select(Artifact)
+        if args.artifact_id is not None:
+            stmt = stmt.where(Artifact.artifact_id == args.artifact_id)
+        if args.pipeline_run_id is not None:
+            stmt = stmt.where(Artifact.pipeline_run_id == args.pipeline_run_id)
+        if args.batch_run_id is not None:
+            stmt = stmt.where(Artifact.batch_run_id == args.batch_run_id)
+        if args.batch_job_attempt_id is not None:
+            stmt = stmt.where(Artifact.batch_job_attempt_id == args.batch_job_attempt_id)
+        stmt = stmt.order_by(Artifact.artifact_id.desc()).limit(args.limit)
+        artifacts = list(session.scalars(stmt))
+        rows = []
+        failed = 0
+        for artifact in artifacts:
+            ok, status = verify_registered_artifact(artifact)
+            failed += 0 if ok else 1
+            rows.append(
+                {
+                    "artifact_id": artifact.artifact_id,
+                    "pipeline_run_id": artifact.pipeline_run_id,
+                    "batch_run_id": artifact.batch_run_id,
+                    "batch_job_attempt_id": artifact.batch_job_attempt_id,
+                    "artifact_type": artifact.artifact_type,
+                    "status": status,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                    "uri": artifact.uri,
+                }
+            )
+    _print_rows(rows, ARTIFACT_VERIFY_COLUMNS, args.format)
+    return 0 if failed == 0 else 1
 
 
 def _format_archive_calibration_prefix(template: str, series: dict) -> str:
@@ -3963,6 +6947,14 @@ PIPELINE_STEP_COLUMNS = [
     "calibrated",
     "frames_with_zp",
     "frames_with_offsets",
+    "reference_candidates",
+    "usable_reference_objects",
+    "base_ensemble_reference_candidates",
+    "base_ensemble_usable_reference_objects",
+    "base_ensemble_required_references_per_frame",
+    "base_ensemble_selected_frames",
+    "base_ensemble_frames_with_offsets",
+    "base_ensemble_calibrated",
     "raw_candidates",
     "selected_candidates",
     "checked_candidates",
@@ -4007,6 +6999,36 @@ PIPELINE_LOG_EVENT_COLUMNS = [
     "context_json",
 ]
 
+ARTIFACT_COLUMNS = [
+    "artifact_id",
+    "pipeline_run_id",
+    "batch_run_id",
+    "batch_job_attempt_id",
+    "series_id",
+    "calibration_version_id",
+    "artifact_type",
+    "artifact_role",
+    "artifact_format",
+    "size_bytes",
+    "sha256",
+    "uri",
+    "publication_uri",
+    "lifecycle_status",
+    "created_at",
+]
+
+ARTIFACT_VERIFY_COLUMNS = [
+    "artifact_id",
+    "pipeline_run_id",
+    "batch_run_id",
+    "batch_job_attempt_id",
+    "artifact_type",
+    "status",
+    "size_bytes",
+    "sha256",
+    "uri",
+]
+
 PIPELINE_STEP_DETAIL_COLUMNS = [
     "pipeline_run_step_id",
     "pipeline_run_id",
@@ -4024,6 +7046,14 @@ PIPELINE_STEP_DETAIL_COLUMNS = [
     "calibrated",
     "frames_with_zp",
     "frames_with_offsets",
+    "reference_candidates",
+    "usable_reference_objects",
+    "base_ensemble_reference_candidates",
+    "base_ensemble_usable_reference_objects",
+    "base_ensemble_required_references_per_frame",
+    "base_ensemble_selected_frames",
+    "base_ensemble_frames_with_offsets",
+    "base_ensemble_calibrated",
     "raw_candidates",
     "selected_candidates",
     "checked_candidates",
@@ -4060,6 +7090,14 @@ def _compact_pipeline_step_result(result: dict | None) -> dict:
         "calibrated",
         "frames_with_zp",
         "frames_with_offsets",
+        "reference_candidates",
+        "usable_reference_objects",
+        "base_ensemble_reference_candidates",
+        "base_ensemble_usable_reference_objects",
+        "base_ensemble_required_references_per_frame",
+        "base_ensemble_selected_frames",
+        "base_ensemble_frames_with_offsets",
+        "base_ensemble_calibrated",
         "raw_candidates",
         "selected_candidates",
         "checked_candidates",
@@ -4644,6 +7682,348 @@ def cmd_export_lightcurve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_audit_field_catalog_identity(args: argparse.Namespace) -> int:
+    from grandgousier.interseries.catalog_identity import (
+        audit_field_catalog_identity,
+        group_identity_columns,
+        series_identity_columns,
+    )
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        try:
+            audit = audit_field_catalog_identity(
+                session,
+                field_id=args.field_id,
+                field_name=args.field_name,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
+    if args.format == "json":
+        print(json.dumps(audit.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+
+    print(
+        "Catalog identity audit: "
+        f"field_id={audit.field_id}, field_name={audit.field_name}, status={audit.status}"
+    )
+    print("Series catalog coverage:")
+    _print_rows(
+        [row.to_dict() for row in audit.series],
+        series_identity_columns(),
+        "table",
+    )
+    print("Repeated same-system groups:")
+    _print_rows(
+        [row.to_dict() for row in audit.groups],
+        group_identity_columns(),
+        "table",
+    )
+    return 0
+
+
+def cmd_plan_interseries_calibration(args: argparse.Namespace) -> int:
+    from grandgousier.interseries.planning import (
+        build_interseries_plan,
+        export_interseries_plan_json,
+        interseries_pair_columns,
+        interseries_series_columns,
+    )
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        try:
+            plan = build_interseries_plan(
+                session,
+                field_id=args.field_id,
+                field_name=args.field_name,
+                instrument_unit_id=args.instrument_unit_id,
+                filter_name=args.filter_name,
+                catalog_name=args.catalog_name,
+                min_points_per_object=args.min_points_per_object,
+                min_common_objects=args.min_common_objects,
+                required_stage2_recipe=args.required_stage2_recipe,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
+    if args.out:
+        out = export_interseries_plan_json(plan, args.out)
+        print(f"Exported inter-series plan JSON: path={out}")
+
+    if args.format == "json":
+        print(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+
+    print(
+        "Inter-series plan: "
+        f"field_id={plan.field_id}, field_name={plan.field_name}, status={plan.status}, "
+        f"series={plan.n_series}, ready={plan.n_ready_series}, "
+        f"eligible_pairs={plan.n_eligible_pairs}, largest_component={plan.largest_component_size}, "
+        f"recommended_reference_series_id={plan.recommended_reference_series_id}"
+    )
+    print("Series candidates:")
+    _print_rows(
+        [row.to_dict() for row in plan.series],
+        interseries_series_columns(),
+        "table",
+    )
+    print("Pairwise overlap:")
+    _print_rows(
+        [row.to_dict() for row in plan.pairs],
+        interseries_pair_columns(),
+        "table",
+    )
+    if plan.connected_components:
+        print(
+            "Eligible connected components: "
+            + "; ".join(",".join(str(value) for value in component) for component in plan.connected_components)
+        )
+    return 0
+
+
+def cmd_analyze_interseries_calibration(args: argparse.Namespace) -> int:
+    from grandgousier.interseries.analysis import (
+        GRAPH_OFFSET_COLUMNS,
+        PAIR_OFFSET_COLUMNS,
+        SERIES_SUMMARY_COLUMNS,
+        analyze_interseries_calibration,
+        export_interseries_analysis,
+    )
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        try:
+            analysis = analyze_interseries_calibration(
+                session,
+                field_id=args.field_id,
+                field_name=args.field_name,
+                instrument_unit_id=args.instrument_unit_id,
+                filter_name=args.filter_name,
+                catalog_name=args.catalog_name,
+                reference_series_id=args.reference_series_id,
+                min_points_per_object=args.min_points_per_object,
+                min_common_objects=args.min_common_objects,
+                clip_sigma=args.clip_sigma,
+                max_clip_iterations=args.max_clip_iterations,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
+    paths = export_interseries_analysis(analysis, args.out_root)
+    if args.format == "json":
+        print(json.dumps(analysis.to_dict(), ensure_ascii=False, indent=2))
+        print(f"Stage-3 diagnostics: {paths['summary'].parent}")
+        return 0
+
+    graph = analysis.graph_solution
+    print(
+        "Inter-series analysis: "
+        f"field_id={analysis.field_id}, field_name={analysis.field_name}, status={analysis.status}, "
+        f"series={len(analysis.selected_series_ids)}, reference_series_id={analysis.reference_series_id}, "
+        f"pairs_ok={sum(1 for row in analysis.pairwise_offsets if row.status == 'OK')}, "
+        f"graph_status={graph.status if graph is not None else None}, "
+        f"reduced_chi2={graph.reduced_chi2 if graph is not None else None}"
+    )
+    print("Series summary:")
+    _print_rows([row.to_dict() for row in analysis.series_summaries], list(SERIES_SUMMARY_COLUMNS), "table")
+    print("Pairwise offsets (delta_ab = m_b - m_a):")
+    _print_rows([row.to_dict() for row in analysis.pairwise_offsets], list(PAIR_OFFSET_COLUMNS), "table")
+    if graph is not None and graph.offsets:
+        print("Global additive series offsets (m_global = m_science + z_s):")
+        _print_rows([row.to_dict() for row in graph.offsets], list(GRAPH_OFFSET_COLUMNS), "table")
+    print(f"Stage-3 diagnostics: {paths['summary'].parent}")
+    return 0
+
+
+def cmd_persist_interseries_calibration(args: argparse.Namespace) -> int:
+    from grandgousier.interseries.persistence import persist_interseries_calibration
+
+    Session = make_session_factory(args.database_url)
+    try:
+        with Session.begin() as session:
+            result = persist_interseries_calibration(
+                session,
+                field_id=args.field_id,
+                field_name=args.field_name,
+                instrument_unit_id=args.instrument_unit_id,
+                filter_name=args.filter_name,
+                catalog_name=args.catalog_name,
+                reference_series_id=args.reference_series_id,
+                min_points_per_object=args.min_points_per_object,
+                min_common_objects=args.min_common_objects,
+                clip_sigma=args.clip_sigma,
+                max_clip_iterations=args.max_clip_iterations,
+                allow_sparse_graph=bool(args.allow_sparse_graph),
+            )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    row = result.to_dict()
+    if args.format == "json":
+        print(json.dumps(row, ensure_ascii=False, indent=2, default=str))
+        return 0
+    print(
+        "Inter-series M4 persistence: "
+        f"generation_id={result.interseries_generation_id}, generation_uid={result.generation_uid}, "
+        f"created={result.created}, reliability={result.reliability_status}, "
+        f"series={result.n_series}, edges={result.n_edges}, dof={result.graph_dof}"
+    )
+    _print_rows([row], list(row.keys()), "table")
+    return 0
+
+
+def cmd_show_interseries_calibration(args: argparse.Namespace) -> int:
+    from grandgousier.interseries.persistence import (
+        list_interseries_generations,
+        load_interseries_generation_edges,
+        load_interseries_generation_series,
+    )
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        rows = list_interseries_generations(
+            session,
+            generation_id=args.generation_id,
+            field_id=args.field_id,
+            filter_name=args.filter_name,
+            limit=args.limit,
+        )
+        if args.format == "json":
+            payload = []
+            for row in rows:
+                item = dict(row)
+                item["series"] = load_interseries_generation_series(
+                    session, generation_id=int(row["interseries_generation_id"])
+                )
+                item["edges"] = load_interseries_generation_edges(
+                    session, generation_id=int(row["interseries_generation_id"])
+                )
+                payload.append(item)
+            print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+            return 0
+
+        if not rows:
+            print("No persisted inter-series calibration generations.")
+            return 0
+        columns = [
+            "interseries_generation_id", "generation_uid", "field_id", "field_name",
+            "instrument_unit_id", "filter_name", "catalog_name", "reference_series_id",
+            "reliability_status", "n_series", "n_edges", "graph_dof", "reduced_chi2",
+            "min_common_objects", "lifecycle_status", "created_at",
+        ]
+        _print_rows(rows, columns, "table")
+        if args.generation_id is not None and len(rows) == 1:
+            gid = int(rows[0]["interseries_generation_id"])
+            print("Series offsets and exact Stage-2 SCIENCE sources:")
+            series = load_interseries_generation_series(session, generation_id=gid)
+            if series:
+                _print_rows(series, list(series[0].keys()), "table")
+            print("Pairwise graph edges:")
+            edges = load_interseries_generation_edges(session, generation_id=gid)
+            if edges:
+                _print_rows(edges, list(edges[0].keys()), "table")
+            else:
+                print("No rows.")
+    return 0
+
+
+def cmd_verify_interseries_calibration(args: argparse.Namespace) -> int:
+    from grandgousier.interseries.persistence import verify_interseries_generation
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        try:
+            result = verify_interseries_generation(session, generation_id=args.generation_id)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+    row = result.to_dict()
+    if args.format == "json":
+        print(json.dumps(row, ensure_ascii=False, indent=2, default=str))
+    else:
+        summary = {key: value for key, value in row.items() if key != "details"}
+        _print_rows([summary], list(summary.keys()), "table")
+    return 0 if result.status == "OK" else 2
+
+
+def cmd_export_global_object_light_curve(args: argparse.Namespace) -> int:
+    from grandgousier.lightcurves.global_object import export_global_object_light_curve
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        try:
+            result = export_global_object_light_curve(
+                session,
+                object_id=args.object_id,
+                field_id=args.field_id,
+                generation_ids=args.generation_ids or None,
+                out_root=args.out_root,
+                include_rejected=bool(args.include_rejected),
+                include_rejected_debug=bool(args.include_rejected_debug),
+                allow_partial=bool(args.allow_partial),
+                require_detection_support=bool(args.require_detection_support),
+                extra_reject_flags=args.extra_reject_flags,
+                plots=not bool(args.no_plots),
+                plot_reduction=args.plot_reduction,
+                plot_max_points=args.plot_max_points,
+                plot_bin_minutes=args.plot_bin_minutes,
+                plot_format=args.plot_format,
+                plot_dpi=args.plot_dpi,
+                plot_time_axis=args.plot_time_axis,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
+    payload = result.to_dict()
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        return 0 if result.accepted_rows > 0 else 2
+
+    print(
+        "M5 global object light curve: "
+        f"object_id={result.object_id}, field_id={result.field_id}, status={result.status}, "
+        f"source_rows={result.rows_source_exact_m4}, written={result.rows_written}, "
+        f"accepted={result.accepted_rows}, rejected={result.rejected_rows}, "
+        f"source={result.science_read_source}, "
+        f"generations={','.join(str(v) for v in result.generation_ids)}"
+    )
+    print(f"CSV: {result.csv_path}")
+    print(f"Summary: {result.summary_path}")
+    if result.rejection_debug_path:
+        print(f"Rejections: {result.rejection_debug_path}")
+    if result.rejection_reasons:
+        print("M5 rejection reasons:")
+        rejection_rows = [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(result.rejection_reasons.items(), key=lambda item: (-item[1], item[0]))
+        ]
+        _print_rows(rejection_rows, ["reason", "count"], "table")
+    if result.plot_paths:
+        plot_rows = []
+        for filter_name, path in sorted(result.plot_paths.items()):
+            plot_rows.append({
+                "filter_name": filter_name,
+                "reduction": result.plot_reduction.get(filter_name),
+                "input_points": result.plot_input_points.get(filter_name),
+                "plot_points": result.plot_output_points.get(filter_name),
+                "time_axis": result.plot_time_axis.get(filter_name),
+                "breaks": result.plot_time_breaks.get(filter_name),
+                "style": result.plot_style.get(filter_name),
+                "plot": path,
+                "plot_data": result.plot_data_paths.get(filter_name),
+            })
+        _print_rows(
+            plot_rows,
+            ["filter_name", "reduction", "input_points", "plot_points", "time_axis", "breaks", "style", "plot", "plot_data"],
+            "table",
+        )
+    if result.warnings:
+        for warning in result.warnings:
+            print(f"WARNING: {warning}")
+    return 0 if result.accepted_rows > 0 else 2
+
+
 def cmd_list_light_curve_objects(args: argparse.Namespace) -> int:
     from grandgousier.lightcurves.product import (
         light_curve_object_columns,
@@ -4914,7 +8294,7 @@ def _normalize_cli_name(value: str) -> str:
 
 def _print_rows(rows: list[dict], columns: list[str], fmt: str) -> None:
     if fmt == "json":
-        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
         return
     if fmt == "csv":
         writer = csv.DictWriter(sys.stdout, fieldnames=columns, extrasaction="ignore")
@@ -5001,9 +8381,118 @@ def cmd_detect_sources(args: argparse.Namespace) -> int:
     return 0 if result.failed_frames == 0 else 2
 
 
+def cmd_psf_field_diagnostics(args: argparse.Namespace) -> int:
+    from grandgousier.archive.fields_series import load_series_selection
+    from grandgousier.quality.psf_field import analyze_psf_field
+
+    frame_ids = [int(value) for value in (args.frame_id or [])]
+    instrument_unit_id = args.instrument_unit_id
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        if args.series_id is not None:
+            selection = load_series_selection(session, int(args.series_id))
+            series_frame_ids = [int(value) for value in selection.get("frame_ids") or []]
+            if frame_ids:
+                allowed = set(series_frame_ids)
+                frame_ids = [value for value in frame_ids if value in allowed]
+            else:
+                frame_ids = series_frame_ids
+            if instrument_unit_id is None and selection.get("instrument_unit_id") is not None:
+                instrument_unit_id = int(selection["instrument_unit_id"])
+        if not frame_ids and instrument_unit_id is None:
+            print("psf-field-diagnostics requires --series-id, --frame-id, or --instrument-unit-id", file=sys.stderr)
+            return 2
+        result = analyze_psf_field(
+            session,
+            frame_ids=frame_ids or None,
+            instrument_unit_id=instrument_unit_id,
+            detection_algorithm=args.detection_algorithm,
+            out_dir=args.out_dir,
+            max_sources_per_frame=args.max_sources_per_frame,
+            min_snr=args.min_snr,
+            cutout_radius_pix=args.cutout_radius_pix,
+            min_isolation_pix=args.min_isolation_pix,
+            clip_sigma=args.clip_sigma,
+            n_iterations=args.n_iterations,
+            render_plots=args.render_plots,
+        )
+    print(
+        "PSF field diagnostics: "
+        f"selected_frames={result.selected_frames}, analyzed_frames={result.analyzed_frames}, "
+        f"measured_sources={result.measured_sources}, failed_frames={result.failed_frames}, "
+        f"without_detections={result.frames_without_detections}, "
+        f"without_usable_sources={result.frames_without_usable_psf_sources}"
+    )
+    if result.frames_csv:
+        print(f"  frames_csv={result.frames_csv}")
+    if result.sources_csv:
+        print(f"  sources_csv={result.sources_csv}")
+    if result.summary_json:
+        print(f"  summary_json={result.summary_json}")
+    if result.field_map_png:
+        print(f"  field_map_png={result.field_map_png}")
+    if result.time_series_png:
+        print(f"  time_series_png={result.time_series_png}")
+    for warning in result.warnings:
+        print(f"  WARNING: {warning}")
+    return 0 if result.failed_frames == 0 and result.analyzed_frames > 0 else 1
+
+
+
+def cmd_adaptive_aperture_diagnostics(args: argparse.Namespace) -> int:
+    from grandgousier.archive.fields_series import load_series_selection
+    from grandgousier.photometry.adaptive_aperture import analyze_adaptive_aperture
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        selection = load_series_selection(session, int(args.series_id))
+        frame_ids = [int(value) for value in selection.get("frame_ids") or []]
+        result = analyze_adaptive_aperture(
+            session,
+            frame_ids=frame_ids,
+            catalog_name=args.catalog_name,
+            detection_algorithm=args.detection_algorithm,
+            out_dir=args.out_dir,
+            base_aperture_radius_pix=args.base_aperture_radius_pix,
+            annulus_inner_pix=args.annulus_inner_pix,
+            annulus_outer_pix=args.annulus_outer_pix,
+            min_psf_snr=args.min_psf_snr,
+            max_psf_sources_per_frame=args.max_psf_sources_per_frame,
+            psf_cutout_radius_pix=args.psf_cutout_radius_pix,
+            psf_min_isolation_pix=args.psf_min_isolation_pix,
+            interpolation_neighbors=args.interpolation_neighbors,
+            min_psf_references=args.min_psf_references,
+            aperture_fwhm_factor=args.aperture_fwhm_factor,
+            max_axis_ratio=args.max_axis_ratio,
+            max_radius_scale=args.max_radius_scale,
+            render_plots=args.render_plots,
+        )
+    print(
+        "Adaptive aperture diagnostics: "
+        f"selected_frames={result.selected_frames}, analyzed_frames={result.analyzed_frames}, "
+        f"measured_pairs={result.measured_pairs}, psf_model_failures={result.frames_without_psf_model}, "
+        f"failed_frames={result.failed_frames}"
+    )
+    for label, value in (
+        ("measurements_csv", result.measurements_csv),
+        ("frames_csv", result.frames_csv),
+        ("objects_csv", result.objects_csv),
+        ("summary_json", result.summary_json),
+        ("field_map_png", result.field_map_png),
+        ("time_series_png", result.time_series_png),
+    ):
+        if value:
+            print(f"  {label}={value}")
+    if result.warnings:
+        print("Warnings:")
+        for warning in result.warnings:
+            print(f"  {warning}")
+    return 0 if result.failed_frames == 0 else 2
+
 def cmd_source_detection_summary(args: argparse.Namespace) -> int:
     from sqlalchemy import func, select
-    from grandgousier.db.models import Frame, InstrumentUnit, SourceDetection
+    from grandgousier.db.detection_runs import SOURCE_DETECTION_RUN
+    from grandgousier.db.models import DetectionRun, DetectionRunFrame, Frame, InstrumentUnit, SourceDetection
 
     Session = make_session_factory(args.database_url)
     with Session() as session:
@@ -5017,14 +8506,17 @@ def cmd_source_detection_summary(args: argparse.Namespace) -> int:
                 InstrumentUnit.filter_name,
                 InstrumentUnit.observing_mode,
                 SourceDetection.detection_status,
-                SourceDetection.algorithm,
+                DetectionRun.algorithm.label("algorithm"),
                 func.count(SourceDetection.source_detection_id).label("n_detections"),
                 func.min(SourceDetection.snr).label("snr_min"),
                 func.max(SourceDetection.snr).label("snr_max"),
             )
             .select_from(SourceDetection)
-            .join(Frame, Frame.frame_id == SourceDetection.frame_id)
+            .join(DetectionRunFrame, DetectionRunFrame.detection_run_frame_id == SourceDetection.detection_run_frame_id)
+            .join(DetectionRun, DetectionRun.detection_run_id == DetectionRunFrame.detection_run_id)
+            .join(Frame, Frame.frame_id == DetectionRunFrame.frame_id)
             .outerjoin(InstrumentUnit, InstrumentUnit.instrument_unit_id == Frame.instrument_unit_id)
+            .where(DetectionRun.run_kind == SOURCE_DETECTION_RUN)
             .group_by(
                 InstrumentUnit.instrument_unit_id,
                 InstrumentUnit.instrument,
@@ -5034,16 +8526,14 @@ def cmd_source_detection_summary(args: argparse.Namespace) -> int:
                 InstrumentUnit.filter_name,
                 InstrumentUnit.observing_mode,
                 SourceDetection.detection_status,
-                SourceDetection.algorithm,
+                DetectionRun.algorithm,
             )
             .order_by(InstrumentUnit.instrument_unit_id, SourceDetection.detection_status)
         )
-        rows = []
-        if args.calibration_name:
-            stmt = stmt.where(CalibrationVersion.name == args.calibration_name)
         if args.instrument_unit_id is not None:
             stmt = stmt.where(InstrumentUnit.instrument_unit_id == int(args.instrument_unit_id))
 
+        rows = []
         for row in session.execute(stmt).all():
             d = dict(row._mapping)
             d["snr_min"] = _round_float(d.get("snr_min"), 3)
@@ -5054,33 +8544,23 @@ def cmd_source_detection_summary(args: argparse.Namespace) -> int:
         if args.limit is not None:
             rows = rows[: int(args.limit)]
     columns = [
-        "instrument_unit_id",
-        "instrument",
-        "site",
-        "tube",
-        "camera",
-        "filter_name",
-        "observing_mode",
-        "detection_status",
-        "algorithm",
-        "n_detections",
-        "snr_min",
-        "snr_max",
+        "instrument_unit_id", "instrument", "site", "tube", "camera", "filter_name",
+        "observing_mode", "detection_status", "algorithm", "n_detections", "snr_min", "snr_max",
     ]
     _print_rows(rows, columns, args.format)
     return 0
 
-
 def cmd_show_source_detections(args: argparse.Namespace) -> int:
     from sqlalchemy import select
-    from grandgousier.db.models import Frame, InstrumentUnit, SourceDetection
+    from grandgousier.db.detection_runs import SOURCE_DETECTION_RUN
+    from grandgousier.db.models import DetectionRun, DetectionRunFrame, Frame, InstrumentUnit, SourceDetection
 
     Session = make_session_factory(args.database_url)
     with Session() as session:
         stmt = (
             select(
                 SourceDetection.source_detection_id,
-                SourceDetection.frame_id,
+                DetectionRunFrame.frame_id.label("frame_id"),
                 InstrumentUnit.instrument,
                 InstrumentUnit.tube,
                 InstrumentUnit.camera,
@@ -5096,60 +8576,38 @@ def cmd_show_source_detections(args: argparse.Namespace) -> int:
                 SourceDetection.snr,
                 SourceDetection.local_background,
                 SourceDetection.detection_status,
-                SourceDetection.algorithm,
+                DetectionRun.algorithm.label("algorithm"),
             )
             .select_from(SourceDetection)
-            .join(Frame, Frame.frame_id == SourceDetection.frame_id)
+            .join(DetectionRunFrame, DetectionRunFrame.detection_run_frame_id == SourceDetection.detection_run_frame_id)
+            .join(DetectionRun, DetectionRun.detection_run_id == DetectionRunFrame.detection_run_id)
+            .join(Frame, Frame.frame_id == DetectionRunFrame.frame_id)
             .outerjoin(InstrumentUnit, InstrumentUnit.instrument_unit_id == Frame.instrument_unit_id)
+            .where(DetectionRun.run_kind == SOURCE_DETECTION_RUN)
             .order_by(SourceDetection.source_detection_id)
             .offset(args.offset)
             .limit(args.limit)
         )
         if args.frame_id is not None:
-            stmt = stmt.where(SourceDetection.frame_id == args.frame_id)
+            stmt = stmt.where(DetectionRunFrame.frame_id == args.frame_id)
         if args.instrument:
             stmt = stmt.where(Frame.instrument == args.instrument)
         if args.instrument_unit_id is not None:
             stmt = stmt.where(Frame.instrument_unit_id == args.instrument_unit_id)
         rows = []
-        if args.calibration_name:
-            stmt = stmt.where(CalibrationVersion.name == args.calibration_name)
-        if args.instrument_unit_id is not None:
-            stmt = stmt.where(InstrumentUnit.instrument_unit_id == int(args.instrument_unit_id))
-
         for row in session.execute(stmt).all():
             d = dict(row._mapping)
             d["date_obs"] = _format_dt(d.get("date_obs"))
             for key, nd in (("x", 3), ("y", 3), ("ra_deg", 8), ("dec_deg", 8), ("peak_adu", 3), ("flux", 3), ("snr", 3), ("local_background", 3)):
                 d[key] = _round_float(d.get(key), nd)
             rows.append(d)
-        if args.offset:
-            rows = rows[int(args.offset):]
-        if args.limit is not None:
-            rows = rows[: int(args.limit)]
     columns = [
-        "source_detection_id",
-        "frame_id",
-        "instrument",
-        "tube",
-        "camera",
-        "filter_name",
-        "frame_object",
-        "date_obs",
-        "x",
-        "y",
-        "ra_deg",
-        "dec_deg",
-        "peak_adu",
-        "flux",
-        "snr",
-        "local_background",
-        "detection_status",
-        "algorithm",
+        "source_detection_id", "frame_id", "instrument", "tube", "camera", "filter_name",
+        "frame_object", "date_obs", "x", "y", "ra_deg", "dec_deg", "peak_adu", "flux",
+        "snr", "local_background", "detection_status", "algorithm",
     ]
     _print_rows(rows, columns, args.format)
     return 0
-
 
 def cmd_query_gaia_for_frames(args: argparse.Namespace) -> int:
     from grandgousier.catalogs.gaia_query import query_gaia_for_frames
@@ -5177,7 +8635,7 @@ def cmd_query_gaia_for_frames(args: argparse.Namespace) -> int:
     print(
         "Gaia query result: "
         f"catalog_name={result.catalog_name}, query_mode={result.query_mode}, selected_frames={result.selected_frames}, "
-        f"queried_frames={result.queried_frames}, queried_cones={result.queried_cones}, read_rows={result.read_rows}, "
+        f"queried_frames={result.queried_frames}, queried_cones={result.queried_cones}, effective_query_mode={result.effective_query_mode}, row_limit_reached_cones={result.row_limit_reached_cones}, read_rows={result.read_rows}, "
         f"inserted_or_updated={result.inserted_or_updated}, linked={result.linked}, "
         f"skipped_missing_file={result.skipped_missing_file}, skipped_oversized_cones={result.skipped_oversized_cones}, failed_frames={result.failed_frames}, "
         f"failed_footprint_reasons={result.failed_footprint_reasons}, "
@@ -5243,7 +8701,8 @@ def cmd_cleanup_duplicate_detection_matches(args: argparse.Namespace) -> int:
 
 def cmd_source_catalog_match_summary(args: argparse.Namespace) -> int:
     from sqlalchemy import func, select
-    from grandgousier.db.models import DetectionCatalogMatch, Frame, InstrumentUnit
+    from grandgousier.db.detection_runs import CATALOG_MATCH_RUN
+    from grandgousier.db.models import DetectionCatalogMatch, DetectionRun, DetectionRunFrame, Frame, InstrumentUnit
 
     Session = make_session_factory(args.database_url)
     with Session() as session:
@@ -5256,8 +8715,8 @@ def cmd_source_catalog_match_summary(args: argparse.Namespace) -> int:
                 InstrumentUnit.camera,
                 InstrumentUnit.filter_name,
                 InstrumentUnit.observing_mode,
-                DetectionCatalogMatch.catalog_name,
-                DetectionCatalogMatch.algorithm,
+                DetectionRun.catalog_name.label("catalog_name"),
+                DetectionRun.algorithm.label("algorithm"),
                 func.count(DetectionCatalogMatch.detection_catalog_match_id).label("n_matches"),
                 func.avg(DetectionCatalogMatch.sep_arcsec).label("sep_mean_arcsec"),
                 func.min(DetectionCatalogMatch.sep_arcsec).label("sep_min_arcsec"),
@@ -5265,31 +8724,23 @@ def cmd_source_catalog_match_summary(args: argparse.Namespace) -> int:
                 func.avg(DetectionCatalogMatch.zero_point).label("zp_mean"),
             )
             .select_from(DetectionCatalogMatch)
-            .join(Frame, Frame.frame_id == DetectionCatalogMatch.frame_id)
+            .join(DetectionRunFrame, DetectionRunFrame.detection_run_frame_id == DetectionCatalogMatch.detection_run_frame_id)
+            .join(DetectionRun, DetectionRun.detection_run_id == DetectionRunFrame.detection_run_id)
+            .join(Frame, Frame.frame_id == DetectionRunFrame.frame_id)
             .outerjoin(InstrumentUnit, InstrumentUnit.instrument_unit_id == Frame.instrument_unit_id)
+            .where(DetectionRun.run_kind == CATALOG_MATCH_RUN)
             .group_by(
-                InstrumentUnit.instrument_unit_id,
-                InstrumentUnit.instrument,
-                InstrumentUnit.site,
-                InstrumentUnit.tube,
-                InstrumentUnit.camera,
-                InstrumentUnit.filter_name,
-                InstrumentUnit.observing_mode,
-                DetectionCatalogMatch.catalog_name,
-                DetectionCatalogMatch.algorithm,
+                InstrumentUnit.instrument_unit_id, InstrumentUnit.instrument, InstrumentUnit.site,
+                InstrumentUnit.tube, InstrumentUnit.camera, InstrumentUnit.filter_name,
+                InstrumentUnit.observing_mode, DetectionRun.catalog_name, DetectionRun.algorithm,
             )
-            .order_by(InstrumentUnit.instrument_unit_id, DetectionCatalogMatch.catalog_name)
+            .order_by(InstrumentUnit.instrument_unit_id, DetectionRun.catalog_name)
         )
         if args.catalog_name:
-            stmt = stmt.where(DetectionCatalogMatch.catalog_name == args.catalog_name)
+            stmt = stmt.where(DetectionRun.catalog_name == args.catalog_name)
         if args.instrument_unit_id is not None:
             stmt = stmt.where(Frame.instrument_unit_id == args.instrument_unit_id)
         rows = []
-        if args.calibration_name:
-            stmt = stmt.where(CalibrationVersion.name == args.calibration_name)
-        if args.instrument_unit_id is not None:
-            stmt = stmt.where(InstrumentUnit.instrument_unit_id == int(args.instrument_unit_id))
-
         for row in session.execute(stmt).all():
             d = dict(row._mapping)
             for key in ("sep_mean_arcsec", "sep_min_arcsec", "sep_max_arcsec"):
@@ -5301,42 +8752,34 @@ def cmd_source_catalog_match_summary(args: argparse.Namespace) -> int:
         if args.limit is not None:
             rows = rows[: int(args.limit)]
     columns = [
-        "instrument_unit_id",
-        "instrument",
-        "site",
-        "tube",
-        "camera",
-        "filter_name",
-        "observing_mode",
-        "catalog_name",
-        "algorithm",
-        "n_matches",
-        "sep_mean_arcsec",
-        "sep_min_arcsec",
-        "sep_max_arcsec",
-        "zp_mean",
+        "instrument_unit_id", "instrument", "site", "tube", "camera", "filter_name",
+        "observing_mode", "catalog_name", "algorithm", "n_matches", "sep_mean_arcsec",
+        "sep_min_arcsec", "sep_max_arcsec", "zp_mean",
     ]
     _print_rows(rows, columns, args.format)
     return 0
 
-
 def cmd_show_source_catalog_matches(args: argparse.Namespace) -> int:
     from sqlalchemy import select
-    from grandgousier.db.models import CatalogSource, DetectionCatalogMatch, Frame, InstrumentUnit, SourceDetection
+    from grandgousier.db.detection_runs import CATALOG_MATCH_RUN
+    from grandgousier.db.models import (
+        CatalogSource, DetectionCatalogMatch, DetectionRun, DetectionRunFrame,
+        Frame, InstrumentUnit, SourceDetection,
+    )
 
     Session = make_session_factory(args.database_url)
     with Session() as session:
         stmt = (
             select(
                 DetectionCatalogMatch.detection_catalog_match_id,
-                DetectionCatalogMatch.frame_id,
+                DetectionRunFrame.frame_id.label("frame_id"),
                 InstrumentUnit.instrument,
                 InstrumentUnit.tube,
                 InstrumentUnit.camera,
                 InstrumentUnit.filter_name,
                 Frame.object_name.label("frame_object"),
                 Frame.date_obs,
-                DetectionCatalogMatch.catalog_name,
+                DetectionRun.catalog_name.label("catalog_name"),
                 CatalogSource.source_id,
                 SourceDetection.x.label("det_x"),
                 SourceDetection.y.label("det_y"),
@@ -5350,73 +8793,39 @@ def cmd_show_source_catalog_matches(args: argparse.Namespace) -> int:
                 DetectionCatalogMatch.match_status,
             )
             .select_from(DetectionCatalogMatch)
-            .join(Frame, Frame.frame_id == DetectionCatalogMatch.frame_id)
+            .join(DetectionRunFrame, DetectionRunFrame.detection_run_frame_id == DetectionCatalogMatch.detection_run_frame_id)
+            .join(DetectionRun, DetectionRun.detection_run_id == DetectionRunFrame.detection_run_id)
+            .join(Frame, Frame.frame_id == DetectionRunFrame.frame_id)
             .join(SourceDetection, SourceDetection.source_detection_id == DetectionCatalogMatch.source_detection_id)
             .join(CatalogSource, CatalogSource.catalog_source_id == DetectionCatalogMatch.catalog_source_id)
             .outerjoin(InstrumentUnit, InstrumentUnit.instrument_unit_id == Frame.instrument_unit_id)
+            .where(DetectionRun.run_kind == CATALOG_MATCH_RUN)
             .order_by(DetectionCatalogMatch.detection_catalog_match_id)
             .offset(args.offset)
             .limit(args.limit)
         )
         if args.catalog_name:
-            stmt = stmt.where(DetectionCatalogMatch.catalog_name == args.catalog_name)
+            stmt = stmt.where(DetectionRun.catalog_name == args.catalog_name)
         if args.frame_id is not None:
-            stmt = stmt.where(DetectionCatalogMatch.frame_id == args.frame_id)
+            stmt = stmt.where(DetectionRunFrame.frame_id == args.frame_id)
         if args.instrument:
             stmt = stmt.where(Frame.instrument == args.instrument)
         if args.instrument_unit_id is not None:
             stmt = stmt.where(Frame.instrument_unit_id == args.instrument_unit_id)
         rows = []
-        if args.calibration_name:
-            stmt = stmt.where(CalibrationVersion.name == args.calibration_name)
-        if args.instrument_unit_id is not None:
-            stmt = stmt.where(InstrumentUnit.instrument_unit_id == int(args.instrument_unit_id))
-
         for row in session.execute(stmt).all():
             d = dict(row._mapping)
             d["date_obs"] = _format_dt(d.get("date_obs"))
-            for key, nd in (
-                ("det_x", 3),
-                ("det_y", 3),
-                ("dx_pix", 4),
-                ("dy_pix", 4),
-                ("sep_arcsec", 4),
-                ("snr", 3),
-                ("detection_mag_inst", 5),
-                ("catalog_mag", 5),
-                ("zero_point", 5),
-            ):
+            for key, nd in (("det_x", 3), ("det_y", 3), ("dx_pix", 4), ("dy_pix", 4), ("sep_arcsec", 4), ("snr", 3), ("detection_mag_inst", 5), ("catalog_mag", 5), ("zero_point", 5)):
                 d[key] = _round_float(d.get(key), nd)
             rows.append(d)
-        if args.offset:
-            rows = rows[int(args.offset):]
-        if args.limit is not None:
-            rows = rows[: int(args.limit)]
     columns = [
-        "detection_catalog_match_id",
-        "frame_id",
-        "instrument",
-        "tube",
-        "camera",
-        "filter_name",
-        "frame_object",
-        "date_obs",
-        "catalog_name",
-        "source_id",
-        "det_x",
-        "det_y",
-        "dx_pix",
-        "dy_pix",
-        "sep_arcsec",
-        "snr",
-        "detection_mag_inst",
-        "catalog_mag",
-        "zero_point",
-        "match_status",
+        "detection_catalog_match_id", "frame_id", "instrument", "tube", "camera", "filter_name",
+        "frame_object", "date_obs", "catalog_name", "source_id", "det_x", "det_y", "dx_pix",
+        "dy_pix", "sep_arcsec", "snr", "detection_mag_inst", "catalog_mag", "zero_point", "match_status",
     ]
     _print_rows(rows, columns, args.format)
     return 0
-
 
 def cmd_frame_qc_summary(args: argparse.Namespace) -> int:
     from sqlalchemy import select
@@ -5808,7 +9217,7 @@ def _add_science_lc_scope_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--frame-id", type=int, action="append", default=[], help="Explicit frame_id; may be repeated")
     parser.add_argument("--object-qc-algorithm", default="object_qc_v1", help="object_qc.algorithm")
-    parser.add_argument("--offset-algorithm", default="interseries_median_v1", help="interseries_calibration_offsets.algorithm")
+    parser.add_argument("--offset-algorithm", default="interseries_graph_median_v1", help="Immutable interseries generation analysis_algorithm")
     parser.add_argument(
         "--reject-flag",
         action="append",
@@ -5846,11 +9255,12 @@ def _median_float(values: list[float]) -> float | None:
 
 def cmd_db_summary(args: argparse.Namespace) -> int:
     from sqlalchemy import func, select
-    from grandgousier.db.models import CatalogSource, DetectionCatalogMatch, Frame, FrameCatalogLink, FrameQc, InstrumentUnit, ProcessingEvent, Object, ObjectQc, Measurement, CalibrationVersion, SourceDetection
+    from grandgousier.db.models import CatalogSource, DetectionCatalogMatch, DetectionRun, DetectionRunFrame, Frame, FrameCatalogLink, FrameQc, InstrumentUnit, Observation, ProcessingEvent, Object, ObjectQc, Measurement, CalibrationVersion, SourceDetection
 
     Session = make_session_factory(args.database_url)
     with Session() as session:
         n_frames = session.scalar(select(func.count(Frame.frame_id)))
+        n_observations = session.scalar(select(func.count(Observation.observation_id)))
         n_events = session.scalar(select(func.count(ProcessingEvent.event_id)))
         n_units = session.scalar(select(func.count(InstrumentUnit.instrument_unit_id)))
         n_catalog_sources = session.scalar(select(func.count(CatalogSource.catalog_source_id)))
@@ -5858,6 +9268,8 @@ def cmd_db_summary(args: argparse.Namespace) -> int:
         n_objects = session.scalar(select(func.count(Object.object_id)))
         n_measurements = session.scalar(select(func.count(Measurement.measurement_id)))
         n_calibration_versions = session.scalar(select(func.count(CalibrationVersion.calibration_version_id)))
+        n_detection_runs = session.scalar(select(func.count(DetectionRun.detection_run_id)))
+        n_detection_run_frames = session.scalar(select(func.count(DetectionRunFrame.detection_run_frame_id)))
         n_source_detections = session.scalar(select(func.count(SourceDetection.source_detection_id)))
         n_detection_catalog_matches = session.scalar(select(func.count(DetectionCatalogMatch.detection_catalog_match_id)))
         n_frame_qc = session.scalar(select(func.count(FrameQc.frame_qc_id)))
@@ -5869,12 +9281,15 @@ def cmd_db_summary(args: argparse.Namespace) -> int:
             select(Frame.wcs_status, func.count(Frame.frame_id)).group_by(Frame.wcs_status)
         ).all()
     print(f"frames={n_frames}")
+    print(f"observations={n_observations}")
     print(f"instrument_units={n_units}")
     print(f"catalog_sources={n_catalog_sources}")
     print(f"frame_catalog_links={n_frame_catalog_links}")
     print(f"objects={n_objects}")
     print(f"measurements={n_measurements}")
     print(f"calibration_versions={n_calibration_versions}")
+    print(f"detection_runs={n_detection_runs}")
+    print(f"detection_run_frames={n_detection_run_frames}")
     print(f"source_detections={n_source_detections}")
     print(f"detection_catalog_matches={n_detection_catalog_matches}")
     print(f"frame_qc={n_frame_qc}")
@@ -5890,9 +9305,24 @@ def cmd_db_summary(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    settings = get_settings()
+    from grandgousier.config import application_settings_mapping, read_config_file
+    from grandgousier.exit_codes import USAGE
+
     parser = build_parser()
     args = parser.parse_args(argv)
+    config_file = getattr(args, "config_file", None)
+    try:
+        settings = get_settings(config_file=config_file)
+        explicit_config = (
+            application_settings_mapping(read_config_file(config_file))
+            if config_file is not None
+            else {}
+        )
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return USAGE
+    if args.database_url is None and explicit_config.get("database_url"):
+        args.database_url = explicit_config["database_url"]
     configure_logging(args.log_level or settings.log_level)
     return args.func(args)
 

@@ -7,8 +7,11 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Iterable
 
-from sqlalchemy import bindparam, text
+from sqlalchemy import bindparam, select, text
 from sqlalchemy.orm import Session
+
+from grandgousier.db.models import CalibrationVersion, Object
+from grandgousier.photometry.calibration_view import load_calibration_photometry_view
 
 from grandgousier.lightcurves.product import (
     export_science_light_curve_csv,
@@ -75,6 +78,7 @@ class TargetLightCurveProduct:
     mag_rms: float | None = None
     mag_mad: float | None = None
     mag_err_median: float | None = None
+    mag_err_systematic_median: float | None = None
     mag_min: float | None = None
     mag_max: float | None = None
     peak_to_peak: float | None = None
@@ -95,6 +99,7 @@ class TargetLightCurveProduct:
             "mag_rms": self.mag_rms,
             "mag_mad": self.mag_mad,
             "mag_err_median": self.mag_err_median,
+            "mag_err_systematic_median": self.mag_err_systematic_median,
             "mag_min": self.mag_min,
             "mag_max": self.mag_max,
             "peak_to_peak": self.peak_to_peak,
@@ -116,30 +121,46 @@ def resolve_target_object(
     target_object_id: int | None = None,
     max_sep_arcsec: float | None = 120.0,
 ) -> TargetResolution:
-    """Resolve the science target object for a field-series run.
+    """Resolve the science target through the storage-independent photometry view."""
 
-    Explicit ``target_object_id`` wins.  Explicit ``target_source_id`` is matched
-    through measurement provenance.  Without explicit IDs the function assumes a
-    pointed-series target and selects the measured catalog object closest to the
-    mean frame centre.  This keeps target light-curve export independent of the
-    variable-candidate RMS threshold.
-    """
+    if (
+        target_object_id is None
+        and not target_source_id
+        and max_sep_arcsec is not None
+        and float(max_sep_arcsec) < 0
+    ):
+        return TargetResolution(
+            resolved=False,
+            catalog_name=catalog_name,
+            method="disabled",
+            reason="target resolution disabled by negative max_sep_arcsec",
+        )
 
-    cv_id = session.execute(
-        text("SELECT calibration_version_id FROM calibration_versions WHERE name = :name"),
-        {"name": calibration_name},
-    ).scalar()
-    if cv_id is None:
-        return TargetResolution(resolved=False, method="calibration_name", reason=f"calibration not found: {calibration_name}")
+    cv = session.scalar(
+        select(CalibrationVersion).where(CalibrationVersion.name == str(calibration_name))
+    )
+    if cv is None:
+        return TargetResolution(
+            resolved=False,
+            method="calibration_name",
+            reason=f"calibration not found: {calibration_name}",
+        )
+
+    view = load_calibration_photometry_view(
+        session,
+        calibration_version_id=int(cv.calibration_version_id),
+        frame_ids=frame_ids,
+        prefer_science=True,
+    )
+    filtered = [
+        row
+        for row in view.rows
+        if not catalog_name or (row.flags or {}).get("catalog_name") == catalog_name
+    ]
+    identities = _identity_rows_from_photometry_view(session, filtered)
 
     if target_object_id is not None:
-        row = _load_object_measurement_row(
-            session,
-            calibration_version_id=int(cv_id),
-            object_id=int(target_object_id),
-            catalog_name=catalog_name,
-            frame_ids=frame_ids,
-        )
+        row = identities.get(int(target_object_id))
         if row is None:
             return TargetResolution(
                 resolved=False,
@@ -148,17 +169,18 @@ def resolve_target_object(
                 method="target_object_id",
                 reason="target object has no measurements in selected calibration/frame set",
             )
+        row = dict(row)
+        row["sep_arcsec"] = 0.0
         return _resolution_from_row(row, method="target_object_id")
 
     if target_source_id:
-        row = _load_source_measurement_row(
-            session,
-            calibration_version_id=int(cv_id),
-            source_id=str(target_source_id),
-            catalog_name=catalog_name,
-            frame_ids=frame_ids,
-        )
-        if row is None:
+        matches = [
+            row
+            for row in identities.values()
+            if str(row.get("source_id") or "") == str(target_source_id)
+        ]
+        matches.sort(key=lambda row: (-int(row.get("n_measurements") or 0), int(row["object_id"])))
+        if not matches:
             return TargetResolution(
                 resolved=False,
                 source_id=str(target_source_id),
@@ -166,6 +188,8 @@ def resolve_target_object(
                 method="target_source_id",
                 reason="target source_id has no measurements in selected calibration/frame set",
             )
+        row = dict(matches[0])
+        row["sep_arcsec"] = 0.0
         return _resolution_from_row(row, method="target_source_id")
 
     target_center = _mean_frame_center(session, frame_ids=frame_ids)
@@ -177,15 +201,24 @@ def resolve_target_object(
             reason="selected frames do not have usable RA/Dec centres",
         )
     target_ra, target_dec = target_center
-    row = _load_nearest_measurement_row(
-        session,
-        calibration_version_id=int(cv_id),
-        target_ra_deg=target_ra,
-        target_dec_deg=target_dec,
-        catalog_name=catalog_name,
-        frame_ids=frame_ids,
+    candidates: list[dict[str, Any]] = []
+    cos_dec = math.cos(math.radians(float(target_dec)))
+    for item in identities.values():
+        if not _is_finite(item.get("ra_deg")) or not _is_finite(item.get("dec_deg")):
+            continue
+        dra = (float(item["ra_deg"]) - float(target_ra)) * cos_dec
+        ddec = float(item["dec_deg"]) - float(target_dec)
+        row = dict(item)
+        row["sep_arcsec"] = math.hypot(dra, ddec) * 3600.0
+        candidates.append(row)
+    candidates.sort(
+        key=lambda row: (
+            float(row["sep_arcsec"]),
+            -int(row.get("n_measurements") or 0),
+            int(row["object_id"]),
+        )
     )
-    if row is None:
+    if not candidates:
         return TargetResolution(
             resolved=False,
             catalog_name=catalog_name,
@@ -194,10 +227,15 @@ def resolve_target_object(
             method="nearest_to_frame_center",
             reason="no measured catalog object is available for target resolution",
         )
-    res = _resolution_from_row(row, method="nearest_to_frame_center")
+
+    res = _resolution_from_row(candidates[0], method="nearest_to_frame_center")
     res.target_ra_deg = target_ra
     res.target_dec_deg = target_dec
-    if max_sep_arcsec is not None and res.sep_arcsec is not None and float(res.sep_arcsec) > float(max_sep_arcsec):
+    if (
+        max_sep_arcsec is not None
+        and res.sep_arcsec is not None
+        and float(res.sep_arcsec) > float(max_sep_arcsec)
+    ):
         return TargetResolution(
             resolved=False,
             catalog_name=catalog_name or res.catalog_name,
@@ -214,6 +252,89 @@ def resolve_target_object(
             nearest_n_measurements=res.n_measurements,
         )
     return res
+
+
+def _identity_rows_from_photometry_view(
+    session: Session, rows: Iterable[Any]
+) -> dict[int, dict[str, Any]]:
+    rows = list(rows)
+    object_ids = sorted({int(row.object_id) for row in rows})
+    objects = {
+        int(obj.object_id): obj
+        for obj in session.scalars(select(Object).where(Object.object_id.in_(object_ids))).all()
+    } if object_ids else {}
+    grouped: dict[int, dict[str, Any]] = {}
+    frames_by_object: dict[int, set[int]] = {}
+    for measurement in rows:
+        object_id = int(measurement.object_id)
+        obj = objects.get(object_id)
+        if obj is None:
+            continue
+        flags = measurement.flags if isinstance(measurement.flags, dict) else {}
+        item = grouped.setdefault(
+            object_id,
+            {
+                "object_id": object_id,
+                "ra_deg": obj.ra_deg,
+                "dec_deg": obj.dec_deg,
+                "catalog_name": flags.get("catalog_name"),
+                "source_id": flags.get("source_id"),
+                "catalog_source_id": _int_or_none(flags.get("catalog_source_id")),
+                "n_measurements": 0,
+            },
+        )
+        if item.get("source_id") is None and flags.get("source_id") is not None:
+            item["source_id"] = flags.get("source_id")
+        if item.get("catalog_source_id") is None:
+            item["catalog_source_id"] = _int_or_none(flags.get("catalog_source_id"))
+        frames_by_object.setdefault(object_id, set()).add(int(measurement.frame_id))
+    for object_id, frame_set in frames_by_object.items():
+        grouped[object_id]["n_measurements"] = len(frame_set)
+    return grouped
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None and str(value).strip() else None
+    except (TypeError, ValueError):
+        return None
+
+
+def cleanup_target_light_curve_artifacts(
+    *,
+    out_dir: str | Path | None,
+    calibration_prefix: str,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Remove target products that are not valid for the current pipeline run.
+
+    Target files live in the series output root rather than an atomically replaced
+    subdirectory.  A rerun with target export disabled or with an unresolved target
+    must therefore delete earlier CSV/JSON/PNG products explicitly.
+    """
+
+    paths: list[Path] = []
+    if out_dir:
+        root = Path(out_dir)
+        stem = f"{calibration_prefix}_target_light_curve"
+        paths = [root / f"{stem}{suffix}" for suffix in (".csv", ".json", ".png")]
+
+    existing = [path for path in paths if path.exists()]
+    removed: list[str] = []
+    if not dry_run:
+        for path in existing:
+            path.unlink()
+            removed.append(str(path))
+
+    return {
+        "out_dir": str(out_dir) if out_dir else None,
+        "calibration_prefix": calibration_prefix,
+        "dry_run": bool(dry_run),
+        "candidate_paths": [str(path) for path in paths],
+        "existing_artifacts": len(existing),
+        "removed_artifacts": len(existing) if not dry_run else 0,
+        "removed_paths": removed,
+    }
 
 
 def export_target_light_curve_product(
@@ -257,13 +378,15 @@ def export_target_light_curve_product(
     product.rows_accepted = sum(1 for r in rows if not r.get("is_rejected"))
     product.rows_rejected = sum(1 for r in rows if r.get("is_rejected"))
     mags = [float(r["mag_global"]) for r in rows if _is_finite(r.get("mag_global"))]
-    errs = [float(r["mag_global_err"]) for r in rows if _is_finite(r.get("mag_global_err"))]
+    errs = [float(r["mag_global_err_random"]) for r in rows if _is_finite(r.get("mag_global_err_random"))]
+    systematic_errs = [float(r["mag_global_err_systematic"]) for r in rows if _is_finite(r.get("mag_global_err_systematic"))]
     mjds = [float(r["mjd"]) for r in rows if _is_finite(r.get("mjd"))]
     product.mag_median = _median(mags)
     product.mag_mean = _mean(mags)
     product.mag_rms = _sample_rms(mags)
     product.mag_mad = _mad(mags)
     product.mag_err_median = _median(errs)
+    product.mag_err_systematic_median = _median(systematic_errs)
     product.mag_min = min(mags) if mags else None
     product.mag_max = max(mags) if mags else None
     product.peak_to_peak = (max(mags) - min(mags)) if mags else None

@@ -1,3 +1,7 @@
+from types import SimpleNamespace
+
+import pytest
+
 from grandgousier.quality import candidate_triage as ct
 from grandgousier.quality.lightcurve_quality import ObjectScatterRow
 
@@ -139,3 +143,108 @@ def test_low_amplitude_intrinsic_channel_selects_clean_bklyn_like_object(monkeyp
     assert result.summary["intrinsic_variability_candidates"] == 0
     assert result.summary["low_amplitude_intrinsic_candidates"] == 1
     assert result.summary["low_amplitude_only_candidates"] == 1
+
+
+def test_missing_reference_residual_is_informational_not_rejection():
+    reasons = ct._candidate_rejection_reasons(
+        {"mag_median": 14.7, "abs_mag_ref_delta": None},
+        SimpleNamespace(flags={}),
+        exclude_flagged=False,
+        exclude_crowded=False,
+        exclude_edge=False,
+        exclude_saturated=False,
+        exclude_catalog_outliers=True,
+        reject_aperture_unstable=False,
+        require_detection_support=False,
+        min_nearest_neighbor_arcsec=None,
+        max_mag_median=22.5,
+        max_ref_mag_delta=2.0,
+    )
+
+    assert "NO_REF_MAG_DELTA" not in reasons
+    assert reasons == []
+
+
+def test_low_amplitude_near_threshold_object_is_preserved_as_borderline(monkeypatch):
+    rows = [_row(6751, mag_rms=0.03395, mag_mad=0.02806, mag_err=0.01454, mag_p10=14.65, mag_p90=14.736)]
+    monkeypatch.setattr(ct, "load_object_scatter_rows", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(ct, "build_variable_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ct, "load_object_qc_map", lambda *args, **kwargs: {})
+
+    result = ct.build_candidate_triage(
+        object(),
+        calibration_name="cal_v1",
+        catalog_name="test_catalog",
+        require_detection_support=False,
+        min_measurements=10,
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert row["candidate_status"] == "BORDERLINE"
+    assert row["candidate_origin"] == ""
+    assert row["candidate_diagnostic_class"] == "BORDERLINE_LOW_AMPLITUDE"
+    assert row["low_amplitude_failed_criteria"] == "mad_over_mag_err"
+    assert row["low_amplitude_mad_over_mag_err_pass"] is False
+    assert row["low_amplitude_rms_over_mag_err_pass"] is True
+    assert row["low_amplitude_robust_peak_to_peak_pass"] is True
+    assert row["low_amplitude_n_measurements_value"] == 70.0
+    assert row["low_amplitude_n_measurements_threshold"] == 30.0
+    assert row["low_amplitude_n_measurements_margin"] == 40.0
+    assert row["low_amplitude_n_measurements_ratio"] == pytest.approx(70.0 / 30.0)
+    assert row["low_amplitude_intrinsic_rms_value"] == pytest.approx(0.03395)
+    assert row["low_amplitude_intrinsic_rms_threshold"] == pytest.approx(0.03)
+    assert row["low_amplitude_intrinsic_rms_pass"] is True
+    assert row["low_amplitude_rms_over_mag_err_value"] == pytest.approx(0.03395 / 0.01454)
+    assert row["low_amplitude_rms_over_mag_err_threshold"] == pytest.approx(2.3)
+    assert row["low_amplitude_mad_over_mag_err_value"] == pytest.approx(0.02806 / 0.01454)
+    assert row["low_amplitude_mad_over_mag_err_threshold"] == pytest.approx(2.0)
+    assert row["low_amplitude_mad_over_mag_err_ratio"] == pytest.approx((0.02806 / 0.01454) / 2.0)
+    assert row["low_amplitude_robust_peak_to_peak_value"] == pytest.approx(0.086)
+    assert row["low_amplitude_robust_peak_to_peak_threshold"] == pytest.approx(0.08)
+    assert 0.9 < row["low_amplitude_min_threshold_ratio"] < 1.0
+    for criterion in ct.LOW_AMPLITUDE_CRITERION_NAMES:
+        for component in ("value", "threshold", "pass", "margin", "ratio"):
+            assert f"low_amplitude_{criterion}_{component}" in ct.LOW_AMPLITUDE_DIAGNOSTIC_COLUMNS
+    assert result.summary["borderline"] == 1
+    assert result.summary["accepted"] == 0
+
+
+def test_two_near_threshold_failures_are_preserved_as_diagnostic(monkeypatch):
+    rows = [
+        _row(
+            6751,
+            mag_rms=0.03363022,
+            mag_mad=0.02813570,
+            mag_err=0.01499514,
+            mag_p10=14.84,
+            mag_p90=14.926,
+        )
+    ]
+    monkeypatch.setattr(ct, "load_object_scatter_rows", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(ct, "build_variable_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ct, "load_object_qc_map", lambda *args, **kwargs: {})
+
+    result = ct.build_candidate_triage(
+        object(),
+        calibration_name="cal_v1",
+        catalog_name="test_catalog",
+        require_detection_support=False,
+        min_measurements=10,
+        diagnostic_max_failed_criteria=2,
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert row["candidate_status"] == "DIAGNOSTIC"
+    assert row["candidate_origin"] == ""
+    assert row["candidate_diagnostic_class"] == "NEAR_THRESHOLD_LOW_AMPLITUDE"
+    assert row["low_amplitude_failed_criteria"] == "rms_over_mag_err,mad_over_mag_err"
+    assert row["low_amplitude_failed_criteria_count"] == 2
+    assert row["low_amplitude_near_threshold"] is True
+    assert row["low_amplitude_borderline"] is False
+    assert row["low_amplitude_min_threshold_ratio"] >= 0.9
+    assert result.summary["near_threshold"] == 1
+    assert result.summary["near_threshold_low_amplitude"] == 1
+    assert result.summary["accepted"] == 0
+    assert result.summary["borderline"] == 0

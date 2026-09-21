@@ -1,0 +1,64 @@
+# Grandgousier 0.5.56+ application configuration.
+# Secrets should normally stay in GRANDGOUSIER_DATABASE_URL rather than this file.
+
+database:
+  # url: postgresql+psycopg://USER:PASSWORD@localhost:5432/grandgousier
+
+logging:
+  level: INFO
+
+paths:
+  processed_root: C:\master\gpx\smoke\processed
+  out_root: reports\field_archive
+
+field_archive:
+  field_id: 33
+  catalog_name: auto_catalog_master_20180907_GPX_TF17_2_mixed
+  instrument_profile: MASTER
+  stage2_recipe: stage3_scale_v1
+  resume: true
+  execute: false
+  plot_max_points: 200
+  stage3_policies:
+    - filter: V
+      min_common: 15
+      reference_series_id: 88
+    - filter: R
+      min_common: 20
+      reference_series_id: 89
+  control_object_ids: [30112, 29786]
+
+# Stage-1 archive-source contract (0.6.1 execution-capable foundation).
+# Source infrastructure remains adapter-specific; derived products are stored separately.
+archives:
+  robophot-local:
+    adapter: fits-filesystem
+    instrument_profile: RoboPhot
+    metadata:
+      backend: fits-headers
+      root: D:\RoboPhot
+      recursive: true
+      science_asset_role: processed
+    assets:
+      backend: filesystem
+      root: D:\RoboPhot
+
+  master-prepared:
+    adapter: master-manifest
+    instrument_profile: MASTER
+    metadata:
+      backend: prepared-inventory
+      manifest: C:\master\gpx\inventory.csv
+      cache_root: C:\master\gpx
+    assets:
+      backend: master-cache
+      cache_root: C:\master\gpx
+      fetch_missing: true
+      # search_roots:
+      #   - C:\master\gpx\smoke
+
+products:
+  backend: filesystem
+  store_id: stage1-default
+  root: C:\grandgousier\products
+

@@ -13,9 +13,11 @@ version: 0.1
 # - ALPHA is stored in hours as a numeric value; do not use it as ra_center with
 #   the current parser, because numeric RA values are interpreted as degrees.
 # - The three TRIP channels should be separated primarily by SERNUM/CAMERA/FILTER.
+# - P4a physical observation identity is SERNUM + DATE-OBS. RoboPhot DATE-OBS is UTC.
+# - FRAMEID/FRAMEUID/UUID aliases below are legacy parser metadata; audited frames had none.
 
 header_aliases:
-  # identifiers / paths
+  # legacy identifiers / paths (not P4a physical observation identity)
   frame_uid: [FRAMEID, FRAMEUID, UUID]
   raw_path: [RAWPATH, FILENAME, FILE]
   calibration_path: [CALPATH, CALIBPATH]
@@ -189,6 +191,18 @@ pixel_scale_arcsec: 0.65
 nominal_gain_e_per_adu: 1.4
 nominal_read_noise_e: 9.0
 
+# Per-epoch random-error budget used by the 0.5.37 physical aperture model.
+# The empirical annulus scatter remains the default floor over the detector
+# prediction, so the gain/read-noise terms are not double-counted. RoboPhot is
+# a 0.60-m telescope at the 290-m Kourovka site; these values activate the
+# small Young-type scintillation term when AIRMASS and EXPTIME are available.
+random_error_model:
+  fractional_flux_floor: 0.0
+  scintillation_enabled: true
+  scintillation_coefficient: 0.09
+  telescope_aperture_m: 0.60
+  site_altitude_m: 290.0
+
 quality_policy:
   saturated_margin_adu: 5000
   max_usable_adu: 60000
@@ -197,3 +211,51 @@ quality_policy:
   max_good_sex_fwhm_arcsec: 5.0
   min_good_sex_n_stars: 20
   max_good_background_adu: null
+
+# Final science-scale calibration. The internal ensemble solution is still used
+# to identify unstable comparison stars; this policy converts the final product
+# to the closest Pan-STARRS reference band. The color term is selected only
+# when it improves the object-level transform significantly; otherwise the
+# final science scale uses a shape-preserving offset-only transform.
+photometric_calibration:
+  enabled: true
+  reference_catalog_name: panstarrs_dr2
+  photometric_system: ps1_ab
+  min_measurements_per_object: 5
+  min_stars_per_frame: 20
+  max_measurement_mag_err: 0.08
+  max_reference_mag_err: 0.05
+  clip_sigma: 4.0
+  n_iterations: 5
+  min_calibrator_objects: 20
+  min_color_span: 0.3
+  max_transform_residual_mad: 0.10
+  max_pivot_color_fraction: 0.25
+  max_shape_metric_delta: 1.0e-10
+  min_color_term_significance: 2.0
+  min_color_model_bic_improvement: 6.0
+  min_color_model_mad_improvement: 0.0
+  filters:
+    g:
+      enabled: true
+      reference_band: g
+      color_index: g-r
+      require_bands: [g, r]
+    r:
+      enabled: true
+      reference_band: r
+      color_index: g-r
+      require_bands: [g, r]
+    i:
+      enabled: true
+      reference_band: i
+      color_index: r-i
+      require_bands: [r, i]
+    B:
+      enabled: false
+    V:
+      enabled: false
+    clear:
+      enabled: false
+    unknown:
+      enabled: false

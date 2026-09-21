@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import csv
+import io
 import math
+import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import requests
 
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
@@ -25,6 +30,7 @@ class GaiaQueryResult:
     selected_frames: int = 0
     queried_frames: int = 0
     queried_cones: int = 0
+    row_limit_reached_cones: int = 0
     read_rows: int = 0
     inserted_or_updated: int = 0
     linked: int = 0
@@ -33,9 +39,143 @@ class GaiaQueryResult:
     skipped_oversized_cones: int = 0
     failed_footprint_reasons: dict[str, int] = field(default_factory=dict)
     sample_failed_footprints: list[dict[str, Any]] = field(default_factory=list)
+    query_provider: str | None = None
+    query_provider_failures: dict[str, str] = field(default_factory=dict)
     dry_run: bool = False
     catalog_name: str = "gaia_dr3"
     query_mode: str = "per_frame"
+    effective_query_mode: str | None = None
+
+
+@dataclass(frozen=True)
+class _GaiaTapProvider:
+    name: str
+    client: Any
+    table_name: str = "gaiadr3.gaia_source"
+
+
+class _StaticTapJob:
+    """Minimal TAP-job compatibility wrapper for an already materialized result."""
+
+    def __init__(self, rows: list["_TapCsvRow"]):
+        self._rows = rows
+
+    def get_results(self) -> list["_TapCsvRow"]:
+        return self._rows
+
+
+class _TapCsvRow(dict):
+    """Mapping row with the ``colnames`` attribute expected by Astropy rows."""
+
+    @property
+    def colnames(self) -> list[str]:
+        return list(self.keys())
+
+
+class _HttpCsvTapClient:
+    """Small synchronous TAP client that requests CSV explicitly.
+
+    ``astroquery.utils.tap.Tap`` currently exposes two platform/service
+    interoperability problems relevant to the clean rebuild: Gaia@AIP can reject
+    its default Accept header with HTTP 406, while the ARI VOTable/BINARY parser
+    can overflow on Windows when a 64-bit Gaia ``source_id`` is decoded through a
+    C ``long``.  The TAP protocol itself is fine.  Requesting CSV over the standard
+    ``/sync`` endpoint avoids both client-side failure modes and keeps ``source_id``
+    as an exact decimal string.
+    """
+
+    def __init__(self, base_url: str, *, timeout_sec: float | None = 120.0):
+        self.base_url = base_url.rstrip("/")
+        self.sync_url = f"{self.base_url}/sync"
+        self.timeout = None if timeout_sec is None else float(timeout_sec)
+
+    def launch_job(self, query: str, maxrec: int | None = None):
+        rows = _tap_sync_csv_query(
+            self.sync_url,
+            query=query,
+            max_rows=maxrec,
+            timeout_sec=self.timeout,
+        )
+        return _StaticTapJob(rows)
+
+
+_NUMERIC_TAP_COLUMNS = {
+    "ra",
+    "dec",
+    "ref_epoch",
+    "pmra",
+    "pmdec",
+    "phot_g_mean_mag",
+    "phot_bp_mean_mag",
+    "phot_rp_mean_mag",
+    "ruwe",
+}
+
+
+def _tap_sync_csv_query(
+    sync_url: str,
+    *,
+    query: str,
+    max_rows: int | None,
+    timeout_sec: float | None,
+) -> list[_TapCsvRow]:
+    payload = {
+        "REQUEST": "doQuery",
+        "LANG": "ADQL",
+        "QUERY": query,
+        "FORMAT": "csv",
+    }
+    if max_rows is not None:
+        payload["MAXREC"] = str(int(max_rows))
+
+    headers = {
+        "Accept": "text/csv, text/plain;q=0.9, */*;q=0.1",
+        "User-Agent": "Grandgousier/0.5.41.4",
+    }
+    response = requests.post(
+        sync_url,
+        data=payload,
+        headers=headers,
+        timeout=timeout_sec,
+    )
+    response.raise_for_status()
+    text = response.content.decode(response.encoding or "utf-8-sig", errors="replace")
+    stripped = text.lstrip()
+    content_type = (response.headers.get("Content-Type") or "").lower()
+    if stripped.startswith("<?xml") or "votable" in content_type or "xml" in content_type:
+        detail = re.sub(r"\s+", " ", stripped)[:500]
+        raise RuntimeError(f"TAP endpoint returned XML instead of CSV: {detail}")
+
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise RuntimeError("TAP CSV response has no header")
+    rows: list[_TapCsvRow] = []
+    for record in reader:
+        row = _TapCsvRow()
+        for key, raw_value in record.items():
+            name = (key or "").strip()
+            value = raw_value.strip() if isinstance(raw_value, str) else raw_value
+            if value in (None, ""):
+                row[name] = None
+            elif name == "source_id":
+                # Keep the 64-bit Gaia identifier out of platform-sized C integer
+                # conversion paths.  Grandgousier stores source_id as text anyway.
+                row[name] = str(value)
+            elif name == "duplicated_source":
+                row[name] = str(value).strip().lower() in {"1", "true", "t", "yes"}
+            elif name in _NUMERIC_TAP_COLUMNS:
+                row[name] = float(value)
+            else:
+                row[name] = value
+        rows.append(row)
+    return rows
+
+
+class _GaiaAllProvidersFailed(RuntimeError):
+    def __init__(self, failures: dict[str, str]):
+        self.failures = dict(failures)
+        details = "; ".join(f"{name}={message}" for name, message in self.failures.items())
+        super().__init__(f"all Gaia TAP providers failed: {details}")
 
 
 def query_gaia_for_frames(
@@ -64,13 +204,7 @@ def query_gaia_for_frames(
     message if the optional dependency is absent.
     """
 
-    try:
-        from astroquery.gaia import Gaia
-    except Exception as exc:  # pragma: no cover - environment dependent
-        raise RuntimeError(
-            "query-gaia-for-frames requires astroquery. Install it with: "
-            "python -m pip install astroquery"
-        ) from exc
+    providers = _build_gaia_tap_providers(gaia_timeout_sec)
 
     if margin_arcmin < 0:
         raise ValueError("margin_arcmin must be non-negative")
@@ -82,9 +216,7 @@ def query_gaia_for_frames(
     if query_mode not in {"per_frame", "frame_union"}:
         raise ValueError("query_mode must be one of: per_frame, frame_union")
 
-    _configure_gaia_timeout(Gaia, gaia_timeout_sec)
-
-    result = GaiaQueryResult(dry_run=dry_run, catalog_name=catalog_name, query_mode=query_mode)
+    result = GaiaQueryResult(dry_run=dry_run, catalog_name=catalog_name, query_mode=query_mode, effective_query_mode=query_mode)
     frames = _select_frames(
         session,
         frame_ids=frame_ids,
@@ -98,7 +230,7 @@ def query_gaia_for_frames(
     if query_mode == "frame_union":
         _query_gaia_for_frame_union(
             session,
-            Gaia,
+            providers,
             frames=frames,
             result=result,
             margin_arcmin=margin_arcmin,
@@ -139,21 +271,27 @@ def query_gaia_for_frames(
                 result.skipped_oversized_cones += 1
                 _record_failed_footprint(result, frame, "oversized_cone")
                 continue
-            table = _query_gaia_cone(
-                Gaia,
+            table, provider_name, provider_failures = _query_gaia_cone(
+                providers,
                 center_ra_deg=center_ra,
                 center_dec_deg=center_dec,
                 radius_deg=radius_deg,
                 mag_limit=mag_limit,
                 max_rows=max_rows_per_frame,
             )
+            _record_query_provider(result, provider_name, provider_failures)
             result.queried_frames += 1
             result.queried_cones += 1
             result.read_rows += len(table)
+            if len(table) >= int(max_rows_per_frame):
+                result.row_limit_reached_cones += 1
             rows = [_gaia_row_to_catalog_source(row, catalog_name=catalog_name) for row in table]
             if rows and not dry_run:
                 _upsert_catalog_sources(session, rows)
                 result.inserted_or_updated += len(rows)
+        except _GaiaAllProvidersFailed as exc:
+            result.query_provider_failures.update(exc.failures)
+            _record_failed_footprint(result, frame, "gaia_query_all_providers_failed")
         except Exception as exc:
             _record_failed_footprint(result, frame, f"exception:{type(exc).__name__}")
 
@@ -180,7 +318,7 @@ def query_gaia_for_frames(
 
 def _query_gaia_for_frame_union(
     session: Session,
-    Gaia,
+    providers: list[_GaiaTapProvider],
     *,
     frames: list[Frame],
     result: GaiaQueryResult,
@@ -206,32 +344,106 @@ def _query_gaia_for_frame_union(
 
     center_ra, center_dec, radius_deg = _combine_cones(cones)
     if max_radius_deg is not None and radius_deg > max_radius_deg:
-        result.skipped_oversized_cones += 1
-        result.failed_frames += len(cones)
-        result.failed_footprint_reasons["oversized_union_cone"] = result.failed_footprint_reasons.get("oversized_union_cone", 0) + len(cones)
+        # A wide multi-night archive can exceed the safety radius even when each
+        # individual full-frame footprint is valid.  Falling back to spatial
+        # clusters preserves the safety guard without exploding into one Gaia
+        # request per frame for repeated pointings.
+        result.effective_query_mode = "frame_clusters"
+        clusters, oversized = _cluster_cones(cones, max_radius_deg=float(max_radius_deg))
+        result.skipped_oversized_cones += len(oversized)
+        result.failed_frames += len(oversized)
+        if oversized:
+            result.failed_footprint_reasons["oversized_individual_cone"] = (
+                result.failed_footprint_reasons.get("oversized_individual_cone", 0) + len(oversized)
+            )
+        for cluster in clusters:
+            _query_gaia_cone_group(
+                session,
+                providers,
+                cones=cluster,
+                result=result,
+                mag_limit=mag_limit,
+                max_rows=max_rows,
+            )
         return
 
+    _query_gaia_cone_group(
+        session,
+        providers,
+        cones=cones,
+        result=result,
+        mag_limit=mag_limit,
+        max_rows=max_rows,
+    )
+
+
+
+def _query_gaia_cone_group(
+    session: Session,
+    providers: list[_GaiaTapProvider],
+    *,
+    cones: list[tuple[float, float, float]],
+    result: GaiaQueryResult,
+    mag_limit: float | None,
+    max_rows: int,
+) -> None:
+    if not cones:
+        return
+    center_ra, center_dec, radius_deg = _combine_cones(cones)
     try:
-        table = _query_gaia_cone(
-            Gaia,
+        table, provider_name, provider_failures = _query_gaia_cone(
+            providers,
             center_ra_deg=center_ra,
             center_dec_deg=center_dec,
             radius_deg=radius_deg,
             mag_limit=mag_limit,
             max_rows=max_rows,
         )
+        _record_query_provider(result, provider_name, provider_failures)
         result.queried_frames += len(cones)
         result.queried_cones += 1
         result.read_rows += len(table)
+        if len(table) >= int(max_rows):
+            result.row_limit_reached_cones += 1
         rows = [_gaia_row_to_catalog_source(row, catalog_name=result.catalog_name) for row in table]
         if rows and not result.dry_run:
             _upsert_catalog_sources(session, rows)
             result.inserted_or_updated += len(rows)
+    except _GaiaAllProvidersFailed as exc:
+        result.query_provider_failures.update(exc.failures)
+        result.failed_frames += len(cones)
+        reason = "gaia_query_all_providers_failed"
+        result.failed_footprint_reasons[reason] = result.failed_footprint_reasons.get(reason, 0) + len(cones)
     except Exception as exc:
         result.failed_frames += len(cones)
         reason = f"gaia_query_exception:{type(exc).__name__}"
         result.failed_footprint_reasons[reason] = result.failed_footprint_reasons.get(reason, 0) + len(cones)
 
+
+def _cluster_cones(
+    cones: list[tuple[float, float, float]], *, max_radius_deg: float
+) -> tuple[list[list[tuple[float, float, float]]], list[tuple[float, float, float]]]:
+    """Greedily group repeated/nearby frame footprints under a safe cone radius."""
+
+    clusters: list[list[tuple[float, float, float]]] = []
+    oversized: list[tuple[float, float, float]] = []
+    for cone in cones:
+        if float(cone[2]) > float(max_radius_deg):
+            oversized.append(cone)
+            continue
+        best_index = None
+        best_radius = None
+        for idx, cluster in enumerate(clusters):
+            candidate = cluster + [cone]
+            _ra, _dec, radius = _combine_cones(candidate)
+            if radius <= max_radius_deg and (best_radius is None or radius < best_radius):
+                best_index = idx
+                best_radius = radius
+        if best_index is None:
+            clusters.append([cone])
+        else:
+            clusters[best_index].append(cone)
+    return clusters, oversized
 
 def _combine_cones(cones: list[tuple[float, float, float]]) -> tuple[float, float, float]:
     if not cones:
@@ -520,11 +732,114 @@ def _frame_cone(path: Path, *, margin_arcmin: float) -> tuple[float, float, floa
     return float(center_ra) % 360.0, float(center_dec), radius_deg
 
 
-def _query_gaia_cone(Gaia, *, center_ra_deg: float, center_dec_deg: float, radius_deg: float, mag_limit: float | None, max_rows: int):
+def _build_gaia_tap_providers(timeout_sec: float | None) -> list[_GaiaTapProvider]:
+    """Build an ordered public Gaia DR3 TAP provider chain.
+
+    Public mirrors are queried through explicit synchronous TAP/CSV requests.
+    This avoids provider/client-specific VOTable problems while preserving the
+    same Gaia DR3 source identifiers and column semantics.  ESAC remains the
+    final astroquery-backed fallback.
+    """
+
+    try:
+        from astroquery.gaia import Gaia
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError(
+            "query-gaia-for-frames requires astroquery. Install it with: "
+            "python -m pip install astroquery"
+        ) from exc
+
+    providers: list[_GaiaTapProvider] = [
+        _GaiaTapProvider(
+            name="gaia_aip_csv",
+            client=_HttpCsvTapClient("https://gaia.aip.de/tap", timeout_sec=timeout_sec),
+        ),
+        _GaiaTapProvider(
+            name="gaia_ari_csv",
+            client=_HttpCsvTapClient("https://gaia.ari.uni-heidelberg.de/tap", timeout_sec=timeout_sec),
+        ),
+    ]
+
+    _configure_gaia_timeout(Gaia, timeout_sec)
+    providers.append(_GaiaTapProvider(name="gaia_esac", client=Gaia))
+    return providers
+
+
+def _record_query_provider(
+    result: GaiaQueryResult,
+    provider_name: str,
+    provider_failures: dict[str, str],
+) -> None:
+    result.query_provider_failures.update(provider_failures)
+    if result.query_provider is None:
+        result.query_provider = provider_name
+    elif result.query_provider != provider_name:
+        result.query_provider = "mixed"
+
+
+def _query_gaia_cone(
+    providers: list[_GaiaTapProvider],
+    *,
+    center_ra_deg: float,
+    center_dec_deg: float,
+    radius_deg: float,
+    mag_limit: float | None,
+    max_rows: int,
+):
+    if not providers:
+        raise RuntimeError("no Gaia TAP providers configured")
+
+    failures: dict[str, str] = {}
+    for provider in providers:
+        query = _build_gaia_cone_adql(
+            table_name=provider.table_name,
+            center_ra_deg=center_ra_deg,
+            center_dec_deg=center_dec_deg,
+            radius_deg=radius_deg,
+            mag_limit=mag_limit,
+            max_rows=max_rows,
+        )
+        try:
+            job = _launch_tap_job(provider.client, query=query, max_rows=max_rows)
+            return job.get_results(), provider.name, failures
+        except Exception as exc:
+            failures[provider.name] = f"{type(exc).__name__}: {exc}"
+
+    raise _GaiaAllProvidersFailed(failures)
+
+
+def _launch_tap_job(client: Any, *, query: str, max_rows: int):
+    """Launch a small public TAP query with broad astroquery compatibility."""
+
+    launch_sync = getattr(client, "launch_job", None)
+    if callable(launch_sync):
+        try:
+            return launch_sync(query, maxrec=max_rows)
+        except TypeError:
+            return launch_sync(query)
+
+    launch_async = getattr(client, "launch_job_async", None)
+    if callable(launch_async):
+        try:
+            return launch_async(query, maxrec=max_rows)
+        except TypeError:
+            return launch_async(query)
+    raise RuntimeError("TAP client exposes neither launch_job nor launch_job_async")
+
+
+def _build_gaia_cone_adql(
+    *,
+    table_name: str,
+    center_ra_deg: float,
+    center_dec_deg: float,
+    radius_deg: float,
+    mag_limit: float | None,
+    max_rows: int,
+) -> str:
     mag_clause = ""
     if mag_limit is not None:
         mag_clause = f"AND phot_g_mean_mag <= {float(mag_limit):.6f}"
-    query = f"""
+    return f"""
         SELECT TOP {int(max_rows)}
             source_id,
             ra,
@@ -537,7 +852,7 @@ def _query_gaia_cone(Gaia, *, center_ra_deg: float, center_dec_deg: float, radiu
             phot_rp_mean_mag,
             ruwe,
             duplicated_source
-        FROM gaiadr3.gaia_source
+        FROM {table_name}
         WHERE 1 = CONTAINS(
             POINT('ICRS', ra, dec),
             CIRCLE('ICRS', {center_ra_deg:.10f}, {center_dec_deg:.10f}, {radius_deg:.10f})
@@ -545,8 +860,6 @@ def _query_gaia_cone(Gaia, *, center_ra_deg: float, center_dec_deg: float, radiu
         {mag_clause}
         ORDER BY phot_g_mean_mag ASC
     """
-    job = Gaia.launch_job_async(query)
-    return job.get_results()
 
 
 def _gaia_row_to_catalog_source(row, *, catalog_name: str) -> dict:

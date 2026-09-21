@@ -1,0 +1,36 @@
+\documentclass[12pt,a4paper]{book}
+
+\input{preamble}
+\input{version}
+
+\title{Grandgousier\\Пользовательское руководство}
+\author{Проект Grandgousier}
+\date{Состояние руководства: версия \manualversion}
+
+\begin{document}
+
+\frontmatter
+\maketitle
+\tableofcontents
+
+\mainmatter
+\include{chapters/00_quick_start}
+\include{chapters/01_overview}
+\include{chapters/02_installation}
+\include{chapters/03_workflow_model}
+\include{chapters/04_series_photometry}
+\include{chapters/05_cli_workflows}
+\include{chapters/06_products_and_qc}
+\include{chapters/07_batch_processing}
+\include{chapters/08_multiseries_stage}
+\include{chapters/09_raw_reduction_stage}
+\include{chapters/10_troubleshooting}
+\include{chapters/11_python_api}
+\include{chapters/12_service_jobs}
+\include{chapters/13_observation_identity}
+
+\appendix
+\include{chapters/a_commands}
+\include{chapters/b_references}
+
+\end{document}

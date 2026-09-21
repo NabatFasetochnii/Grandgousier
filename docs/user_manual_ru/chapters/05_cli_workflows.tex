@@ -1,0 +1,107 @@
+\chapter{CLI и типовые сценарии}
+
+\section{Главная команда}
+
+Для большинства пользовательских запусков следует начинать с \cli{process-archive-path}. Без \cli{--execute} она выполняет planning/preflight, с \cli{--execute} --- записывает результаты и запускает pipeline.
+
+\begin{lstlisting}
+python -m grandgousier.cli process-archive-path `
+  --path "D:\archive\series" `
+  --execute `
+  --manifest-out reports\series.json
+\end{lstlisting}
+
+\section{Явный существующий каталог}
+
+Для воспроизводимых повторных запусков можно передавать заранее известный identity catalog:
+
+\begin{lstlisting}
+python -m grandgousier.cli process-archive-path `
+  --path "D:\archive\series" `
+  --execute `
+  --catalog-name "existing_catalog_name"
+\end{lstlisting}
+
+Пустой explicit catalog считается precondition error, если пользователь явно не разрешил отладочный режим пустого каталога.
+
+\section{Selective rerun существующей series}
+
+Начиная с 0.5.45.1 \cli{process-archive-path} может повторно запускать только явно выбранную
+существующую series, не перестраивая field-series grouping и не перезапуская соседние series из
+того же каталога:
+
+\begin{lstlisting}
+python -m grandgousier.cli process-archive-path `
+  --path "D:\archive\night" `
+  --execute `
+  --series-id 78 `
+  --catalog-name "existing_catalog_name" `
+  --ensemble-min-ref-stars-per-frame 20
+\end{lstlisting}
+
+Параметр \cli{--series-id} можно повторять. В selective mode программа проверяет, что каждая
+запрошенная series действительно содержит кадры, найденные под \cli{--path}; иначе запуск
+останавливается с \path{FAILED_PRECONDITION_SERIES_SELECTION}. Новые series в этом режиме
+не создаются. Default conventional ensemble threshold остаётся 30; меньшее значение следует
+задавать только по диагностически подтверждённой причине.
+
+\section{Color calibration}
+
+\begin{lstlisting}
+--enable-color-calibration
+\end{lstlisting}
+
+При штатной политике reference photometry программа может автоматически получить недостающее покрытие внешнего каталога. Для полностью локального запуска используйте соответствующий запрет automatic reference fetch.
+
+\section{Candidate-excluded ensemble}
+
+Режим до сходимости:
+
+\begin{lstlisting}
+--exclude-candidates-from-ensemble `
+--candidate-ensemble-until-converged `
+--candidate-ensemble-convergence-max-iterations 10 `
+--candidate-ensemble-growth-policy initial_only
+\end{lstlisting}
+
+Политика \cli{initial\_only} фиксирует исходный exclusion set и не позволяет новым diagnostics каскадно расширять reference exclusions.
+
+
+\section{Удалённый MASTER archive: discovery, download и reduction}
+
+Stage~1A отделяет поиск удалённых наблюдений от реальной передачи файлов. Discovery поддерживает \cli{auto|postgres|http}; HTTPS mode предназначен в том числе для рабочих станций, которым MASTER PostgreSQL закрыт через \cli{pg\_hba.conf}. Начиная с 0.5.41.7 HTTPS discovery использует штатный параметр \cli{coord2000} веб-интерфейса и локально уточняет область до запрошенного \cli{--radius-deg}; допустимый радиус для HTTPS сейчас не больше $0.95^\circ$. Сначала создайте inventory:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-search `
+  --search-transport http `
+  --http-user "googlov" `
+  --ra 327.60625 `
+  --dec 72.1686111 `
+  --radius-deg 0.8 `
+  --out "C:\master\gpx\inventory.csv"
+\end{lstlisting}
+
+Затем проверьте download plan без \cli{--execute}:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-fetch `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --out-root "C:\master\gpx"
+\end{lstlisting}
+
+Для реального transfer добавьте \cli{--execute}. Dark/flat дедуплицируются по remote path, существующие файлы по умолчанию не перезаписываются, а пароль HTTP Basic Auth запрашивается скрытым prompt или читается из environment.
+
+
+После загрузки сначала проверьте Stage~1B plan:
+
+\begin{lstlisting}
+python -m grandgousier.cli master-archive-reduce `
+  --manifest "C:\master\gpx\inventory.csv" `
+  --cache-root "C:\master\gpx"
+\end{lstlisting}
+
+Для записи processed FITS добавьте \cli{--execute}. По умолчанию результаты появляются в \cli{<cache-root>/processed/YYYY/MM/DD/<raw\_id>\_processed.fits}; одновременно пишется \cli{master\_reduction\_report.csv}. Редуктор не масштабирует SDARK по экспозиции и не перенормирует SFLAT: несовместимые calibration frames считаются precondition error.
+
+\section{Диагностические параметры}
+
+Performance/diagnostic flags предназначены для проверки алгоритма и обычно не нужны в массовом production-run. Их следует включать только при исследовании конкретной стадии и затем возвращаться к обычной команде.

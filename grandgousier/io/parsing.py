@@ -29,6 +29,26 @@ def to_int(value: Any) -> int | None:
 def parse_datetime(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
+
+    # Canonical Stage-1 records serialize normalized UTC datetimes with an
+    # explicit ISO-8601 offset (for example ``+00:00``).  Astropy's ``isot``
+    # parser does not accept that suffix, so handle standard Python ISO forms
+    # first and normalize them back to UTC.  Naive ISO values retain the
+    # historical Grandgousier rule: interpret them as UTC.
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value).strip()
+        iso_raw = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+        try:
+            parsed = datetime.fromisoformat(iso_raw)
+        except Exception:
+            parsed = None
+    if parsed is not None:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
     try:
         t = Time(value, format="isot", scale="utc")
         return t.to_datetime(timezone=timezone.utc)

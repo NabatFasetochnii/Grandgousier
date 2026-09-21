@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
+from statistics import median
 
 from grandgousier.calibration.preliminary import LightcurveRow
 
@@ -18,6 +19,9 @@ class LightcurvePlotResult:
     inverted_y: bool
     x_offset: float | None = None
     time_warning: str | None = None
+    time_axis_mode: str | None = None
+    n_time_breaks: int = 0
+    plot_style: str | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +171,305 @@ def export_lightcurve_plot(
         x_offset=x_offset,
         time_warning=time_warning,
     )
+
+
+def export_global_lightcurve_plot(
+    rows: Sequence[dict],
+    path: str | Path,
+    *,
+    title: str | None = None,
+    dpi: int = 160,
+    figsize: tuple[float, float] = (9.2, 5.2),
+    reduction_mode: str = "raw",
+    time_axis_mode: str = "auto",
+) -> LightcurvePlotResult:
+    """Plot an M5 globally calibrated light curve.
+
+    Rows are expected to be exact M5 points or plot-only time bins with
+    ``mjd``, ``mag_global`` and ``series_id``. Error bars intentionally use
+    only the random/bin component. ``mag_err_series_zp`` remains a correlated
+    series-level uncertainty and is not drawn as if it were independent noise.
+
+    ``time_axis_mode=auto`` preserves time inside observing blocks but shortens
+    large empty gaps between non-overlapping series. Break marks make that
+    non-linear time axis explicit; the scientific CSV and plot-data CSV retain
+    the original MJD values.
+    """
+
+    rows_list = [dict(row) for row in rows]
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    finite_rows = [
+        row for row in rows_list
+        if _is_finite(row.get("mjd")) and _is_finite(row.get("mag_global"))
+    ]
+    if not finite_rows:
+        raise ValueError("No finite M5 plot points")
+
+    time_axis_mode = str(time_axis_mode).lower()
+    if time_axis_mode not in {"auto", "continuous", "compressed"}:
+        raise ValueError("time_axis_mode must be one of: auto, continuous, compressed")
+    axis = _build_global_time_axis(finite_rows, requested_mode=time_axis_mode)
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "matplotlib is required for M5 global light-curve plots. "
+            "Install it with: python -m pip install matplotlib"
+        ) from exc
+
+    fig, ax = plt.subplots(figsize=figsize)
+    grouped: dict[int, list[tuple[dict, float]]] = {}
+    for row, plot_x in zip(finite_rows, axis["x_values"], strict=False):
+        grouped.setdefault(int(row.get("series_id") or -1), []).append((row, float(plot_x)))
+    archive_overview = len(grouped) > 12
+
+    for series_id, group in sorted(grouped.items()):
+        group.sort(key=lambda item: float(item[0]["mjd"]))
+        xs = [plot_x for _row, plot_x in group]
+        ys = [float(row["mag_global"]) for row, _plot_x in group]
+        errors = [
+            float(row["mag_err_random"]) if _is_finite(row.get("mag_err_random")) else None
+            for row, _plot_x in group
+        ]
+        label = f"series {series_id}" if series_id >= 0 else "series unknown"
+        style_kwargs = {"color": "C0", "alpha": 0.82} if archive_overview else {}
+        if all(error is not None and error >= 0 for error in errors):
+            ax.errorbar(
+                xs,
+                ys,
+                yerr=[float(error) for error in errors],
+                marker="o" if reduction_mode == "bin" else ".",
+                linestyle="-" if reduction_mode == "bin" else "none",
+                capsize=2 if reduction_mode == "bin" else 0,
+                label="_nolegend_" if archive_overview else label,
+                **style_kwargs,
+            )
+        else:
+            ax.plot(
+                xs,
+                ys,
+                marker="o" if reduction_mode == "bin" else ".",
+                linestyle="-" if reduction_mode == "bin" else "none",
+                label="_nolegend_" if archive_overview else label,
+                **style_kwargs,
+            )
+
+        if reduction_mode == "bin":
+            for x_value, (row, _plot_x) in zip(xs, group, strict=False):
+                lo = row.get("mag_min")
+                hi = row.get("mag_max")
+                if _is_finite(lo) and _is_finite(hi) and float(hi) > float(lo):
+                    vline_kwargs = {"color": "C0"} if archive_overview else {}
+                    ax.vlines(
+                        x_value, float(lo), float(hi), alpha=0.25, linewidth=0.8, **vline_kwargs
+                    )
+
+    if axis["mode"] == "compressed":
+        break_positions = list(axis["break_positions"])
+        dense_breaks = len(break_positions) > 8
+        ax.set_xlabel(
+            "MJD (large gaps compressed; dotted lines mark time breaks)"
+            if dense_breaks
+            else "MJD (large gaps compressed; // marks time breaks)"
+        )
+        if axis["tick_positions"]:
+            ax.set_xticks(axis["tick_positions"])
+            ax.set_xticklabels(axis["tick_labels"], fontsize=8)
+        slash_positions = break_positions
+        if dense_breaks:
+            n_marks = min(6, len(break_positions))
+            indexes = sorted({round(i * (len(break_positions) - 1) / max(1, n_marks - 1)) for i in range(n_marks)})
+            slash_positions = [break_positions[index] for index in indexes]
+        for break_x in break_positions:
+            ax.axvline(float(break_x), linestyle=":", linewidth=0.8, alpha=0.18)
+        for break_x in slash_positions:
+            ax.text(
+                float(break_x),
+                0.006,
+                "//",
+                transform=ax.get_xaxis_transform(),
+                ha="center",
+                va="bottom",
+                fontsize=10,
+                clip_on=False,
+            )
+    else:
+        ax.set_xlabel(f"MJD - {axis['x_offset']:.0f}")
+
+    ax.set_ylabel("Global calibrated magnitude")
+    ax.grid(True, alpha=0.3)
+    ax.invert_yaxis()
+    ax.set_title(title or "M5 global object light curve")
+    if not archive_overview:
+        ax.legend(fontsize=8, ncol=2 if len(grouped) > 6 else 1)
+    note_x, note_y, note_va, note_ha = (0.99, 0.99, "top", "right") if axis["mode"] == "compressed" else (0.01, 0.01, "bottom", "left")
+    ax.text(
+        note_x,
+        note_y,
+        "Error bars: random/bin component only; M4 series ZP uncertainty is correlated.",
+        transform=ax.transAxes,
+        va=note_va,
+        ha=note_ha,
+        fontsize=8,
+        alpha=0.75,
+    )
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi)
+    plt.close(fig)
+
+    return LightcurvePlotResult(
+        output_path=str(path),
+        n_rows=len(rows_list),
+        n_points=len(finite_rows),
+        x_key="mjd_compressed" if axis["mode"] == "compressed" else "mjd_zero",
+        y_key="mag_global",
+        inverted_y=True,
+        x_offset=float(axis["x_offset"]),
+        time_warning=(
+            "Large empty time gaps are compressed for display only."
+            if axis["mode"] == "compressed" else None
+        ),
+        time_axis_mode=str(axis["mode"]),
+        n_time_breaks=len(axis["break_positions"]),
+        plot_style="archive_overview" if archive_overview else "series_detailed",
+    )
+
+
+def _build_global_time_axis(rows: Sequence[dict], *, requested_mode: str = "auto") -> dict[str, object]:
+    """Return a display-only MJD transform with optional large-gap compression.
+
+    Time differences *inside* each contiguous observing block are unchanged.
+    Only empty gaps between non-overlapping series intervals can be shortened.
+    The return value is intentionally simple so it can be regression-tested
+    without Matplotlib.
+    """
+
+    if not rows:
+        raise ValueError("No rows for M5 time-axis mapping")
+    requested_mode = str(requested_mode).lower()
+    if requested_mode not in {"auto", "continuous", "compressed"}:
+        raise ValueError("requested_mode must be one of: auto, continuous, compressed")
+
+    mjds = [float(row["mjd"]) for row in rows if _is_finite(row.get("mjd"))]
+    if not mjds:
+        raise ValueError("No finite MJD values for M5 time-axis mapping")
+    x_offset = float(math.floor(min(mjds)))
+    if requested_mode == "continuous":
+        return {
+            "mode": "continuous",
+            "x_values": [float(row["mjd"]) - x_offset for row in rows],
+            "x_offset": x_offset,
+            "break_positions": [],
+            "tick_positions": [],
+            "tick_labels": [],
+            "compressed_gap_minutes": None,
+        }
+
+    by_series: dict[int, list[float]] = {}
+    for row in rows:
+        if not _is_finite(row.get("mjd")):
+            continue
+        by_series.setdefault(int(row.get("series_id") or -1), []).append(float(row["mjd"]))
+    intervals = [
+        (min(values), max(values), series_id)
+        for series_id, values in by_series.items()
+        if values
+    ]
+    intervals.sort(key=lambda item: (item[0], item[1], item[2]))
+    if len(intervals) <= 1:
+        return {
+            "mode": "continuous",
+            "x_values": [float(row["mjd"]) - x_offset for row in rows],
+            "x_offset": x_offset,
+            "break_positions": [],
+            "tick_positions": [],
+            "tick_labels": [],
+            "compressed_gap_minutes": None,
+        }
+
+    positive_spans = [end - start for start, end, _sid in intervals if end > start]
+    typical_span = median(positive_spans) if positive_spans else 10.0 / 1440.0
+    target_gap = min(max(float(typical_span) * 0.12, 2.0 / 1440.0), 30.0 / 1440.0)
+    auto_threshold = max(target_gap * 1.5, 10.0 / 1440.0)
+
+    breaks: list[dict[str, float]] = []
+    cumulative_removed = 0.0
+    current_end = float(intervals[0][1])
+    for start, end, _series_id in intervals[1:]:
+        start = float(start)
+        end = float(end)
+        gap = start - current_end
+        threshold = target_gap if requested_mode == "compressed" else auto_threshold
+        if gap > threshold:
+            display_gap = min(gap, target_gap)
+            removed = gap - display_gap
+            left_display = current_end - cumulative_removed - x_offset
+            cumulative_removed += removed
+            right_display = start - cumulative_removed - x_offset
+            breaks.append({
+                "actual_right_start": start,
+                "removed": removed,
+                "cumulative_removed": cumulative_removed,
+                "display_mid": (left_display + right_display) / 2.0,
+            })
+        current_end = max(current_end, end)
+
+    if not breaks:
+        return {
+            "mode": "continuous",
+            "x_values": [float(row["mjd"]) - x_offset for row in rows],
+            "x_offset": x_offset,
+            "break_positions": [],
+            "tick_positions": [],
+            "tick_labels": [],
+            "compressed_gap_minutes": target_gap * 1440.0,
+        }
+
+    def map_mjd(value: float) -> float:
+        removed = 0.0
+        for item in breaks:
+            if value >= float(item["actual_right_start"]):
+                removed = float(item["cumulative_removed"])
+            else:
+                break
+        return value - removed - x_offset
+
+    x_values = [map_mjd(float(row["mjd"])) for row in rows]
+
+    # One label per series is useful for small/medium overviews. For very many
+    # series keep at most ten evenly distributed labels to avoid a black axis.
+    selected = intervals
+    max_ticks = 6 if len(intervals) > 12 else 10
+    if len(selected) > max_ticks:
+        idxs = sorted({
+            round(i * (len(selected) - 1) / max(1, max_ticks - 1))
+            for i in range(max_ticks)
+        })
+        selected = [selected[index] for index in idxs]
+    show_series = len(intervals) <= 12
+    tick_positions: list[float] = []
+    tick_labels: list[str] = []
+    for start, end, series_id in selected:
+        midpoint = (float(start) + float(end)) / 2.0
+        tick_positions.append(map_mjd(midpoint))
+        label = f"{midpoint:.2f}"
+        if show_series:
+            label += f"\ns{series_id}"
+        tick_labels.append(label)
+
+    return {
+        "mode": "compressed",
+        "x_values": x_values,
+        "x_offset": x_offset,
+        "break_positions": [float(item["display_mid"]) for item in breaks],
+        "tick_positions": tick_positions,
+        "tick_labels": tick_labels,
+        "compressed_gap_minutes": target_gap * 1440.0,
+    }
 
 
 def _build_x_values(

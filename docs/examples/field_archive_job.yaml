@@ -1,0 +1,18 @@
+processed_root: C:\master\gpx\smoke\processed
+field_id: 33
+catalog_name: auto_catalog_master_20180907_GPX_TF17_2_mixed
+instrument_profile: MASTER
+execute: false
+resume: true
+stage2_recipe: stage3_scale_v1
+stage3_policies:
+  - filter: V
+    min_common: 15
+    reference_series_id: 88
+  - filter: R
+    min_common: 20
+    reference_series_id: 89
+control_object_ids: [30112, 29786]
+exclude_dates: []
+out_root: reports\gpx_tf17_service
+plot_max_points: 200

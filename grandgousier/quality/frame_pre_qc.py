@@ -16,6 +16,8 @@ from grandgousier.photometry.source_detection import _local_maxima
 
 
 PRE_QC_ALGORITHM = "frame_pre_photometry_qc_v1"
+PRE_QC_POLICY_VERSION = "area_scaled_large_detector_v2"
+PRE_QC_REFERENCE_PIXELS = 2048 * 2048
 
 
 @dataclass
@@ -34,6 +36,10 @@ class FramePreQcResult:
     bad_frame_ids: list[int] = field(default_factory=list)
     warning_frame_ids: list[int] = field(default_factory=list)
     sample_bad_frames: list[dict[str, Any]] = field(default_factory=list)
+    # Transient in-process handoff to source detection. This is deliberately
+    # excluded from summary()/Frame.quality_flags so candidate coordinate lists
+    # never become persistent QC payload.
+    detection_seeds: dict[int, dict[str, Any]] = field(default_factory=dict, repr=False)
     dry_run: bool = False
 
     def summary(self) -> dict[str, Any]:
@@ -70,6 +76,7 @@ def run_frame_pre_qc(
     min_finite_fraction: float = 0.95,
     sample_bad_limit: int = 10,
     dry_run: bool = False,
+    capture_detection_seeds: bool = False,
 ) -> FramePreQcResult:
     """Run cheap frame-level QC before expensive forced photometry.
 
@@ -113,7 +120,18 @@ def run_frame_pre_qc(
                 max_bright_fraction=max_bright_fraction,
                 max_saturated_fraction=max_saturated_fraction,
                 min_finite_fraction=min_finite_fraction,
+                capture_detection_seed=capture_detection_seeds,
             )
+            detection_seed = qc.pop("_detection_seed", None)
+            if isinstance(detection_seed, dict):
+                try:
+                    stat = path.stat()
+                    detection_seed["raw_path"] = str(path)
+                    detection_seed["file_size"] = int(stat.st_size)
+                    detection_seed["file_mtime_ns"] = int(stat.st_mtime_ns)
+                except OSError:
+                    pass
+                result.detection_seeds[int(frame.frame_id)] = detection_seed
             flags = dict(qc.get("flags", {}))
             severity = str(qc.get("severity", "OK"))
             if flags.get("DETECTION_CAP_REACHED"):
@@ -161,6 +179,7 @@ def analyze_frame_image(
     max_bright_fraction: float | None,
     max_saturated_fraction: float | None,
     min_finite_fraction: float,
+    capture_detection_seed: bool = False,
 ) -> dict[str, Any]:
     finite = np.isfinite(data)
     n_pix = int(data.size)
@@ -170,6 +189,7 @@ def analyze_frame_image(
     if n_finite < 100:
         return {
             "algorithm": PRE_QC_ALGORITHM,
+            "policy_version": PRE_QC_POLICY_VERSION,
             "severity": "BAD",
             "flags": {"BAD_TOO_FEW_FINITE_PIXELS": True},
             "n_pix": n_pix,
@@ -186,6 +206,7 @@ def analyze_frame_image(
     if not math.isfinite(sigma) or sigma <= 0:
         return {
             "algorithm": PRE_QC_ALGORITHM,
+            "policy_version": PRE_QC_POLICY_VERSION,
             "severity": "BAD",
             "flags": {"BAD_ZERO_BACKGROUND_SCALE": True},
             "n_pix": n_pix,
@@ -206,7 +227,8 @@ def analyze_frame_image(
         flags["BAD_LOW_FINITE_FRACTION"] = True
     if detection_cap_reached:
         flags["DETECTION_CAP_REACHED"] = True
-    if max_local_maxima is not None and n_local_maxima > int(max_local_maxima):
+    max_local_maxima_effective = _effective_max_local_maxima(max_local_maxima, n_pix=n_pix)
+    if max_local_maxima_effective is not None and n_local_maxima > max_local_maxima_effective:
         flags["BAD_EXCESS_DETECTIONS"] = True
     if max_bright_fraction is not None and bright_fraction > float(max_bright_fraction):
         flags["BAD_BACKGROUND_STRUCTURE"] = True
@@ -229,8 +251,9 @@ def analyze_frame_image(
     else:
         severity = "OK"
 
-    return {
+    result = {
         "algorithm": PRE_QC_ALGORITHM,
+        "policy_version": PRE_QC_POLICY_VERSION,
         "severity": severity,
         "flags": flags,
         "n_pix": n_pix,
@@ -246,14 +269,29 @@ def analyze_frame_image(
         "threshold_sigma": float(threshold_sigma),
         "threshold_adu": threshold,
         "n_local_maxima_before_cap": n_local_maxima,
+        "local_maxima_per_mpix": float(n_local_maxima / max(1.0, n_pix / 1_000_000.0)),
+        "max_local_maxima_configured": None if max_local_maxima is None else int(max_local_maxima),
+        "max_local_maxima_effective": max_local_maxima_effective,
         "detection_cap": int(detection_cap),
         "bright_fraction": bright_fraction,
         "saturated_fraction_proxy": saturated_fraction,
     }
+    if capture_detection_seed:
+        # Same threshold and same _local_maxima implementation are used by the
+        # immediately following detection step. Keep the coordinates only in
+        # memory; run_frame_pre_qc removes this private key before persistence.
+        result["_detection_seed"] = {
+            "threshold_sigma": float(threshold_sigma),
+            "background": float(median),
+            "sigma": float(sigma),
+            "threshold": float(threshold),
+            "candidates": tuple((int(y), int(x)) for y, x in local_maxima),
+        }
+    return result
 
 
 def filter_bad_pre_qc_frame_ids(session: Session, frame_ids: list[int]) -> list[int]:
-    """Return frame IDs not marked BAD by frame_pre_photometry_qc_v1."""
+    """Return frame IDs not marked BAD by the current pre-photometry QC algorithm."""
 
     if not frame_ids:
         return []
@@ -266,6 +304,23 @@ def filter_bad_pre_qc_frame_ids(session: Session, frame_ids: list[int]) -> list[
             bad.add(int(frame.frame_id))
     return [int(fid) for fid in frame_ids if int(fid) not in bad]
 
+
+
+def _effective_max_local_maxima(max_local_maxima: int | None, *, n_pix: int) -> int | None:
+    """Scale the excess-detection guard for detectors larger than 2048x2048.
+
+    The historical threshold is preserved exactly for images up to the reference
+    area. Larger detectors get the same allowed local-maximum density rather than
+    being penalized solely for having more pixels.
+    """
+
+    if max_local_maxima is None:
+        return None
+    configured = int(max_local_maxima)
+    if configured < 0:
+        raise ValueError("max_local_maxima must be non-negative when provided")
+    scale = max(1.0, float(max(0, int(n_pix))) / float(PRE_QC_REFERENCE_PIXELS))
+    return int(math.ceil(configured * scale))
 
 def _select_frames(
     session: Session,
@@ -291,6 +346,8 @@ def _compact_qc(qc: dict[str, Any]) -> dict[str, Any]:
         "background_median",
         "background_mad_sigma",
         "n_local_maxima_before_cap",
+        "local_maxima_per_mpix",
+        "max_local_maxima_effective",
         "detection_cap",
         "bright_fraction",
         "finite_fraction",

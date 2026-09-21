@@ -1,0 +1,129 @@
+\chapter{Service/job layer для production-запусков}
+
+Начиная с версии 0.5.51.0 команда \texttt{process-field-archive} проходит через единый service layer \texttt{grandgousier.services}. Научный M8 workflow при этом не дублируется и не переписывается: service layer нормализует runtime-конфигурацию, выполняет readiness checks, удерживает concurrency lock, запускает существующий \texttt{run\_field\_archive\_workflow()} и сохраняет machine-readable job artifacts.
+
+\section{Источники конфигурации}
+
+Для field-archive job используется следующий приоритет:
+
+\begin{enumerate}
+  \item явно переданные CLI/Python overrides;
+  \item YAML/JSON job config;
+  \item environment variables;
+  \item встроенные defaults.
+\end{enumerate}
+
+Прежний CLI остаётся допустимым. Дополнительно можно передать файл:
+
+\begin{lstlisting}
+python -m grandgousier.cli process-field-archive `
+  --job-config docs\examples\field_archive_job.yaml
+\end{lstlisting}
+
+Пример YAML:
+
+\begin{lstlisting}
+processed_root: C:\master\gpx\smoke\processed
+field_id: 33
+catalog_name: auto_catalog_master_20180907_GPX_TF17_2_mixed
+instrument_profile: MASTER
+execute: false
+resume: true
+stage2_recipe: stage3_scale_v1
+stage3_policies:
+  - filter: V
+    min_common: 15
+    reference_series_id: 88
+  - filter: R
+    min_common: 20
+    reference_series_id: 89
+control_object_ids: [30112, 29786]
+exclude_dates: []
+out_root: reports\gpx_tf17_service
+plot_max_points: 200
+\end{lstlisting}
+
+Для plan-only поверх файла, где \texttt{execute: true}, используется явный \texttt{--plan-only}. Для отключения resume используется \texttt{--no-resume}. CLI-значения заменяют соответствующие значения файла.
+
+Поддерживаются environment variables \texttt{GRANDGOUSIER\_FIELD\_ARCHIVE\_*}: \texttt{PROCESSED\_ROOT}, \texttt{FIELD\_ID}, \texttt{CATALOG\_NAME}, \texttt{INSTRUMENT\_PROFILE}, \texttt{EXECUTE}, \texttt{RESUME}, \texttt{STAGE2\_RECIPE}, \texttt{STAGE3\_POLICIES}, \texttt{CONTROL\_OBJECT\_IDS}, \texttt{EXCLUDE\_DATES}, \texttt{INCLUDE\_DATES}, \texttt{OUT\_ROOT}, \texttt{PLOT\_MAX\_POINTS}. URL основной БД по-прежнему задаётся через \texttt{GRANDGOUSIER\_DATABASE\_URL} или глобальный CLI-параметр \texttt{--database-url}.
+
+\section{Readiness preflight}
+
+Перед M8 service layer по умолчанию проверяет:
+
+\begin{itemize}
+  \item существование processed root;
+  \item доступность package-resources выбранного instrument profile;
+  \item доступность CA bundle из \texttt{certifi};
+  \item возможность записи в report root;
+  \item PostgreSQL connection и \texttt{SELECT 1};
+  \item отсутствие pending managed migrations;
+  \item отсутствие checksum drift migration ledger.
+\end{itemize}
+
+Отдельная read-only команда:
+
+\begin{lstlisting}
+python -m grandgousier.cli field-archive-readiness `
+  --processed-root "C:\master\gpx\smoke\processed" `
+  --instrument-profile MASTER `
+  --out-root reports\gpx_tf17_service
+\end{lstlisting}
+
+Readiness никогда не применяет migration автоматически. При \texttt{pending>0} или checksum drift production job не запускается. \texttt{--no-preflight} предназначен только для контролируемой диагностики и тестов; штатный server workflow должен оставлять preflight включённым.
+
+\section{Concurrency lock}
+
+До запуска M8 service layer пытается получить PostgreSQL session-level advisory lock. Scope lock включает \texttt{field\_id}, shared catalog namespace и processed root. Если другой worker уже обрабатывает тот же scope, второй job завершается как \texttt{FAILED\_PRECONDITION} с типом \texttt{FieldArchiveJobLocked}; параллельная вторая реализация Stage~2/M0--M5 не запускается.
+
+Lock не создаёт новых таблиц и не требует migration. Он удерживается отдельным PostgreSQL connection только на время M8 call и освобождается при нормальном завершении или exception.
+
+\section{Job artifacts и статусы}
+
+Каждый invocation получает новый \texttt{job\_id}. В каталоге
+
+\begin{lstlisting}
+<out_root>\_jobs\<job_id>\
+\end{lstlisting}
+
+создаются:
+
+\begin{itemize}
+  \item \texttt{run\_manifest.json} --- версия Grandgousier, Python/platform, plan/execute mode, fingerprint и secret-safe resolved config;
+  \item \texttt{job\_config.json} --- sanitized config и SHA-256 fingerprint; DB URL/пароль не публикуются;
+  \item \texttt{job\_events.jsonl} --- append-only structured events;
+  \item \texttt{job\_summary.json} --- итоговый service result;
+  \item \texttt{diagnosis.json} --- нормализованный recovery code, severity и рекомендуемые действия;
+  \item \texttt{failure.json} --- сохраняется только при readiness/workflow/exception/concurrency failure.
+\end{itemize}
+
+Начиная с 0.5.59.0 этот набор считается \emph{run bundle}. Для его read-only диагностики не требуется подключение к PostgreSQL:
+
+\begin{lstlisting}
+grandgousier diagnose-run reports\field_archive\_jobs\<job_id>
+\end{lstlisting}
+
+Команда принимает также прямой путь к \texttt{job\_summary.json}. Старые job directories до 0.5.59 читаются как legacy bundle: диагностика остаётся доступной, а отсутствующие \texttt{run\_manifest.json}/\texttt{diagnosis.json} явно перечисляются.
+
+Основные service statuses: \texttt{PLANNED}, \texttt{RUNNING}, \texttt{READY}, \texttt{READY\_WITH\_WARNINGS}, \texttt{FAILED\_PRECONDITION}, \texttt{FAILED}, \texttt{INTERRUPTED}. Внутренний M8 status сохраняется отдельно в поле \texttt{workflow} и не подменяется service status.
+
+JSONL содержит события старта job, readiness, acquisition concurrency lock, scan/plan, запуска и завершения Stage~2 batches, Stage~3 scopes, M5 controls, завершения M8 и финального статуса. Existing \texttt{final\_report.json}/\texttt{report.html} M8 продолжают публиковаться в обычном report root. Для совместимости \texttt{process-field-archive --format json} после запуска M8 сохраняет прежний M8 JSON payload; полный service wrapper доступен через \texttt{--format job-json}.
+
+\section{Python service API}
+
+Service layer предназначен для будущего worker/HTTP adapter и может вызываться напрямую:
+
+\begin{lstlisting}[language=Python]
+from grandgousier.services import (
+    FieldArchiveJobConfig,
+    run_field_archive_job,
+)
+
+config = FieldArchiveJobConfig.from_sources(
+    config_file="field_archive_job.yaml",
+)
+result = run_field_archive_job(config)
+print(result.status, result.job_id)
+\end{lstlisting}
+
+Это не создаёт новую научную ветку. Stage~2 recipe, M0--M5 sign/error conventions, M4 immutable persistence и M5 exact linkage остаются реализациями существующих modules. HTTP server, authentication и worker queue в версии \manualversion{} намеренно ещё не добавлены.

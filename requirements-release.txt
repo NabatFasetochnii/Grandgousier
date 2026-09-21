@@ -1,0 +1,5 @@
+# Tooling used to build and validate release artifacts from a source checkout.
+# Install these into the release environment before running tools/release_check.py.
+build>=1.2,<2
+wheel>=0.44,<1
+packaging>=23.2,<27

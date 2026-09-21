@@ -19,3 +19,17 @@
 \ir migrate_mvp5_28_reference_photometry.sql
 \ir migrate_mvp5_30_5_calibration_provenance.sql
 \ir migrate_mvp5_31_0_lightcurve_product.sql
+\ir migrate_mvp5_34_2_measurement_error_components.sql
+\ir migrate_mvp5_38_3_measurement_calibration_index.sql
+\ir migrate_mvp5_39_1_schema_migration_ledger.sql
+\ir migrate_mvp5_39_2_calibration_product_provenance.sql
+
+\ir migrate_mvp5_39_5_calibration_immutable_generations.sql
+\ir migrate_mvp5_39_6_artifact_registry.sql
+\ir migrate_mvp5_39_7_batch_orchestration.sql
+
+\ir migrate_mvp5_40_0_normalized_calibration_terms.sql
+\ir migrate_mvp5_40_2_science_measurements.sql
+\ir migrate_mvp5_40_13_science_measurement_index_cleanup.sql
+\ir migrate_mvp6_4_0_science_photometry_cache.sql
+\ir migrate_mvp6_4_3_science_flag_overrides.sql

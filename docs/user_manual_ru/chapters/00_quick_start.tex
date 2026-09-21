@@ -1,0 +1,209 @@
+\chapter{Быстрый старт}
+
+Этот раздел предназначен для первого запуска уже подготовленной серии FITS. Текущая наиболее отработанная часть \program{} --- фотометрия одной серии наблюдений с последующей калибровкой, контролем качества и публикацией science measurements.
+
+Начиная с 0.6.0 перед source-specific загрузкой доступен единый metadata-only план Stage~1. Он нормализует observation identity и ссылки на assets, но не материализует science pixels и не изменяет БД Grandgousier.
+
+\begin{lstlisting}
+python -m grandgousier.cli stage1-plan `
+  --config grandgousier.yaml `
+  --source robophot-local `
+  --filter i `
+  --out reports\stage1_robophot_plan.json
+\end{lstlisting}
+
+Метод \texttt{materialize()} объекта \texttt{AssetProvider} в этом режиме не вызывается. Derived FITS планируются в отдельном \texttt{ProductStore}, поэтому source archive не обязан хранить calibrated products.
+
+Начиная с 0.6.1.0 проверенный canonical plan можно явно материализовать в ProductStore отдельной командой. В 0.6.1.1 MASTER materialization поддерживает частичный локальный cache: уже имеющиеся assets переиспользуются, а при явном execute догружаются только отсутствующие refs через repository-local transport. Для первого запуска рекомендуется ограничение одним кадром:
+
+\begin{lstlisting}
+python -m grandgousier.cli stage1-execute `
+  --config grandgousier.yaml `
+  --source master-prepared `
+  --limit 1 `
+  --plan-out reports\stage1_execute_plan.json `
+  --report-out reports\stage1_execution.json
+\end{lstlisting}
+
+Команда materialize'ит только требуемые assets, для MASTER вызывает существующий редуктор \texttt{MASTER\_DARK\_FLAT\_V1}, а для уже processed FITS выполняет byte-preserving import. Рядом с каждым новым продуктом создаётся \texttt{*.provenance.json} с SHA-256 входов/выхода и deterministic fingerprint. Повтор идентичного запуска должен вернуть \texttt{SKIPPED\_EXISTING}. Если хотя бы один item canonical plan имеет \texttt{BLOCKED}, частичное выполнение не начинается. Stage~2 и Grandgousier DB этой командой пока не запускаются и не изменяются.
+
+Начиная с 0.6.2.0 следующий шаг выполняется отдельной командой \cli{stage1-handoff}. Она принимает именно execution report, а не каталог ProductStore. По умолчанию handoff read-only: checksum/provenance и FITS identity проверяются, затем существующий P4 guard показывает, какие physical observations уже представлены и какие exact products действительно могут войти в Stage~2.
+
+\begin{lstlisting}
+python -m grandgousier.cli stage1-handoff `
+  --config grandgousier.yaml `
+  --execution-report reports\stage1_execution.json `
+  --report-out reports\stage1_handoff_plan.json
+\end{lstlisting}
+
+Только после проверки preflight добавляется \cli{--execute}. Уже представленный physical observation не создаёт новый \texttt{Frame}; если все products уже представлены, Stage~2 вообще не вызывается и БД не изменяется. Для новых observations Stage~2 получает только exact ProductStore paths из этого execution report; соседние/старые FITS не сканируются.
+
+Если данные находятся только в удалённом архиве MASTER, версия \manualversion{} умеет выполнить полный локальный подготовительный цикл Stage~1: discovery через \cli{master-archive-search}, загрузку raw/header/SDARK/SFLAT через \cli{master-archive-fetch} и первичную редукцию \cli{master-archive-reduce}. Редуктор строит float32 science FITS по формуле $(raw-SDARK)/SFLAT$, переносит точный TAN--SIP WCS из серверного \cli{*\_header.fits} и добавляет компактный uint8 DQ-extension. Перед массовой загрузкой \cli{master-archive-series} позволяет по одному inventory увидеть предварительное разбиение архива на наблюдательные серии по полю, фильтру и временному разрыву. Для ограниченного диска raw можно безопасно удалять после подтверждённого Stage~1B, а processed FITS --- после появления финальных \cli{science\_measurements}; для этого предназначена plan-only по умолчанию команда \cli{master-archive-prune}.
+
+\section{Установка}
+
+Создайте виртуальное окружение Python 3.11 или новее. Для рабочей копии исходников можно использовать editable-установку; для production-проверки рекомендуется собранный wheel:
+
+\begin{lstlisting}
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
+.\.venv\Scripts\python.exe -m pip install -e .
+\end{lstlisting}
+
+Если нужен полный дополнительный набор для photometry/image-reduction, вместо базовой editable-команды можно установить package с extra:
+
+\begin{lstlisting}
+.\.venv\Scripts\python.exe -m pip install -e ".[photometry]"
+\end{lstlisting}
+
+Собранный wheel устанавливается из любого каталога и начиная с версии \manualversion{} уже содержит штатные instrument profiles и SQL migrations; наличие рядом исходных каталогов \texttt{configs/} и \texttt{scripts/} для runtime не требуется.
+
+
+\section{Первичная проверка установки}
+
+Начиная с 0.5.56.0 рекомендуется сразу создать единый application config и выполнить operational preflight:
+
+\begin{lstlisting}
+python -m grandgousier.cli config-example --out grandgousier.yaml
+python -m grandgousier.cli doctor --config grandgousier.yaml
+\end{lstlisting}
+
+Пароль PostgreSQL предпочтительно оставить в переменной окружения \cli{GRANDGOUSIER\_DATABASE\_URL}, а не записывать в YAML. Команда \cli{doctor} проверяет Python, обязательные/дополнительные зависимости, package resources, подключение к БД, migration ledger и настроенные каталоги. Для отсутствующих optional photometry packages по умолчанию выводится warning; режим \cli{--strict-optional} превращает его в ошибку.
+
+После \cli{process-field-archive} версии 0.5.59+ путь \texttt{\_jobs\textbackslash <job\_id>} является переносимым run bundle. Если job завершился нештатно, первым шагом используйте \cli{grandgousier diagnose-run <job-dir>}; команда не меняет БД.
+
+Для уже обработанного поля доступна компактная read-only проверка:
+
+\begin{lstlisting}
+python -m grandgousier.cli status `
+  --config grandgousier.yaml `
+  --field-id 33 `
+  --verbose
+\end{lstlisting}
+
+Она не изменяет БД: выводит Stage~2 recipe readiness и проверяет, что latest immutable M4 generation использует ровно текущий READY source scope.
+
+\section{Подключение к PostgreSQL}
+
+\begin{lstlisting}
+$env:GRANDGOUSIER_DATABASE_URL="postgresql+psycopg://USER:PASSWORD@localhost:5432/grandgousier"
+\end{lstlisting}
+
+Для новой БД создайте полный текущий schema contract и сразу проверьте migration ledger:
+
+\begin{lstlisting}
+python -m grandgousier.cli init-db
+python -m grandgousier.cli schema-status
+\end{lstlisting}
+
+Для уже существующей БД сначала выполните \cli{schema-status}, затем штатный \cli{migrate-db}; для старой pre-ledger БД допускается только явный \cli{migrate-db --adopt-legacy} после структурной проверки. Managed migration runner читает SQL из ресурсов установленного пакета, поэтому source checkout не требуется.
+
+После обновления до 0.5.52.0 существующая БД получает managed migration \texttt{mvp5\_52\_0\_observation\_identity}. После \cli{migrate-db} рекомендуется сначала выполнить read-only plan стабильной physical-observation identity, а запись включать только при \texttt{collisions=0} и \texttt{can\_execute=YES}:
+
+\begin{lstlisting}
+python -m grandgousier.cli backfill-observation-identity `
+  --instrument MASTER `
+  --instrument RoboPhot `
+  --out-root reports\observation_identity_055200
+\end{lstlisting}
+
+После проверки отчёта повторите команду с \cli{--execute}. Эта операция не удаляет frames и не меняет legacy \texttt{frame\_uid}.
+
+Начиная с 0.5.53.0 новая migration не требуется: штатное индексирование MASTER/RoboPhot автоматически создаёт или переиспользует physical observation и заполняет \texttt{frames.observation\_id}. Копия того же FITS в другом пути остаётся отдельным Frame product, но при совместимых physical metadata должна ссылаться на тот же observation.
+
+Начиная с 0.5.54.0 перед созданием новых \texttt{field\_series\_frames} действует observation-level science-input guard. Уже представленный physical observation не создаёт вторую science epoch; несколько ещё не выбранных file products блокируются как неоднозначные, а не ранжируются по пути, mtime или frame ID. Plan-only \cli{process-archive-path} показывает эти решения до записи в БД.
+
+\section{Планирование обработки каталога}
+
+Без \cli{--execute} команда ничего не записывает и показывает план:
+
+\begin{lstlisting}
+python -m grandgousier.cli process-archive-path `
+  --path "D:\archive\field_or_night"
+\end{lstlisting}
+
+\section{Реальная обработка}
+
+\begin{lstlisting}
+python -m grandgousier.cli process-archive-path `
+  --path "D:\archive\field_or_night" `
+  --execute `
+  --manifest-out reports\process_archive_manifest.json
+\end{lstlisting}
+
+Для поддерживаемой абсолютной/цветовой калибровки:
+
+\begin{lstlisting}
+python -m grandgousier.cli process-archive-path `
+  --path "D:\archive\field_or_night" `
+  --execute `
+  --enable-color-calibration `
+  --manifest-out reports\process_archive_color_manifest.json
+\end{lstlisting}
+
+
+\section{Объединённая кривая после Stage 3}
+
+Если для поля уже существуют проверенные immutable M4 generations, версия \manualversion{} может сразу экспортировать единую object-history кривую и построить отдельный график каждого фильтра:
+
+\begin{lstlisting}
+python -m grandgousier.cli export-global-object-light-curve `
+  --object-id 12345 `
+  --field-id 33 `
+  --out-root reports\object_12345_global
+\end{lstlisting}
+
+Если экспорт сообщает 0 accepted points, начиная с 0.5.47.1 summary печатает причины rejection. Для построчного diagnostic CSV добавьте \texttt{--include-rejected-debug}; plots при этом не строятся, пока нет accepted points.
+
+Основной CSV содержит точные Stage~2 \texttt{SCIENCE} points с применённым M4 offset и по умолчанию не подвергается downsampling. Графики используют только accepted points. Если число exact linked source rows до QC больше \texttt{--plot-max-points} (по умолчанию 5000 на фильтр), plot-layer консервативно переходит к временному биннингу. Начиная с 0.5.47.2 этот лимит является жёстким верхним пределом числа plot points на фильтр. По умолчанию \texttt{--plot-time-axis auto} также сжимает большие пустые интервалы между наблюдательными сериями и помечает разрывы \texttt{//}; исходный MJD в CSV не изменяется. Фильтры не смешиваются.
+
+Начиная с 0.5.47.3 M5 не выбрасывает всю series только из-за object-level \texttt{SATURATED\_LIKE}: по умолчанию отвергаются лишь конкретные epochs с measurement flag \texttt{SATURATED\_OR\_NEAR\_SATURATED}. Строгий старый veto можно включить явно через \texttt{--extra-reject-flags SATURATED\_LIKE}.
+
+
+\section{Массовая обработка поля одной командой (M8)}
+
+Начиная с версии \manualversion{} после валидации Stage~2--M5 доступна нативная resumable-оркестрация всего processed-архива одного поля. Команда сама пропускает уже готовые batches, обрабатывает новые/incomplete batches тем же production recipe, проверяет SCIENCE materialization и catalog identity, запускает M0--M4 с явно заданной scientific policy и, при необходимости, M5 control objects.
+
+\begin{lstlisting}
+python -m grandgousier.cli process-field-archive `
+  --processed-root "C:\master\gpx\smoke\processed" `
+  --field-id 33 `
+  --catalog-name "auto_catalog_master_20180907_GPX_TF17_2_mixed" `
+  --stage3-policy "V:15:88" `
+  --stage3-policy "R:20:89" `
+  --control-object-id 30112 `
+  --control-object-id 29786 `
+  --resume `
+  --execute `
+  --out-root reports\gpx_tf17_final
+\end{lstlisting}
+
+Без \texttt{--execute} команда только строит план. Начиная с 0.5.55.0 этот план также проверяет persisted Stage~2 provenance: generic \texttt{DONE} series, созданная несовместимым recipe, не считается готовой для Stage~3 и не перестраивается скрытно. Подробный результат сохраняется в \texttt{stage2\_recipe\_readiness.csv}. Краткий формат policy --- \texttt{FILTER:MIN\_COMMON}; далее опционально задаются \texttt{REFERENCE\_SERIES\_ID} и \texttt{INSTRUMENT\_UNIT\_ID}. В M8 v1 допускается ровно одна policy на filter. Порог \texttt{min\_common\_objects} никогда не снижается автоматически: disconnected M1--M3 graph является blocking gate. Для GPX\_TF17 V=15 --- локально обоснованное исключение из-за series~78; R сохраняет 20.
+
+При \texttt{--resume} READY batches получают \texttt{SKIP\_READY}; новые --- \texttt{RUN\_NEW}; частично завершённые --- \texttt{RESUME\_INCOMPLETE}. Начиная с 0.5.55.0 \texttt{RECIPE\_MISMATCH} и \texttt{MISSING\_PROVENANCE} являются blocking conflict и не превращаются автоматически в resume/rebuild. Начиная с 0.5.54.3 P4-linked alternate Frame products не считаются незавершёнными, если соответствующая physical Observation уже имеет READY representative в этом field; historical не-READY duplicate series не перекрывает существующий READY representative. Начиная с 0.5.48.1 leaf batch, в котором ни одна series-like группа не достигает production-порога \texttt{min\_frames\_per\_series=10}, получает \texttt{SKIP\_TOO\_SMALL} и не запускает Stage~2. Явно опасные/нежелательные даты исключаются через \texttt{--exclude-date}. Leaf batch с FITS более чем одной календарной даты считается неоднозначным и блокирует execute. Итоговый каталог содержит \texttt{final\_report.json}, \texttt{report.html}, CSV по batches, frame-QC, M4 series/edges/offsets и M5 controls. Начиная с 0.5.51.0 перед M8 автоматически выполняется service readiness, удерживается PostgreSQL advisory lock для данного field/catalog/root scope, а machine-readable job metadata записывается в \texttt{<out-root>/\_jobs/<job-id>}. Для deployment-проверки без запуска M8 используйте \texttt{field-archive-readiness}; для повторяемых server jobs можно передавать \texttt{--job-config} с YAML/JSON.
+
+\section{Что считать успешным результатом}
+
+Штатный результат одной серии содержит:
+
+\begin{itemize}
+  \item проиндексированные кадры и идентифицированную серию;
+  \item forced-aperture measurements для рабочего каталога;
+  \item aperture correction, frame zero point и ensemble calibration;
+  \item object/field QC;
+  \item при наличии reference photometry --- абсолютную/цветовую calibration;
+  \item финальную science calibration и таблицу science measurements;
+  \item manifest и связанные диагностические продукты.
+\end{itemize}
+
+Статус \cli{DONE\_WITH\_WARNINGS} не обязательно означает потерю фотометрии: необходимо смотреть \cli{science\_status}, число science points и конкретные warnings в manifest.
+
+\section{Проверка эталонного science baseline}
+
+Для полного окружения с optional photometry/Gaia после \cli{doctor=READY} доступна frozen acceptance-проверка:
+
+\begin{lstlisting}
+grandgousier acceptance-check --dataset gpx_tf17_2 --config grandgousier.yaml
+\end{lstlisting}
+
+Она не запускает повторную обработку и не должна изменять PostgreSQL.

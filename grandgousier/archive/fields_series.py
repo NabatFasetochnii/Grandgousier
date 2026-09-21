@@ -11,6 +11,8 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
+from grandgousier.archive.observation_selection import select_persisted_science_frames
+
 
 @dataclass
 class BuildFieldSeriesResult:
@@ -25,6 +27,8 @@ class BuildFieldSeriesResult:
     updated_series: int = 0
     dry_run: bool = False
     frame_selection_diagnostics: dict[str, Any] = field(default_factory=dict)
+    observation_selection: dict[str, Any] = field(default_factory=dict)
+    observation_selection_rows: list[dict[str, Any]] = field(default_factory=list)
     rows: list[dict[str, Any]] = field(default_factory=list)
 
     def summary(self) -> dict[str, Any]:
@@ -40,6 +44,7 @@ class BuildFieldSeriesResult:
             "updated_series": self.updated_series,
             "dry_run": self.dry_run,
             "frame_selection_diagnostics": self.frame_selection_diagnostics,
+            "observation_selection": self.observation_selection,
         }
 
 
@@ -84,6 +89,24 @@ def build_field_series(
         frame_ids=frame_ids,
         only_unassigned=only_unassigned,
     )
+
+    # Existing field-series membership always wins. Preserve the historical
+    # skipped_already_assigned counter before applying the P4c guard to the
+    # remaining unassigned candidates.
+    result.skipped_already_assigned = sum(1 for frame in frames if frame.get("already_assigned"))
+    unassigned_frames = [frame for frame in frames if not frame.get("already_assigned")]
+    guard_candidates = frames if not only_unassigned else unassigned_frames
+    observation_selection = select_persisted_science_frames(
+        session,
+        [int(frame["frame_id"]) for frame in guard_candidates],
+        allow_reassign_existing_frame=not only_unassigned,
+        lock_observations=not dry_run,
+    )
+    result.observation_selection = dict(observation_selection.summary)
+    result.observation_selection_rows = list(observation_selection.rows)
+    selected_ids = set(observation_selection.selected_frame_ids)
+    frames = [frame for frame in guard_candidates if int(frame["frame_id"]) in selected_ids]
+
     existing_fields = _load_fields(session)
     field_cache = {int(f["field_id"]): dict(f) for f in existing_fields}
 
@@ -91,9 +114,6 @@ def build_field_series(
     frames_by_field: dict[int, list[dict[str, Any]]] = {}
     synthetic_field_id = -1
     for frame in frames:
-        if frame.get("already_assigned"):
-            result.skipped_already_assigned += 1
-            continue
         if frame.get("ra_center_deg") is None or frame.get("dec_center_deg") is None:
             result.skipped_no_center += 1
             continue
@@ -177,6 +197,7 @@ def load_series_selection(session: Session, series_id: int) -> dict[str, Any]:
             SELECT sf.frame_id
             FROM field_series_frames sf
             JOIN frames fr ON fr.frame_id = sf.frame_id
+            JOIN frame_locations fl ON fl.frame_id = fr.frame_id AND fl.is_primary
             WHERE sf.series_id = :series_id
             ORDER BY sf.order_index, fr.mjd, fr.date_obs, fr.frame_id
             """
@@ -422,7 +443,7 @@ def list_series_frames(session: Session, *, series_id: int, limit: int = 200) ->
                 sf.series_id,
                 sf.order_index,
                 fr.frame_id,
-                fr.raw_path,
+                fl.locator AS raw_path,
                 fr.object_name,
                 fr.date_obs,
                 fr.mjd,
@@ -438,6 +459,7 @@ def list_series_frames(session: Session, *, series_id: int, limit: int = 200) ->
                 fr.processing_status
             FROM field_series_frames sf
             JOIN frames fr ON fr.frame_id = sf.frame_id
+            JOIN frame_locations fl ON fl.frame_id = fr.frame_id AND fl.is_primary
             WHERE sf.series_id = :series_id
             ORDER BY sf.order_index, fr.mjd, fr.date_obs, fr.frame_id
             LIMIT :limit
@@ -453,7 +475,7 @@ def _series_status_from_pipeline_status(pipeline_status: str | None) -> str:
     status = (pipeline_status or "UNKNOWN").upper()
     if status == "DONE":
         return "PROCESSED"
-    if status == "FAILED":
+    if status.startswith("FAILED"):
         return "FAILED"
     if status in {"RUNNING", "READY", "PROCESSED"}:
         return status
@@ -749,6 +771,7 @@ def _create_series_group(
         "first_frame_id": first.get("frame_id"),
         "last_frame_id": last.get("frame_id"),
         "frame_ids_sample": [int(f["frame_id"]) for f in frames[:10]],
+        "grouping_method": grouping_method,
     }
     series_uid = _make_series_uid(
         field_id=field_id,
@@ -757,6 +780,7 @@ def _create_series_group(
         mjd_start=min(mjds) if mjds else None,
         mjd_end=max(mjds) if mjds else None,
         frame_ids=[int(f["frame_id"]) for f in frames],
+        grouping_method=grouping_method,
     )
     if dry_run:
         result.created_series += 1
@@ -829,9 +853,8 @@ def _create_series_group(
                 """
                 INSERT INTO field_series_frames (series_id, frame_id, order_index)
                 VALUES (:series_id, :frame_id, :order_index)
-                ON CONFLICT (frame_id) DO UPDATE
-                SET series_id = EXCLUDED.series_id,
-                    order_index = EXCLUDED.order_index
+                ON CONFLICT (series_id, frame_id) DO UPDATE
+                SET order_index = EXCLUDED.order_index
                 """
             ),
             value,
@@ -939,12 +962,14 @@ def _make_series_uid(
     mjd_start: float | None,
     mjd_end: float | None,
     frame_ids: list[int],
+    grouping_method: str,
 ) -> str:
     key = "|".join(
         [
             str(field_id),
             str(instrument_unit_id),
             str(filter_name),
+            str(grouping_method),
             f"{mjd_start:.8f}" if mjd_start is not None else "-",
             f"{mjd_end:.8f}" if mjd_end is not None else "-",
             ",".join(map(str, frame_ids[:3] + frame_ids[-3:])),

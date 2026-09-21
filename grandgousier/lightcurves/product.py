@@ -7,9 +7,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, or_, select, text
 from sqlalchemy.orm import Session
 
+from grandgousier.db.models import (
+    CalibrationVersion,
+    Field,
+    FieldSeries,
+    FieldSeriesFrame,
+    Frame,
+    Measurement,
+    InterseriesCalibrationGeneration,
+    InterseriesCalibrationSeries,
+    ObjectQc,
+)
+from grandgousier.photometry.calibration_view import load_calibration_photometry_view
 from grandgousier.quality.field_report import _calibration_chain_names, _resolve_field_series_filter
 
 DETECTION_SUPPORT_REJECT_FLAGS: tuple[str, ...] = (
@@ -63,8 +75,18 @@ SCIENCE_LIGHT_CURVE_COLUMNS: tuple[str, ...] = (
     "mag_inst",
     "mag_cal",
     "mag_err",
+    "mag_err_random",
+    "mag_err_systematic",
+    "mag_err_detector",
+    "mag_err_epoch_floor",
+    "mag_err_effective_detector_only",
+    "mag_err_effective_total",
+    "mag_err_effective",
+    "residual_noise_floor_applied",
     "mag_global",
     "mag_global_err",
+    "mag_global_err_random",
+    "mag_global_err_systematic",
     "interseries_offset_mag",
     "interseries_offset_err",
     "interseries_offset_status",
@@ -103,6 +125,7 @@ OBJECT_COLUMNS: tuple[str, ...] = (
     "mag_global_rms",
     "mag_global_mad",
     "mag_err_median",
+    "mag_err_systematic_median",
     "filters",
 )
 
@@ -235,10 +258,9 @@ def resolve_light_curve_scope(
     resolved_names = [str(row["name"]) for row in calibration_rows]
     source_chain_names: list[str] = []
     for cv_id in calibration_version_ids:
-        try:
-            source_chain_names.extend(_calibration_chain_names(session, cv_id))
-        except Exception:
-            pass
+        cv = session.get(CalibrationVersion, int(cv_id))
+        if cv is not None:
+            source_chain_names.extend(_calibration_chain_names(session, cv))
     all_names = _unique_strs([*resolved_names, *source_chain_names])
 
     selected_frame_ids: list[int] = []
@@ -290,7 +312,7 @@ def load_science_light_curve_rows(
     field_series_name: str | None = None,
     frame_ids: list[int] | None = None,
     object_qc_algorithm: str = "object_qc_v1",
-    offset_algorithm: str = "interseries_median_v1",
+    offset_algorithm: str = "interseries_graph_median_v1",
     reject_flags: set[str] | None = None,
     exclude_rejected: bool = False,
     limit: int | None = None,
@@ -352,7 +374,7 @@ def build_light_curve_summary(
     field_series_name: str | None = None,
     frame_ids: list[int] | None = None,
     object_qc_algorithm: str = "object_qc_v1",
-    offset_algorithm: str = "interseries_median_v1",
+    offset_algorithm: str = "interseries_graph_median_v1",
     reject_flags: set[str] | None = None,
 ) -> LightCurveSummary:
     scope, rows = load_science_light_curve_rows(
@@ -437,7 +459,7 @@ def list_light_curve_objects(
     field_series_name: str | None = None,
     frame_ids: list[int] | None = None,
     object_qc_algorithm: str = "object_qc_v1",
-    offset_algorithm: str = "interseries_median_v1",
+    offset_algorithm: str = "interseries_graph_median_v1",
     reject_flags: set[str] | None = None,
     min_points: int = 1,
     exclude_rejected: bool = False,
@@ -501,30 +523,32 @@ def _load_calibration_rows(
     calibration_prefixes: list[str],
     model_name: str | None,
 ) -> list[dict[str, Any]]:
-    where = []
-    params: dict[str, Any] = {}
-    if calibration_names:
-        where.append("cv.name = ANY(:calibration_names)")
-        params["calibration_names"] = list(calibration_names)
-    if calibration_prefixes:
-        prefix_terms = []
-        for i, prefix in enumerate(calibration_prefixes):
-            key = f"prefix_{i}"
-            prefix_terms.append(f"cv.name LIKE :{key}")
-            params[key] = f"{prefix}%"
-        where.append("(" + " OR ".join(prefix_terms) + ")")
-    if model_name:
-        where.append("cv.model_name = :model_name")
-        params["model_name"] = model_name
-    sql = """
-        SELECT cv.calibration_version_id, cv.name, cv.model_name, cv.instrument_unit_id
-        FROM calibration_versions cv
-    """
-    if where:
-        sql += " WHERE " + " AND ".join(f"({part})" for part in where)
-    sql += " ORDER BY cv.created_at, cv.calibration_version_id"
-    return [dict(row) for row in session.execute(text(sql), params).mappings().all()]
+    """Load selected calibrations without PostgreSQL array-bind ambiguity.
 
+    Psycopg array adaptation for raw ``ANY(:names)`` binds is driver/type
+    dependent (notably varchar/text arrays).  Use SQLAlchemy expanding ``IN``
+    expressions instead so the ordinary light-curve path behaves identically
+    on PostgreSQL and the SQLite test backend.
+    """
+
+    stmt = select(
+        CalibrationVersion.calibration_version_id.label("calibration_version_id"),
+        CalibrationVersion.name.label("name"),
+        CalibrationVersion.model_name.label("model_name"),
+        CalibrationVersion.instrument_unit_id.label("instrument_unit_id"),
+    )
+    if calibration_names:
+        stmt = stmt.where(CalibrationVersion.name.in_([str(v) for v in calibration_names]))
+    if calibration_prefixes:
+        stmt = stmt.where(
+            or_(
+                *[CalibrationVersion.name.like(f"{str(prefix)}%") for prefix in calibration_prefixes]
+            )
+        )
+    if model_name:
+        stmt = stmt.where(CalibrationVersion.model_name == str(model_name))
+    stmt = stmt.order_by(CalibrationVersion.created_at, CalibrationVersion.calibration_version_id)
+    return [dict(row) for row in session.execute(stmt).mappings().all()]
 
 def _load_raw_light_curve_rows(
     session: Session,
@@ -535,186 +559,218 @@ def _load_raw_light_curve_rows(
     object_qc_algorithm: str,
     offset_algorithm: str,
 ) -> list[dict[str, Any]]:
-    where = ["m.calibration_version_id = ANY(:calibration_version_ids)"]
-    params: dict[str, Any] = {
-        "calibration_version_ids": list(scope.calibration_version_ids),
-        "object_qc_algorithm": object_qc_algorithm,
-        "offset_algorithm": offset_algorithm,
-    }
-    if scope.catalog_name:
-        where.append("m.flags ->> 'catalog_name' = :catalog_name")
-        params["catalog_name"] = scope.catalog_name
-    if source_id is not None:
-        where.append("m.flags ->> 'source_id' = :source_id")
-        params["source_id"] = str(source_id)
-    if object_id is not None:
-        where.append("m.object_id = :object_id")
-        params["object_id"] = int(object_id)
-    if scope.instrument_unit_id is not None:
-        where.append("f.instrument_unit_id = :instrument_unit_id")
-        params["instrument_unit_id"] = int(scope.instrument_unit_id)
-    if scope.selected_frame_ids:
-        where.append("m.frame_id = ANY(:frame_ids)")
-        params["frame_ids"] = list(scope.selected_frame_ids)
-
-    sql = f"""
-        SELECT
-            m.measurement_id,
-            m.object_id,
-            m.frame_id,
-            fsf.series_id,
-            fld.field_name,
-            cv.name AS calibration_name,
-            cv.calibration_version_id,
-            cv.model_name,
-            f.date_obs,
-            f.mjd,
-            f.jd,
-            f.instrument_unit_id,
-            f.instrument,
-            f.site,
-            f.tube,
-            f.camera,
-            f.filter_name,
-            m.x,
-            m.y,
-            m.flux,
-            m.flux_err,
-            m.mag_inst,
-            m.mag_cal,
-            m.mag_err,
-            m.aperture_radius_pix,
-            m.local_background,
-            m.local_zp_correction,
-            m.centroid_dx_pix,
-            m.centroid_dy_pix,
-            m.flags AS measurement_flags,
-            f.quality_flags AS frame_quality_flags,
-            oq.flags AS object_qc_flags,
-            ico.offset_mag AS interseries_offset_mag,
-            ico.offset_err AS interseries_offset_err,
-            ico.status AS interseries_offset_status,
-            ico.algorithm AS interseries_algorithm
-        FROM measurements m
-        JOIN frames f ON f.frame_id = m.frame_id
-        JOIN calibration_versions cv ON cv.calibration_version_id = m.calibration_version_id
-        LEFT JOIN field_series_frames fsf ON fsf.frame_id = f.frame_id
-        LEFT JOIN field_series fs ON fs.series_id = fsf.series_id
-        LEFT JOIN fields fld ON fld.field_id = fs.field_id
-        LEFT JOIN object_qc oq
-            ON oq.object_id = m.object_id
-           AND oq.calibration_version_id = m.calibration_version_id
-           AND oq.algorithm = :object_qc_algorithm
-           AND (oq.catalog_name IS NOT DISTINCT FROM (m.flags ->> 'catalog_name'))
-           AND (oq.instrument_unit_id IS NOT DISTINCT FROM f.instrument_unit_id)
-        LEFT JOIN interseries_calibration_offsets ico
-            ON ico.calibration_version_id = m.calibration_version_id
-           AND ico.series_id IS NOT DISTINCT FROM fsf.series_id
-           AND ico.algorithm = :offset_algorithm
-           AND ico.status IN ('ACTIVE', 'OK')
-        WHERE {' AND '.join(where)}
-        ORDER BY m.object_id, f.mjd NULLS LAST, f.date_obs NULLS LAST, m.frame_id, m.measurement_id
-    """
-    try:
-        return [dict(row) for row in session.execute(text(sql), params).mappings().all()]
-    except Exception as exc:
-        message = str(exc).lower()
-        if "interseries_calibration_offsets" in message and ("does not exist" in message or "undefinedtable" in message):
-            session.rollback()
-            return _load_raw_light_curve_rows_without_offsets(
-                session,
-                scope=scope,
-                source_id=source_id,
-                object_id=object_id,
-                object_qc_algorithm=object_qc_algorithm,
-            )
-        raise
+    # 0.7 has one BASE Measurement layer; every derived/science representation
+    # is consumed through the storage-independent calibration view.
+    return _load_raw_light_curve_rows_virtual(
+        session,
+        scope=scope,
+        source_id=source_id,
+        object_id=object_id,
+        object_qc_algorithm=object_qc_algorithm,
+        offset_algorithm=offset_algorithm,
+    )
 
 
-def _load_raw_light_curve_rows_without_offsets(
+def _load_raw_light_curve_rows_virtual(
     session: Session,
     *,
     scope: LightCurveScope,
     source_id: str | None,
     object_id: int | None,
     object_qc_algorithm: str,
+    offset_algorithm: str,
 ) -> list[dict[str, Any]]:
-    where = ["m.calibration_version_id = ANY(:calibration_version_ids)"]
-    params: dict[str, Any] = {
-        "calibration_version_ids": list(scope.calibration_version_ids),
-        "object_qc_algorithm": object_qc_algorithm,
+    """Build the public light-curve row shape from normalized calibration state."""
+
+    cv_ids = sorted({int(value) for value in scope.calibration_version_ids})
+    cvs = {
+        int(cv.calibration_version_id): cv
+        for cv in session.scalars(
+            select(CalibrationVersion).where(CalibrationVersion.calibration_version_id.in_(cv_ids))
+        ).all()
     }
-    if scope.catalog_name:
-        where.append("m.flags ->> 'catalog_name' = :catalog_name")
-        params["catalog_name"] = scope.catalog_name
-    if source_id is not None:
-        where.append("m.flags ->> 'source_id' = :source_id")
-        params["source_id"] = str(source_id)
-    if object_id is not None:
-        where.append("m.object_id = :object_id")
-        params["object_id"] = int(object_id)
+    object_filter = [int(object_id)] if object_id is not None else None
+    virtual_rows: list[tuple[CalibrationVersion, Any]] = []
+    for cv_id in cv_ids:
+        cv = cvs.get(cv_id)
+        if cv is None:
+            continue
+        view = load_calibration_photometry_view(
+            session,
+            calibration_version_id=cv_id,
+            frame_ids=scope.selected_frame_ids or None,
+            object_ids=object_filter,
+            prefer_science=True,
+            prefer_cache=True,
+        )
+        for row in view.rows:
+            flags = row.flags if isinstance(row.flags, dict) else {}
+            if scope.catalog_name and flags.get("catalog_name") != scope.catalog_name:
+                continue
+            if source_id is not None and str(flags.get("source_id") or "") != str(source_id):
+                continue
+            if object_id is not None and int(row.object_id) != int(object_id):
+                continue
+            virtual_rows.append((cv, row))
+    if not virtual_rows:
+        return []
+
+    frame_ids = sorted({int(row.frame_id) for _cv, row in virtual_rows})
+    frames = {
+        int(frame.frame_id): frame
+        for frame in session.scalars(select(Frame).where(Frame.frame_id.in_(frame_ids))).all()
+    }
     if scope.instrument_unit_id is not None:
-        where.append("f.instrument_unit_id = :instrument_unit_id")
-        params["instrument_unit_id"] = int(scope.instrument_unit_id)
-    if scope.selected_frame_ids:
-        where.append("m.frame_id = ANY(:frame_ids)")
-        params["frame_ids"] = list(scope.selected_frame_ids)
+        virtual_rows = [
+            (cv, row)
+            for cv, row in virtual_rows
+            if (frames.get(int(row.frame_id)) is not None)
+            and frames[int(row.frame_id)].instrument_unit_id == int(scope.instrument_unit_id)
+        ]
+    if not virtual_rows:
+        return []
 
-    sql = f"""
-        SELECT
-            m.measurement_id,
-            m.object_id,
-            m.frame_id,
-            fsf.series_id,
-            fld.field_name,
-            cv.name AS calibration_name,
-            cv.calibration_version_id,
-            cv.model_name,
-            f.date_obs,
-            f.mjd,
-            f.jd,
-            f.instrument_unit_id,
-            f.instrument,
-            f.site,
-            f.tube,
-            f.camera,
-            f.filter_name,
-            m.x,
-            m.y,
-            m.flux,
-            m.flux_err,
-            m.mag_inst,
-            m.mag_cal,
-            m.mag_err,
-            m.aperture_radius_pix,
-            m.local_background,
-            m.local_zp_correction,
-            m.centroid_dx_pix,
-            m.centroid_dy_pix,
-            m.flags AS measurement_flags,
-            f.quality_flags AS frame_quality_flags,
-            oq.flags AS object_qc_flags,
-            NULL::double precision AS interseries_offset_mag,
-            NULL::double precision AS interseries_offset_err,
-            NULL::text AS interseries_offset_status,
-            NULL::text AS interseries_algorithm
-        FROM measurements m
-        JOIN frames f ON f.frame_id = m.frame_id
-        JOIN calibration_versions cv ON cv.calibration_version_id = m.calibration_version_id
-        LEFT JOIN field_series_frames fsf ON fsf.frame_id = f.frame_id
-        LEFT JOIN field_series fs ON fs.series_id = fsf.series_id
-        LEFT JOIN fields fld ON fld.field_id = fs.field_id
-        LEFT JOIN object_qc oq
-            ON oq.object_id = m.object_id
-           AND oq.calibration_version_id = m.calibration_version_id
-           AND oq.algorithm = :object_qc_algorithm
-           AND (oq.catalog_name IS NOT DISTINCT FROM (m.flags ->> 'catalog_name'))
-           AND (oq.instrument_unit_id IS NOT DISTINCT FROM f.instrument_unit_id)
-        WHERE {' AND '.join(where)}
-        ORDER BY m.object_id, f.mjd NULLS LAST, f.date_obs NULLS LAST, m.frame_id, m.measurement_id
+    # A frame may belong to several reproducible grouping definitions in 0.7.
+    # CalibrationVersion.series_id is the authoritative series scope for a
+    # derived product; never infer it from a frame->series dictionary.
+    scoped_series_ids = sorted({
+        int(cv.series_id)
+        for cv, _row in virtual_rows
+        if cv.series_id is not None
+    })
+    series_info: dict[int, tuple[str | None, int]] = {}
+    if scoped_series_ids:
+        for series_id_value, field_name, field_id_value in session.execute(
+            select(FieldSeries.series_id, Field.field_name, Field.field_id)
+            .join(Field, Field.field_id == FieldSeries.field_id)
+            .where(FieldSeries.series_id.in_(scoped_series_ids))
+        ).all():
+            series_info[int(series_id_value)] = (field_name, int(field_id_value))
+
+    object_ids = sorted({int(row.object_id) for _cv, row in virtual_rows})
+    qcs = session.scalars(
+        select(ObjectQc).where(
+            ObjectQc.object_id.in_(object_ids),
+            ObjectQc.calibration_version_id.in_(cv_ids),
+            ObjectQc.algorithm == str(object_qc_algorithm),
+        )
+    ).all()
+    qc_by_key: dict[tuple[int, int, str | None, int | None], ObjectQc] = {}
+    for qc in qcs:
+        key = (
+            int(qc.object_id),
+            int(qc.calibration_version_id) if qc.calibration_version_id is not None else -1,
+            qc.catalog_name,
+            int(qc.instrument_unit_id) if qc.instrument_unit_id is not None else None,
+        )
+        qc_by_key[key] = qc
+
+    offset_sql = """
+        SELECT DISTINCT ON (ics.science_calibration_version_id, ics.series_id)
+            ics.science_calibration_version_id AS calibration_version_id,
+            ics.series_id,
+            ics.offset_mag,
+            ics.offset_err_mag AS offset_err,
+            g.reliability_status AS status,
+            g.analysis_algorithm AS algorithm
+        FROM interseries_calibration_series ics
+        JOIN interseries_calibration_generations g
+          ON g.interseries_generation_id = ics.interseries_generation_id
+        WHERE ics.science_calibration_version_id IN :cv_ids
+          AND g.lifecycle_status = 'COMPLETE_IMMUTABLE'
     """
-    return [dict(row) for row in session.execute(text(sql), params).mappings().all()]
+    offset_params: dict[str, Any] = {"cv_ids": cv_ids}
+    if offset_algorithm:
+        offset_sql += " AND g.analysis_algorithm = :algorithm"
+        offset_params["algorithm"] = str(offset_algorithm)
+    offset_sql += """
+        ORDER BY ics.science_calibration_version_id, ics.series_id,
+                 g.created_at DESC, g.interseries_generation_id DESC
+    """
+    offset_stmt = text(offset_sql).bindparams(bindparam("cv_ids", expanding=True))
+    offset_rows = session.execute(offset_stmt, offset_params).mappings().all()
+    offsets_by_key = {
+        (int(value["calibration_version_id"]), int(value["series_id"])): value
+        for value in offset_rows
+    }
 
+    result: list[dict[str, Any]] = []
+    for cv, measurement in virtual_rows:
+        frame = frames.get(int(measurement.frame_id))
+        if frame is None:
+            continue
+        flags = dict(measurement.flags or {})
+        series_id_value = (
+            int(cv.series_id)
+            if cv.series_id is not None
+            else (int(scope.series_id) if scope.series_id is not None else None)
+        )
+        field_name = series_info.get(series_id_value, (None, -1))[0] if series_id_value is not None else None
+        qc = qc_by_key.get(
+            (
+                int(measurement.object_id),
+                int(cv.calibration_version_id),
+                flags.get("catalog_name"),
+                int(frame.instrument_unit_id) if frame.instrument_unit_id is not None else None,
+            )
+        )
+        offset = (
+            offsets_by_key.get((int(cv.calibration_version_id), int(series_id_value)))
+            if series_id_value is not None
+            else None
+        )
+        result.append(
+            {
+                "measurement_id": measurement.measurement_id or measurement.base_measurement_id,
+                "object_id": int(measurement.object_id),
+                "frame_id": int(measurement.frame_id),
+                "series_id": series_id_value,
+                "field_name": field_name,
+                "calibration_name": str(cv.name),
+                "calibration_version_id": int(cv.calibration_version_id),
+                "model_name": cv.model_name,
+                "date_obs": frame.date_obs,
+                "mjd": frame.mjd,
+                "jd": frame.jd,
+                "instrument_unit_id": frame.instrument_unit_id,
+                "instrument": frame.instrument,
+                "site": frame.site,
+                "tube": frame.tube,
+                "camera": frame.camera,
+                "filter_name": frame.filter_name,
+                "x": measurement.x,
+                "y": measurement.y,
+                "flux": measurement.flux,
+                "flux_err": measurement.flux_err,
+                "mag_inst": measurement.mag_inst,
+                "mag_cal": measurement.mag_cal,
+                "mag_err": measurement.mag_err,
+                "mag_err_random": measurement.mag_err_random,
+                "mag_err_systematic": measurement.mag_err_systematic,
+                "aperture_radius_pix": measurement.aperture_radius_pix,
+                "local_background": measurement.local_background,
+                "local_zp_correction": measurement.local_zp_correction,
+                "centroid_dx_pix": measurement.centroid_dx_pix,
+                "centroid_dy_pix": measurement.centroid_dy_pix,
+                "measurement_flags": flags,
+                "frame_quality_flags": dict(frame.quality_flags or {}),
+                "object_qc_flags": dict(qc.flags or {}) if qc is not None else {},
+                "interseries_offset_mag": offset["offset_mag"] if offset is not None else None,
+                "interseries_offset_err": offset["offset_err"] if offset is not None else None,
+                "interseries_offset_status": offset["status"] if offset is not None else None,
+                "interseries_algorithm": offset["algorithm"] if offset is not None else None,
+            }
+        )
+    result.sort(
+        key=lambda row: (
+            int(row["object_id"]),
+            float(row["mjd"]) if row.get("mjd") is not None else float("inf"),
+            str(row.get("date_obs") or ""),
+            int(row["frame_id"]),
+            int(row.get("measurement_id") or 0),
+        )
+    )
+    return result
 
 def _science_row_from_db(row: dict[str, Any], *, reject_flags: set[str]) -> dict[str, Any]:
     measurement_flags = _dict_or_empty(row.get("measurement_flags"))
@@ -725,17 +781,44 @@ def _science_row_from_db(row: dict[str, Any], *, reject_flags: set[str]) -> dict
         object_qc_flags=object_flags,
         frame_quality_flags=frame_flags,
     )
+    random_err = row.get("mag_err_random") if row.get("mag_err_random") is not None else row.get("mag_err")
+    systematic_err = row.get("mag_err_systematic")
+    detector_err = measurement_flags.get("mag_err_detector")
+    if not _is_finite(detector_err):
+        detector_err = random_err
+    epoch_floor_err = measurement_flags.get("mag_err_epoch_floor")
+    effective_detector_only_err = measurement_flags.get("mag_err_effective_detector_only")
+    if (
+        not _is_finite(effective_detector_only_err)
+        and _is_finite(detector_err)
+        and _is_finite(epoch_floor_err)
+    ):
+        effective_detector_only_err = math.hypot(
+            float(detector_err), float(epoch_floor_err)
+        )
+    effective_total_err = measurement_flags.get("mag_err_effective_total")
+    if (
+        not _is_finite(effective_total_err)
+        and _is_finite(random_err)
+        and _is_finite(epoch_floor_err)
+    ):
+        effective_total_err = math.hypot(float(random_err), float(epoch_floor_err))
+    effective_err = effective_total_err
+    if not _is_finite(effective_err):
+        effective_err = measurement_flags.get("mag_err_effective")
     is_rejected, reject_reasons = evaluate_rejection(
         quality_flags=quality_flags,
         mag=row.get("mag_cal"),
-        mag_err=row.get("mag_err"),
+        mag_err=random_err,
         reject_flags=reject_flags,
     )
     mag_global = row.get("mag_cal")
     offset = row.get("interseries_offset_mag")
     if _is_finite(mag_global) and _is_finite(offset):
         mag_global = float(mag_global) + float(offset)
-    mag_global_err = combine_mag_error(row.get("mag_err"), row.get("interseries_offset_err"))
+    mag_global_err_random = random_err
+    mag_global_err_systematic = combine_mag_error(systematic_err, row.get("interseries_offset_err"))
+    mag_global_err = combine_mag_error(mag_global_err_random, mag_global_err_systematic)
     if row.get("interseries_offset_mag") is None:
         interseries_status = "NO_INTERSERIES_OFFSET"
     else:
@@ -767,9 +850,19 @@ def _science_row_from_db(row: dict[str, Any], *, reject_flags: set[str]) -> dict
         "flux_err": row.get("flux_err"),
         "mag_inst": row.get("mag_inst"),
         "mag_cal": row.get("mag_cal"),
-        "mag_err": row.get("mag_err"),
+        "mag_err": random_err,
+        "mag_err_random": random_err,
+        "mag_err_systematic": systematic_err,
+        "mag_err_detector": detector_err,
+        "mag_err_epoch_floor": epoch_floor_err,
+        "mag_err_effective_detector_only": effective_detector_only_err,
+        "mag_err_effective_total": effective_total_err,
+        "mag_err_effective": effective_err,
+        "residual_noise_floor_applied": bool(measurement_flags.get("residual_noise_floor_applied", False)),
         "mag_global": mag_global,
         "mag_global_err": mag_global_err,
+        "mag_global_err_random": mag_global_err_random,
+        "mag_global_err_systematic": mag_global_err_systematic,
         "interseries_offset_mag": row.get("interseries_offset_mag"),
         "interseries_offset_err": row.get("interseries_offset_err"),
         "interseries_offset_status": interseries_status,

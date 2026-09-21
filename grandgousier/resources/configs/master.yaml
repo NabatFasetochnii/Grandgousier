@@ -1,0 +1,206 @@
+name: MASTER
+version: 0.2
+
+# MASTER/Grandgousier instrument profile.
+# Photometric-system unit should be built as:
+#   instrument + site + axis/tube + camera + filter + observing_mode
+# For the uploaded test frame the expected unit is:
+#   MASTER + KAO + EAST + 204 + I + science
+# P4a physical observation identity uses FITS UNIQNUM; legacy frame_uid remains file/path-sensitive.
+
+header_aliases:
+  # legacy identifier aliases / paths; P4a observation identity separately uses UNIQNUM
+  frame_uid: [UNIQNUM]
+  raw_path: [RAWPATH, FILENAME, FILE]
+  dark_path: [DARK]
+  flat_path: [FLAT]
+  sextractor_catalog_path: [SEXCAT]
+
+  # time
+  date_obs: [DATE-OBS]
+  jd: [JD]
+  mjd: [MJD, MJD-OBS]
+
+  # exposure / frame type
+  exptime: [EXPTIME, EXPOSURE]
+  filter: [FILTER]
+  object: [OBJNAME, OBJECT]
+  image_type: [IMAGETYP, IMAGETYPE, FRAME, FRAMETYP]
+  observing_mode: [OBJECT]
+  project: [PROJECT]
+  observer: [OBSERVER]
+
+  # MASTER-specific instrument split
+  site: [OBSERVAT, OBSERVATORY, OBSERVID, OBSID, SITE]
+  site_code: [OBSERVID, OBSID]
+  tube: [AXIS, TUBE, TEL, TELESCOP, MASTERID]
+  camera: [ID_CAM, CAMERA, CCDID]
+
+  # pointing: prefer solved WCS center when available; ALPHA/DELTA are commanded target coordinates.
+  ra_center: [CRVAL1, ALPHA, RA]
+  dec_center: [CRVAL2, DELTA, DEC]
+  ra_requested: [ALPHA, RA]
+  dec_requested: [DELTA, DEC]
+
+  # image geometry
+  naxis1: [NAXIS1]
+  naxis2: [NAXIS2]
+  image_width_full: [IMAGEW]
+  image_height_full: [IMAGEH]
+  x_start: [XSTART]
+  y_start: [YSTART]
+  binning_x: [XBINNING, XBIN]
+  binning_y: [YBINNING, YBIN]
+  pixel_size_x_um: [XPIXZ]
+  pixel_size_y_um: [YPIXZ]
+
+  # detector
+  gain: [GAIN]
+  read_noise: [RDNOISE, READNOIS, READNOISE]
+  ccd_temp: [CCD-TEMP, CCDTEMP]
+  set_temp: [SET-TEMP]
+  heatsink_temp: [HEATSINK]
+
+  # observing conditions
+  airmass: [AIRMASS]
+  elevation_deg: [ELEV, ALT]
+  azimuth_deg: [AZIMUTH, AZ]
+  moon_distance_deg: [DMOON]
+  moon_phase: [MOONPHAS]
+  sky_temp: [SKY-TEMP]
+  ambient_temp: [AMB-TEMP]
+  wind: [WIND]
+  wind_max: [WINDMAX]
+  humidity: [HUMIDITY]
+  sky_brightness: [SKY-BKG, BACKGRND]
+  extinction: [EXTINCT]
+  focus: [FOCUS]
+  tube_temp: [TUBETMP]
+
+  # already-existing calibrated-header products
+  quality: [QUALITY]
+  sex_fwhm: [SEXFWHM]
+  sex_ellipticity: [SEXELL]
+  sex_n_stars: [SEXNSTAR]
+  zero_point: [ZEROPOI, ZEROPT, ZEROPOINT]
+  zero_point_error: [ZEROERR, ZPERR]
+  background_mag_arcsec2: [BACKGRND]
+
+  # aperture metadata from MASTER/SExtractor output
+  sex_aper0_diam_pix: [SEXAPER0]
+  sex_aper1_diam_pix: [SEXAPER1]
+  sex_aper2_diam_pix: [SEXAPER2]
+  sex_aper3_diam_pix: [SEXAPER3]
+
+filter_aliases:
+  C: clear
+  CLEAR: clear
+  clear: clear
+  W: white
+  WHITE: white
+  white: white
+  B: B
+  V: V
+  R: R
+  I: I
+  P: pol
+  POL: pol
+  pol: pol
+  NONE: unknown
+  None: unknown
+  null: unknown
+  '': unknown
+
+image_type_aliases:
+  LIGHT: science
+  Light: science
+  light: science
+  OBJECT: science
+  Object: science
+  object: science
+  SCIENCE: science
+  Science: science
+  science: science
+  DARK: dark
+  Dark: dark
+  dark: dark
+  BIAS: bias
+  Bias: bias
+  bias: bias
+  ZERO: bias
+  Zero: bias
+  zero: bias
+  FLAT: flat
+  Flat: flat
+  flat: flat
+  TWILIGHT FLAT: flat
+  Twilight Flat: flat
+  twilight flat: flat
+
+# MASTER images in this archive can be trimmed cutouts with NAXIS1/NAXIS2 smaller than full IMAGEW/IMAGEH.
+# Photometry should use NAXIS1/NAXIS2 for the current FITS array and XSTART/YSTART when mapping to the full detector.
+saturation_level_adu: 60000
+pixel_scale_arcsec: 1.85
+nominal_gain_e_per_adu: null
+nominal_read_noise_e: null
+
+# Keep instrument-dependent terms explicit until gain/read-noise and telescope
+# metadata are supplied for each MASTER channel. The physical model still
+# records fallback provenance and evaluates the legacy formula in parallel.
+random_error_model:
+  fractional_flux_floor: 0.0
+  scintillation_enabled: false
+  scintillation_coefficient: 0.09
+  telescope_aperture_m: null
+  site_altitude_m: null
+
+quality_policy:
+  saturated_margin_adu: 5000
+  max_usable_adu: 55000
+  min_good_elevation_deg: 20
+  max_good_sex_ellipticity: 0.35
+  max_good_sex_fwhm_pix: 8.0
+  min_good_sex_n_stars: 50
+
+# Pan-STARRS native R/I mapping plus Tonry et al. (2012, Table 6) stellar
+# transformations for Johnson B/V.  The synthesized B/V values are Vega-based
+# and should only be used for stellar calibration sources.
+photometric_calibration:
+  enabled: true
+  reference_catalog_name: panstarrs_dr2
+  photometric_system: ps1_ab_plus_tonry2012_johnson_vega
+  min_measurements_per_object: 5
+  min_stars_per_frame: 20
+  max_measurement_mag_err: 0.10
+  max_reference_mag_err: 0.05
+  clip_sigma: 4.0
+  n_iterations: 5
+  filters:
+    R:
+      enabled: true
+      reference_band: r
+      color_index: g-r
+      require_bands: [g, r]
+    I:
+      enabled: true
+      reference_band: i
+      color_index: r-i
+      require_bands: [r, i]
+    B:
+      enabled: true
+      reference_band: b
+      color_index: g-r
+      require_bands: [g, r, b]
+    V:
+      enabled: true
+      reference_band: v
+      color_index: g-r
+      require_bands: [g, r, v]
+    clear:
+      enabled: false
+    white:
+      enabled: false
+    pol:
+      enabled: false
+    unknown:
+      enabled: false

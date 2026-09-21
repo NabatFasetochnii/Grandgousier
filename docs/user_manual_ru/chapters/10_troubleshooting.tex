@@ -1,0 +1,110 @@
+\chapter{Диагностика проблем}
+
+\section{Pipeline завершился с warnings}
+
+Сначала проверяйте не только общий status, но и \cli{science\_status}, число science points и список warnings. Некоторые warnings относятся к отключённой target provenance или внешней reference photometry и не делают внутреннюю фотометрию недействительной.
+
+\section{Нет measurements}
+
+Проверьте по порядку:
+
+\begin{enumerate}
+  \item действительно ли кадры вошли в выбранную series;
+  \item содержит ли identity catalog источники;
+  \item появились ли catalog-frame links;
+  \item есть ли detection/catalog matches;
+  \item не исключены ли все кадры pre-QC;
+  \item создалась ли BASE photometry calibration.
+\end{enumerate}
+
+\section{Проблема с внешним каталогом}
+
+При временной недоступности Gaia/PS1 лучше повторить запрос позднее или использовать уже импортированный каталог. Не следует обходить пустой каталог отладочным флагом в обычной science-обработке.
+
+\section{Проверка конкретного pipeline run}
+
+Для диагностики производительности и ошибок полезно смотреть \cli{pipeline\_run\_steps}: статус, \cli{elapsed\_sec}, result JSON и error message каждого шага.
+
+
+\section{XeLaTeX сообщает, что основной шрифт не содержит Cyrillic}
+
+Если Polyglossia завершает сборку сообщением вида
+\cli{does not contain the "Cyrillic" script}, сначала убедитесь, что используется
+актуальная версия руководства. Начиная с 0.5.40.46 проект явно задаёт
+\cli{\\cyrillicfont}, \cli{\\cyrillicfontsf} и \cli{\\cyrillicfonttt}.
+На Windows/MiKTeX приоритет имеют стандартные системные шрифты Times New Roman,
+Arial и Consolas; на других системах используются Liberation или DejaVu.
+
+После обновления удалять глобальную конфигурацию MiKTeX не требуется. Достаточно
+повторить две сборки \cli{xelatex}; при необходимости можно предварительно удалить
+локальные \cli{main.aux}, \cli{main.toc}, \cli{main.out} и \cli{main.log}.
+
+\section{Перед сообщением об ошибке}
+
+Сохраните:
+
+\begin{itemize}
+  \item команду запуска;
+  \item версию Grandgousier;
+  \item pipeline run ID;
+  \item manifest;
+  \item traceback/error message;
+  \item название dataset/series и число кадров.
+\end{itemize}
+
+
+\section{MASTER: все кадры получают BAD\_EXCESS\_DETECTIONS}
+
+В версиях до 0.5.43.0 pre-QC использовал абсолютный предел числа local maxima и мог ложно отклонить полный $4098\times4098$ MASTER frame только из-за большой площади детектора. В 0.5.43.0 лимит area-scaled. Для диагностики смотрите \cli{n\_local\_maxima\_before\_cap}, \cli{local\_maxima\_per\_mpix} и \cli{max\_local\_maxima\_effective}.
+
+\section{MASTER: Gaia cone слишком велик или ровно достиг MAXREC}
+
+Для MASTER default safety radius auto-catalog равен $1.6^\circ$. Oversized union автоматически разбивается на spatial clusters. Если \cli{row\_limit\_reached\_cones>0}, каталог мог быть обрезан TAP-сервисом; используйте более яркий \cli{--auto-catalog-mag-limit} или осознанно увеличьте \cli{--auto-catalog-max-rows-per-frame}. По умолчанию auto magnitude limit наследуется от \cli{--working-catalog-mag-limit}.
+
+
+\section{Сначала запустите doctor и status}
+
+Для проблем установки или deployment сначала выполните:
+
+\begin{lstlisting}
+python -m grandgousier.cli doctor --config grandgousier.yaml
+\end{lstlisting}
+
+\texttt{FAIL} у \texttt{database} или \texttt{schema\_migrations} означает инфраструктурную проблему до science pipeline. \texttt{WARN} у optional dependencies допускается только если соответствующий функционал не используется.
+
+Если установка исправна, но поле выглядит незавершённым, используйте read-only:
+
+\begin{lstlisting}
+python -m grandgousier.cli status --config grandgousier.yaml --field-id 33 --verbose
+\end{lstlisting}
+
+\texttt{BLOCKED\_STAGE2\_RECIPE} означает несовместимую/неизвестную provenance у реально готовой к Stage~3 series; автоматического rebuild нет. \texttt{STAGE3\_STALE\_OR\_MISSING} означает, что latest M4 generation отсутствует, не проходит verification или его exact source series уже не совпадают с текущим READY scope. В этих случаях сначала строится plan, а не выполняется destructive cleanup.
+
+
+
+\section{Диагностика run bundle}
+
+После любого \cli{process-field-archive} версии 0.5.59+ сначала используйте сохранённый bundle вместо ручного чтения traceback:
+
+\begin{lstlisting}
+grandgousier diagnose-run reports\field_archive\_jobs\<job_id>
+\end{lstlisting}
+
+Основные recovery codes:
+\begin{itemize}
+  \item \texttt{RUNTIME\_READINESS\_FAILED} --- сначала исправляются FAIL-пункты doctor/schema/path, M8 не запускается;
+  \item \texttt{FIELD\_ARCHIVE\_JOB\_LOCKED} --- не обходить advisory lock, дождаться активного job;
+  \item \texttt{STAGE2\_PROVENANCE\_CONFLICT} --- не использовать resume для скрытого rebuild; определить series через status и выполнить явный rerun;
+  \item \texttt{STAGE2\_DETECTION\_SUPPORT\_MISSING} --- veto \texttt{NO\_DETECTION\_SUPPORT} не ослабляется, исправляется Stage~2 source series;
+  \item \texttt{CATALOG\_PRECONDITION\_FAILED} --- сначала audit catalog identity/readiness;
+  \item \texttt{STAGE3\_GRAPH\_DISCONNECTED} --- анализировать rejected references/edges, не ослаблять QC автоматически;
+  \item \texttt{UNEXPECTED\_PROCESSING\_FAILURE} --- сохранять весь bundle; traceback уже находится в \texttt{failure.json}.
+\end{itemize}
+
+\section{Acceptance-check завершился FAILED}
+
+\texttt{full\_science\_environment=FAIL} означает, что строгий doctor не видит полный optional photometry/Gaia stack. \texttt{database\_baseline=FAIL} означает, что проверяется уже не тот frozen DB state; не следует автоматически исправлять БД под baseline. Ошибка \texttt{stage3\_*} или \texttt{m5\_object\_*} означает scientific drift и требует отдельного анализа источника изменения. \texttt{no\_unexpected\_db\_writes=FAIL} является нарушением read-only acceptance contract.
+
+\subsection{Release-check показывает старую версию внутри нового wheel}
+
+Если метаданные wheel соответствуют текущей версии, но проверка \texttt{wheel\_install\_smoke} сообщает более старый \texttt{grandgousier.\_\_version\_\_}, это означает загрязнённый локальный staging setuptools. Начиная с 0.5.59.1 \texttt{tools/release\_check.py} перед сборкой автоматически удаляет каталоги \texttt{dist}, \texttt{build} и корневые \texttt{*.egg-info}; вручную очищать их перед обычным release-check не требуется.

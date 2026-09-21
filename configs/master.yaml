@@ -6,9 +6,10 @@ version: 0.2
 #   instrument + site + axis/tube + camera + filter + observing_mode
 # For the uploaded test frame the expected unit is:
 #   MASTER + KAO + EAST + 204 + I + science
+# P4a physical observation identity uses FITS UNIQNUM; legacy frame_uid remains file/path-sensitive.
 
 header_aliases:
-  # identifiers / paths
+  # legacy identifier aliases / paths; P4a observation identity separately uses UNIQNUM
   frame_uid: [UNIQNUM]
   raw_path: [RAWPATH, FILENAME, FILE]
   dark_path: [DARK]
@@ -143,6 +144,16 @@ pixel_scale_arcsec: 1.85
 nominal_gain_e_per_adu: null
 nominal_read_noise_e: null
 
+# Keep instrument-dependent terms explicit until gain/read-noise and telescope
+# metadata are supplied for each MASTER channel. The physical model still
+# records fallback provenance and evaluates the legacy formula in parallel.
+random_error_model:
+  fractional_flux_floor: 0.0
+  scintillation_enabled: false
+  scintillation_coefficient: 0.09
+  telescope_aperture_m: null
+  site_altitude_m: null
+
 quality_policy:
   saturated_margin_adu: 5000
   max_usable_adu: 55000
@@ -150,3 +161,46 @@ quality_policy:
   max_good_sex_ellipticity: 0.35
   max_good_sex_fwhm_pix: 8.0
   min_good_sex_n_stars: 50
+
+# Pan-STARRS native R/I mapping plus Tonry et al. (2012, Table 6) stellar
+# transformations for Johnson B/V.  The synthesized B/V values are Vega-based
+# and should only be used for stellar calibration sources.
+photometric_calibration:
+  enabled: true
+  reference_catalog_name: panstarrs_dr2
+  photometric_system: ps1_ab_plus_tonry2012_johnson_vega
+  min_measurements_per_object: 5
+  min_stars_per_frame: 20
+  max_measurement_mag_err: 0.10
+  max_reference_mag_err: 0.05
+  clip_sigma: 4.0
+  n_iterations: 5
+  filters:
+    R:
+      enabled: true
+      reference_band: r
+      color_index: g-r
+      require_bands: [g, r]
+    I:
+      enabled: true
+      reference_band: i
+      color_index: r-i
+      require_bands: [r, i]
+    B:
+      enabled: true
+      reference_band: b
+      color_index: g-r
+      require_bands: [g, r, b]
+    V:
+      enabled: true
+      reference_band: v
+      color_index: g-r
+      require_bands: [g, r, v]
+    clear:
+      enabled: false
+    white:
+      enabled: false
+    pol:
+      enabled: false
+    unknown:
+      enabled: false

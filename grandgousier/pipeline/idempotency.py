@@ -262,10 +262,10 @@ def _check_object_qc(session: Session, scope: _Scope) -> IdempotencyCheckResult:
 
 
 def _check_source_detections(session: Session, scope: _Scope) -> IdempotencyCheckResult:
-    where = ["sd.algorithm = :detection_algorithm"]
+    where = ["dr.run_kind = 'SOURCE_DETECTION'", "dr.algorithm = :detection_algorithm"]
     params = _base_params(scope)
     if scope.frame_ids:
-        where.append("sd.frame_id = ANY(:frame_ids)")
+        where.append("drf.frame_id = ANY(:frame_ids)")
     if scope.instrument_unit_id is not None:
         where.append("f.instrument_unit_id = :instrument_unit_id")
     return _duplicate_check(
@@ -273,33 +273,44 @@ def _check_source_detections(session: Session, scope: _Scope) -> IdempotencyChec
         name="source_detections",
         table_name="source_detections",
         identity=["frame_id", "algorithm", "x_round_1mpix", "y_round_1mpix"],
-        from_sql="source_detections sd JOIN frames f ON f.frame_id = sd.frame_id",
+        from_sql=(
+            "source_detections sd "
+            "JOIN detection_run_frames drf ON drf.detection_run_frame_id = sd.detection_run_frame_id "
+            "JOIN detection_runs dr ON dr.detection_run_id = drf.detection_run_id "
+            "JOIN frames f ON f.frame_id = drf.frame_id"
+        ),
         where_sql=" AND ".join(where),
-        group_sql="sd.frame_id, sd.algorithm, ROUND(sd.x::numeric, 3), ROUND(sd.y::numeric, 3)",
-        select_sql="sd.frame_id, sd.algorithm, ROUND(sd.x::numeric, 3) AS x_round_1mpix, ROUND(sd.y::numeric, 3) AS y_round_1mpix",
+        group_sql="drf.frame_id, dr.algorithm, ROUND(sd.x::numeric, 3), ROUND(sd.y::numeric, 3)",
+        select_sql="drf.frame_id, dr.algorithm, ROUND(sd.x::numeric, 3) AS x_round_1mpix, ROUND(sd.y::numeric, 3) AS y_round_1mpix",
         params=params,
         example_limit=scope.example_limit,
     )
 
 
 def _check_detection_catalog_matches(session: Session, scope: _Scope) -> IdempotencyCheckResult:
-    where = ["dcm.algorithm = :detection_match_algorithm"]
+    where = ["dr.run_kind = 'CATALOG_MATCH'", "dr.algorithm = :detection_match_algorithm"]
     params = _base_params(scope)
     if scope.catalog_name is not None:
-        where.append("dcm.catalog_name = :catalog_name")
+        where.append("cs.catalog_name = :catalog_name")
     if scope.frame_ids:
-        where.append("dcm.frame_id = ANY(:frame_ids)")
+        where.append("drf.frame_id = ANY(:frame_ids)")
     if scope.instrument_unit_id is not None:
-        where.append("EXISTS (SELECT 1 FROM frames f WHERE f.frame_id = dcm.frame_id AND f.instrument_unit_id = :instrument_unit_id)")
+        where.append("f.instrument_unit_id = :instrument_unit_id")
     return _duplicate_check(
         session,
         name="detection_catalog_matches",
         table_name="detection_catalog_matches",
         identity=["frame_id", "catalog_source_id", "catalog_name", "algorithm"],
-        from_sql="detection_catalog_matches dcm",
+        from_sql=(
+            "detection_catalog_matches dcm "
+            "JOIN detection_run_frames drf ON drf.detection_run_frame_id = dcm.detection_run_frame_id "
+            "JOIN detection_runs dr ON dr.detection_run_id = drf.detection_run_id "
+            "JOIN catalog_sources cs ON cs.catalog_source_id = dcm.catalog_source_id "
+            "JOIN frames f ON f.frame_id = drf.frame_id"
+        ),
         where_sql=" AND ".join(where),
-        group_sql="dcm.frame_id, dcm.catalog_source_id, dcm.catalog_name, dcm.algorithm",
-        select_sql="dcm.frame_id, dcm.catalog_source_id, dcm.catalog_name, dcm.algorithm",
+        group_sql="drf.frame_id, dcm.catalog_source_id, cs.catalog_name, dr.algorithm",
+        select_sql="drf.frame_id, dcm.catalog_source_id, cs.catalog_name, dr.algorithm",
         params=params,
         example_limit=scope.example_limit,
     )

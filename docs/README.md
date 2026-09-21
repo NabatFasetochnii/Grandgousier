@@ -1,31 +1,12 @@
 # Документация Grandgousier
 
-## Для продолжения разработки
+Рабочая документация намеренно сведена к небольшому набору файлов.
 
-- [`../CONTEXT.md`](../CONTEXT.md) — входная точка для нового чата.
-- [`context/CURRENT_STATE.md`](context/CURRENT_STATE.md) — текущее подтверждённое состояние.
-- [`context/NEXT_TASKS.md`](context/NEXT_TASKS.md) — ближайшие задачи.
-- [`context/KNOWN_ISSUES.md`](context/KNOWN_ISSUES.md) — известные проблемы.
-- [`context/TEST_DATASETS.md`](context/TEST_DATASETS.md) — контрольные данные.
-- [`context/COMMANDS.md`](context/COMMANDS.md) — рабочие команды.
+- `CURRENT_ARCHITECTURE.md` — действующая архитектура и границы слоёв.
+- `ROADMAP.md` — ближайшие инженерные задачи и acceptance gates.
+- `PROJECT_HISTORY.md` — единый архив старых release notes, patch README, ADR, handoff и context snapshots.
+- `../CONTEXT.md` — краткое подтверждённое текущее состояние для продолжения разработки.
+- `user_manual_ru/` — русскоязычный пользовательский LaTeX-мануал.
+- `../context/project_state.yaml` — machine-readable project state.
 
-## Архитектура и решения
-
-- [`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md) — фактическая архитектура кода.
-- [`decisions/`](decisions/) — ADR: причины решений, которые неочевидны из кода.
-
-## История версий
-
-Новые release notes хранятся в [`releases/`](releases/). Старые `README_MVP*.md` пока оставлены в корне для сохранения истории и ссылок; новые файлы такого формата создавать не следует.
-
-## Правило обновления
-
-При завершении значимого патча нужно обновить:
-
-1. версию в `pyproject.toml` и `grandgousier/__init__.py`;
-2. `docs/context/CURRENT_STATE.md`;
-3. `docs/context/NEXT_TASKS.md` и `KNOWN_ISSUES.md`, если изменились;
-4. `context/project_state.yaml`;
-5. release note в `docs/releases/<version>.md`;
-6. regression tests;
-7. переносной bundle командой `python scripts/build_context_bundle.py`.
+Новые `README_MVP*.md`, `docs/releases/*.md`, `docs/context/HANDOFF*.md`, отдельные next-chat prompts и patch-specific Markdown больше не создаются. Историю дополняют одной краткой записью в `PROJECT_HISTORY.md`; текущее состояние меняют в `CONTEXT.md`; ближайший план — в `ROADMAP.md`.

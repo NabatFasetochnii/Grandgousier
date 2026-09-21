@@ -1,0 +1,136 @@
+\chapter{Стабильная идентичность физических наблюдений}
+
+\section{Почему \texttt{frame\_uid} недостаточно}
+
+До версии~0.5.52.0 таблица \texttt{frames} одновременно играла роль каталога файлов и фактической идентичности экспозиций. Поле \texttt{frame\_uid} исторически вычисляется из пути к FITS, размера файла и времени модификации. Поэтому копирование одного и того же физического наблюдения в другой каталог создаёт другой \texttt{frame\_uid}. Для уже существующих Stage~2/Stage~3 продуктов это поле сохраняется без изменения как legacy file identity.
+
+Начиная с 0.5.52.0 добавлен отдельный уровень \texttt{observations}. Одна строка \texttt{observations} соответствует одной физической экспозиции, а одна или несколько строк \texttt{frames} могут представлять разные файловые или processing-варианты этой экспозиции:
+
+\begin{verbatim}
+physical exposure -> observations.observation_id -> 1..N frames.frame_id
+\end{verbatim}
+
+Backfill не удаляет и не объединяет строки \texttt{frames}, не меняет их \texttt{frame\_id} и \texttt{frame\_uid} и не перепривязывает существующие научные продукты.
+
+\section{Identity scheme MASTER}
+
+Для проиндексированных MASTER-кадров scheme \texttt{master\_uniqnum\_v1} использует исходный FITS header \texttt{UNIQNUM}. Путь, размер FITS и mtime в stable identity не входят.
+
+Повторение одного \texttt{UNIQNUM} допустимо, если строки отличаются только файловым представлением. При различии физических параметров экспозиции --- например камеры, фильтра, времени или экспозиции --- группа считается blocking collision и backfill не выполняется.
+
+\section{Identity scheme RoboPhot}
+
+Для RoboPhot scheme \texttt{robophot\_sernum\_dateobs\_v1} использует два исходных FITS header key:
+
+\begin{verbatim}
+SERNUM + DATE-OBS
+\end{verbatim}
+
+\texttt{DATE-OBS} в FITS RoboPhot уже записан в UTC. Timestamp без явного timezone трактуется как UTC и канонизируется в форму с \texttt{Z}; никакого преобразования из локального времени обсерватории не выполняется. Например:
+
+\begin{verbatim}
+2023-11-05T19:43:56.636
+-> 2023-11-05T19:43:56.636Z
+\end{verbatim}
+
+Одновременные кадры разных камер остаются разными observations, потому что \texttt{SERNUM} является частью native identity.
+
+\section{Schema migration}
+
+После обновления существующей БД сначала проверьте migration ledger:
+
+\begin{lstlisting}
+python -m grandgousier.cli schema-status
+python -m grandgousier.cli migrate-db --dry-run
+python -m grandgousier.cli migrate-db
+python -m grandgousier.cli schema-status
+\end{lstlisting}
+
+Migration \texttt{mvp5\_52\_0\_observation\_identity} создаёт таблицу \texttt{observations} и nullable FK \texttt{frames.observation\_id}. Она сама не выполняет backfill и не изменяет legacy идентификаторы.
+
+\section{Read-only plan и backfill}
+
+Первый запуск выполняйте без \texttt{--execute}:
+
+\begin{lstlisting}
+python -m grandgousier.cli backfill-observation-identity `
+  --instrument MASTER `
+  --instrument RoboPhot `
+  --out-root reports\observation_identity_055200
+\end{lstlisting}
+
+Команда формирует \texttt{summary.json}, \texttt{observation\_groups.csv} и \texttt{frame\_identity\_issues.csv}. В консоли и summary необходимо проверить:
+
+\begin{itemize}
+  \item \texttt{invalid=0};
+  \item \texttt{collisions=0};
+  \item \texttt{link\_conflicts=0};
+  \item \texttt{can\_execute=YES}.
+\end{itemize}
+
+Группы классифицируются как \texttt{SINGLE}, \texttt{COPY\_LIKE}, \texttt{PRODUCT\_VARIANT} или \texttt{COLLISION}. \texttt{COPY\_LIKE} и \texttt{PRODUCT\_VARIANT} не означают удаления дубликатов: это несколько файловых представлений одной физической экспозиции. \texttt{COLLISION} блокирует запись.
+
+После проверки отчёта backfill выполняется явно:
+
+\begin{lstlisting}
+python -m grandgousier.cli backfill-observation-identity `
+  --instrument MASTER `
+  --instrument RoboPhot `
+  --out-root reports\observation_identity_055200 `
+  --execute
+\end{lstlisting}
+
+Повторный запуск идемпотентен: существующие observations повторно используются, а уже корректно связанные frames считаются \texttt{already\_linked}.
+
+\section{Автоматическое связывание при индексировании начиная с 0.5.53.0}
+
+После P4a backfill штатный archive indexer автоматически использует тот же stable identity builder при добавлении новых MASTER/RoboPhot FITS. Поведение различается по ситуации:
+
+\begin{itemize}
+  \item новая физическая экспозиция создаёт новую строку \texttt{observations}, после чего новый \texttt{Frame} получает её \texttt{observation\_id};
+  \item копия или перемещение той же экспозиции может создать новый \texttt{Frame}, если изменился legacy \texttt{frame\_uid}, но при совместимых физических metadata используется существующий \texttt{Observation};
+  \item другой processing/file product той же экспозиции также сохраняется отдельным \texttt{Frame}; различия размера файла, геометрии и имени объекта сами по себе не являются новой физической экспозицией;
+  \item при повторной индексации exact legacy frame новая строка \texttt{frames} не создаётся, но отсутствующая корректная связь \texttt{observation\_id} восстанавливается;
+  \item если stable identity отсутствует или невалидна, новый file product остаётся ingestible, но сохраняется с \texttt{observation\_id=NULL}; создаётся warning и fallback identity из пути, имени объекта или времени не придумывается;
+  \item если одинаковая native identity сопровождается несовместимыми физическими metadata, ingestion данного файла завершается ошибкой и не маскируется как \texttt{skipped\_existing}.
+\end{itemize}
+
+Создание одной и той же observation конкурирующими indexer-процессами обрабатывается отдельно от file-level duplicate: unique race считается нормальной только если после конфликта можно перечитать и подтвердить ровно ту же physical identity.
+
+Версия~0.5.53.0 не требует новой migration: используется schema P4a. Legacy \texttt{frame\_uid} остаётся file-level ключом и не переписывается.
+
+\section{P4c: защита science input начиная с 0.5.54.0}
+
+Версия~0.5.54.0 добавляет консервативную проверку непосредственно перед созданием новых связей \texttt{field\_series\_frames}. Архив по-прежнему может хранить несколько \texttt{Frame} products одной physical observation, но автоматическое построение series не должно интерпретировать их как несколько независимых эпох.
+
+Основные состояния:
+
+\begin{itemize}
+  \item \texttt{SELECTED} --- у observation есть ровно один не представленный file product; он допускается к новой series;
+  \item \texttt{ALREADY\_REPRESENTED} --- один product уже входит в \texttt{field\_series\_frames}; он сохраняет приоритет, а новый alternate product не создаёт вторую science epoch;
+  \item \texttt{AMBIGUOUS\_MULTIPLE\_PRODUCTS} --- у ещё не представленной observation несколько file products; автоматический выбор запрещён;
+  \item \texttt{EXISTING\_MULTIPLE\_REPRESENTATIVES} --- в исторической БД уже больше одного product той же observation входит в series; это audit condition, а не повод для автоматического удаления или reassignment;
+  \item \texttt{MISSING\_OBSERVATION\_ID} --- MASTER/RoboPhot frame не имеет физической связи P4 и не допускается к новой automatic series до исправления identity.
+\end{itemize}
+
+Для instruments, для которых P4 identity scheme ещё не определена, сохраняется legacy behavior. Совпадающий timestamp сам по себе ничего не дедуплицирует: например, синхронные RoboPhot камеры имеют разные observations благодаря \texttt{SERNUM}.
+
+\subsection{Plan-only диагностика}
+
+\cli{process-archive-path} без \cli{--execute} теперь использует stable identity уже прочитанного FITS header и строит read-only projected selection. При заданном \cli{--manifest-out} JSON содержит \texttt{observation\_selection\_results}, а рядом создаётся CSV:
+
+\begin{verbatim}
+<manifest stem>_observation_selection.csv
+\end{verbatim}
+
+В нём сохраняются path/frame UID, physical identity, action, существующие Frame products, series IDs и причина решения. Это позволяет проверить duplicate-rich каталог до индексации и Stage~2.
+
+\subsection{Replay semantics начиная с 0.5.54.1}
+
+Обычный \cli{process-archive-path} трактует уже представленные/заблокированные Frames только как audit context. Pipeline queue строится из series, созданных или явно перестроенных из Frames, выбранных P4c в текущем invocation. Если выбранных science Frames нет, команда завершается до catalog/network и Stage~2. Намеренный повторный запуск существующей series выполняется явно через \cli{--series-id}; этот selective режим hotfix не подавляет.
+
+\section{Оставшееся ограничение: качество alternate products}
+
+P4c не выбирает научно ``лучший'' reduction из нескольких не представленных file products. В частности, программа не использует \texttt{MIN(frame\_id)}, newest/oldest file, размер, mtime или путь как критерий качества. Такие группы блокируются до отдельного provenance/quality решения.
+
+Дополнительный MASTER-блок GPX\_TF17 за 2018-09-07 прошёл полный P4c/M8 real-validation: plan-only и execute классифицируют его как \texttt{READY / SKIP\_READY}, новые series не создаются, а DB-инварианты Frames/Observations/field-series и M4 generations не меняются. Поэтому исторический production exclusion для этой даты больше не требуется. Это не отменяет общий safety rule: для нового duplicate-rich блока сначала проверяйте observation-level selection/readiness plan-only и не снимайте исключение только по факту наличия links.

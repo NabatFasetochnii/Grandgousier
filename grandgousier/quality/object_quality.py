@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import math
-from collections import defaultdict
-from dataclasses import dataclass
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass, field
 from statistics import median
+from time import perf_counter
+from typing import Any
 
+import numpy as np
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
@@ -20,6 +23,7 @@ from grandgousier.db.models import (
     CalibrationVersion,
     CatalogSource,
     DetectionCatalogMatch,
+    DetectionRunFrame,
     Frame,
     InstrumentUnit,
     Measurement,
@@ -27,7 +31,11 @@ from grandgousier.db.models import (
     ObjectQc,
     SourceDetection,
 )
-from grandgousier.quality.lightcurve_quality import ObjectScatterRow, load_object_scatter_rows
+from grandgousier.quality.lightcurve_quality import (
+    CalibrationAnalysisSnapshot,
+    ObjectScatterRow,
+    load_calibration_analysis_snapshot,
+)
 
 
 @dataclass
@@ -58,7 +66,122 @@ class ObjectQcResult:
     aperture_median_shift: int = 0
     preserved_aperture_stability: int = 0
     multiple_detections_per_frame: int = 0
+    neighbor_algorithm: str | None = None
+    neighbor_catalog_sources: int = 0
+    neighbor_target_sources: int = 0
+    neighbor_pair_evaluations: int = 0
+    neighbor_cache_hit: bool = False
+    analysis_snapshot_algorithm: str | None = None
+    analysis_snapshot_cache_hit: bool = False
+    analysis_snapshot_derived: bool = False
+    analysis_snapshot_materialization_source: str | None = None
+    analysis_snapshot_measurements: int = 0
+    support_snapshot_algorithm: str | None = None
+    support_snapshot_cache_hit: bool = False
+    support_snapshot_catalog_sources: int = 0
+    support_snapshot_detection_sources: int = 0
+    timings_sec: dict[str, float] = field(default_factory=dict)
     dry_run: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectQcCatalogSourceRow:
+    catalog_source_id: int
+    catalog_name: str | None
+    source_id: str
+    ra_deg: float | None
+    dec_deg: float | None
+
+
+@dataclass
+class ObjectQcSupportSnapshot:
+    catalog_name: str | None
+    instrument_unit_id: int | None
+    frame_ids: tuple[int, ...] | None
+    target_source_ids: tuple[str, ...]
+    catalog_sources_by_id: dict[str, ObjectQcCatalogSourceRow]
+    neighbor_stats: dict[str, dict[str, Any]]
+    neighbor_diagnostics: dict[str, Any]
+    detection_stats: dict[int, dict[str, Any]]
+    algorithm: str = "object_qc_support_snapshot_v1"
+    timings_sec: dict[str, float] = field(default_factory=dict)
+
+    def matches(
+        self,
+        *,
+        catalog_name: str | None,
+        instrument_unit_id: int | None,
+        frame_ids: list[int] | tuple[int, ...] | None,
+        target_source_ids: set[str] | tuple[str, ...] | list[str],
+    ) -> bool:
+        normalized_frames = (
+            tuple(sorted({int(value) for value in frame_ids})) if frame_ids else None
+        )
+        normalized_targets = tuple(sorted({str(value) for value in target_source_ids}))
+        return (
+            self.catalog_name == catalog_name
+            and self.instrument_unit_id == instrument_unit_id
+            and self.frame_ids == normalized_frames
+            and self.target_source_ids == normalized_targets
+        )
+
+
+def load_object_qc_support_snapshot(
+    session: Session,
+    *,
+    catalog_name: str | None,
+    instrument_unit_id: int | None,
+    frame_ids: list[int] | tuple[int, ...] | None,
+    target_source_ids: set[str] | tuple[str, ...] | list[str],
+) -> ObjectQcSupportSnapshot:
+    """Load calibration-independent object-QC support data once per field scope.
+
+    Catalog geometry and detection support depend on the catalog/frame selection,
+    not on the current calibration generation.  Keeping them in a separate
+    snapshot allows initial, candidate-excluded and color-calibrated QC passes to
+    reuse the same data without repeating multi-table detection queries.
+    """
+
+    total_started = perf_counter()
+    timings: dict[str, float] = {}
+    normalized_frames = tuple(sorted({int(value) for value in frame_ids})) if frame_ids else None
+    normalized_targets = tuple(sorted({str(value) for value in target_source_ids}))
+
+    phase_started = perf_counter()
+    catalog_sources_by_id = _load_catalog_sources_by_source_id(
+        session, catalog_name=catalog_name
+    )
+    timings["load_catalog_sources"] = perf_counter() - phase_started
+
+    phase_started = perf_counter()
+    neighbor_stats, neighbor_diag = _build_neighbor_stats_with_diagnostics(
+        catalog_sources_by_id,
+        target_source_ids=set(normalized_targets),
+    )
+    timings["build_neighbor_stats"] = perf_counter() - phase_started
+
+    phase_started = perf_counter()
+    detection_stats = _load_detection_support_stats(
+        session,
+        catalog_name=catalog_name,
+        instrument_unit_id=instrument_unit_id,
+        frame_ids=list(normalized_frames) if normalized_frames is not None else None,
+    )
+    timings["load_detection_support"] = perf_counter() - phase_started
+    timings["total"] = perf_counter() - total_started
+    timings["_runner_cache_hit"] = 0.0
+
+    return ObjectQcSupportSnapshot(
+        catalog_name=catalog_name,
+        instrument_unit_id=instrument_unit_id,
+        frame_ids=normalized_frames,
+        target_source_ids=normalized_targets,
+        catalog_sources_by_id=catalog_sources_by_id,
+        neighbor_stats=neighbor_stats,
+        neighbor_diagnostics=dict(neighbor_diag),
+        detection_stats=detection_stats,
+        timings_sec=timings,
+    )
 
 
 @dataclass
@@ -105,21 +228,46 @@ def compute_object_qc(
     dry_run: bool = False,
     insert_batch_size: int = DEFAULT_BULK_INSERT_BATCH_SIZE,
     target_object_ids: list[int] | None = None,
+    analysis_snapshot: CalibrationAnalysisSnapshot | None = None,
+    support_snapshot: ObjectQcSupportSnapshot | None = None,
 ) -> ObjectQcResult:
     """Compute object-level quality flags from catalog geometry and measurements."""
 
+    total_started = perf_counter()
+    phase_started = perf_counter()
     cv = session.scalar(select(CalibrationVersion).where(CalibrationVersion.name == calibration_name))
     if cv is None:
         raise ValueError(f"Calibration version not found: {calibration_name}")
+    cv_lookup_sec = perf_counter() - phase_started
 
-    object_rows = load_object_scatter_rows(
-        session,
+    phase_started = perf_counter()
+    snapshot_cache_hit = bool(
+        analysis_snapshot is not None
+        and analysis_snapshot.timings_sec.get("_runner_cache_hit", 1.0)
+    )
+    if analysis_snapshot is None:
+        analysis_snapshot = load_calibration_analysis_snapshot(
+            session,
+            calibration_name=calibration_name,
+            calibration_version_id=cv.calibration_version_id,
+            catalog_name=catalog_name,
+            instrument_unit_id=instrument_unit_id,
+            frame_ids=frame_ids,
+            min_measurements=min_measurements,
+            fwhm_header_unit=fwhm_header_unit,
+        )
+    elif not analysis_snapshot.matches(
         calibration_name=calibration_name,
         catalog_name=catalog_name,
         instrument_unit_id=instrument_unit_id,
         frame_ids=frame_ids,
         min_measurements=min_measurements,
-    )
+        fwhm_header_unit=fwhm_header_unit,
+    ):
+        raise ValueError("analysis_snapshot scope does not match compute_object_qc arguments")
+    snapshot_load_sec = perf_counter() - phase_started
+    object_rows = analysis_snapshot.object_rows
+    measurement_stats = analysis_snapshot.measurement_geometry
     result = ObjectQcResult(
         calibration_version_id=cv.calibration_version_id,
         calibration_name=calibration_name,
@@ -128,29 +276,133 @@ def compute_object_qc(
         selected_objects=len(object_rows),
         insert_batch_size=int(insert_batch_size),
         dry_run=dry_run,
+        analysis_snapshot_algorithm=analysis_snapshot.algorithm,
+        analysis_snapshot_cache_hit=snapshot_cache_hit,
+        analysis_snapshot_derived=bool(analysis_snapshot.timings_sec.get("_runner_derived", 0.0)),
+        analysis_snapshot_materialization_source=analysis_snapshot.materialization_source,
+        analysis_snapshot_measurements=len(analysis_snapshot.measurement_rows),
+        timings_sec={
+            "calibration_lookup": cv_lookup_sec,
+            "load_calibration_analysis_snapshot": snapshot_load_sec,
+            "load_object_scatter_rows": (
+                0.0
+                if snapshot_cache_hit
+                else float(analysis_snapshot.timings_sec.get("build_object_scatter_rows", 0.0))
+            ),
+            "load_measurement_geometry": (
+                0.0
+                if snapshot_cache_hit
+                else float(analysis_snapshot.timings_sec.get("build_measurement_geometry", 0.0))
+            ),
+            "analysis_snapshot_db_load": (
+                0.0
+                if snapshot_cache_hit
+                else float(
+                    analysis_snapshot.timings_sec.get("load_measurement_rows", 0.0)
+                    + analysis_snapshot.timings_sec.get("load_object_rows", 0.0)
+                    + analysis_snapshot.timings_sec.get("load_frame_rows", 0.0)
+                )
+            ),
+            "analysis_snapshot_derive_terms": (
+                0.0
+                if snapshot_cache_hit
+                else float(analysis_snapshot.timings_sec.get("derive_color_terms_load", 0.0))
+            ),
+            "analysis_snapshot_derive_rows": (
+                0.0
+                if snapshot_cache_hit
+                else float(analysis_snapshot.timings_sec.get("derive_color_measurement_rows", 0.0))
+            ),
+            "analysis_snapshot_compact_plan": (
+                0.0
+                if snapshot_cache_hit
+                else float(analysis_snapshot.timings_sec.get("compact_normalized_plan", 0.0))
+            ),
+            "analysis_snapshot_compact_term_load": (
+                0.0
+                if snapshot_cache_hit
+                else float(analysis_snapshot.timings_sec.get("compact_normalized_term_load", 0.0))
+            ),
+            "analysis_snapshot_compact_base_query": (
+                0.0
+                if snapshot_cache_hit
+                else float(analysis_snapshot.timings_sec.get("compact_normalized_base_query", 0.0))
+            ),
+            "analysis_snapshot_compact_seed_reuse": (
+                0.0
+                if snapshot_cache_hit
+                else float(analysis_snapshot.timings_sec.get("compact_normalized_seed_reuse", 0.0))
+            ),
+            "analysis_snapshot_compact_seed_rows": (
+                0.0
+                if snapshot_cache_hit
+                else float(analysis_snapshot.timings_sec.get("compact_normalized_seed_rows", 0.0))
+            ),
+            "analysis_snapshot_compact_fused_reconstruction": (
+                0.0
+                if snapshot_cache_hit
+                else float(analysis_snapshot.timings_sec.get("compact_normalized_fused_reconstruction", 0.0))
+            ),
+        },
     )
 
     if not object_rows:
+        result.timings_sec["total"] = perf_counter() - total_started
         return result
 
     target_ids = {int(v) for v in (target_object_ids or []) if v is not None}
+    measured_source_ids = {
+        str(row.source_id)
+        for row in object_rows
+        if row.source_id is not None and str(row.source_id).strip()
+    }
 
-    catalog_sources_by_id = _load_catalog_sources_by_source_id(session, catalog_name=catalog_name)
-    neighbor_stats = _build_neighbor_stats(catalog_sources_by_id)
-    measurement_stats = _load_measurement_geometry(
-        session,
-        calibration_version_id=cv.calibration_version_id,
+    support_cache_hit = bool(
+        support_snapshot is not None
+        and support_snapshot.timings_sec.get("_runner_cache_hit", 1.0)
+    )
+    if support_snapshot is None:
+        support_snapshot = load_object_qc_support_snapshot(
+            session,
+            catalog_name=catalog_name,
+            instrument_unit_id=instrument_unit_id,
+            frame_ids=frame_ids,
+            target_source_ids=measured_source_ids,
+        )
+    elif not support_snapshot.matches(
         catalog_name=catalog_name,
         instrument_unit_id=instrument_unit_id,
         frame_ids=frame_ids,
-        fwhm_header_unit=fwhm_header_unit,
+        target_source_ids=measured_source_ids,
+    ):
+        raise ValueError("support_snapshot scope does not match compute_object_qc arguments")
+
+    catalog_sources_by_id = support_snapshot.catalog_sources_by_id
+    neighbor_stats = support_snapshot.neighbor_stats
+    neighbor_diag = support_snapshot.neighbor_diagnostics
+    detection_stats = support_snapshot.detection_stats
+    result.support_snapshot_algorithm = support_snapshot.algorithm
+    result.support_snapshot_cache_hit = support_cache_hit
+    result.support_snapshot_catalog_sources = len(catalog_sources_by_id)
+    result.support_snapshot_detection_sources = len(detection_stats)
+    result.timings_sec["load_catalog_sources"] = (
+        0.0 if support_cache_hit else float(support_snapshot.timings_sec.get("load_catalog_sources", 0.0))
     )
-    detection_stats = _load_detection_support_stats(
-        session,
-        catalog_name=catalog_name,
-        instrument_unit_id=instrument_unit_id,
-        frame_ids=frame_ids,
+    result.timings_sec["build_neighbor_stats"] = (
+        0.0 if support_cache_hit else float(support_snapshot.timings_sec.get("build_neighbor_stats", 0.0))
     )
+    result.timings_sec["load_detection_support"] = (
+        0.0 if support_cache_hit else float(support_snapshot.timings_sec.get("load_detection_support", 0.0))
+    )
+    result.neighbor_algorithm = str(neighbor_diag["algorithm"])
+    result.neighbor_catalog_sources = int(neighbor_diag["catalog_sources"])
+    result.neighbor_target_sources = int(neighbor_diag["target_sources"])
+    result.neighbor_pair_evaluations = int(neighbor_diag["pair_evaluations"])
+    # A reused QC support snapshot is itself a stronger cache hit than the
+    # lower-level process-local neighbor cache.
+    result.neighbor_cache_hit = bool(support_cache_hit or neighbor_diag["cache_hit"])
+
+    phase_started = perf_counter()
     existing_qc_map = load_object_qc_map(
         session,
         calibration_name=calibration_name,
@@ -182,8 +434,10 @@ def compute_object_qc(
             instrument_unit_id=instrument_unit_id,
             algorithm=algorithm,
         )
+    result.timings_sec["load_qc_provenance"] = perf_counter() - phase_started
 
     rows = []
+    object_loop_started = perf_counter()
     for row in tqdm(object_rows, desc="Object QC", unit="object"):
         result.checked_objects += 1
         source_id = row.source_id
@@ -384,8 +638,12 @@ def compute_object_qc(
                         },
                         "photometric_consistency": {
                             "ref_mag": ref_mag,
+                            "reference_catalog_name": row.reference_catalog_name,
+                            "reference_band": row.reference_band,
                             "mag_ref_delta": mag_ref_delta,
                             "abs_mag_ref_delta": abs_mag_ref_delta,
+                            "mag_err_random_median": row.mag_err_median,
+                            "mag_err_systematic_median": row.mag_err_systematic_median,
                         },
                     },
                     existing_qc,
@@ -395,12 +653,17 @@ def compute_object_qc(
             }
         )
 
+    result.timings_sec["object_loop"] = perf_counter() - object_loop_started
     if dry_run or not rows:
+        result.timings_sec["total"] = perf_counter() - total_started
         return result
 
+    phase_started = perf_counter()
     result.insert_batches = _upsert_object_qc_rows(session, rows, insert_batch_size=insert_batch_size)
     session.commit()
+    result.timings_sec["upsert_and_commit"] = perf_counter() - phase_started
     result.written = len(rows)
+    result.timings_sec["total"] = perf_counter() - total_started
     return result
 
 
@@ -761,55 +1024,77 @@ def _load_detection_support_stats(
     instrument_unit_id: int | None,
     frame_ids: list[int] | None = None,
 ) -> dict[int, dict]:
-    """Return detection-match support metrics keyed by catalog_source_id.
+    """Return detection support keyed by catalog_source_id using scalar rows.
 
-    The primary support metric is the number of unique frames with at least one
-    matched detection. Raw match counts are retained separately because they are
-    useful blend diagnostics, but they must not be used as a fraction denominator:
-    a crowded source can have several detection matches in the same frame.
+    Only four scalar columns are needed for these statistics.  Avoiding ORM
+    hydration of DetectionCatalogMatch, SourceDetection and Frame for every
+    match materially reduces both query transfer and Python object creation.
     """
 
     stmt = (
-        select(DetectionCatalogMatch, SourceDetection, Frame)
-        .join(SourceDetection, SourceDetection.source_detection_id == DetectionCatalogMatch.source_detection_id)
-        .join(Frame, Frame.frame_id == DetectionCatalogMatch.frame_id)
+        select(
+            DetectionCatalogMatch.catalog_source_id.label("catalog_source_id"),
+            DetectionRunFrame.frame_id.label("frame_id"),
+            DetectionCatalogMatch.sep_arcsec.label("sep_arcsec"),
+            SourceDetection.snr.label("snr"),
+        )
+        .select_from(DetectionCatalogMatch)
+        .join(
+            DetectionRunFrame,
+            DetectionRunFrame.detection_run_frame_id == DetectionCatalogMatch.detection_run_frame_id,
+        )
+        .join(
+            SourceDetection,
+            SourceDetection.source_detection_id == DetectionCatalogMatch.source_detection_id,
+        )
+        .join(CatalogSource, CatalogSource.catalog_source_id == DetectionCatalogMatch.catalog_source_id)
+        .join(Frame, Frame.frame_id == DetectionRunFrame.frame_id)
         .where(DetectionCatalogMatch.match_status == "MATCHED")
     )
     if catalog_name:
-        stmt = stmt.where(DetectionCatalogMatch.catalog_name == catalog_name)
+        stmt = stmt.where(CatalogSource.catalog_name == catalog_name)
     if instrument_unit_id is not None:
         stmt = stmt.where(Frame.instrument_unit_id == instrument_unit_id)
     if frame_ids:
         stmt = stmt.where(Frame.frame_id.in_(frame_ids))
 
-    grouped: dict[int, list[tuple[DetectionCatalogMatch, SourceDetection, int]]] = defaultdict(list)
-    for match, det, frame in session.execute(stmt).all():
-        grouped[int(match.catalog_source_id)].append((match, det, int(frame.frame_id)))
+    grouped: dict[int, list[tuple[int, float | None, float | None]]] = defaultdict(list)
+    for row in session.execute(stmt).mappings():
+        grouped[int(row["catalog_source_id"])].append(
+            (int(row["frame_id"]), row["sep_arcsec"], row["snr"])
+        )
 
     out: dict[int, dict] = {}
     for catalog_source_id, values in grouped.items():
-        by_frame: dict[int, list[tuple[DetectionCatalogMatch, SourceDetection]]] = defaultdict(list)
-        for match, det, frame_id in values:
-            by_frame[frame_id].append((match, det))
+        by_frame: dict[int, list[tuple[float | None, float | None]]] = defaultdict(list)
+        raw_snrs: list[float] = []
+        for frame_id, sep_arcsec, snr in values:
+            by_frame[frame_id].append((sep_arcsec, snr))
+            if snr is not None and _is_finite(snr):
+                raw_snrs.append(float(snr))
 
-        best_per_frame: list[tuple[DetectionCatalogMatch, SourceDetection]] = []
+        best_per_frame: list[tuple[float | None, float | None]] = []
         n_multiple_detection_frames = 0
         for frame_values in by_frame.values():
             if len(frame_values) > 1:
                 n_multiple_detection_frames += 1
-            best_per_frame.append(min(frame_values, key=lambda item: _sep_sort_value(item[0].sep_arcsec)))
+            best_per_frame.append(
+                min(frame_values, key=lambda item: _sep_sort_value(item[0]))
+            )
 
         seps = [
-            float(m.sep_arcsec)
-            for m, _d in best_per_frame
-            if m.sep_arcsec is not None and _is_finite(m.sep_arcsec)
+            float(sep)
+            for sep, _snr in best_per_frame
+            if sep is not None and _is_finite(sep)
         ]
-        snrs = [float(d.snr) for _m, d in best_per_frame if d.snr is not None and _is_finite(d.snr)]
-        raw_snrs = [float(d.snr) for _m, d, _frame_id in values if d.snr is not None and _is_finite(d.snr)]
+        snrs = [
+            float(snr)
+            for _sep, snr in best_per_frame
+            if snr is not None and _is_finite(snr)
+        ]
         n_raw = len(values)
         n_frames = len(by_frame)
         out[catalog_source_id] = {
-            # Backward-compatible aliases now use unique-frame support.
             "n_detection_matches": n_frames,
             "n_detection_match_frames": n_frames,
             "n_detection_matches_raw": n_raw,
@@ -828,43 +1113,216 @@ def _sep_sort_value(value) -> float:
     return abs(float(value))
 
 
-def _load_catalog_sources_by_source_id(session: Session, *, catalog_name: str | None) -> dict[str, CatalogSource]:
-    stmt = select(CatalogSource)
+def _load_catalog_sources_by_source_id(
+    session: Session, *, catalog_name: str | None
+) -> dict[str, ObjectQcCatalogSourceRow]:
+    stmt = select(
+        CatalogSource.catalog_source_id.label("catalog_source_id"),
+        CatalogSource.catalog_name.label("catalog_name"),
+        CatalogSource.source_id.label("source_id"),
+        CatalogSource.ra_deg.label("ra_deg"),
+        CatalogSource.dec_deg.label("dec_deg"),
+    )
     if catalog_name:
         stmt = stmt.where(CatalogSource.catalog_name == catalog_name)
-    out = {}
-    for source in session.scalars(stmt).all():
-        out[str(source.source_id)] = source
+    out: dict[str, ObjectQcCatalogSourceRow] = {}
+    for row in session.execute(stmt).mappings():
+        source_id = str(row["source_id"])
+        out[source_id] = ObjectQcCatalogSourceRow(
+            catalog_source_id=int(row["catalog_source_id"]),
+            catalog_name=row["catalog_name"],
+            source_id=source_id,
+            ra_deg=row["ra_deg"],
+            dec_deg=row["dec_deg"],
+        )
     return out
 
 
-def _build_neighbor_stats(sources_by_id: dict[str, CatalogSource]) -> dict[str, dict]:
+_NEIGHBOR_STATS_CACHE_MAX_ENTRIES = 8
+_NEIGHBOR_STATS_CACHE: OrderedDict[tuple, dict[str, dict]] = OrderedDict()
+_NEIGHBOR_VECTOR_BLOCK_SIZE = 256
+_ARCSEC_PER_RADIAN = 180.0 * 3600.0 / math.pi
+
+
+def _build_neighbor_stats(
+    sources_by_id: dict[str, Any],
+    *,
+    target_source_ids: set[str] | None = None,
+) -> dict[str, dict]:
+    """Return exact spherical neighbor statistics for selected catalog sources.
+
+    The legacy implementation evaluated every catalog source against every other
+    source in Python.  Large MASTER footprints can contain about 20k Gaia rows,
+    making that O(N^2) Python loop the dominant pipeline cost.  This implementation
+    evaluates only measured target sources against the full neighbor catalog and
+    performs the pair calculation in vectorized NumPy blocks.
+    """
+
+    stats, _diagnostics = _build_neighbor_stats_with_diagnostics(
+        sources_by_id,
+        target_source_ids=target_source_ids,
+    )
+    return stats
+
+
+def _build_neighbor_stats_with_diagnostics(
+    sources_by_id: dict[str, Any],
+    *,
+    target_source_ids: set[str] | None = None,
+    block_size: int = _NEIGHBOR_VECTOR_BLOCK_SIZE,
+) -> tuple[dict[str, dict], dict[str, object]]:
+    if block_size < 1:
+        raise ValueError("block_size must be positive")
+
+    requested_ids = (
+        {str(value) for value in target_source_ids}
+        if target_source_ids is not None
+        else set(sources_by_id)
+    )
+    catalog_fingerprint = _catalog_coordinate_fingerprint(sources_by_id)
+    cache_key = (catalog_fingerprint, tuple(sorted(requested_ids)))
+    cached = _NEIGHBOR_STATS_CACHE.get(cache_key)
+    if cached is not None:
+        _NEIGHBOR_STATS_CACHE.move_to_end(cache_key)
+        return cached, {
+            "algorithm": "measured_targets_vectorized_haversine_v1",
+            "catalog_sources": len(sources_by_id),
+            "target_sources": len(requested_ids),
+            "pair_evaluations": len(sources_by_id) * len(requested_ids),
+            "cache_hit": True,
+        }
+
+    default_row = {
+        "nearest_neighbor_arcsec": None,
+        "neighbors_within_3arcsec": 0,
+        "neighbors_within_5arcsec": 0,
+        "neighbors_within_10arcsec": 0,
+    }
+    out: dict[str, dict] = {source_id: dict(default_row) for source_id in requested_ids}
+
+    valid_sources: list[Any] = [
+        source
+        for source in sources_by_id.values()
+        if _is_finite(source.ra_deg) and _is_finite(source.dec_deg)
+    ]
+    target_sources: list[Any] = [
+        sources_by_id[source_id]
+        for source_id in sorted(requested_ids)
+        if source_id in sources_by_id
+        and _is_finite(sources_by_id[source_id].ra_deg)
+        and _is_finite(sources_by_id[source_id].dec_deg)
+    ]
+
+    if valid_sources and target_sources:
+        all_ra = np.radians(
+            np.asarray([float(source.ra_deg) for source in valid_sources], dtype=float)
+        )
+        all_dec = np.radians(
+            np.asarray([float(source.dec_deg) for source in valid_sources], dtype=float)
+        )
+        target_ra = np.radians(
+            np.asarray([float(source.ra_deg) for source in target_sources], dtype=float)
+        )
+        target_dec = np.radians(
+            np.asarray([float(source.dec_deg) for source in target_sources], dtype=float)
+        )
+        all_catalog_ids = np.asarray(
+            [
+                int(source.catalog_source_id)
+                if source.catalog_source_id is not None
+                else -(index + 1)
+                for index, source in enumerate(valid_sources)
+            ],
+            dtype=np.int64,
+        )
+        valid_catalog_id_by_source = {
+            str(source.source_id): int(all_catalog_ids[index])
+            for index, source in enumerate(valid_sources)
+        }
+        target_catalog_ids = np.asarray(
+            [valid_catalog_id_by_source[str(source.source_id)] for source in target_sources],
+            dtype=np.int64,
+        )
+
+        for start in range(0, len(target_sources), int(block_size)):
+            stop = min(len(target_sources), start + int(block_size))
+            delta_dec = all_dec[None, :] - target_dec[start:stop, None]
+            delta_ra = all_ra[None, :] - target_ra[start:stop, None]
+            haversine = (
+                np.sin(delta_dec / 2.0) ** 2
+                + np.cos(target_dec[start:stop, None])
+                * np.cos(all_dec[None, :])
+                * np.sin(delta_ra / 2.0) ** 2
+            )
+            np.clip(haversine, 0.0, 1.0, out=haversine)
+            separations = 2.0 * np.arcsin(np.sqrt(haversine)) * _ARCSEC_PER_RADIAN
+            self_mask = target_catalog_ids[start:stop, None] == all_catalog_ids[None, :]
+            separations[self_mask] = np.inf
+
+            nearest = np.min(separations, axis=1)
+            count3 = np.count_nonzero(separations <= 3.0, axis=1)
+            count5 = np.count_nonzero(separations <= 5.0, axis=1)
+            count10 = np.count_nonzero(separations <= 10.0, axis=1)
+            for offset, source in enumerate(target_sources[start:stop]):
+                nearest_value = float(nearest[offset])
+                out[str(source.source_id)] = {
+                    "nearest_neighbor_arcsec": (
+                        nearest_value if math.isfinite(nearest_value) else None
+                    ),
+                    "neighbors_within_3arcsec": int(count3[offset]),
+                    "neighbors_within_5arcsec": int(count5[offset]),
+                    "neighbors_within_10arcsec": int(count10[offset]),
+                }
+
+    _NEIGHBOR_STATS_CACHE[cache_key] = out
+    _NEIGHBOR_STATS_CACHE.move_to_end(cache_key)
+    while len(_NEIGHBOR_STATS_CACHE) > _NEIGHBOR_STATS_CACHE_MAX_ENTRIES:
+        _NEIGHBOR_STATS_CACHE.popitem(last=False)
+
+    return out, {
+        "algorithm": "measured_targets_vectorized_haversine_v1",
+        "catalog_sources": len(sources_by_id),
+        "target_sources": len(requested_ids),
+        "pair_evaluations": len(sources_by_id) * len(requested_ids),
+        "cache_hit": False,
+    }
+
+
+def _catalog_coordinate_fingerprint(sources_by_id: dict[str, Any]) -> tuple:
+    if not sources_by_id:
+        return (0, (), None, None, None, None)
     sources = list(sources_by_id.values())
-    out: dict[str, dict] = {}
-    for a in sources:
-        seps = []
-        for b in sources:
-            if a.catalog_source_id == b.catalog_source_id:
-                continue
-            sep = _angular_sep_arcsec(a.ra_deg, a.dec_deg, b.ra_deg, b.dec_deg)
-            if _is_finite(sep):
-                seps.append(float(sep))
-        if seps:
-            nn = min(seps)
-            out[str(a.source_id)] = {
-                "nearest_neighbor_arcsec": nn,
-                "neighbors_within_3arcsec": sum(1 for x in seps if x <= 3.0),
-                "neighbors_within_5arcsec": sum(1 for x in seps if x <= 5.0),
-                "neighbors_within_10arcsec": sum(1 for x in seps if x <= 10.0),
+    catalog_ids = [
+        int(source.catalog_source_id)
+        for source in sources
+        if source.catalog_source_id is not None
+    ]
+    catalog_names = tuple(
+        sorted(
+            {
+                str(source.catalog_name)
+                for source in sources
+                if getattr(source, "catalog_name", None) is not None
             }
-        else:
-            out[str(a.source_id)] = {
-                "nearest_neighbor_arcsec": None,
-                "neighbors_within_3arcsec": 0,
-                "neighbors_within_5arcsec": 0,
-                "neighbors_within_10arcsec": 0,
-            }
-    return out
+        )
+    )
+    source_ids = sorted(
+        str(source.source_id)
+        for source in sources
+        if getattr(source, "source_id", None) is not None
+    )
+    # Catalog rows are immutable during one pipeline process.  Catalog identity,
+    # row count and source/primary-key bounds make the process-local cache safe
+    # without hashing all 20k coordinates on every repeated QC pass.
+    return (
+        len(sources_by_id),
+        catalog_names,
+        min(catalog_ids) if catalog_ids else None,
+        max(catalog_ids) if catalog_ids else None,
+        source_ids[0] if source_ids else None,
+        source_ids[-1] if source_ids else None,
+    )
+
 
 
 def _load_measurement_geometry(

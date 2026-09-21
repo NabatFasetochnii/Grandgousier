@@ -14,7 +14,8 @@ from tqdm import tqdm
 from grandgousier.db.bulk import DEFAULT_BULK_INSERT_BATCH_SIZE
 from grandgousier.db.measurement_io import upsert_measurement_rows
 from grandgousier.db.models import CalibrationVersion, Frame, FrameQc, InstrumentUnit, Measurement, Object
-from grandgousier.calibration.provenance import set_source_calibration
+from grandgousier.calibration.provenance import prepare_calibration_version_for_write, set_source_calibration
+from grandgousier.photometry.calibration_view import load_calibration_photometry_view
 
 
 @dataclass
@@ -192,7 +193,9 @@ def calibrate_measurements_from_frame_qc(
                 "flux_err": measurement.flux_err,
                 "mag_inst": measurement.mag_inst,
                 "mag_cal": mag_cal,
-                "mag_err": measurement.mag_err,
+                "mag_err": measurement.mag_err_random if measurement.mag_err_random is not None else measurement.mag_err,
+                "mag_err_random": measurement.mag_err_random if measurement.mag_err_random is not None else measurement.mag_err,
+                "mag_err_systematic": measurement.mag_err_systematic,
                 "aperture_radius_pix": measurement.aperture_radius_pix,
                 "local_background": measurement.local_background,
                 "local_zp_correction": qc.zp_median,
@@ -295,6 +298,114 @@ def load_lightcurve_rows(
     frame_ids: list[int] | None = None,
     limit: int | None = None,
 ) -> list[LightcurveRow]:
+    # Compact D3 calibrations have no Measurement rows of their own.  When a
+    # calibration is named explicitly, consume the storage-independent view so
+    # aperture-stability and diagnostic readers continue to work unchanged.
+    if calibration_name is not None:
+        cv = session.scalar(
+            select(CalibrationVersion).where(CalibrationVersion.name == calibration_name)
+        )
+        if cv is None:
+            return []
+        view = load_calibration_photometry_view(
+            session,
+            calibration_version_id=int(cv.calibration_version_id),
+            frame_ids=frame_ids,
+            object_ids=[int(object_id)] if object_id is not None else None,
+            prefer_science=True,
+        )
+        candidate_rows = list(view.rows)
+        frame_ids_needed = sorted({int(row.frame_id) for row in candidate_rows})
+        object_ids_needed = sorted({int(row.object_id) for row in candidate_rows})
+        frames = {
+            int(row.frame_id): row
+            for row in session.scalars(
+                select(Frame).where(Frame.frame_id.in_(frame_ids_needed))
+            ).all()
+        } if frame_ids_needed else {}
+        objects = {
+            int(row.object_id): row
+            for row in session.scalars(
+                select(Object).where(Object.object_id.in_(object_ids_needed))
+            ).all()
+        } if object_ids_needed else {}
+        instrument_ids = sorted(
+            {
+                int(frame.instrument_unit_id)
+                for frame in frames.values()
+                if frame.instrument_unit_id is not None
+            }
+        )
+        instruments = {
+            int(row.instrument_unit_id): row
+            for row in session.scalars(
+                select(InstrumentUnit).where(
+                    InstrumentUnit.instrument_unit_id.in_(instrument_ids)
+                )
+            ).all()
+        } if instrument_ids else {}
+
+        rows: list[LightcurveRow] = []
+        candidate_rows.sort(
+            key=lambda meas: (
+                float(frames[int(meas.frame_id)].mjd)
+                if int(meas.frame_id) in frames
+                and frames[int(meas.frame_id)].mjd is not None
+                else float("inf"),
+                str(frames[int(meas.frame_id)].date_obs or "")
+                if int(meas.frame_id) in frames
+                else "",
+                int(meas.measurement_id or meas.base_measurement_id or 0),
+            )
+        )
+        for meas in candidate_rows:
+            frame = frames.get(int(meas.frame_id))
+            obj = objects.get(int(meas.object_id))
+            if frame is None or obj is None:
+                continue
+            if (
+                instrument_unit_id is not None
+                and frame.instrument_unit_id != int(instrument_unit_id)
+            ):
+                continue
+            flags = dict(meas.flags or {})
+            if catalog_name and flags.get("catalog_name") != catalog_name:
+                continue
+            if source_id and str(flags.get("source_id") or "") != str(source_id):
+                continue
+            iu = (
+                instruments.get(int(frame.instrument_unit_id))
+                if frame.instrument_unit_id is not None
+                else None
+            )
+            rows.append(
+                LightcurveRow(
+                    measurement_id=int(
+                        meas.measurement_id or meas.base_measurement_id or 0
+                    ),
+                    frame_id=int(frame.frame_id),
+                    object_id=int(obj.object_id),
+                    source_id=flags.get("source_id"),
+                    catalog_name=flags.get("catalog_name"),
+                    date_obs=frame.date_obs,
+                    mjd=frame.mjd,
+                    filter_name=getattr(iu, "filter_name", None),
+                    x=meas.x,
+                    y=meas.y,
+                    flux=meas.flux,
+                    flux_err=meas.flux_err,
+                    mag_inst=meas.mag_inst,
+                    mag_cal=meas.mag_cal,
+                    mag_err=meas.mag_err,
+                    local_zp_correction=meas.local_zp_correction,
+                    flags=flags,
+                )
+            )
+            if limit is not None and len(rows) >= int(limit):
+                break
+        return rows
+
+    # Unscoped legacy listing retains the historical all-calibration behavior.
     stmt = (
         select(Measurement, Frame, Object, CalibrationVersion, InstrumentUnit)
         .join(Frame, Frame.frame_id == Measurement.frame_id)
@@ -303,8 +414,6 @@ def load_lightcurve_rows(
         .outerjoin(InstrumentUnit, InstrumentUnit.instrument_unit_id == Frame.instrument_unit_id)
         .order_by(Frame.mjd, Frame.date_obs, Measurement.measurement_id)
     )
-    if calibration_name:
-        stmt = stmt.where(CalibrationVersion.name == calibration_name)
     if object_id is not None:
         stmt = stmt.where(Measurement.object_id == object_id)
     if instrument_unit_id is not None:
@@ -449,7 +558,6 @@ def _get_or_create_preliminary_calibration_version(
     max_zp_mad: float | None,
     min_n_matched: int | None,
 ) -> CalibrationVersion:
-    cv = session.scalar(select(CalibrationVersion).where(CalibrationVersion.name == name))
     params = {
         "source_calibration_name": source_calibration_name,
         "source_calibration_version_id": source_cv.calibration_version_id,
@@ -462,25 +570,17 @@ def _get_or_create_preliminary_calibration_version(
         "min_n_matched": min_n_matched,
         "warning": "diagnostic Gaia-G zero point; no color term",
     }
-    if cv is None:
-        cv = CalibrationVersion(
-            name=name,
-            model_name="preliminary_frame_qc_zero_point_v1",
-            instrument_unit_id=instrument_unit_id,
-            used_catalogs={"frame_qc_catalog": catalog_name},
-            parameters=params,
-            notes="MVP5.2 preliminary per-frame zero point calibration. Not final science photometry.",
-        )
-        set_source_calibration(cv, source_cv)
-        session.add(cv)
-    else:
-        cv.model_name = "preliminary_frame_qc_zero_point_v1"
-        cv.instrument_unit_id = instrument_unit_id
-        cv.used_catalogs = {"frame_qc_catalog": catalog_name}
-        cv.parameters = params
-        set_source_calibration(cv, source_cv)
-        cv.notes = "MVP5.2 preliminary per-frame zero point calibration. Not final science photometry."
-    return cv
+    return prepare_calibration_version_for_write(
+        session,
+        logical_name=name,
+        model_name="preliminary_frame_qc_zero_point_v1",
+        instrument_unit_id=instrument_unit_id,
+        used_catalogs={"frame_qc_catalog": catalog_name},
+        parameters=params,
+        notes="MVP5.2 preliminary per-frame zero point calibration. Not final science photometry.",
+        source_cv=source_cv,
+        immutable_generation=False,
+    )
 
 
 def _is_finite(value) -> bool:

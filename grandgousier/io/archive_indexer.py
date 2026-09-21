@@ -20,9 +20,23 @@ from grandgousier.db.models import (
     ProcessingEventLevel,
     make_instrument_unit_uid,
 )
+from grandgousier.identity.linking import (
+    ObservationLinkConflict,
+    ObservationLinkResult,
+    ObservationLinkStatus,
+    ensure_observation_for_frame,
+    validate_same_legacy_frame,
+)
+from grandgousier.identity.consistency import group_consistency
+from grandgousier.identity.observation import build_frame_observation_identity
 from grandgousier.instruments.base import InstrumentProfile
 from grandgousier.io.fits_header import header_to_jsonable, read_primary_header
 from grandgousier.io.frame_uid import make_frame_uid
+from grandgousier.io.frame_locations import (
+    add_or_touch_frame_location,
+    copy_location_metadata,
+    find_frame_by_locator,
+)
 from grandgousier.io.parsing import parse_datetime, parse_dec_deg, parse_ra_deg, to_float, to_int
 
 logger = logging.getLogger(__name__)
@@ -186,35 +200,155 @@ def index_archive_paths(
         discovered += 1
         try:
             frame = build_frame_from_path(path, profile)
-            exists = session.query(Frame.frame_id).filter(Frame.frame_uid == frame.frame_uid).first()
-            if exists:
+            # Locator identity is separate from Frame identity.  Re-reading the same
+            # path touches the location row; moving/copying a file is handled below
+            # through physical-observation + copy-like product equivalence.
+            existing = find_frame_by_locator(session, str(path))
+            if existing is None:
+                # Compatibility with pre-C in-memory/tests and a concurrent insert
+                # that still happens to share the legacy path-sensitive frame_uid.
+                existing = session.query(Frame).filter(Frame.frame_uid == frame.frame_uid).one_or_none()
+            if existing is not None:
+                if not dry_run:
+                    validate_same_legacy_frame(existing, frame)
+                    add_or_touch_frame_location(
+                        existing,
+                        locator=str(path),
+                        file_size_bytes=frame.file_size_bytes,
+                        file_mtime_utc=frame.file_mtime_utc,
+                        make_primary=True,
+                    )
+                    ensure_observation_for_frame(session, existing)
+                    session.commit()
                 skipped_existing += 1
                 continue
-            if not dry_run:
-                frame.instrument_unit = get_or_create_instrument_unit(session, profile, frame)
-                session.add(frame)
-                session.commit()
+
+            if dry_run:
+                inserted += 1
+                continue
+
+            link_result = ensure_observation_for_frame(session, frame)
+            if link_result.observation_id is not None:
+                identity = build_frame_observation_identity(frame)
+                existing_products = list(
+                    session.scalars(
+                        session.query(Frame)
+                        .filter(Frame.observation_id == int(link_result.observation_id))
+                        .statement
+                    )
+                )
+                copy_like = []
+                for product in existing_products:
+                    hard, _soft, classification = group_consistency([product, frame], identity)
+                    if not hard and classification == "COPY_LIKE":
+                        copy_like.append(product)
+                if len(copy_like) > 1:
+                    raise ObservationLinkConflict(
+                        "multiple copy-like Frame products already exist for one physical observation; "
+                        "refusing automatic location reassignment"
+                    )
+                if len(copy_like) == 1:
+                    existing = copy_like[0]
+                    copy_location_metadata(source=frame, target=existing, make_primary=True)
+                    ensure_observation_for_frame(session, existing)
+                    session.commit()
+                    skipped_existing += 1
+                    continue
+
+            frame.instrument_unit = get_or_create_instrument_unit(session, profile, frame)
+            session.add(frame)
+            session.flush()
+            _record_observation_identity_warning(
+                session,
+                frame=frame,
+                path=path,
+                result=link_result,
+            )
+            session.commit()
             inserted += 1
-        except IntegrityError:
+        except IntegrityError as exc:
             session.rollback()
-            skipped_existing += 1
+            # A concurrent insertion of the same legacy file is the only remaining
+            # IntegrityError that retains historical skipped_existing semantics.
+            # Observation unique-key races are handled inside the linking SAVEPOINT.
+            concurrent = find_frame_by_locator(session, str(path))
+            if concurrent is None:
+                concurrent = session.query(Frame).filter(Frame.frame_uid == frame.frame_uid).one_or_none()
+            if concurrent is not None:
+                try:
+                    validate_same_legacy_frame(concurrent, frame)
+                    ensure_observation_for_frame(session, concurrent)
+                    session.commit()
+                    skipped_existing += 1
+                    continue
+                except Exception as reconcile_exc:
+                    session.rollback()
+                    exc = reconcile_exc
+            failed += 1
+            logger.exception("Integrity failure while indexing %s", path)
+            _record_index_failure(session, path, exc, dry_run=dry_run)
         except Exception as exc:
             session.rollback()
             failed += 1
             logger.exception("Failed to index %s", path)
-            if not dry_run:
-                session.add(
-                    ProcessingEvent(
-                        frame_id=None,
-                        stage="index_archive",
-                        level=ProcessingEventLevel.ERROR,
-                        message=f"Failed to index FITS file: {path}",
-                        details={"path": str(path), "error": repr(exc)},
-                    )
-                )
-                session.commit()
+            _record_index_failure(session, path, exc, dry_run=dry_run)
 
     return IndexResult(discovered, inserted, skipped_existing, failed)
+
+
+def _record_observation_identity_warning(
+    session: Session,
+    *,
+    frame: Frame,
+    path: Path,
+    result: ObservationLinkResult,
+) -> None:
+    if result.status not in {
+        ObservationLinkStatus.MISSING_IDENTITY,
+        ObservationLinkStatus.INVALID_IDENTITY,
+    }:
+        return
+    session.add(
+        ProcessingEvent(
+            frame_id=frame.frame_id,
+            stage="observation_identity",
+            level=ProcessingEventLevel.WARNING,
+            message=(
+                "Frame indexed without physical observation identity: "
+                f"{result.status.value}"
+            ),
+            details={
+                "path": str(path),
+                "status": result.status.value,
+                "detail": result.detail,
+            },
+        )
+    )
+
+
+def _record_index_failure(
+    session: Session,
+    path: Path,
+    exc: Exception,
+    *,
+    dry_run: bool,
+) -> None:
+    if dry_run:
+        return
+    session.add(
+        ProcessingEvent(
+            frame_id=None,
+            stage="index_archive",
+            level=ProcessingEventLevel.ERROR,
+            message=f"Failed to index FITS file: {path}",
+            details={
+                "path": str(path),
+                "error": repr(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+    )
+    session.commit()
 
 
 def _as_str(value) -> str | None:

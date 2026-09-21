@@ -1,0 +1,13 @@
+include README_PUBLIC.md
+prune internal_tools
+prune tests
+prune docs
+prune context
+exclude CONTEXT.md
+global-exclude __pycache__ *.py[cod]
+
+exclude README.md
+
+include requirements-release.txt
+recursive-include tools *.py
+recursive-include release *.md

@@ -1,0 +1,22 @@
+{
+  "R": {
+    "selected_series_ids": [77, 80, 81],
+    "source_calibration_version_ids": [967, 976, 986],
+    "reference_series_id": 77,
+    "min_common_objects": 20,
+    "graph_dof": 1,
+    "reduced_chi2": 2.08097055541148,
+    "offsets_mag": {"77": 0.0, "80": 0.003827704318990652, "81": 0.027447556459462567},
+    "expected_reliability": "REDUNDANT_GRAPH_OK"
+  },
+  "V": {
+    "selected_series_ids": [76, 78, 79],
+    "source_calibration_version_ids": [960, 991, 981],
+    "reference_series_id": 76,
+    "min_common_objects": 15,
+    "graph_dof": 0,
+    "reduced_chi2": null,
+    "offsets_mag": {"76": 0.0, "78": -0.0003765113057019321, "79": 0.0026336673793707632},
+    "expected_reliability": "SPARSE_GRAPH_NO_CLOSURE"
+  }
+}

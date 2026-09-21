@@ -1,0 +1,465 @@
+\chapter{Межсерийная фотометрия и история объекта}
+
+\section{Назначение Stage 3}
+
+Stage 3 начинается после того, как отдельные серии уже прошли Stage 2 и для них существуют опубликованные \texttt{SCIENCE} generations с таблицей \texttt{science\_measurements}.
+
+Главный принцип архитектуры: межсерийная калибровка вычисляется один раз для поля и совместимой фотометрической системы, а не повторно для каждого объекта.
+
+\begin{lstlisting}
+FIELD
+  series A ---+
+  series B ---+--> inter-series calibration --> object histories
+  series C ---+
+\end{lstlisting}
+
+После этого долговременная кривая любого объекта строится применением уже найденной поправки соответствующей series.
+
+\section{Ограничения первого MVP}
+
+Первый вариант Stage 3 намеренно ограничен наиболее проверяемым случаем:
+
+\begin{itemize}
+  \item одно поле;
+  \item одинаковый \texttt{instrument\_unit\_id};
+  \item одинаковый фильтр;
+  \item одинаковый catalog namespace;
+  \item минимум две series с опубликованной Stage 2 science photometry;
+  \item достаточное число общих объектов.
+\end{itemize}
+
+Одинаковый catalog namespace на первом этапе является существенным ограничением. В текущей модели \texttt{objects.object\_uid} включает catalog namespace/source identity. Поэтому совпадение \texttt{object\_id} между independently processed series считается прямым межсерийным identity только при совместимой catalog provenance. Cross-catalog matching будет отдельным поздним этапом Stage 3.
+
+\section{Этап 3.0: проверка готовности поля}
+
+Начиная с версии \texttt{0.5.41.0}, доступна read-only команда:
+
+\begin{lstlisting}
+python -m grandgousier.cli plan-interseries-calibration `
+  --field-id 12 `
+  --min-points-per-object 5 `
+  --min-common-objects 20
+\end{lstlisting}
+
+Вместо \texttt{--field-id} можно использовать точное имя:
+
+\begin{lstlisting}
+python -m grandgousier.cli plan-interseries-calibration `
+  --field-name "TIC13533330_01" `
+  --filter V
+\end{lstlisting}
+
+Команда ничего не записывает в БД. Она отвечает на вопрос, какие уже существующие Stage 2 продукты можно использовать для первой межсерийной калибровки.
+
+Начиная с версии \texttt{0.5.55.0} planner может дополнительно проверить persisted Stage~2 provenance, не повторяя фотометрию:
+
+\begin{lstlisting}
+python -m grandgousier.cli plan-interseries-calibration `
+  --field-id 33 `
+  --catalog-name "auto_catalog_master_20180907_GPX_TF17_2_mixed" `
+  --required-stage2-recipe stage3_scale_v1 `
+  --min-points-per-object 5 `
+  --min-common-objects 15
+\end{lstlisting}
+
+Проверка идёт по связи опубликованной \texttt{SCIENCE} generation с создавшим её \texttt{pipeline\_run} и его \texttt{recipe\_json}; имя calibration не используется как научная provenance. Для пригодной series выводится \texttt{READY\_STAGE3\_RECIPE}. Доказанное отличие критического параметра даёт \texttt{RECIPE\_MISMATCH}; отсутствие достаточных persisted полей --- \texttt{MISSING\_PROVENANCE}. Последний статус не интерпретируется по догадке. Результат цветового quality gate, в частности \texttt{color\_calibration\_activated=false}, не является recipe mismatch, если цветовая калибровка была запрошена по recipe.
+
+Canonical \texttt{stage3\_scale\_v1} для новых запусков сохраняет \texttt{ensemble\_min\_ref\_stars\_per\_frame=30}. Readiness-contract допускает исторически real-validated значение 20 как совместимое legacy-состояние наряду с canonical 30 и показывает его отдельной compatibility note; новые runs по-прежнему создаются с 30.
+
+Начиная с версии \texttt{0.5.45.2}, для каждой series сначала выбирается самая новая опубликованная \texttt{SCIENCE} generation по времени финализации продукта: \texttt{finalized\_at}, затем \texttt{materialized\_at}, \texttt{pipeline\_run\_id} и \texttt{calibration\_version\_id}. Номер \texttt{generation\_no} не сравнивается между различными \texttt{logical\_name}, поскольку он нумеруется отдельно внутри каждого логического продукта.
+
+Начиная с clean schema \texttt{0.7.0}, Stage~3 читает финальный durable SCIENCE layer
+\texttt{science\_photometry} через единый calibration view. Старые
+\texttt{science\_photometry\_cache}/\texttt{science\_measurements} paths относятся
+только к frozen 0.6 reference DB и не являются частью active 0.7 workflow.
+
+\subsection{Durable SCIENCE storage в 0.7.0}
+
+В clean schema 0.7 финальный SCIENCE product хранится в узкой таблице
+\texttt{science\_photometry}. Она keyed by
+\texttt{(calibration\_version\_id, base\_measurement\_id)} и содержит только
+скаляры, которые действительно могут изменяться calibration stages:
+\texttt{flux}, \texttt{flux\_err}, \texttt{mag\_inst}, \texttt{mag\_cal},
+\texttt{mag\_err}, \texttt{mag\_err\_random},
+\texttt{mag\_err\_systematic}, \texttt{local\_zp\_correction}.
+Геометрия aperture, centroid и object/frame identity не дублируются: они
+наследуются через immutable BASE measurement.
+
+Таблицы 0.6 \texttt{science\_measurements},
+\texttt{science\_photometry\_cache}, \texttt{science\_flag\_override\_sets} и
+\texttt{science\_flag\_overrides} не создаются в новой 0.7 БД. Команды их
+backfill/verification/retirement также удалены из active CLI. Они относятся
+только к frozen 0.6 reference database и не должны применяться к clean rebuild.
+
+Штатный pipeline не имеет режима, который пишет derived full-copy rows в
+\texttt{measurements}: canonical \texttt{measurements} является BASE-only.
+Stage~3 и global-object/light-curve readers получают финальную фотометрию через
+единый calibration view поверх durable \texttt{science\_photometry}.
+
+Для каждой пары series строится пересечение usable object IDs. Пара считается непосредственно пригодной только если одновременно выполняются условия:
+
+\begin{enumerate}
+  \item обе series имеют готовую science generation;
+  \item совпадает instrument unit;
+  \item совпадает filter;
+  \item совпадает catalog namespace;
+  \item число общих usable objects не меньше \texttt{--min-common-objects}.
+\end{enumerate}
+
+Возможные итоговые статусы planner:
+
+\begin{description}
+  \item[\texttt{NEED\_MORE\_READY\_SERIES}] меньше двух пригодных science series;
+  \item[\texttt{NO\_ELIGIBLE\_SERIES\_OVERLAP}] series есть, но нет допустимой пары;
+  \item[\texttt{READY\_FOR\_PAIRWISE\_MVP}] существует связная допустимая пара;
+  \item[\texttt{READY\_FOR\_GRAPH\_VALIDATION}] существует связная группа минимум из трёх series.
+\end{description}
+
+Planner также выводит connected components графа series и рекомендует reference series. На этом этапе reference series выбирается детерминированно по числу usable objects, затем по числу science points и frames. Это ещё не photometric quality estimator, а только удобная стартовая точка для следующего алгоритма.
+
+JSON-отчёт можно сохранить командой:
+
+\begin{lstlisting}
+python -m grandgousier.cli plan-interseries-calibration `
+  --field-id 12 `
+  --out reports\stage3_field12_plan.json `
+  --format json
+\end{lstlisting}
+
+\section{Read-only M1--M3 analysis начиная с 0.5.45.0}
+
+Первая вычислительная реализация Stage~3 запускается командой
+
+\begin{lstlisting}
+python -m grandgousier.cli analyze-interseries-calibration `
+  --field-id 12 `
+  --filter V `
+  --out-root reports\stage3_field12_V
+\end{lstlisting}
+
+Команда ничего не записывает в БД. Она использует только опубликованные Stage~2 \texttt{SCIENCE} generations и создаёт диагностические CSV/JSON, необходимые для проверки M1--M3 до введения persistent Stage~3 product.
+
+\subsection{M1: representative magnitude объекта в series}
+
+Для объекта $j$ в series $s$ из пригодных точек Stage~2 $m_{ijs}$ используется медиана
+
+\[
+  \bar m_{js}=\operatorname{median}_i(m_{ijs}).
+\]
+
+Внутрисерийный robust scatter определяется как
+
+\[
+  \sigma_{js}^{\mathrm{rob}}=1.4826\,\operatorname{MAD}_i(m_{ijs}),
+\]
+
+а неопределённость representative magnitude берётся консервативно как максимум ошибки медианы по robust scatter и типичной measurement uncertainty, делённых на $\sqrt{N}$.
+
+Для inter-series reference population используются объекты ближайшей по provenance финальной ENSEMBLE-итерации с \texttt{is\_reference=true}; стандартные object-QC reject flags дают дополнительный veto. Это не меняет Stage~2 и не создаёт новую reference population скрыто.
+
+\subsection{M2: попарное смещение series}
+
+В версии 0.5.45.0 знак зафиксирован однозначно. Для общего reference object $j$ в series $a$ и $b$:
+
+\[
+  d_j^{ab}=\bar m_{jb}-\bar m_{ja}.
+\]
+
+После iterative median/MAD clipping оценивается
+
+\[
+  \Delta_{ab}=\operatorname{median}_j(d_j^{ab}).
+\]
+
+С этой конвенцией одновременно выполняются
+
+\[
+  z_a-z_b=\Delta_{ab}
+\]
+
+и последующее применение поправки
+
+\[
+  m^{\mathrm{global}}_{ijs}=m^{\mathrm{science}}_{ijs}+z_s.
+\]
+
+Для каждой пары сохраняются число initial/used/rejected calibrators, robust scatter, uncertainty и полный список calibrators с residuals.
+
+\subsection{M3: глобальное графовое решение}
+
+При наличии трёх и более series pairwise offsets становятся рёбрами графа. После фиксации gauge
+
+\[
+  z_{\mathrm{ref}}=0
+\]
+
+решается weighted least-squares система
+
+\[
+  z_a-z_b\simeq\Delta_{ab}.
+\]
+
+Для каждого ребра сохраняется closure residual
+
+\[
+  r_{ab}=(z_a-z_b)-\Delta_{ab},
+\]
+
+а для всего графа --- $\chi^2$, число степеней свободы, reduced $\chi^2$ и максимальный стандартизованный residual. Это позволяет обнаружить несовместимую series или edge до записи межсерийной калибровки в БД.
+
+Если в одном field scope присутствуют несколько независимых совместимых components, команда не выбирает ``самую большую'' молча. Нужно сузить \texttt{--filter}, \texttt{--instrument-unit-id}, \texttt{--catalog-name} либо явно указать \texttt{--reference-series-id}.
+
+\subsection{Диагностические файлы}
+
+\begin{description}
+  \item[\texttt{series\_summary.csv}] identity и качество каждой выбранной series;
+  \item[\texttt{series\_object\_states.csv}] M1 representative states;
+  \item[\texttt{pairwise\_offsets.csv}] M2 offsets и robust diagnostics;
+  \item[\texttt{pairwise\_calibrators.csv}] все использованные и rejected calibrators;
+  \item[\texttt{graph\_offsets.csv}] M3 additive offsets $z_s$;
+  \item[\texttt{graph\_edges.csv}] closure residuals каждого ребра;
+  \item[\texttt{interseries\_summary.json}] полная сводка M1--M3 и provenance input generations.
+\end{description}
+
+\section{M4: immutable persistent inter-series generation начиная с 0.5.46.0}
+
+После реальной проверки M1--M3 версия \texttt{0.5.46.0} вводит persistent Stage~3 product. Ранняя таблица \texttt{interseries\_calibration\_offsets} остаётся legacy compatibility layer и не используется как production M4 storage. Новая схема состоит из трёх таблиц:
+
+\begin{description}
+  \item[\texttt{interseries\_calibration\_generations}] immutable generation-level provenance и качество графа;
+  \item[\texttt{interseries\_calibration\_series}] точные input \texttt{SCIENCE} calibration IDs и additive offsets $z_s$;
+  \item[\texttt{interseries\_calibration\_edges}] pairwise M2 diagnostics, membership calibrator object IDs и M3 closure residuals.
+\end{description}
+
+Перед первым использованием необходимо применить managed migration:
+
+\begin{lstlisting}
+python -m grandgousier.cli schema-status
+python -m grandgousier.cli migrate-db
+\end{lstlisting}
+
+Generation fingerprint является SHA-256 от точных \texttt{series\_id + calibration\_version\_id} входов, field/instrument/filter/catalog scope, reference series и параметров M1--M3. Поэтому повтор той же команды idempotent, а новая Stage~2 SCIENCE generation или изменение threshold создаёт новый M4 generation. Старый generation не мутируется.
+
+Для redundant графа:
+
+\begin{lstlisting}
+python -m grandgousier.cli persist-interseries-calibration `
+  --field-id 33 `
+  --filter R `
+  --catalog-name "auto_catalog_master_20180907_GPX_TF17_2_mixed" `
+  --reference-series-id 77 `
+  --min-points-per-object 5 `
+  --min-common-objects 20
+\end{lstlisting}
+
+Если connected graph является деревом, то $\mathrm{dof}=0$ и независимого closure test нет. Такой результат получает reliability \texttt{SPARSE\_GRAPH\_NO\_CLOSURE} и не записывается без явного подтверждения \texttt{--allow-sparse-graph}. Это не понижает threshold автоматически; пользователь должен уже иметь отдельное научное обоснование sparse bridge.
+
+\begin{lstlisting}
+python -m grandgousier.cli persist-interseries-calibration `
+  --field-id 33 `
+  --filter V `
+  --reference-series-id 76 `
+  --min-common-objects 15 `
+  --allow-sparse-graph
+\end{lstlisting}
+
+Надёжность успешного generation кодируется явно:
+
+\begin{description}
+  \item[\texttt{REDUNDANT\_GRAPH\_OK}] граф имеет положительное число степеней свободы и внутренний closure test;
+  \item[\texttt{SPARSE\_GRAPH\_NO\_CLOSURE}] граф связан, но является деревом и closure redundancy отсутствует.
+\end{description}
+
+Проверка persisted generation:
+
+\begin{lstlisting}
+python -m grandgousier.cli verify-interseries-calibration `
+  --generation-id 1
+\end{lstlisting}
+
+Verifier не выбирает автоматически более новую Stage~2 calibration. Он проверяет fingerprint, exact source SCIENCE IDs, наличие retained \texttt{science\_measurements}, graph equations, $\chi^2$ и reliability уже записанного generation.
+
+Неопределённость \texttt{offset\_err\_mag} является общей zero-point uncertainty соответствующей series. Она коррелирована между всеми points этой series и поэтому M4 не добавляет её независимо к каждой Stage~2 measurement и не переписывает \texttt{mag\_err\_random}/\texttt{mag\_err\_systematic}. Такое применение относится к следующему object-history слою M5.
+
+\section{M5: read-only global object history начиная с 0.5.47.0}
+
+M5 не материализует новую копию всех measurements в БД. Он читает точные \texttt{science\_measurements}, перечисленные в \texttt{interseries\_calibration\_series}, и применяет только соответствующий persisted M4 offset:
+\[
+  m_{\mathrm{global},i}=m_{\mathrm{science},i}+z_s.
+\]
+Join является строгим одновременно по \texttt{series\_id} и \texttt{science\_calibration\_version\_id}. Поэтому M5 не может случайно применить offset к более новой Stage~2 generation.
+
+Базовый вызов:
+
+\begin{lstlisting}
+python -m grandgousier.cli export-global-object-light-curve `
+  --object-id 12345 `
+  --field-id 33 `
+  --out-root reports\object_12345_global
+\end{lstlisting}
+
+Если в одном scope уже накопилось несколько immutable M4 generations, automatic selection намеренно завершается ошибкой. Для воспроизводимого historical/controlled export нужно явно перечислить generation IDs:
+
+\begin{lstlisting}
+  --generation-id 1 `
+  --generation-id 2
+\end{lstlisting}
+
+Для каждой current SCIENCE series M5 проверяет, совпадает ли newest SCIENCE calibration ID с exact source ID выбранного M4 generation. При наличии current object points в unlinked/stale series export по умолчанию прекращается. \texttt{--allow-partial} разрешает вывести только exact-linked часть, но это должно считаться осознанно неполным продуктом.
+
+\subsection{Выходные файлы}
+
+Для \texttt{--out-root reports\\object\_12345\_global} создаются:
+
+\begin{description}
+  \item[\texttt{object\_12345\_global.csv}] точные accepted M5 points; без downsampling;
+  \item[\texttt{object\_12345\_global\_summary.json}] M4 provenance, coverage, uncertainty semantics и plot policy;
+  \item[\texttt{object\_12345\_global\_V.png}] отдельный plot фильтра V;
+  \item[\texttt{object\_12345\_global\_V\_plot.csv}] именно те raw/binned points, которые показаны на plot;
+  \item[аналогичные R/g/r/i файлы] создаются независимо для каждого встреченного фильтра.
+\end{description}
+
+По умолчанию main CSV содержит только science-accepted points. \texttt{--include-rejected} добавляет rejected rows с \texttt{quality\_flags} и \texttt{reject\_reasons}; plot всё равно строится только по accepted points.
+
+Начиная с 0.5.47.1 случай, когда exact M4 linkage найден, но все rows отвергнуты QC, имеет явный статус \texttt{NO\_ACCEPTED\_POINTS\_AFTER\_QC}. Summary содержит \texttt{rejection\_reasons} и \texttt{rejection\_reasons\_by\_series}. Команда печатает эти счётчики и возвращает exit code 2. Это не означает ошибку M4: например, насыщенная или явно нестабильная звезда может корректно иметь 0 accepted points.
+
+Для детальной проверки можно добавить:
+
+\begin{lstlisting}
+--include-rejected-debug
+\end{lstlisting}
+
+Тогда создаётся отдельный \texttt{<out-root>\_rejections.csv} с \texttt{series\_id}, \texttt{frame\_id}, exact SCIENCE/M4 IDs, magnitude, merged \texttt{quality\_flags} и \texttt{reject\_reasons}. Этот файл диагностический и не меняет основной accepted CSV. Если accepted points нет, plots намеренно не создаются, поскольку plotting policy использует только science-accepted points.
+
+\subsection{Насыщение в M5 начиная с 0.5.47.3}
+
+Object-QC flag \texttt{SATURATED\_LIKE} имеет series-level смысл: объект имел хотя бы один saturated/near-saturated epoch. Он остаётся важным veto при выборе ensemble reference stars и в Object-QC/candidate policy, но начиная с 0.5.47.3 сам по себе \emph{не} отвергает все epochs объекта при M5 global-history export. M5 использует measurement-level flag \texttt{SATURATED\_OR\_NEAR\_SATURATED} и отвергает только конкретный epoch, на котором этот флаг активен.
+
+Таким образом, наличие \texttt{SATURATED\_LIKE} в \texttt{quality\_flags} accepted M5 row допустимо и является диагностической provenance-информацией. Остальные object-level reject flags не меняются. Если требуется намеренно вернуть строгий series-level veto, его можно явно запросить через
+\begin{lstlisting}
+--extra-reject-flags SATURATED_LIKE
+\end{lstlisting}
+Это изменение относится только к default M5 row-selection; общий \texttt{DEFAULT\_REJECT\_FLAGS}, Stage~2 Object-QC и M1--M4 reference selection не меняются.
+
+\subsection{Неопределённости M5}
+
+В CSV сохраняются раздельно:
+
+\begin{description}
+  \item[\texttt{mag\_err\_random}] random component Stage~2 measurement;
+  \item[\texttt{mag\_err\_science\_systematic}] Stage~2 systematic component, если он существует;
+  \item[\texttt{mag\_err\_series\_zp}] M4 uncertainty $\sigma_{z,s}$, общая и коррелированная для всей series.
+\end{description}
+
+Для удобного одночислового отображения экспортируется
+\[
+  \sigma_{\mathrm{effective},i}
+  =\sqrt{\sigma_{\mathrm{random},i}^2+\sigma_{z,s}^2}.
+\]
+Это поле является convenience estimate, а не независимой ошибкой каждой точки: $\sigma_{z,s}$ нельзя усреднять как white noise при последующем анализе.
+
+\subsection{Ограничение числа точек на графике}
+
+Основной CSV никогда не уменьшается из-за plot policy. Опция \texttt{--plot-max-points} относится только к визуализации и по умолчанию равна 5000 points на filter. Начиная с 0.5.47.2 это жёсткий верхний предел: итоговый binned plot не может содержать больше указанного числа points на filter. Каждый непустой series получает как минимум один bin; если заданный limit меньше числа непустых series, программа останавливает построение plot вместо скрытого удаления целых series.
+
+В режиме \texttt{--plot-reduction auto} решение raw/bin консервативно принимается по числу exact linked source rows до QC; если оно не превышает лимит, строятся accepted исходные точки. Если лимит превышен, бюджет bins распределяется между series методом наибольших остатков с учётом их числа measurements, после чего каждая series бинингуется отдельно. Для series $s$ с выделенным числом bins $P_s$ автоматическая ширина приблизительно равна
+\[
+  \Delta t_s = \frac{t_{\max,s}-t_{\min,s}}{P_s},
+\]
+но не меньше одной секунды. Точка точно на $t_{\max,s}$ принудительно относится к последнему выделенному bin, поэтому inclusive endpoint не создаёт $(P_s+1)$-й bin. Можно задать физическую ширину через \texttt{--plot-bin-minutes}; в 0.5.47.2 она трактуется как минимальная ширина и при необходимости автоматически увеличивается, чтобы сохранить общий hard cap.
+
+Для каждого непустого bin $B$ plot-layer вычисляет arithmetic mean
+\[
+  \bar m_B=\frac{1}{n_B}\sum_{i\in B}m_i,
+\]
+а random error для отображения выбирает консервативно:
+\[
+ \sigma_{B,\mathrm{rand}}=
+ \max\left(
+   \frac{s_B}{\sqrt{n_B}},
+   \frac{\sqrt{\sum_{i\in B}\sigma_{\mathrm{random},i}^2}}{n_B}
+ \right).
+\]
+Дополнительно сохраняются \texttt{mag\_min} и \texttt{mag\_max}; график показывает min--max envelope, поэтому сильные excursions не исчезают полностью при усреднении. M4 zero-point uncertainty на error bars не рисуется как независимая: она остаётся отдельным correlated series-level полем.
+
+\texttt{--plot-reduction bin} принудительно включает биннинг, \texttt{--plot-reduction none} или \texttt{--no-plots} отключают визуализацию. Формат выбирается через \texttt{--plot-format png|pdf|svg}.
+
+\subsection{Разрыв и сжатие оси времени}
+
+Для multi-night overview физически пустые промежутки между сериями могут быть намного длиннее самих наблюдений. Опция
+\begin{lstlisting}
+--plot-time-axis auto|continuous|compressed
+\end{lstlisting}
+управляет только отображением. Значение \texttt{auto} используется по умолчанию: временные интервалы внутри каждого наблюдательного блока сохраняются без изменения, а большие gaps между неперекрывающимися series сокращаются до небольшого визуального зазора. На оси такие места отмечаются \texttt{//}. Подписи показывают исходный MJD, а при небольшом числе series также их идентификаторы.
+
+\texttt{continuous} оставляет обычную линейную ось MJD. \texttt{compressed} принудительно предпочитает сокращение межсерийных gaps, когда это возможно. Это преобразование не изменяет \texttt{mjd} в основном CSV и \texttt{*\_plot.csv}; оно применяется только внутри Matplotlib renderer.
+
+При числе series до 12 сохраняются отдельные визуальные стили и legend для series. Если series больше 12, renderer автоматически переходит в archive-overview: использует единый визуальный стиль внутри одного filter и убирает per-series legend, чтобы сотни цветов и подписей не занимали весь рисунок. Структура наблюдений при этом читается по MJD-подписям и отметкам разрывов времени.
+
+\section{M8: resumable batch orchestration начиная с 0.5.48.0}
+
+M8 не вводит новый photometric estimator и не меняет уравнения M1--M5. Это orchestration layer над уже реализованными scientific APIs. Он делит \texttt{processed-root} на leaf batches с FITS, сверяет их с БД и присваивает состояние \texttt{SKIP\_READY}, \texttt{RUN\_NEW}, \texttt{RESUME\_INCOMPLETE}, \texttt{SKIP\_TOO\_SMALL} или \texttt{STOP\_CONFLICT}. Начиная с 0.5.48.1 \texttt{SKIP\_TOO\_SMALL} выставляется до Stage~2, если ни одна series-like группа (profile/instrument/site/tube/camera/filter/object) не набирает \texttt{min\_frames\_per\_series=10}. READY данные при resume не перерабатываются. Leaf batch, содержащий FITS более чем одной календарной даты, намеренно блокируется как неоднозначный. Начиная с 0.5.54.3 readiness для P4-linked данных считается по физическим Observation, а не по обязательному прямому назначению каждого Frame product: alternate Frame не делает batch неполным, если та же Observation уже представлена READY science series данного field. При нескольких historical representatives M8 предпочитает READY representative; если READY representatives несколько, выбирается representative с наибольшим science-frame coverage. Observation без representative и legacy Frame с \texttt{observation\_id=NULL}, не назначенный напрямую, по-прежнему дают \texttt{RESUME\_INCOMPLETE}.
+
+Stage~2 запускается frozen recipe \texttt{stage3\_scale\_v1}: \texttt{adaptive\_ellipse}, aperture-correction policy \texttt{evidence}, conventional ensemble с минимум 30 references/frame, candidate-excluded iteration до сходимости с growth policy \texttt{initial\_only}, photometric-frame-QC, PSF diagnostics и color-calibration attempt; spatial ensemble остаётся выключенным. Target provenance для архивного field-run отключается.
+
+После новых Stage~2 products M8 последовательно требует:
+\begin{enumerate}
+  \item parity \texttt{science\_measurements} для новых/возобновлённых SCIENCE generations;
+  \item \texttt{READY\_SHARED\_IDENTITY};
+  \item M0 readiness для каждого явно заданного scope;
+  \item connected M1--M3 graph со статусом \texttt{READY\_M1\_M3}/\texttt{OK};
+  \item immutable M4 persist и \texttt{verify-interseries-calibration = OK};
+  \item при заданных control objects --- M5 с ненулевым числом accepted points.
+\end{enumerate}
+
+Порог \texttt{min\_common\_objects} является частью explicit policy и никогда не изменяется orchestration автоматически. M8 v1 допускает ровно одну explicit policy на filter, чтобы выбор итоговой M4 generation оставался однозначным. Если graph disconnected, workflow останавливается и оставляет partial machine-readable report.
+
+Итоговый M8 report bundle содержит \texttt{final\_report.json}, \texttt{report.html}, \texttt{batches.csv}, \texttt{frame\_qc.csv}, \texttt{series.csv}, \texttt{interseries\_edges.csv}, \texttt{interseries\_offsets.csv} и \texttt{control\_objects.csv}, а также полные M1--M3 diagnostics и M5 products в подкаталогах.
+
+\section{Последующие этапы}
+
+После стабилизации M8 следующий этап --- multi-series QC/variability metrics, затем support heterogeneous instrument units и cross-catalog identity.
+
+Актуальная инженерная карта находится в \texttt{docs/ROADMAP.md}; исторический Stage~3 plan сохранён в \texttt{docs/PROJECT\_HISTORY.md}.
+
+\section{Подготовка чистой Stage 2 базы перед M1}
+
+Версия \texttt{0.5.41.1} добавляет промежуточный infrastructure milestone между M0 и M1. Его задача --- не менять фотометрический алгоритм, а обеспечить, чтобы Stage~3 сравнивал science products, пересчитанные одной современной версией Stage~2, а не смесь исторических benchmark generations.
+
+После полного пересчёта следует проверить field-wide catalog identity:
+
+\begin{lstlisting}
+python -m grandgousier.cli audit-field-catalog-identity `
+  --field-id 2
+\end{lstlisting}
+
+Команда группирует повторные series по \texttt{field\_id + instrument\_unit\_id + filter\_name} и проверяет catalog namespaces, реально связанные с кадрами через \texttt{frame\_catalog\_links}. Для прямого object-ID stitching первого Stage~3 MVP предпочтителен статус
+
+\begin{lstlisting}
+READY_SHARED_IDENTITY
+\end{lstlisting}
+
+и для каждой повторной группы
+
+\begin{lstlisting}
+READY_SHARED_NAMESPACE
+\end{lstlisting}
+
+Это означает, что серии одной фотометрической системы используют один и тот же catalog namespace. При текущей схеме \texttt{object\_uid} строится из catalog namespace/source identity, поэтому такой shared namespace обеспечивает стабильное повторное использование одного \texttt{object\_id} при новом forced-photometry проходе.
+
+Статус \texttt{NEEDS\_RECONCILIATION} означает, что две series одной системы используют несовпадающие catalog namespaces. В таком состоянии M1/M2 запускать не следует: сначала нужна унификация catalog identity или будущий cross-catalog reconciliation.
+
+
+\subsection{Стабильность catalog namespace при clean rebuild}
+
+Stage~3 использует устойчивую object identity между series. Поэтому clean rebuild Stage~2 не должен без необходимости заново создавать уже существующий auto-catalog. Версия \texttt{0.5.41.2} повторно использует заполненный каталог с точным ожидаемым auto-generated именем до попытки Gaia query. Это сохраняет существующий namespace и исключает сетевую зависимость для уже известных полей. После rebuild всё равно необходимо выполнить \texttt{audit-field-catalog-identity}: reuse одного старого namespace не решает автоматически cross-catalog identity для series, которые исторически были построены в разных namespaces.
+
+\subsection{Глобальный retirement старого SCIENCE V1 (0.6.4.5)}
+После точного retirement отдельных полей команды обслуживания поддерживают явную область
+\texttt{--all-materialized}. Она выбирает только неизменяемые SCIENCE-продукты, для которых
+в базе ещё физически существуют строки \texttt{science\_measurements}. Флаг взаимоисключающий
+с \texttt{--field-id} и явными \texttt{--calibration-version-id}; без \texttt{--execute}
+никакого удаления не происходит. Типичная последовательность: заполнить compact cache,
+построить и проверить exact flag overrides, выполнить полный retirement dry-run и только затем
+повторить retirement с \texttt{--execute}. Уже retired продукты автоматически не попадают в
+глобальную область, так как V1-строк у них больше нет.

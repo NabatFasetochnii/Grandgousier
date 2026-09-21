@@ -20,6 +20,8 @@ def test_science_light_curve_columns_include_global_product_fields():
         "frame_id",
         "series_id",
         "mag_cal",
+        "mag_err_effective_detector_only",
+        "mag_err_effective_total",
         "mag_global",
         "interseries_offset_mag",
         "quality_flags",
@@ -84,3 +86,85 @@ def test_light_curve_reject_flags_can_make_detection_support_diagnostic_only():
     assert "NO_DETECTION_SUPPORT" not in relaxed
     assert "WEAK_DETECTION_SUPPORT" not in relaxed
     assert "HIGH_RMS" in relaxed
+
+
+def test_science_lightcurve_reader_has_no_legacy_storage_path() -> None:
+    from pathlib import Path
+
+    source = (Path(__file__).parents[1] / "grandgousier" / "lightcurves" / "product.py").read_text(encoding="utf-8")
+    assert "science_measurements" not in source
+    assert "science_photometry_cache" not in source
+    assert "interseries_calibration_offsets" not in source
+    assert "load_calibration_photometry_view" in source
+    assert "interseries_calibration_series" in source
+
+
+def test_raw_lightcurve_always_uses_storage_independent_view(monkeypatch):
+    from grandgousier.lightcurves import product
+
+    scope = product.LightCurveScope(calibration_version_ids=[7, 8])
+    sentinel = [{"source": "virtual"}]
+    monkeypatch.setattr(
+        product,
+        "_load_raw_light_curve_rows_virtual",
+        lambda *args, **kwargs: sentinel,
+    )
+
+    rows = product._load_raw_light_curve_rows(
+        object(),
+        scope=scope,
+        source_id=None,
+        object_id=42,
+        object_qc_algorithm="object_qc_v1",
+        offset_algorithm="interseries_graph_median_v1",
+    )
+    assert rows is sentinel
+
+
+def test_lightcurve_reader_avoids_raw_postgresql_array_and_nullable_predicate_binds() -> None:
+    from pathlib import Path
+
+    source = (Path(__file__).parents[1] / "grandgousier" / "lightcurves" / "product.py").read_text(encoding="utf-8")
+    assert "ANY(:calibration_names)" not in source
+    assert "science_calibration_version_id = ANY(:cv_ids)" not in source
+    assert "(:algorithm IS NULL OR" not in source
+    assert 'bindparam("cv_ids", expanding=True)' in source
+
+
+def test_resolve_lightcurve_scope_passes_calibration_object_to_chain_resolver(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from grandgousier.lightcurves import product
+
+    calibration = SimpleNamespace(calibration_version_id=7, name="ens")
+
+    class FakeSession:
+        def get(self, model, key):
+            assert key == 7
+            return calibration
+
+    monkeypatch.setattr(
+        product,
+        "_load_calibration_rows",
+        lambda *args, **kwargs: [
+            {
+                "calibration_version_id": 7,
+                "name": "ens",
+                "model_name": "ensemble_differential_v1",
+                "instrument_unit_id": 1,
+            }
+        ],
+    )
+
+    seen = []
+
+    def fake_chain(session, cv):
+        seen.append(cv)
+        return ["ens", "base"]
+
+    monkeypatch.setattr(product, "_calibration_chain_names", fake_chain)
+    monkeypatch.setattr(product, "_resolve_field_series_filter", lambda *args, **kwargs: None)
+
+    scope = product.resolve_light_curve_scope(FakeSession(), calibration_names=["ens"])
+
+    assert seen == [calibration]
+    assert scope.calibration_version_ids == [7]

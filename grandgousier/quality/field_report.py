@@ -20,6 +20,7 @@ from grandgousier.db.models import (
     Measurement,
     ObjectQc,
 )
+from grandgousier.photometry.calibration_view import load_calibration_photometry_view
 from grandgousier.quality.blend_diagnostics import (
     blend_diagnostic_columns,
     build_blend_diagnostic_rows,
@@ -29,7 +30,11 @@ from grandgousier.quality.candidate_triage import (
     build_candidate_triage,
     candidate_triage_columns,
 )
-from grandgousier.quality.lightcurve_quality import build_rms_mag_summary, load_object_scatter_rows
+from grandgousier.quality.lightcurve_quality import (
+    CalibrationAnalysisSnapshot,
+    build_rms_mag_summary,
+    load_object_scatter_rows,
+)
 from grandgousier.quality.object_quality import _has_aperture_stability, _preserve_aperture_stability_flags
 
 
@@ -81,6 +86,9 @@ def build_field_qc_report(
     low_amplitude_min_rms_over_mag_err: float | None = 2.3,
     low_amplitude_min_mad_over_mag_err: float | None = 2.0,
     low_amplitude_min_robust_peak_to_peak: float | None = 0.08,
+    borderline_threshold_ratio: float = 0.9,
+    diagnostic_max_failed_criteria: int = 2,
+    analysis_snapshot: CalibrationAnalysisSnapshot | None = None,
 ) -> FieldQcReport:
     """Build a compact field/series QC report from existing database products."""
 
@@ -124,16 +132,33 @@ def build_field_qc_report(
         catalog_name=catalog_name,
         instrument_unit_id=instrument_unit_id,
         frame_ids=selected_frame_ids,
+        analysis_snapshot=analysis_snapshot,
     )
 
-    object_rows = load_object_scatter_rows(
-        session,
-        calibration_name=calibration_name,
-        catalog_name=catalog_name,
-        instrument_unit_id=instrument_unit_id,
-        frame_ids=selected_frame_ids,
-        min_measurements=min_measurements,
+    analysis_snapshot_cache_hit = bool(
+        analysis_snapshot is not None
+        and analysis_snapshot.timings_sec.get("_runner_cache_hit", 1.0)
     )
+    if analysis_snapshot is not None:
+        if not analysis_snapshot.matches(
+            calibration_name=calibration_name,
+            catalog_name=catalog_name,
+            instrument_unit_id=instrument_unit_id,
+            frame_ids=selected_frame_ids,
+            min_measurements=min_measurements,
+            fwhm_header_unit=analysis_snapshot.fwhm_header_unit,
+        ):
+            raise ValueError("analysis_snapshot scope does not match build_field_qc_report arguments")
+        object_rows = analysis_snapshot.object_rows
+    else:
+        object_rows = load_object_scatter_rows(
+            session,
+            calibration_name=calibration_name,
+            catalog_name=catalog_name,
+            instrument_unit_id=instrument_unit_id,
+            frame_ids=selected_frame_ids,
+            min_measurements=min_measurements,
+        )
     rms_bins = build_rms_mag_summary(
         object_rows,
         bin_width=bin_width,
@@ -185,6 +210,9 @@ def build_field_qc_report(
         low_amplitude_min_rms_over_mag_err=low_amplitude_min_rms_over_mag_err,
         low_amplitude_min_mad_over_mag_err=low_amplitude_min_mad_over_mag_err,
         low_amplitude_min_robust_peak_to_peak=low_amplitude_min_robust_peak_to_peak,
+        borderline_threshold_ratio=borderline_threshold_ratio,
+        diagnostic_max_failed_criteria=diagnostic_max_failed_criteria,
+        object_rows=object_rows,
     )
     candidate_rows = triage.rows
 
@@ -223,6 +251,15 @@ def build_field_qc_report(
             "filter_name": getattr(instrument_unit, "filter_name", None),
             "frame_qc_algorithm": frame_qc_algorithm,
             "object_qc_algorithm": object_qc_algorithm,
+            "analysis_snapshot_algorithm": (
+                analysis_snapshot.algorithm if analysis_snapshot is not None else None
+            ),
+            "analysis_snapshot_cache_hit": analysis_snapshot_cache_hit,
+            "analysis_snapshot_measurements": (
+                len(analysis_snapshot.measurement_rows)
+                if analysis_snapshot is not None
+                else None
+            ),
             "frame_selection_mode": _frame_selection_mode(series_selection=series_selection, frame_ids=selected_frame_ids),
             "selected_frame_ids_count": len(selected_frame_ids) if selected_frame_ids else None,
             "field_series": _field_series_metadata(series_selection),
@@ -241,6 +278,8 @@ def build_field_qc_report(
                 "low_amplitude_min_rms_over_mag_err": low_amplitude_min_rms_over_mag_err,
                 "low_amplitude_min_mad_over_mag_err": low_amplitude_min_mad_over_mag_err,
                 "low_amplitude_min_robust_peak_to_peak": low_amplitude_min_robust_peak_to_peak,
+                "borderline_threshold_ratio": borderline_threshold_ratio,
+                "diagnostic_max_failed_criteria": diagnostic_max_failed_criteria,
             },
         },
         "frames": frames,
@@ -257,6 +296,8 @@ def build_field_qc_report(
         "blend_diagnostics": blend_summary,
         "top_candidates": {
             "accepted": [r for r in candidate_rows if r.get("candidate_status") == "ACCEPTED"][:top_limit],
+            "borderline": [r for r in candidate_rows if r.get("candidate_status") == "BORDERLINE"][:top_limit],
+            "diagnostic": [r for r in candidate_rows if r.get("candidate_status") == "DIAGNOSTIC"][:top_limit],
             "rejected": [r for r in candidate_rows if r.get("candidate_status") == "REJECTED"][:top_limit],
         },
         "top_blend_risk": blend_rows[:top_limit],
@@ -807,23 +848,65 @@ def _measurement_summary(
     catalog_name: str | None,
     instrument_unit_id: int | None,
     frame_ids: list[int] | None = None,
+    analysis_snapshot: CalibrationAnalysisSnapshot | None = None,
 ) -> dict[str, Any]:
-    stmt = select(Measurement, Frame).join(Frame, Frame.frame_id == Measurement.frame_id).where(
-        Measurement.calibration_version_id == calibration_version_id
+    if analysis_snapshot is not None:
+        measurements = list(analysis_snapshot.measurement_rows)
+        object_ids = {int(row.object_id) for row in measurements}
+        mag_cals = [
+            float(row.mag_cal)
+            for row in measurements
+            if row.mag_cal is not None and _is_finite(row.mag_cal)
+        ]
+        mag_errs = [
+            float(row.mag_err)
+            for row in measurements
+            if row.mag_err is not None and _is_finite(row.mag_err)
+        ]
+        return {
+            "n_measurements": len(measurements),
+            "n_objects": len(object_ids),
+            "mag_cal_min": min(mag_cals) if mag_cals else None,
+            "mag_cal_max": max(mag_cals) if mag_cals else None,
+            "mag_err_median": _median(mag_errs),
+            "materialization_source": analysis_snapshot.materialization_source,
+        }
+
+    view = load_calibration_photometry_view(
+        session,
+        calibration_version_id=int(calibration_version_id),
+        frame_ids=frame_ids,
+        prefer_science=True,
     )
-    if instrument_unit_id is not None:
-        stmt = stmt.where(Frame.instrument_unit_id == instrument_unit_id)
-    if frame_ids:
-        stmt = stmt.where(Frame.frame_id.in_(frame_ids))
-    measurements = []
-    for meas, frame in session.execute(stmt).all():
-        flags = meas.flags or {}
-        if catalog_name and flags.get("catalog_name") != catalog_name:
-            continue
-        measurements.append(meas)
-    object_ids = {m.object_id for m in measurements}
-    mag_cals = [float(m.mag_cal) for m in measurements if m.mag_cal is not None and _is_finite(m.mag_cal)]
-    mag_errs = [float(m.mag_err) for m in measurements if m.mag_err is not None and _is_finite(m.mag_err)]
+    rows = list(view.rows)
+    if instrument_unit_id is not None and rows:
+        candidate_frame_ids = sorted({int(row.frame_id) for row in rows})
+        allowed = set(
+            int(value)
+            for value in session.scalars(
+                select(Frame.frame_id).where(
+                    Frame.frame_id.in_(candidate_frame_ids),
+                    Frame.instrument_unit_id == int(instrument_unit_id),
+                )
+            ).all()
+        )
+        rows = [row for row in rows if int(row.frame_id) in allowed]
+    measurements = [
+        row
+        for row in rows
+        if not catalog_name or (row.flags or {}).get("catalog_name") == catalog_name
+    ]
+    object_ids = {int(row.object_id) for row in measurements}
+    mag_cals = [
+        float(row.mag_cal)
+        for row in measurements
+        if row.mag_cal is not None and _is_finite(row.mag_cal)
+    ]
+    mag_errs = [
+        float(row.mag_err)
+        for row in measurements
+        if row.mag_err is not None and _is_finite(row.mag_err)
+    ]
     return {
         "n_measurements": len(measurements),
         "n_objects": len(object_ids),
@@ -831,8 +914,8 @@ def _measurement_summary(
         "mag_cal_min": min(mag_cals) if mag_cals else None,
         "mag_cal_max": max(mag_cals) if mag_cals else None,
         "mag_err_median": _median(mag_errs),
+        "materialization_source": view.source,
     }
-
 
 def _object_qc_summary(
     session: Session,
@@ -934,6 +1017,10 @@ def _summary_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
         {"section": "candidate_triage", "metric": "target_candidates", "value": triage.get("target_candidates")},
         {"section": "candidate_triage", "metric": "forced_target_candidates", "value": triage.get("forced_target_candidates")},
         {"section": "candidate_triage", "metric": "accepted", "value": triage.get("accepted")},
+        {"section": "candidate_triage", "metric": "borderline", "value": triage.get("borderline")},
+        {"section": "candidate_triage", "metric": "borderline_low_amplitude", "value": triage.get("borderline_low_amplitude")},
+        {"section": "candidate_triage", "metric": "near_threshold", "value": triage.get("near_threshold")},
+        {"section": "candidate_triage", "metric": "near_threshold_low_amplitude", "value": triage.get("near_threshold_low_amplitude")},
         {"section": "candidate_triage", "metric": "rejected", "value": triage.get("rejected")},
         {"section": "candidate_triage", "metric": "rejection_counts", "value": _counts_text(triage.get("rejection_counts", {}))},
         {"section": "blend", "metric": "possible_blend", "value": blends.get("possible_blend")},

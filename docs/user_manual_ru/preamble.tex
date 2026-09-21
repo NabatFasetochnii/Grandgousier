@@ -1,0 +1,76 @@
+\usepackage{fontspec}
+\usepackage{polyglossia}
+\setdefaultlanguage{russian}
+\setotherlanguage{english}
+
+% The manual is primarily built on Windows/MiKTeX.  Probe the standard
+% Windows fonts first so MiKTeX does not try to synthesize missing Noto/
+% Liberation fonts through makemf/hbf2gf.  The explicit Polyglossia
+% Cyrillic font families are required even when the selected main font
+% already contains Cyrillic glyphs.
+\IfFontExistsTF{Times New Roman}{
+  \setmainfont{Times New Roman}
+  \setsansfont{Arial}
+  \setmonofont{Consolas}[Scale=MatchLowercase]
+  \newfontfamily\cyrillicfont{Times New Roman}[Script=Cyrillic]
+  \newfontfamily\cyrillicfontsf{Arial}[Script=Cyrillic]
+  \newfontfamily\cyrillicfonttt{Consolas}[Script=Cyrillic,Scale=MatchLowercase]
+}{
+  \IfFontExistsTF{Liberation Serif}{
+    \setmainfont{Liberation Serif}
+    \setsansfont{Liberation Sans}
+    \setmonofont{Liberation Mono}[Scale=MatchLowercase]
+    \newfontfamily\cyrillicfont{Liberation Serif}[Script=Cyrillic]
+    \newfontfamily\cyrillicfontsf{Liberation Sans}[Script=Cyrillic]
+    \newfontfamily\cyrillicfonttt{Liberation Mono}[Script=Cyrillic,Scale=MatchLowercase]
+  }{
+    \setmainfont{DejaVu Serif}
+    \setsansfont{DejaVu Sans}
+    \setmonofont{DejaVu Sans Mono}[Scale=MatchLowercase]
+    \newfontfamily\cyrillicfont{DejaVu Serif}[Script=Cyrillic]
+    \newfontfamily\cyrillicfontsf{DejaVu Sans}[Script=Cyrillic]
+    \newfontfamily\cyrillicfonttt{DejaVu Sans Mono}[Script=Cyrillic,Scale=MatchLowercase]
+  }
+}
+
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{bookmark}
+\usepackage{csquotes}
+
+\hypersetup{
+  unicode=true,
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue,
+  pdftitle={Grandgousier — пользовательское руководство},
+  pdfauthor={Проект Grandgousier}
+}
+
+\setlist{nosep}
+\setlength{\parindent}{1.25em}
+\setlength{\parskip}{0.35em}
+\emergencystretch=2em
+
+\lstdefinestyle{grandgousier}{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  showstringspaces=false
+}
+\lstset{style=grandgousier}
+
+\newcommand{\program}{\texttt{Grandgousier}}
+\newcommand{\cli}[1]{\texttt{#1}}
+\newcommand{\stage}[1]{\textbf{Стадия #1}}

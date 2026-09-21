@@ -11,6 +11,7 @@ from grandgousier.db.models import (
     CalibrationVersion,
     CatalogSource,
     DetectionCatalogMatch,
+    DetectionRunFrame,
     Frame,
     InstrumentUnit,
     Measurement,
@@ -353,17 +354,18 @@ def _load_detection_match_map(
         return {}
 
     stmt = (
-        select(DetectionCatalogMatch, SourceDetection)
+        select(DetectionCatalogMatch, SourceDetection, DetectionRunFrame.frame_id)
+        .select_from(DetectionCatalogMatch)
+        .join(DetectionRunFrame, DetectionRunFrame.detection_run_frame_id == DetectionCatalogMatch.detection_run_frame_id)
         .join(SourceDetection, SourceDetection.source_detection_id == DetectionCatalogMatch.source_detection_id)
         .where(
             DetectionCatalogMatch.catalog_source_id == catalog_source.catalog_source_id,
-            DetectionCatalogMatch.catalog_name == catalog_name,
             DetectionCatalogMatch.match_status == "MATCHED",
         )
     )
     out: dict[int, dict[str, float]] = {}
-    for match, det in session.execute(stmt).all():
-        out[int(match.frame_id)] = {
+    for match, det, frame_id in session.execute(stmt).all():
+        out[int(frame_id)] = {
             "det_sep_arcsec": match.sep_arcsec,
             "det_snr": det.snr,
             "det_x": det.x,
@@ -383,8 +385,9 @@ def _load_frame_detections(
 ) -> list[SourceDetection]:
     stmt = (
         select(SourceDetection)
+        .join(DetectionRunFrame, DetectionRunFrame.detection_run_frame_id == SourceDetection.detection_run_frame_id)
         .where(
-            SourceDetection.frame_id == frame_id,
+            DetectionRunFrame.frame_id == frame_id,
             SourceDetection.x >= float(x0),
             SourceDetection.x <= float(x1),
             SourceDetection.y >= float(y0),
@@ -413,12 +416,15 @@ def _load_matched_detection_id(
     if catalog_source is None:
         return None
     match = session.scalar(
-        select(DetectionCatalogMatch).where(
+        select(DetectionCatalogMatch)
+        .join(DetectionRunFrame, DetectionRunFrame.detection_run_frame_id == DetectionCatalogMatch.detection_run_frame_id)
+        .where(
             DetectionCatalogMatch.catalog_source_id == catalog_source.catalog_source_id,
-            DetectionCatalogMatch.catalog_name == catalog_name,
-            DetectionCatalogMatch.frame_id == frame_id,
+            DetectionRunFrame.frame_id == frame_id,
             DetectionCatalogMatch.match_status == "MATCHED",
         )
+        .order_by(DetectionCatalogMatch.detection_catalog_match_id.desc())
+        .limit(1)
     )
     return int(match.source_detection_id) if match is not None else None
 

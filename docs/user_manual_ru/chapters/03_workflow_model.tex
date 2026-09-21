@@ -1,0 +1,26 @@
+\chapter{Модель данных и рабочего процесса}
+
+\section{Кадр, серия и объект}
+
+Начиная с 0.5.52.0 модель явно разделяет физическую экспозицию и её файловое представление. \textbf{Observation} --- одна физическая экспозиция с path-independent identity; \textbf{кадр (frame)} --- конкретный FITS/file product, поэтому несколько frames могут ссылаться на один observation. \textbf{Серия} --- набор кадров, относящихся к одному согласованному наблюдательному контексту. \textbf{Объект} --- устойчивый источник, идентифицируемый через каталог и БД.
+
+Legacy \texttt{frames.frame\_uid} сохраняется и не переписывается. Новая связь \texttt{frames.observation\_id} вводится отдельно, чтобы копии или processing-варианты одной экспозиции не требовали объединения существующих frame rows. Разделение этих уровней принципиально: file identity, physical exposure identity, калибровка одной серии и долговременная межсерийная калибровка объекта являются разными понятиями.
+
+\section{Calibration products}
+
+Современная архитектура сохраняет базовые measurements и нормализованные calibration terms. Промежуточные калибровки имеют provenance и immutable generations. Финальный пользовательский слой --- science measurements, восстановленные из базовой фотометрии и опубликованных calibration terms.
+
+\section{Почему не следует просто переписывать measurements}
+
+Хранение calibration generations позволяет:
+
+\begin{itemize}
+  \item повторить обработку новой версией алгоритма;
+  \item сравнить две calibration generations;
+  \item не уничтожать предыдущий результат;
+  \item восстановить, каким именно набором terms была получена science magnitude.
+\end{itemize}
+
+\section{Manifest и pipeline run}
+
+Каждый recorded pipeline run хранит structured steps и их результаты. Manifest предназначен для пользовательского и машинного контроля запуска; таблицы pipeline runs позволяют сравнивать этапы и производительность между версиями.

@@ -1,0 +1,40 @@
+\chapter{Продукты, QC и воспроизводимость}
+
+\section{Основные продукты}
+
+Пользовательский результат обработки серии включает БД и файловые artifacts. К наиболее важным относятся:
+
+\begin{itemize}
+  \item science calibration generation;
+  \item science measurements;
+  \item field/object QC;
+  \item candidate light curves и summaries;
+  \item manifest;
+  \item pipeline run log и step results;
+  \item зарегистрированные immutable artifacts, если запуск выполнялся recorded workflow.
+\end{itemize}
+
+\section{Random и systematic errors}
+
+В современной схеме случайная и систематическая составляющие ошибки разделяются. Диагностические residual floors могут присутствовать в provenance, не обязательно будучи применёнными к science error. При интерпретации следует различать measured diagnostic quantity и фактически применённую error component.
+
+\section{Object QC}
+
+Object QC оценивает scatter, magnitude-dependent noise, crowding/blending evidence и detection support. Эти признаки используются как характеристика качества объекта и как input для candidate logic.
+
+\section{Field QC}
+
+Field-level report суммирует качество серии: coverage, scatter, astrometry, aperture diagnostics, candidate statistics и другие series-level показатели.
+
+\section{Воспроизводимость}
+
+Для научно значимого результата следует сохранять или иметь возможность восстановить:
+
+\begin{itemize}
+  \item pipeline run ID;
+  \item software version;
+  \item calibration generation IDs;
+  \item входную серию и identity catalog;
+  \item manifest;
+  \item immutable artifacts/checksums, если они опубликованы.
+\end{itemize}

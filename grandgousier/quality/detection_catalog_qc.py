@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
 import numpy as np
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, joinedload
 from tqdm import tqdm
 
 from grandgousier.db.bulk import DEFAULT_BULK_INSERT_BATCH_SIZE, iter_sized_chunks, row_column_count
+from grandgousier.db.detection_io import PostgresDetectionCatalogMatchCopyStage, postgres_copy_capable
+from grandgousier.db.detection_runs import (
+    CATALOG_MATCH_RUN,
+    SOURCE_DETECTION_RUN,
+    create_detection_run,
+    create_detection_run_frame,
+)
 from grandgousier.db.models import (
     CatalogSource,
     DetectionCatalogMatch,
+    DetectionRun,
+    DetectionRunFrame,
     Frame,
     FrameCatalogLink,
     FrameQc,
@@ -25,18 +35,70 @@ QC_ALGORITHM = "detection_catalog_qc_v1"
 
 @dataclass
 class DetectionCatalogQcResult:
+    detection_run_id: int | None = None
     selected_frames: int = 0
     checked_frames: int = 0
     selected_detections: int = 0
     selected_catalog_sources: int = 0
     matched: int = 0
     frame_qc_written: int = 0
+    frame_qc_batches: int = 0
     insert_batches: int = 0
     insert_batch_size: int = DEFAULT_BULK_INSERT_BATCH_SIZE
     deleted_existing_matches: int = 0
+    delete_batches: int = 0
     failed_frames: int = 0
     dry_run: bool = False
     catalog_name: str = ""
+    read_strategy: str = "BULK_SCALAR_2QUERY_V1"
+    write_strategy: str = "SQLALCHEMY_PER_FRAME_UPSERT"
+    prefetched_detection_rows: int = 0
+    prefetched_catalog_rows: int = 0
+    staging_rows: int = 0
+    staging_copy_batches: int = 0
+    frame_load_sec: float = 0.0
+    detection_load_sec: float = 0.0
+    catalog_load_sec: float = 0.0
+    matching_sec: float = 0.0
+    qc_build_sec: float = 0.0
+    delete_existing_sec: float = 0.0
+    staging_copy_sec: float = 0.0
+    insert_select_sec: float = 0.0
+    frame_qc_upsert_sec: float = 0.0
+    quality_flag_merge_sec: float = 0.0
+    quality_flag_flush_sec: float = 0.0
+    write_finalize_sec: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class DetectionMatchInput:
+    source_detection_id: int
+    frame_id: int
+    x: float
+    y: float
+    ra_deg: float
+    dec_deg: float
+    peak_adu: float | None
+    flux: float | None
+    snr: float | None
+    algorithm: str
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogMatchSource:
+    catalog_source_id: int
+    source_id: str
+    ra_deg: float
+    dec_deg: float
+    ref_mags: dict
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogMatchLink:
+    frame_id: int
+    catalog_source_id: int
+    x: float | None
+    y: float | None
 
 
 def match_detections_to_catalog(
@@ -55,18 +117,20 @@ def match_detections_to_catalog(
     replace_existing: bool = False,
     dry_run: bool = False,
     insert_batch_size: int = DEFAULT_BULK_INSERT_BATCH_SIZE,
+    pipeline_run_id: int | None = None,
 ) -> DetectionCatalogQcResult:
-    """Cross-match stored detections with catalog sources already projected into frames.
+    """Cross-match stored detections with projected catalog sources.
 
-    Matching is greedy one-to-one per frame. It chooses the nearest catalog source
-    within ``radius_arcsec`` for every detection, sorted by increasing separation.
-    The resulting matches are stored in ``detection_catalog_matches`` and per-frame
-    aggregate QC is stored in ``frame_qc``.
+    Run-level configuration is stored once in ``detection_runs`` and per-frame
+    execution state in ``detection_run_frames``.  High-cardinality match rows keep
+    only relation-specific diagnostics plus photometric snapshots required for exact
+    historical QC.
     """
 
     if radius_arcsec <= 0:
         raise ValueError("radius_arcsec must be positive")
 
+    frame_load_started = time.perf_counter()
     frames = _select_frames(
         session,
         frame_ids=frame_ids,
@@ -75,75 +139,285 @@ def match_detections_to_catalog(
         only_wcs_ok=only_wcs_ok,
         limit=limit_frames,
     )
+    frame_load_sec = float(time.perf_counter() - frame_load_started)
     result = DetectionCatalogQcResult(
         selected_frames=len(frames),
         dry_run=dry_run,
         catalog_name=catalog_name,
         insert_batch_size=int(insert_batch_size),
+        frame_load_sec=frame_load_sec,
     )
+    selected_frame_ids = [int(frame.frame_id) for frame in frames]
 
-    for frame in tqdm(frames, desc="Matching detections to catalog", unit="frame"):
-        result.checked_frames += 1
-        try:
-            detections = _select_detections(
-                session,
-                frame_id=frame.frame_id,
-                algorithm=detection_algorithm,
-                min_snr=min_snr,
-            )
-            catalog_rows = _select_catalog_sources_for_frame(
-                session,
-                frame_id=frame.frame_id,
-                catalog_name=catalog_name,
-            )
-            result.selected_detections += len(detections)
-            result.selected_catalog_sources += len(catalog_rows)
+    started = time.perf_counter()
+    detections_by_frame = _select_detections_bulk(
+        session,
+        frame_ids=selected_frame_ids,
+        algorithm=detection_algorithm,
+        min_snr=min_snr,
+    )
+    result.detection_load_sec = float(time.perf_counter() - started)
+    result.prefetched_detection_rows = int(sum(len(rows) for rows in detections_by_frame.values()))
 
-            rows = _match_frame(
-                frame=frame,
-                detections=detections,
-                catalog_rows=catalog_rows,
-                catalog_name=catalog_name,
-                radius_arcsec=radius_arcsec,
-                mag_key=mag_key,
-            )
-            result.matched += len(rows)
+    started = time.perf_counter()
+    catalog_by_frame = _select_catalog_sources_bulk(
+        session,
+        frame_ids=selected_frame_ids,
+        catalog_name=catalog_name,
+    )
+    result.catalog_load_sec = float(time.perf_counter() - started)
+    result.prefetched_catalog_rows = int(sum(len(rows) for rows in catalog_by_frame.values()))
 
-            qc_row = _build_frame_qc_row(
-                frame=frame,
-                catalog_name=catalog_name,
-                detections=detections,
-                catalog_rows=catalog_rows,
-                match_rows=rows,
-                mag_key=mag_key,
-                radius_arcsec=radius_arcsec,
-                detection_algorithm=detection_algorithm,
-            )
+    match_run = None
+    if not dry_run:
+        match_run = create_detection_run(
+            session,
+            run_kind=CATALOG_MATCH_RUN,
+            algorithm=MATCH_ALGORITHM,
+            catalog_name=catalog_name,
+            parameters={
+                "detection_algorithm": detection_algorithm,
+                "radius_arcsec": radius_arcsec,
+                "mag_key": mag_key,
+                "min_snr": min_snr,
+            },
+            pipeline_run_id=pipeline_run_id,
+        )
+        result.detection_run_id = int(match_run.detection_run_id)
+
+    copy_stage: PostgresDetectionCatalogMatchCopyStage | None = None
+    copy_buffer: list[dict] = []
+    copy_buffer_rows = 8192
+    successful_frame_ids: list[int] = []
+    qc_rows: list[dict] = []
+    if dry_run:
+        result.write_strategy = "DRY_RUN"
+    elif postgres_copy_capable(session):
+        copy_stage = PostgresDetectionCatalogMatchCopyStage.create(session)
+        result.write_strategy = "POSTGRESQL_COPY_STAGING"
+    else:
+        result.write_strategy = "SQLALCHEMY_PER_FRAME_UPSERT"
+
+    try:
+        for frame in tqdm(frames, desc="Matching detections to catalog", unit="frame"):
+            result.checked_frames += 1
+            try:
+                detections = detections_by_frame.get(int(frame.frame_id), [])
+                catalog_rows = catalog_by_frame.get(int(frame.frame_id), [])
+                result.selected_detections += len(detections)
+                result.selected_catalog_sources += len(catalog_rows)
+
+                started = time.perf_counter()
+                rows = _match_frame(
+                    frame=frame,
+                    detections=detections,
+                    catalog_rows=catalog_rows,
+                    radius_arcsec=radius_arcsec,
+                    mag_key=mag_key,
+                )
+                result.matching_sec += float(time.perf_counter() - started)
+                result.matched += len(rows)
+
+                started = time.perf_counter()
+                qc_row = _build_frame_qc_row(
+                    frame=frame,
+                    catalog_name=catalog_name,
+                    detections=detections,
+                    catalog_rows=catalog_rows,
+                    match_rows=rows,
+                    mag_key=mag_key,
+                    radius_arcsec=radius_arcsec,
+                    detection_algorithm=detection_algorithm,
+                )
+                result.qc_build_sec += float(time.perf_counter() - started)
+            except Exception as exc:  # noqa: BLE001 - preserve per-frame isolation.
+                result.failed_frames += 1
+                if match_run is not None:
+                    create_detection_run_frame(
+                        session,
+                        detection_run_id=int(match_run.detection_run_id),
+                        frame_id=int(frame.frame_id),
+                        status="FAILED",
+                        diagnostics={
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc)[:1000],
+                        },
+                    )
+                continue
 
             if dry_run:
                 continue
 
-            if replace_existing:
-                deleted = session.execute(
-                    delete(DetectionCatalogMatch).where(
-                        DetectionCatalogMatch.frame_id == frame.frame_id,
-                        DetectionCatalogMatch.catalog_name == catalog_name,
-                        DetectionCatalogMatch.algorithm == MATCH_ALGORITHM,
-                    )
-                ).rowcount or 0
+            assert match_run is not None
+            if replace_existing and copy_stage is None:
+                started = time.perf_counter()
+                deleted, _ = _delete_prior_catalog_match_run_frames(
+                    session,
+                    frame_ids=[int(frame.frame_id)],
+                    catalog_name=catalog_name,
+                    algorithm=MATCH_ALGORITHM,
+                    keep_detection_run_id=int(match_run.detection_run_id),
+                )
+                result.delete_existing_sec += float(time.perf_counter() - started)
+                result.delete_batches += 1
                 result.deleted_existing_matches += deleted
 
-            if rows:
-                result.insert_batches += _upsert_detection_catalog_matches(session, rows, insert_batch_size=insert_batch_size)
-            _upsert_frame_qc(session, qc_row)
-            _merge_frame_quality_flags(frame, qc_row)
-            result.frame_qc_written += 1
-        except Exception:
-            result.failed_frames += 1
+            run_frame = create_detection_run_frame(
+                session,
+                detection_run_id=int(match_run.detection_run_id),
+                frame_id=int(frame.frame_id),
+                status="DONE",
+                diagnostics={
+                    "n_detections": int(len(detections)),
+                    "n_catalog_sources": int(len(catalog_rows)),
+                    "n_matched": int(len(rows)),
+                },
+            )
+            storage_rows = [
+                _match_storage_row(row, detection_run_frame_id=int(run_frame.detection_run_frame_id))
+                for row in rows
+            ]
 
-    if not dry_run:
-        session.commit()
+            if copy_stage is not None:
+                successful_frame_ids.append(int(frame.frame_id))
+                if storage_rows:
+                    copy_buffer.extend(storage_rows)
+                    if len(copy_buffer) >= copy_buffer_rows:
+                        copy_stage.append_rows(copy_buffer)
+                        copy_buffer.clear()
+                qc_rows.append(qc_row)
+                started = time.perf_counter()
+                _merge_frame_quality_flags(frame, qc_row)
+                result.quality_flag_merge_sec += float(time.perf_counter() - started)
+                result.frame_qc_written += 1
+                continue
+
+            if storage_rows:
+                started = time.perf_counter()
+                result.insert_batches += _upsert_detection_catalog_matches(
+                    session,
+                    storage_rows,
+                    insert_batch_size=insert_batch_size,
+                )
+                result.insert_select_sec += float(time.perf_counter() - started)
+            started = time.perf_counter()
+            _upsert_frame_qc(session, qc_row)
+            result.frame_qc_upsert_sec += float(time.perf_counter() - started)
+            result.frame_qc_batches += 1
+            started = time.perf_counter()
+            _merge_frame_quality_flags(frame, qc_row)
+            result.quality_flag_merge_sec += float(time.perf_counter() - started)
+            result.frame_qc_written += 1
+
+        if not dry_run and copy_stage is not None:
+            if copy_buffer:
+                copy_stage.append_rows(copy_buffer)
+                copy_buffer.clear()
+
+            if qc_rows:
+                started = time.perf_counter()
+                session.flush()
+                result.quality_flag_flush_sec = float(time.perf_counter() - started)
+
+            if replace_existing and successful_frame_ids:
+                assert match_run is not None
+                started = time.perf_counter()
+                deleted, _ = _delete_prior_catalog_match_run_frames(
+                    session,
+                    frame_ids=successful_frame_ids,
+                    catalog_name=catalog_name,
+                    algorithm=MATCH_ALGORITHM,
+                    keep_detection_run_id=int(match_run.detection_run_id),
+                )
+                result.delete_existing_sec += float(time.perf_counter() - started)
+                result.delete_batches = 1
+                result.deleted_existing_matches += deleted
+
+            copy_stage.merge()
+            result.staging_rows = int(copy_stage.rows_staged)
+            result.staging_copy_batches = int(copy_stage.copy_batches)
+            result.staging_copy_sec = float(copy_stage.staging_copy_sec)
+            result.insert_select_sec = float(copy_stage.insert_select_sec)
+            result.insert_batches = 1 if copy_stage.rows_staged else 0
+
+            if qc_rows:
+                started = time.perf_counter()
+                result.frame_qc_batches = _upsert_frame_qc_rows(
+                    session,
+                    qc_rows,
+                    insert_batch_size=insert_batch_size,
+                )
+                result.frame_qc_upsert_sec = float(time.perf_counter() - started)
+
+        if not dry_run:
+            started = time.perf_counter()
+            if copy_stage is not None:
+                copy_stage.close()
+            session.commit()
+            result.write_finalize_sec = float(time.perf_counter() - started)
+    finally:
+        if copy_stage is not None and not copy_stage.closed:
+            try:
+                copy_stage.close()
+            except Exception:
+                pass
+
     return result
+
+
+def _delete_prior_catalog_match_run_frames(
+    session: Session,
+    *,
+    frame_ids: list[int],
+    catalog_name: str,
+    algorithm: str,
+    keep_detection_run_id: int,
+) -> tuple[int, int]:
+    if not frame_ids:
+        return 0, 0
+    old_run_frame_ids = (
+        select(DetectionRunFrame.detection_run_frame_id)
+        .join(DetectionRun, DetectionRun.detection_run_id == DetectionRunFrame.detection_run_id)
+        .where(
+            DetectionRunFrame.frame_id.in_(frame_ids),
+            DetectionRun.run_kind == CATALOG_MATCH_RUN,
+            DetectionRun.catalog_name == catalog_name,
+            DetectionRun.algorithm == algorithm,
+            DetectionRun.detection_run_id != int(keep_detection_run_id),
+        )
+    )
+    n_matches = int(
+        session.scalar(
+            select(func.count(DetectionCatalogMatch.detection_catalog_match_id)).where(
+                DetectionCatalogMatch.detection_run_frame_id.in_(old_run_frame_ids)
+            )
+        )
+        or 0
+    )
+    deleted_run_frames = int(
+        session.execute(
+            delete(DetectionRunFrame).where(
+                DetectionRunFrame.detection_run_frame_id.in_(old_run_frame_ids)
+            )
+        ).rowcount
+        or 0
+    )
+    return n_matches, deleted_run_frames
+
+
+def _match_storage_row(row: dict, *, detection_run_frame_id: int) -> dict:
+    return {
+        "detection_run_frame_id": int(detection_run_frame_id),
+        "source_detection_id": int(row["source_detection_id"]),
+        "catalog_source_id": int(row["catalog_source_id"]),
+        "match_status": str(row.get("match_status") or "MATCHED"),
+        "sep_arcsec": row.get("sep_arcsec"),
+        "dx_pix": row.get("dx_pix"),
+        "dy_pix": row.get("dy_pix"),
+        "detection_mag_inst": row.get("detection_mag_inst"),
+        "catalog_mag": row.get("catalog_mag"),
+        "zero_point": row.get("zero_point"),
+    }
 
 
 def _select_frames(
@@ -169,27 +443,140 @@ def _select_frames(
     return list(session.scalars(stmt).all())
 
 
+def _select_detections_bulk(
+    session: Session,
+    *,
+    frame_ids: list[int],
+    algorithm: str,
+    min_snr: float | None,
+) -> dict[int, list[DetectionMatchInput]]:
+    if not frame_ids:
+        return {}
+    stmt = (
+        select(
+            SourceDetection.source_detection_id,
+            DetectionRunFrame.frame_id.label("frame_id"),
+            SourceDetection.x,
+            SourceDetection.y,
+            SourceDetection.ra_deg,
+            SourceDetection.dec_deg,
+            SourceDetection.peak_adu,
+            SourceDetection.flux,
+            SourceDetection.snr,
+            DetectionRun.algorithm.label("algorithm"),
+        )
+        .select_from(SourceDetection)
+        .join(
+            DetectionRunFrame,
+            DetectionRunFrame.detection_run_frame_id == SourceDetection.detection_run_frame_id,
+        )
+        .join(
+            DetectionRun,
+            DetectionRun.detection_run_id == DetectionRunFrame.detection_run_id,
+        )
+        .where(
+            DetectionRunFrame.frame_id.in_(frame_ids),
+            DetectionRun.run_kind == SOURCE_DETECTION_RUN,
+            DetectionRun.algorithm == algorithm,
+            SourceDetection.detection_status == "DETECTED",
+            SourceDetection.ra_deg.is_not(None),
+            SourceDetection.dec_deg.is_not(None),
+        )
+        .order_by(
+            DetectionRunFrame.frame_id,
+            SourceDetection.snr.desc().nullslast(),
+        )
+    )
+    if min_snr is not None:
+        stmt = stmt.where(SourceDetection.snr >= float(min_snr))
+
+    grouped: dict[int, list[DetectionMatchInput]] = {}
+    for row in session.execute(stmt).mappings().all():
+        frame_id = int(row["frame_id"])
+        grouped.setdefault(frame_id, []).append(
+            DetectionMatchInput(
+                source_detection_id=int(row["source_detection_id"]),
+                frame_id=frame_id,
+                x=float(row["x"]),
+                y=float(row["y"]),
+                ra_deg=float(row["ra_deg"]),
+                dec_deg=float(row["dec_deg"]),
+                peak_adu=_safe_float(row["peak_adu"]),
+                flux=_safe_float(row["flux"]),
+                snr=_safe_float(row["snr"]),
+                algorithm=str(row["algorithm"]),
+            )
+        )
+    return grouped
+
+
+def _select_catalog_sources_bulk(
+    session: Session,
+    *,
+    frame_ids: list[int],
+    catalog_name: str,
+) -> dict[int, list[tuple[CatalogMatchSource, CatalogMatchLink]]]:
+    if not frame_ids:
+        return {}
+    stmt = (
+        select(
+            FrameCatalogLink.frame_id,
+            FrameCatalogLink.catalog_source_id,
+            FrameCatalogLink.x,
+            FrameCatalogLink.y,
+            CatalogSource.source_id,
+            CatalogSource.ra_deg,
+            CatalogSource.dec_deg,
+            CatalogSource.ref_mags,
+        )
+        .select_from(FrameCatalogLink)
+        .join(CatalogSource, CatalogSource.catalog_source_id == FrameCatalogLink.catalog_source_id)
+        .where(
+            FrameCatalogLink.frame_id.in_(frame_ids),
+            FrameCatalogLink.in_footprint.is_(True),
+            CatalogSource.catalog_name == catalog_name,
+        )
+        .order_by(FrameCatalogLink.frame_id, CatalogSource.catalog_source_id)
+    )
+
+    grouped: dict[int, list[tuple[CatalogMatchSource, CatalogMatchLink]]] = {}
+    source_cache: dict[int, CatalogMatchSource] = {}
+    for row in session.execute(stmt).mappings().all():
+        frame_id = int(row["frame_id"])
+        catalog_source_id = int(row["catalog_source_id"])
+        source = source_cache.get(catalog_source_id)
+        if source is None:
+            source = CatalogMatchSource(
+                catalog_source_id=catalog_source_id,
+                source_id=str(row["source_id"]),
+                ra_deg=float(row["ra_deg"]),
+                dec_deg=float(row["dec_deg"]),
+                ref_mags=dict(row["ref_mags"] or {}),
+            )
+            source_cache[catalog_source_id] = source
+        link = CatalogMatchLink(
+            frame_id=frame_id,
+            catalog_source_id=catalog_source_id,
+            x=_safe_float(row["x"]),
+            y=_safe_float(row["y"]),
+        )
+        grouped.setdefault(frame_id, []).append((source, link))
+    return grouped
+
+
 def _select_detections(
     session: Session,
     *,
     frame_id: int,
     algorithm: str,
     min_snr: float | None,
-) -> list[SourceDetection]:
-    stmt = (
-        select(SourceDetection)
-        .where(
-            SourceDetection.frame_id == frame_id,
-            SourceDetection.algorithm == algorithm,
-            SourceDetection.detection_status == "DETECTED",
-            SourceDetection.ra_deg.is_not(None),
-            SourceDetection.dec_deg.is_not(None),
-        )
-        .order_by(SourceDetection.snr.desc().nullslast())
-    )
-    if min_snr is not None:
-        stmt = stmt.where(SourceDetection.snr >= float(min_snr))
-    return list(session.scalars(stmt).all())
+) -> list[DetectionMatchInput]:
+    return _select_detections_bulk(
+        session,
+        frame_ids=[int(frame_id)],
+        algorithm=algorithm,
+        min_snr=min_snr,
+    ).get(int(frame_id), [])
 
 
 def _select_catalog_sources_for_frame(
@@ -215,16 +602,15 @@ def _select_catalog_sources_for_frame(
 def _match_frame(
     *,
     frame: Frame,
-    detections: list[SourceDetection],
-    catalog_rows: list[tuple[CatalogSource, FrameCatalogLink]],
-    catalog_name: str,
+    detections: list[DetectionMatchInput],
+    catalog_rows: list[tuple[CatalogMatchSource, CatalogMatchLink]],
     radius_arcsec: float,
     mag_key: str,
 ) -> list[dict]:
     if not detections or not catalog_rows:
         return []
 
-    candidates: list[tuple[float, SourceDetection, CatalogSource, FrameCatalogLink]] = []
+    candidates: list[tuple[float, DetectionMatchInput, CatalogMatchSource, CatalogMatchLink]] = []
     for det, source, link in _candidate_pairs(frame=frame, detections=detections, catalog_rows=catalog_rows, radius_arcsec=radius_arcsec):
         if det.ra_deg is None or det.dec_deg is None:
             continue
@@ -253,11 +639,8 @@ def _match_frame(
             zp = cat_mag - det_mag_inst
         rows.append(
             {
-                "frame_id": frame.frame_id,
                 "source_detection_id": det.source_detection_id,
                 "catalog_source_id": source.catalog_source_id,
-                "catalog_name": catalog_name,
-                "algorithm": MATCH_ALGORITHM,
                 "match_status": "MATCHED",
                 "sep_arcsec": sep,
                 "dx_pix": dx,
@@ -265,16 +648,6 @@ def _match_frame(
                 "detection_mag_inst": det_mag_inst,
                 "catalog_mag": cat_mag,
                 "zero_point": zp,
-                "details": {
-                    "catalog_source_id": source.catalog_source_id,
-                    "source_id": source.source_id,
-                    "mag_key": mag_key,
-                    "detection_algorithm": det.algorithm,
-                    "catalog_x": link.x,
-                    "catalog_y": link.y,
-                    "detection_snr": det.snr,
-                    "detection_peak_adu": det.peak_adu,
-                },
             }
         )
     return rows
@@ -283,10 +656,10 @@ def _match_frame(
 def _candidate_pairs(
     *,
     frame: Frame,
-    detections: list[SourceDetection],
-    catalog_rows: list[tuple[CatalogSource, FrameCatalogLink]],
+    detections: list[DetectionMatchInput],
+    catalog_rows: list[tuple[CatalogMatchSource, CatalogMatchLink]],
     radius_arcsec: float,
-) -> list[tuple[SourceDetection, CatalogSource, FrameCatalogLink]]:
+) -> list[tuple[DetectionMatchInput, CatalogMatchSource, CatalogMatchLink]]:
     """Return plausible detection/catalog pairs using a pixel-space prefilter.
 
     The final acceptance is still performed in sky coordinates.  This grid only
@@ -300,7 +673,7 @@ def _candidate_pairs(
 
     cell = max(1.0, float(radius_pix))
     r2 = float(radius_pix) * float(radius_pix)
-    grid: dict[tuple[int, int], list[tuple[CatalogSource, FrameCatalogLink]]] = {}
+    grid: dict[tuple[int, int], list[tuple[CatalogMatchSource, CatalogMatchLink]]] = {}
     for source, link in catalog_rows:
         x = _safe_float(link.x)
         y = _safe_float(link.y)
@@ -309,7 +682,7 @@ def _candidate_pairs(
         key = (int(math.floor(x / cell)), int(math.floor(y / cell)))
         grid.setdefault(key, []).append((source, link))
 
-    pairs: list[tuple[SourceDetection, CatalogSource, FrameCatalogLink]] = []
+    pairs: list[tuple[DetectionMatchInput, CatalogMatchSource, CatalogMatchLink]] = []
     neighbor_span = max(1, int(math.ceil(radius_pix / cell)))
     for det in detections:
         dx0 = _safe_float(det.x)
@@ -348,8 +721,8 @@ def _build_frame_qc_row(
     *,
     frame: Frame,
     catalog_name: str,
-    detections: list[SourceDetection],
-    catalog_rows: list[tuple[CatalogSource, FrameCatalogLink]],
+    detections: list[DetectionMatchInput],
+    catalog_rows: list[tuple[CatalogMatchSource, CatalogMatchLink]],
     match_rows: list[dict],
     mag_key: str,
     radius_arcsec: float,
@@ -397,7 +770,7 @@ def _upsert_detection_catalog_matches(session: Session, rows: list[dict], *, ins
         # source-detection reruns that allowed stale matches for old detection IDs
         # to accumulate. The frame/source/catalog key makes this step idempotent.
         stmt = stmt.on_conflict_do_update(
-            constraint="uq_detection_catalog_matches_frame_source_catalog_algorithm",
+            constraint="uq_detection_catalog_matches_run_frame_catalog_source",
             set_={
                 "source_detection_id": stmt.excluded.source_detection_id,
                 "match_status": stmt.excluded.match_status,
@@ -407,7 +780,39 @@ def _upsert_detection_catalog_matches(session: Session, rows: list[dict], *, ins
                 "detection_mag_inst": stmt.excluded.detection_mag_inst,
                 "catalog_mag": stmt.excluded.catalog_mag,
                 "zero_point": stmt.excluded.zero_point,
-                "details": stmt.excluded.details,
+            },
+        )
+        session.execute(stmt)
+        n_batches += 1
+    return n_batches
+
+
+def _upsert_frame_qc_rows(
+    session: Session,
+    rows: list[dict],
+    *,
+    insert_batch_size: int | None = None,
+) -> int:
+    if not rows:
+        return 0
+    table = FrameQc.__table__
+    n_batches = 0
+    for chunk in iter_sized_chunks(rows, n_columns=row_column_count(rows), requested=insert_batch_size):
+        stmt = insert(table).values(list(chunk))
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_frame_qc_frame_catalog_algorithm",
+            set_={
+                "n_detections": stmt.excluded.n_detections,
+                "n_catalog_sources": stmt.excluded.n_catalog_sources,
+                "n_matched": stmt.excluded.n_matched,
+                "zp_n": stmt.excluded.zp_n,
+                "astrom_rms_arcsec": stmt.excluded.astrom_rms_arcsec,
+                "dx_median_pix": stmt.excluded.dx_median_pix,
+                "dy_median_pix": stmt.excluded.dy_median_pix,
+                "sep_median_arcsec": stmt.excluded.sep_median_arcsec,
+                "sep_p95_arcsec": stmt.excluded.sep_p95_arcsec,
+                "zp_median": stmt.excluded.zp_median,
+                "zp_mad": stmt.excluded.zp_mad,
             },
         )
         session.execute(stmt)
@@ -472,7 +877,7 @@ def _sky_sep_arcsec(ra1_deg, dec1_deg, ra2_deg, dec2_deg) -> float | None:
     return math.degrees(2 * math.asin(math.sqrt(a))) * 3600.0
 
 
-def _catalog_mag(source: CatalogSource, mag_key: str) -> float | None:
+def _catalog_mag(source: CatalogMatchSource, mag_key: str) -> float | None:
     mags = source.ref_mags or {}
     if mag_key in mags:
         return _safe_float(mags.get(mag_key))
