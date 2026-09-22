@@ -54,6 +54,10 @@ archives:
       backend: master-cache
       cache_root: C:\master\gpx
       fetch_missing: true
+      # Abort a transfer after this interval without actual byte progress.
+      stall_timeout_seconds: 300
+      # Emit bounded transport progress at most this often.
+      progress_interval_seconds: 15
       # search_roots:
       #   - C:\master\gpx\smoke
 

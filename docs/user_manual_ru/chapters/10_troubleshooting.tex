@@ -52,6 +52,10 @@ Arial и Consolas; на других системах используются L
   \item название dataset/series и число кадров.
 \end{itemize}
 
+\section{MASTER HTTP: stalled или неполный download}
+
+Проверьте, что заданы \cli{GRANDGOUSIER\_MASTER\_HTTP\_USER} и \cli{GRANDGOUSIER\_MASTER\_HTTP\_PASSWORD}. Downloader не считает непустой \cli{.part} завершённым: actual size сравнивается с размером ответа, а для resume дополнительно проверяется начало \cli{Content-Range}. При ошибке итоговый файл не публикуется, безопасный \cli{.part} сохраняется для следующей попытки. В журнале видны bounded progress events, номер attempt и причина retry; credentials, Authorization и authenticated URL не выводятся. Stall определяется отсутствием прироста байтов в течение 300 секунд и не требует обязательного HEAD.
+
 
 \section{MASTER: все кадры получают BAD\_EXCESS\_DETECTIONS}
 

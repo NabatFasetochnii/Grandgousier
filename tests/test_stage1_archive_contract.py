@@ -442,11 +442,27 @@ def test_master_asset_provider_fetches_only_missing_selected_asset(tmp_path: Pat
             return "https://example.invalid/data" + remote_path
 
         @staticmethod
-        def download_master_task(task, *, session, timeout_connect, timeout_read, overwrite, checksum):
+        def download_master_task(
+            task,
+            *,
+            session,
+            timeout_connect,
+            timeout_read,
+            overwrite,
+            checksum,
+            max_attempts,
+            stall_timeout_seconds,
+            progress_interval_seconds,
+            progress_callback,
+        ):
             calls.append(task.remote_path)
             assert session is not None
             assert overwrite is False
             assert checksum is False
+            assert max_attempts == 5
+            assert stall_timeout_seconds == 300.0
+            assert progress_interval_seconds == 15.0
+            assert progress_callback is not None
             task.local_path.parent.mkdir(parents=True, exist_ok=True)
             task.local_path.write_bytes(b"downloaded-selected-asset")
             return FakeResult()

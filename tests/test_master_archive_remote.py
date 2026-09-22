@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -144,9 +146,10 @@ def test_master_fetch_tasks_deduplicate_calibration_files(tmp_path: Path) -> Non
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int, chunks: list[bytes]) -> None:
+    def __init__(self, status_code: int, chunks: list[bytes], headers: dict[str, str] | None = None) -> None:
         self.status_code = status_code
         self._chunks = chunks
+        self.headers = headers or {}
 
     def __enter__(self):
         return self
@@ -199,11 +202,191 @@ def test_master_download_resumes_when_server_returns_206(tmp_path: Path) -> None
         local_path=final_path,
         roles=("raw",),
     )
-    session = _FakeSession(_FakeResponse(206, [b"def"]))
+    session = _FakeSession(
+        _FakeResponse(
+            206,
+            [b"def"],
+            {"Content-Range": "bytes 3-5/6", "Content-Length": "3", "ETag": '"asset"'},
+        )
+    )
     result = download_master_task(task, session=session)
     assert result.status == "DOWNLOADED_RESUMED"
     assert final_path.read_bytes() == b"abcdef"
     assert session.calls[0][1]["headers"] == {"Range": "bytes=3-"}
+
+
+def _download_task(tmp_path: Path, name: str = "asset.fit.gz") -> MasterFetchTask:
+    return MasterFetchTask(
+        remote_path=f"/master/imdata/rawdata/{name}",
+        url=f"https://example.invalid/data/master/imdata/rawdata/{name}",
+        local_path=tmp_path / name,
+        roles=("raw",),
+    )
+
+
+def test_master_download_validates_fresh_content_length(tmp_path: Path) -> None:
+    task = _download_task(tmp_path)
+    session = _FakeSession(_FakeResponse(200, [b"abc"], {"Content-Length": "6"}))
+    result = download_master_task(task, session=session)
+    assert result.status == "FAILED"
+    assert not task.local_path.exists()
+    assert task.local_path.with_name("asset.fit.gz.part").read_bytes() == b"abc"
+
+
+def test_master_download_rejects_resume_with_wrong_range_start(tmp_path: Path) -> None:
+    task = _download_task(tmp_path)
+    part = task.local_path.with_name("asset.fit.gz.part")
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"abc")
+    session = _FakeSession(
+        _FakeResponse(206, [b"def"], {"Content-Range": "bytes 0-2/6", "Content-Length": "3"})
+    )
+    result = download_master_task(task, session=session)
+    assert result.status == "FAILED"
+    assert part.read_bytes() == b"abc"
+    assert not task.local_path.exists()
+
+
+def test_master_download_restarts_when_resume_returns_200(tmp_path: Path) -> None:
+    task = _download_task(tmp_path)
+    part = task.local_path.with_name("asset.fit.gz.part")
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"old")
+    session = _FakeSession(_FakeResponse(200, [b"abcdef"], {"Content-Length": "6"}))
+    events = []
+    result = download_master_task(task, session=session, progress_callback=events.append)
+    assert result.status == "DOWNLOADED"
+    assert task.local_path.read_bytes() == b"abcdef"
+    assert events[0].event == "RANGE_IGNORED_RESTARTING_FROM_ZERO"
+
+
+def test_master_download_rejects_oversized_part(tmp_path: Path) -> None:
+    task = _download_task(tmp_path)
+    part = task.local_path.with_name("asset.fit.gz.part")
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"too-large")
+    session = _FakeSession(
+        _FakeResponse(206, [b"x"], {"Content-Range": "bytes 9-9/5", "Content-Length": "1"})
+    )
+    result = download_master_task(task, session=session)
+    assert result.status == "FAILED"
+    assert part.read_bytes() == b"too-large"
+    assert not task.local_path.exists()
+
+
+def test_master_download_retries_from_preserved_part(tmp_path: Path) -> None:
+    task = _download_task(tmp_path)
+    part = task.local_path.with_name("asset.fit.gz.part")
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"abc")
+
+    class RetrySession(_FakeSession):
+        def __init__(self):
+            self.responses = [
+                _FakeResponse(206, [b"def"], {"Content-Range": "bytes 3-5/6", "Content-Length": "3"}),
+                _FakeResponse(206, [b"f"], {"Content-Range": "bytes 5-5/6", "Content-Length": "1"}),
+            ]
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            response = self.responses.pop(0)
+            if len(self.calls) == 1:
+                response._chunks = [b"def"]
+
+                def fail_after_chunk(chunk_size):
+                    yield b"de"
+                    raise OSError("connection lost")
+
+                response.iter_content = fail_after_chunk
+            return response
+
+    session = RetrySession()
+    result = download_master_task(task, session=session, max_attempts=2)
+    assert result.status == "DOWNLOADED_RESUMED"
+    assert task.local_path.read_bytes() == b"abcdef"
+    assert [call[1]["headers"] for call in session.calls] == [
+        {"Range": "bytes=3-"},
+        {"Range": "bytes=5-"},
+    ]
+
+
+def test_master_download_stall_preserves_part_without_sleep(tmp_path: Path) -> None:
+    task = _download_task(tmp_path)
+    clock_values = iter([0.0, 0.0, 301.0])
+
+    class ClockedResponse(_FakeResponse):
+        def iter_content(self, chunk_size: int):
+            yield b"abc"
+            yield b"def"
+
+    session = _FakeSession(ClockedResponse(200, [b"ignored"], {"Content-Length": "6"}))
+    result = download_master_task(
+        task, session=session, stall_timeout_seconds=300.0, monotonic=lambda: next(clock_values)
+    )
+    assert result.status == "FAILED"
+    assert task.local_path.with_name("asset.fit.gz.part").read_bytes() == b"abc"
+
+
+def test_master_download_does_not_append_after_remote_change(tmp_path: Path) -> None:
+    task = _download_task(tmp_path)
+    part = task.local_path.with_name("asset.fit.gz.part")
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"abc")
+    part.with_name(part.name + ".meta.json").write_text(
+        '{"schema": "grandgousier.stage1.master-cache.v1", "remote_path": "/master/x", '
+        '"etag": "old", "expected_bytes": 6}\n',
+        encoding="utf-8",
+    )
+    session = _FakeSession(
+        _FakeResponse(
+            206,
+            [b"def"],
+            {"Content-Range": "bytes 3-5/6", "Content-Length": "3", "ETag": "new"},
+        )
+    )
+    result = download_master_task(task, session=session)
+    assert result.status == "FAILED"
+    assert part.read_bytes() == b"abc"
+    assert not task.local_path.exists()
+
+
+def test_master_download_local_http_server_validates_real_response(tmp_path: Path) -> None:
+    payload = b"local-master-payload"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path != "/asset":
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("ETag", '"local"')
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        import requests
+
+        task = MasterFetchTask(
+            remote_path="/master/local/asset",
+            url=f"http://127.0.0.1:{server.server_port}/asset",
+            local_path=tmp_path / "asset.fit.gz",
+            roles=("raw",),
+        )
+        result = download_master_task(task, session=requests.Session())
+        assert result.status == "DOWNLOADED"
+        assert task.local_path.read_bytes() == payload
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 

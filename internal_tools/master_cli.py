@@ -18,6 +18,7 @@ from internal_tools.master_remote import (
     search_master_archive_http,
     summarize_master_inventory,
     summarize_master_observing_series,
+    TransportProgress,
     write_master_fetch_report,
     write_master_inventory_csv,
 )
@@ -141,6 +142,14 @@ def register_master_remote_commands(sub: argparse._SubParsersAction) -> None:
     p_master_fetch.add_argument("--timeout-connect", type=float, default=15.0, help="HTTP connect timeout seconds")
     p_master_fetch.add_argument("--timeout-read", type=float, default=180.0, help="HTTP read timeout seconds")
     p_master_fetch.add_argument(
+        "--stall-timeout", type=float, default=300.0,
+        help="Abort an attempt after this many seconds without byte progress",
+    )
+    p_master_fetch.add_argument(
+        "--progress-interval", type=float, default=15.0,
+        help="Seconds between bounded transfer progress events",
+    )
+    p_master_fetch.add_argument(
         "--report-out", default=None, help="Download report CSV; default <out-root>/master_fetch_report.csv"
     )
     p_master_fetch.add_argument(
@@ -213,7 +222,7 @@ def cmd_master_archive_search(args: argparse.Namespace) -> int:
 
         if rows is None:
             http_user, http_password = resolve_master_http_credentials(
-                user=args.http_user, prompt_password=True
+                user=args.http_user, prompt_password=False
             )
             session = make_master_http_session(user=http_user, password=http_password, retries=4)
             rows = search_master_archive_http(
@@ -325,7 +334,7 @@ def cmd_master_archive_fetch(args: argparse.Namespace) -> int:
 
     try:
         http_user, http_password = resolve_master_http_credentials(
-            user=args.http_user, prompt_password=True
+            user=args.http_user, prompt_password=False
         )
         session = make_master_http_session(user=http_user, password=http_password, retries=args.retries)
     except Exception as exc:
@@ -333,6 +342,18 @@ def cmd_master_archive_fetch(args: argparse.Namespace) -> int:
         return 2
 
     results = []
+
+    def report_progress(progress: TransportProgress) -> None:
+        if progress.event not in {"PROGRESS", "RETRY", "COMPLETE", "RANGE_IGNORED_RESTARTING_FROM_ZERO"}:
+            return
+        expected = "?" if progress.expected_bytes is None else str(progress.expected_bytes)
+        rate = "?" if progress.recent_throughput is None else f"{progress.recent_throughput:.2f} MiB/s"
+        print(
+            f"MASTER transfer {progress.remote_path}: {progress.total_downloaded}/{expected} bytes, "
+            f"{rate}, attempt {progress.attempt}, event={progress.event}"
+            + (f", reason={progress.reason}" if progress.reason else "")
+        )
+
     try:
         for index, task in enumerate(tasks, start=1):
             result = download_master_task(
@@ -342,6 +363,10 @@ def cmd_master_archive_fetch(args: argparse.Namespace) -> int:
                 timeout_read=args.timeout_read,
                 overwrite=args.overwrite,
                 checksum=not args.no_checksum,
+                max_attempts=max(1, args.retries + 1),
+                stall_timeout_seconds=args.stall_timeout,
+                progress_interval_seconds=args.progress_interval,
+                progress_callback=report_progress,
             )
             results.append(result)
             print(

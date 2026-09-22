@@ -89,7 +89,9 @@ python -m grandgousier.cli master-archive-fetch `
   --out-root "C:\master\gpx"
 \end{lstlisting}
 
-Для реального transfer добавьте \cli{--execute}. Dark/flat дедуплицируются по remote path, существующие файлы по умолчанию не перезаписываются, а пароль HTTP Basic Auth запрашивается скрытым prompt или читается из environment.
+Для реального transfer добавьте \cli{--execute}. Dark/flat дедуплицируются по remote path, существующие файлы по умолчанию не перезаписываются. Для non-interactive запуска задайте \cli{GRANDGOUSIER\_MASTER\_HTTP\_USER} и \cli{GRANDGOUSIER\_MASTER\_HTTP\_PASSWORD}; при отсутствии credentials команда завершается fail-fast и не открывает prompt.
+
+HTTP downloader проверяет authoritative размер из \cli{Content-Length} или \cli{Content-Range}, не принимает resume с несовпадающим началом Range и атомарно публикует файл только после проверки полного размера. При временной ошибке сохраняется \cli{.part}; следующая попытка возобновляет передачу с его фактического размера. Прогресс передаётся ограниченно по времени (по умолчанию каждые 15 секунд), а отсутствие реального прироста байтов в течение 300 секунд прерывает попытку и оставляет \cli{.part} для retry. Размер stall timeout и интервал можно изменить в секции \cli{archives.*.assets}: \cli{stall\_timeout\_seconds} и \cli{progress\_interval\_seconds}.
 
 
 После загрузки сначала проверьте Stage~1B plan:

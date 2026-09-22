@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import time
 from html import unescape
 from html.parser import HTMLParser
 from collections import defaultdict
@@ -62,6 +63,27 @@ FETCH_REPORT_COLUMNS = [
 
 class MasterRemoteCredentialError(RuntimeError):
     """Raised when remote MASTER fetch credentials are not configured."""
+
+
+class MasterTransportError(RuntimeError):
+    """Raised when an asset response cannot be safely resumed or promoted."""
+
+
+@dataclass(frozen=True)
+class TransportProgress:
+    """Current bounded state for one MASTER asset transfer."""
+
+    remote_path: str
+    expected_bytes: int | None
+    existing_offset: int
+    downloaded_this_attempt: int
+    total_downloaded: int
+    elapsed: float
+    recent_throughput: float | None
+    attempt: int
+    last_progress_monotonic: float
+    event: str
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1141,7 +1163,19 @@ def download_master_task(
     overwrite: bool = False,
     checksum: bool = True,
     chunk_size: int = 1024 * 1024,
+    max_attempts: int = 1,
+    stall_timeout_seconds: float = 300.0,
+    progress_interval_seconds: float = 15.0,
+    progress_callback: Callable[[TransportProgress], None] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> MasterDownloadResult:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
+    if stall_timeout_seconds <= 0:
+        raise ValueError("stall_timeout_seconds must be positive")
+    if progress_interval_seconds <= 0:
+        raise ValueError("progress_interval_seconds must be positive")
+
     final_path = task.local_path
     final_path.parent.mkdir(parents=True, exist_ok=True)
     if final_path.exists() and final_path.is_file() and final_path.stat().st_size > 0 and not overwrite:
@@ -1163,65 +1197,275 @@ def download_master_task(
     if overwrite and part_path.exists():
         part_path.unlink()
         metadata_path.unlink(missing_ok=True)
-    resume_from = part_path.stat().st_size if part_path.exists() else 0
-    headers = {"Range": f"bytes={resume_from}-"} if resume_from > 0 else {}
+    metadata = _read_transport_metadata(metadata_path)
+    initial_offset = part_path.stat().st_size if part_path.exists() else 0
+    last_error: Exception | None = None
 
-    try:
-        metadata_path.write_text(
-            json.dumps(
-                {
-                    "schema": MASTER_CACHE_MARKER_SCHEMA,
-                    "remote_path": task.remote_path,
-                    "url": task.url,
-                    "roles": list(task.roles),
-                },
-                sort_keys=True,
+    def emit(progress: TransportProgress) -> None:
+        if progress_callback is not None:
+            progress_callback(progress)
+
+    for attempt in range(1, max_attempts + 1):
+        resume_from = part_path.stat().st_size if part_path.exists() else 0
+        started = monotonic()
+        last_progress = started
+        last_report = started - progress_interval_seconds
+        downloaded_this_attempt = 0
+        expected_total = _optional_positive_int(metadata.get("expected_bytes"))
+        try:
+            headers = {"Range": f"bytes={resume_from}-"} if resume_from > 0 else {}
+            response = session.get(
+                task.url,
+                stream=True,
+                headers=headers,
+                timeout=(float(timeout_connect), float(timeout_read)),
             )
-            + "\n",
-            encoding="utf-8",
-        )
-        with session.get(
-            task.url,
-            stream=True,
-            headers=headers,
-            timeout=(float(timeout_connect), float(timeout_read)),
-        ) as response:
-            if response.status_code == 401:
-                raise RuntimeError("HTTP 401 Unauthorized")
-            if response.status_code == 404:
-                raise RuntimeError("HTTP 404 Not Found")
-            response.raise_for_status()
+            with response:
+                if response.status_code == 401:
+                    raise RuntimeError("HTTP 401 Unauthorized")
+                if response.status_code == 404:
+                    raise RuntimeError("HTTP 404 Not Found")
+                response.raise_for_status()
 
-            append = resume_from > 0 and response.status_code == 206
-            mode = "ab" if append else "wb"
-            with part_path.open(mode) as handle:
-                for chunk in response.iter_content(chunk_size=chunk_size):
-                    if chunk:
+                expected_total, append = _validate_master_response(
+                    response,
+                    requested_offset=resume_from,
+                    prior_metadata=metadata,
+                )
+                if resume_from > 0 and response.status_code == 200:
+                    emit(_make_progress(
+                        task.remote_path, expected_total, resume_from, downloaded_this_attempt,
+                        part_path.stat().st_size, started, attempt, last_progress,
+                        "RANGE_IGNORED_RESTARTING_FROM_ZERO", monotonic(),
+                    ))
+                    part_path.unlink(missing_ok=True)
+                    metadata = {}
+                    resume_from = 0
+                    downloaded_this_attempt = 0
+                    append = False
+
+                current_size = part_path.stat().st_size if part_path.exists() else 0
+                metadata = _write_transport_metadata(
+                    metadata_path,
+                    task=task,
+                    expected_bytes=expected_total,
+                    current_size=current_size,
+                    response=response,
+                    attempts=attempt,
+                )
+                mode = "ab" if append else "wb"
+                with part_path.open(mode) as handle:
+                    for chunk in response.iter_content(chunk_size=chunk_size):
+                        now = monotonic()
+                        if now - last_progress > stall_timeout_seconds:
+                            raise MasterTransportError(
+                                f"MASTER transfer stalled for {stall_timeout_seconds:.0f}s"
+                            )
+                        if not chunk:
+                            continue
                         handle.write(chunk)
+                        handle.flush()
+                        downloaded_this_attempt += len(chunk)
+                        last_progress = now
+                        current_size += len(chunk)
+                        if now - last_report >= progress_interval_seconds:
+                            emit(_make_progress(
+                                task.remote_path, expected_total, resume_from,
+                                downloaded_this_attempt, current_size, started, attempt,
+                                last_progress, "PROGRESS", now,
+                            ))
+                            last_report = now
+                            _write_transport_metadata(
+                                metadata_path,
+                                task=task,
+                                expected_bytes=expected_total,
+                                current_size=current_size,
+                                response=response,
+                                attempts=attempt,
+                                last_progress_monotonic=last_progress,
+                            )
 
-        if part_path.stat().st_size <= 0:
-            raise RuntimeError("Downloaded file is empty")
-        os.replace(part_path, final_path)
-        metadata_path.unlink(missing_ok=True)
-        return MasterDownloadResult(
-            remote_path=task.remote_path,
-            url=task.url,
-            local_path=final_path,
-            roles=task.roles,
-            status="DOWNLOADED_RESUMED" if resume_from > 0 and append else "DOWNLOADED",
-            size_bytes=final_path.stat().st_size,
-            sha256=_sha256_file(final_path) if checksum else None,
-        )
-    except Exception as exc:
-        return MasterDownloadResult(
-            remote_path=task.remote_path,
-            url=task.url,
-            local_path=final_path,
-            roles=task.roles,
-            status="FAILED",
-            size_bytes=part_path.stat().st_size if part_path.exists() else None,
-            error=f"{type(exc).__name__}: {exc}",
-        )
+            actual_size = part_path.stat().st_size if part_path.exists() else 0
+            if actual_size <= 0:
+                raise MasterTransportError("Downloaded file is empty")
+            if expected_total is not None and actual_size != expected_total:
+                raise MasterTransportError(
+                    f"Downloaded size {actual_size} does not match expected {expected_total}"
+                )
+            os.replace(part_path, final_path)
+            metadata_path.unlink(missing_ok=True)
+            now = monotonic()
+            emit(_make_progress(
+                task.remote_path, expected_total, resume_from, downloaded_this_attempt,
+                actual_size, started, attempt, last_progress, "COMPLETE", now,
+            ))
+            return MasterDownloadResult(
+                remote_path=task.remote_path,
+                url=task.url,
+                local_path=final_path,
+                roles=task.roles,
+                status="DOWNLOADED_RESUMED" if initial_offset > 0 and append else "DOWNLOADED",
+                size_bytes=actual_size,
+                sha256=_sha256_file(final_path) if checksum else None,
+            )
+        except Exception as exc:
+            last_error = exc
+            current_size = part_path.stat().st_size if part_path.exists() else 0
+            _write_transport_metadata(
+                metadata_path,
+                task=task,
+                expected_bytes=expected_total,
+                current_size=current_size,
+                response=None,
+                attempts=attempt,
+                last_progress_monotonic=last_progress,
+            )
+            if attempt < max_attempts:
+                now = monotonic()
+                emit(_make_progress(
+                    task.remote_path, expected_total, resume_from, downloaded_this_attempt,
+                    current_size, started, attempt, last_progress, "RETRY", now,
+                    reason=_safe_transport_error(exc, task.url),
+                ))
+                continue
+            break
+
+    return MasterDownloadResult(
+        remote_path=task.remote_path,
+        url=task.url,
+        local_path=final_path,
+        roles=task.roles,
+        status="FAILED",
+        size_bytes=part_path.stat().st_size if part_path.exists() else None,
+        error=_safe_transport_error(last_error, task.url) if last_error else "transfer failed",
+    )
+
+
+_CONTENT_RANGE_RE = re.compile(r"^bytes\s+(\d+)-(\d+)/(\d+|\*)$", re.IGNORECASE)
+
+
+def _optional_positive_int(value: object) -> int | None:
+    if value in {None, ""}:
+        return None
+    parsed = int(value)
+    return parsed if parsed > 0 else None
+
+
+def _response_header(response, name: str) -> str | None:
+    value = response.headers.get(name)
+    return str(value).strip() if value not in {None, ""} else None
+
+
+def _safe_transport_error(error: Exception, url: str) -> str:
+    """Keep transport diagnostics useful without exposing the request URL."""
+    detail = str(error).replace(url, "<redacted-url>")
+    detail = re.sub(r"https?://\S+", "<redacted-url>", detail)
+    return f"{type(error).__name__}: {detail}"
+
+
+def _validate_master_response(response, *, requested_offset: int, prior_metadata: dict[str, object]):
+    content_range = _response_header(response, "Content-Range")
+    content_length = _optional_positive_int(_response_header(response, "Content-Length"))
+    etag = _response_header(response, "ETag")
+    last_modified = _response_header(response, "Last-Modified")
+    old_etag = str(prior_metadata.get("etag") or "").strip() or None
+    old_last_modified = str(prior_metadata.get("last_modified") or "").strip() or None
+    remote_changed = (old_etag and etag != old_etag) or (
+        old_last_modified and last_modified != old_last_modified
+    )
+    if requested_offset > 0 and remote_changed:
+        raise MasterTransportError("Remote MASTER asset changed while resuming")
+
+    if response.status_code == 206:
+        if not content_range:
+            raise MasterTransportError("206 response is missing Content-Range")
+        match = _CONTENT_RANGE_RE.fullmatch(content_range)
+        if not match or match.group(3) == "*":
+            raise MasterTransportError(f"Invalid Content-Range: {content_range}")
+        start, end, total = (int(value) for value in match.groups())
+        if start != requested_offset or end < start or total <= end:
+            raise MasterTransportError(f"Unexpected Content-Range: {content_range}")
+        segment_size = end - start + 1
+        if content_length is not None and content_length != segment_size:
+            raise MasterTransportError("Content-Length does not match Content-Range")
+        return total, requested_offset > 0
+    if response.status_code == 200:
+        if requested_offset > 0:
+            return content_length, False
+        return content_length, False
+    raise MasterTransportError(f"Unexpected HTTP status {response.status_code}")
+
+
+def _read_transport_metadata(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_transport_metadata(
+    path: Path,
+    *,
+    task: MasterFetchTask,
+    expected_bytes: int | None,
+    current_size: int,
+    response,
+    attempts: int,
+    last_progress_monotonic: float | None = None,
+) -> dict[str, object]:
+    previous = _read_transport_metadata(path)
+    payload = {
+        "schema": MASTER_CACHE_MARKER_SCHEMA,
+        "remote_path": task.remote_path,
+        "roles": list(task.roles),
+        "expected_bytes": expected_bytes,
+        "current_size": current_size,
+        "attempts": attempts,
+        "etag": _response_header(response, "ETag") if response is not None else previous.get("etag"),
+        "last_modified": (
+            _response_header(response, "Last-Modified")
+            if response is not None else previous.get("last_modified")
+        ),
+    }
+    if last_progress_monotonic is not None:
+        payload["last_progress_monotonic"] = last_progress_monotonic
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    return payload
+
+
+def _make_progress(
+    remote_path: str,
+    expected_bytes: int | None,
+    existing_offset: int,
+    downloaded_this_attempt: int,
+    total_downloaded: int,
+    started: float,
+    attempt: int,
+    last_progress: float,
+    event: str,
+    now: float,
+    reason: str | None = None,
+) -> TransportProgress:
+    elapsed = max(now - started, 0.0)
+    recent_throughput = (
+        downloaded_this_attempt / 1048576.0 / elapsed if elapsed > 0 else None
+    )
+    return TransportProgress(
+        remote_path=remote_path,
+        expected_bytes=expected_bytes,
+        existing_offset=existing_offset,
+        downloaded_this_attempt=downloaded_this_attempt,
+        total_downloaded=total_downloaded,
+        elapsed=elapsed,
+        recent_throughput=recent_throughput,
+        attempt=attempt,
+        last_progress_monotonic=last_progress,
+        event=event,
+        reason=reason,
+    )
 
 
 def write_master_fetch_report(results: Iterable[MasterDownloadResult], path: str | Path) -> Path:

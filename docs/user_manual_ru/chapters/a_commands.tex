@@ -103,6 +103,8 @@ python -m grandgousier.cli master-archive-fetch `
   --execute
 \end{lstlisting}
 
+Для HTTP transfer credentials задаются только через environment \cli{GRANDGOUSIER\_MASTER\_HTTP\_USER} и \cli{GRANDGOUSIER\_MASTER\_HTTP\_PASSWORD}; password не передаётся аргументом CLI. Downloader проверяет \cli{Content-Length}/\cli{Content-Range}, итоговый размер и resume offset. При сетевой ошибке или stall сохраняется \cli{.part}, а повтор использует Range от фактического offset. По умолчанию stall timeout равен 300 секундам, progress interval --- 15 секундам; параметры можно переопределить в конфигурации archive assets.
+
 
 \section{Показать provisional серии MASTER до скачивания}
 

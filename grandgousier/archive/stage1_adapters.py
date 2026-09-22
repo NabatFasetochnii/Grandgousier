@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import math
 import os
 import time
@@ -52,6 +53,9 @@ from grandgousier.instruments.base import InstrumentProfile
 from grandgousier.io.fits_header import header_to_jsonable
 from grandgousier.io.parsing import parse_datetime, parse_dec_deg, parse_ra_deg, to_float, to_int
 from grandgousier.resources import instrument_profile_path
+
+
+_MASTER_TRANSPORT_LOGGER = logging.getLogger("grandgousier.master_transport")
 
 _PROFILE_FILES = {"MASTER": "master.yaml", "RoboPhot": "robophot.yaml"}
 _SECRET_KEY_PARTS = ("password", "secret", "token", "credential", "database_url")
@@ -473,6 +477,8 @@ class MasterCacheAssetProvider(AssetProvider):
         retries: int = 4,
         timeout_connect: float = 15.0,
         timeout_read: float = 180.0,
+        stall_timeout: float = 300.0,
+        progress_interval: float = 15.0,
         disk_reserve_bytes: int | str | None = None,
         cache_policy: Stage1CachePolicy | None = None,
     ) -> None:
@@ -487,6 +493,8 @@ class MasterCacheAssetProvider(AssetProvider):
         self.retries = max(0, int(retries))
         self.timeout_connect = float(timeout_connect)
         self.timeout_read = float(timeout_read)
+        self.stall_timeout = float(stall_timeout)
+        self.progress_interval = float(progress_interval)
         self.disk_reserve_bytes = normalize_disk_reserve(disk_reserve_bytes)
         self.cache_policy = cache_policy or normalize_cache_policy(
             default_min_free_bytes=self.disk_reserve_bytes
@@ -578,6 +586,10 @@ class MasterCacheAssetProvider(AssetProvider):
             timeout_read=self.timeout_read,
             overwrite=False,
             checksum=False,
+            max_attempts=self.retries + 1,
+            stall_timeout_seconds=self.stall_timeout,
+            progress_interval_seconds=self.progress_interval,
+            progress_callback=self._on_transport_progress,
         )
         if result.status == "FAILED" or not target.is_file() or target.stat().st_size <= 0:
             detail = result.error or f"download status={result.status}"
@@ -585,6 +597,23 @@ class MasterCacheAssetProvider(AssetProvider):
                 f"Failed to materialize MASTER asset {ref.role} {ref.locator}: {detail}"
             )
         return target
+
+    @staticmethod
+    def _on_transport_progress(progress) -> None:
+        if progress.event not in {"PROGRESS", "RETRY", "COMPLETE", "RANGE_IGNORED_RESTARTING_FROM_ZERO"}:
+            return
+        expected = "?" if progress.expected_bytes is None else str(progress.expected_bytes)
+        rate = "?" if progress.recent_throughput is None else f"{progress.recent_throughput:.2f} MiB/s"
+        _MASTER_TRANSPORT_LOGGER.info(
+            "MASTER transfer %s: %s/%s bytes, %s, attempt %s, event=%s%s",
+            progress.remote_path,
+            progress.total_downloaded,
+            expected,
+            rate,
+            progress.attempt,
+            progress.event,
+            f", reason={progress.reason}" if progress.reason else "",
+        )
 
     def maintain_cache(
         self,
@@ -828,6 +857,8 @@ def _master_manifest_factory(source_id: str, raw: Mapping[str, Any]) -> ArchiveS
         retries=int(assets.get("retries", 4)),
         timeout_connect=float(assets.get("timeout_connect", 15.0)),
         timeout_read=float(assets.get("timeout_read", 180.0)),
+        stall_timeout=float(assets.get("stall_timeout_seconds", 300.0)),
+        progress_interval=float(assets.get("progress_interval_seconds", 15.0)),
         disk_reserve_bytes=assets.get(
             "stage1_disk_reserve_bytes", DEFAULT_STAGE1_DISK_RESERVE_BYTES
         ),
