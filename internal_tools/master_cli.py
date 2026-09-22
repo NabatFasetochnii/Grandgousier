@@ -212,7 +212,9 @@ def cmd_master_archive_search(args: argparse.Namespace) -> int:
                     postgres_error = exc
 
         if rows is None:
-            http_user, http_password = resolve_master_http_credentials(user=args.http_user)
+            http_user, http_password = resolve_master_http_credentials(
+                user=args.http_user, prompt_password=True
+            )
             session = make_master_http_session(user=http_user, password=http_password, retries=4)
             rows = search_master_archive_http(
                 session=session,
@@ -322,7 +324,9 @@ def cmd_master_archive_fetch(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        http_user, http_password = resolve_master_http_credentials(user=args.http_user)
+        http_user, http_password = resolve_master_http_credentials(
+            user=args.http_user, prompt_password=True
+        )
         session = make_master_http_session(user=http_user, password=http_password, retries=args.retries)
     except Exception as exc:
         print(f"MASTER HTTP setup failed: {type(exc).__name__}: {exc}", file=sys.stderr)

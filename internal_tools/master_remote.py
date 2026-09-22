@@ -60,6 +60,10 @@ FETCH_REPORT_COLUMNS = [
 ]
 
 
+class MasterRemoteCredentialError(RuntimeError):
+    """Raised when remote MASTER fetch credentials are not configured."""
+
+
 @dataclass(frozen=True)
 class MasterFetchTask:
     remote_path: str
@@ -121,21 +125,35 @@ def resolve_master_http_credentials(
     *,
     user: str | None = None,
     password: str | None = None,
-    prompt_password: bool = True,
+    prompt_password: bool = False,
 ) -> tuple[str, str]:
-    resolved_user = user or os.getenv(MASTER_HTTP_USER_ENV)
-    resolved_password = password or os.getenv(MASTER_HTTP_PASSWORD_ENV)
+    resolved_user = _configured_credential(user) or _configured_credential(
+        os.getenv(MASTER_HTTP_USER_ENV)
+    )
+    resolved_password = _configured_credential(password) or _configured_credential(
+        os.getenv(MASTER_HTTP_PASSWORD_ENV)
+    )
     if not resolved_user:
-        raise RuntimeError(
-            f"MASTER HTTP user is required; pass --http-user or set {MASTER_HTTP_USER_ENV}"
+        raise MasterRemoteCredentialError(
+            "MASTER HTTP credentials are required to fetch missing assets. "
+            f"Configure {MASTER_HTTP_USER_ENV} and {MASTER_HTTP_PASSWORD_ENV}."
         )
     if not resolved_password and prompt_password:
         resolved_password = getpass.getpass(f"MASTER HTTP password for {resolved_user}: ")
+        resolved_password = _configured_credential(resolved_password)
     if not resolved_password:
-        raise RuntimeError(
-            f"MASTER HTTP password is required; set {MASTER_HTTP_PASSWORD_ENV} or allow interactive prompt"
+        raise MasterRemoteCredentialError(
+            "MASTER HTTP password is required to fetch missing assets. "
+            f"Configure {MASTER_HTTP_PASSWORD_ENV}."
         )
     return resolved_user, resolved_password
+
+
+def _configured_credential(value: str | None) -> str | None:
+    """Treat missing and whitespace-only runtime credentials as unset."""
+    if value is None or not value.strip():
+        return None
+    return value
 
 
 def master_remote_path_to_url(remote_path: str | None, *, base_url: str | None = None) -> str | None:

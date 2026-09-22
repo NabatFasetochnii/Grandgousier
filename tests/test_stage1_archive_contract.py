@@ -23,7 +23,7 @@ except ModuleNotFoundError as exc:
     ASTROPY_AVAILABLE = False
 
 pytestmark = pytest.mark.skipif(not ASTROPY_AVAILABLE, reason="astropy is not installed")
-from grandgousier.archive.stage1_contract import (
+from grandgousier.archive.stage1_contract import (  # noqa: E402
     ArchiveRequest,
     ArchiveSourceDescriptor,
     AssetRef,
@@ -31,8 +31,12 @@ from grandgousier.archive.stage1_contract import (
     ObservationRecord,
     make_source_observation_uid,
 )
-from grandgousier.archive.stage1_planner import build_stage1_plan
-from grandgousier.identity.observation import MASTER_IDENTITY_SCHEME, ROBOPHOT_IDENTITY_SCHEME
+from grandgousier.archive.stage1_planner import build_stage1_plan  # noqa: E402
+from grandgousier.identity.observation import (  # noqa: E402
+    MASTER_IDENTITY_SCHEME,
+    ROBOPHOT_IDENTITY_SCHEME,
+)
+from internal_tools.master_remote import MasterRemoteCredentialError  # noqa: E402
 
 
 def _write_master_fits(path: Path, *, uniqnum: str = "203_17870") -> None:
@@ -391,7 +395,10 @@ def test_master_asset_provider_reuses_secondary_partial_cache(tmp_path: Path) ->
         source_id="master-prod",
         cache_root=primary,
         search_roots=(secondary,),
-        fetch_missing=False,
+        fetch_missing=True,
+    )
+    provider._repository_transport = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("local asset lookup must not initialize HTTP transport")
     )
     materialized = provider.materialize(ref)
     assert materialized.path == local
@@ -421,7 +428,8 @@ def test_master_asset_provider_fetches_only_missing_selected_asset(tmp_path: Pat
         MasterFetchTask = FakeTask
 
         @staticmethod
-        def resolve_master_http_credentials():
+        def resolve_master_http_credentials(*, prompt_password):
+            assert prompt_password is False
             return "user", "password"
 
         @staticmethod
@@ -460,6 +468,46 @@ def test_master_asset_provider_fetches_only_missing_selected_asset(tmp_path: Pat
     assert calls == [ref.locator]
     provider.close()
     assert session.closed is True
+
+
+def test_master_asset_provider_missing_credentials_fail_before_download(tmp_path: Path) -> None:
+    class FakeTransport:
+        class MasterFetchTask:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        @staticmethod
+        def master_remote_path_to_url(remote_path):
+            return "https://example.invalid/data" + remote_path
+
+        @staticmethod
+        def download_master_task(*args, **kwargs):
+            raise AssertionError("download must not start without credentials")
+
+        @staticmethod
+        def resolve_master_http_credentials(*, prompt_password):
+            assert prompt_password is False
+            raise MasterRemoteCredentialError(
+                "MASTER HTTP password is required to fetch missing assets. "
+                "Configure GRANDGOUSIER_MASTER_HTTP_PASSWORD."
+            )
+
+    provider = MasterCacheAssetProvider(
+        source_id="master-prod",
+        cache_root=tmp_path / "cache",
+        fetch_missing=True,
+    )
+    provider._repository_transport = lambda: FakeTransport  # type: ignore[method-assign]
+    ref = AssetRef(
+        source_id="master-prod",
+        role="science_raw",
+        backend="master-cache",
+        locator="/master/raw/missing.fit.gz",
+    )
+
+    with pytest.raises(MasterRemoteCredentialError, match="MASTER HTTP password"):
+        provider.materialize(ref)
+    assert not list((tmp_path / "cache").rglob("*.part"))
 
 
 def test_master_runtime_separates_metadata_and_asset_cache_roots(tmp_path: Path) -> None:

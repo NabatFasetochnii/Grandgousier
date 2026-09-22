@@ -535,7 +535,7 @@ class MasterCacheAssetProvider(AssetProvider):
         if self._session is not None:
             return self._session
         transport = self._repository_transport()
-        user, password = transport.resolve_master_http_credentials()
+        user, password = transport.resolve_master_http_credentials(prompt_password=False)
         self._session = transport.make_master_http_session(
             user=user, password=password, retries=self.retries
         )

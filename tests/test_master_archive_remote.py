@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+import internal_tools.master_remote as master_remote
 from internal_tools.master_remote import (
     MasterFetchTask,
+    MasterRemoteCredentialError,
     _build_sbox_strings,
     build_master_fetch_tasks,
     download_master_task,
@@ -14,6 +18,48 @@ from internal_tools.master_remote import (
     summarize_master_inventory,
     summarize_master_observing_series,
 )
+
+
+def test_master_credentials_fail_fast_without_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GRANDGOUSIER_MASTER_HTTP_USER", raising=False)
+    monkeypatch.delenv("GRANDGOUSIER_MASTER_HTTP_PASSWORD", raising=False)
+
+    def unexpected_prompt(_message: str) -> str:
+        raise AssertionError("interactive credential prompt is not allowed")
+
+    monkeypatch.setattr(master_remote.getpass, "getpass", unexpected_prompt)
+    with pytest.raises(MasterRemoteCredentialError, match="GRANDGOUSIER_MASTER_HTTP_USER"):
+        master_remote.resolve_master_http_credentials()
+
+
+def test_master_credentials_reject_whitespace_and_partial_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GRANDGOUSIER_MASTER_HTTP_USER", "  ")
+    monkeypatch.setenv("GRANDGOUSIER_MASTER_HTTP_PASSWORD", "configured")
+    with pytest.raises(MasterRemoteCredentialError, match="GRANDGOUSIER_MASTER_HTTP_USER"):
+        master_remote.resolve_master_http_credentials()
+
+    monkeypatch.setenv("GRANDGOUSIER_MASTER_HTTP_USER", "configured-user")
+    monkeypatch.setenv("GRANDGOUSIER_MASTER_HTTP_PASSWORD", " \t")
+    with pytest.raises(MasterRemoteCredentialError, match="GRANDGOUSIER_MASTER_HTTP_PASSWORD"):
+        master_remote.resolve_master_http_credentials()
+
+
+def test_master_credentials_accept_synthetic_runtime_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GRANDGOUSIER_MASTER_HTTP_USER", "synthetic-user")
+    monkeypatch.setenv("GRANDGOUSIER_MASTER_HTTP_PASSWORD", "synthetic-value")
+    assert master_remote.resolve_master_http_credentials() == ("synthetic-user", "synthetic-value")
+
+
+def test_master_credentials_interactive_mode_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GRANDGOUSIER_MASTER_HTTP_USER", "synthetic-user")
+    monkeypatch.delenv("GRANDGOUSIER_MASTER_HTTP_PASSWORD", raising=False)
+    monkeypatch.setattr(master_remote.getpass, "getpass", lambda _message: "synthetic-value")
+    assert master_remote.resolve_master_http_credentials(prompt_password=True) == (
+        "synthetic-user",
+        "synthetic-value",
+    )
 
 
 def test_master_remote_path_mapping() -> None:

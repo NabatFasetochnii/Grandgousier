@@ -181,7 +181,7 @@ MASTER PostgreSQL OR authenticated MASTER HTTPS
 $env:GRANDGOUSIER_MASTER_HTTP_USER="MASTER_USER"
 \end{lstlisting}
 
-HTTP password можно либо задать через \cli{GRANDGOUSIER\_MASTER\_HTTP\_PASSWORD}, либо не задавать вообще: при HTTPS discovery и при \cli{master-archive-fetch --execute} программа запросит его через скрытый интерактивный prompt.
+Для unattended Stage~1 HTTP credentials должны быть доступны process environment: \cli{GRANDGOUSIER\_MASTER\_HTTP\_USER} и \cli{GRANDGOUSIER\_MASTER\_HTTP\_PASSWORD}. Пароль не передавайте аргументом CLI и не храните в source/config defaults. Если выбранный asset уже найден в \cli{assets.search\_roots}, credentials не требуются. Если asset отсутствует локально и password не настроен, canonical \cli{stage1-execute} завершается сразу понятной configuration error и не вызывает скрытый prompt. Legacy discovery/fetch CLI может использовать explicit interactive mode для workstation.
 
 Optional переменная \cli{GRANDGOUSIER\_MASTER\_HTTP\_BASE\_URL} переопределяет стандартный адрес \cli{https://master.kourovka.ru}.
 
