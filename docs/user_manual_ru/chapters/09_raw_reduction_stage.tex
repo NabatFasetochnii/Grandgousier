@@ -77,6 +77,12 @@ archives:
       fetch_missing: true
       # optional; default is 1 GiB and is never consumed by Stage 1
       # stage1_disk_reserve_bytes: 1073741824
+      # optional cache lifecycle policy; max_bytes is unlimited when omitted
+      # stage1_cache_max_bytes: 107374182400
+      # stage1_cache_min_free_bytes: 1073741824
+      # stage1_cache_retention_days: 30
+      # stage1_cache_cleanup_grace_seconds: 3600
+      # stage1_cache_cleanup_interval_seconds: 900
       # optional additional local caches:
       # search_roots: [C:\master\gpx\smoke]
 
@@ -94,6 +100,16 @@ Credential-bearing values в user-facing summary/plan редактируются
 Production \cli{stage1-execute} читает discovery stream и обрабатывает его фиксированными bounded batches. Размер batch задаётся через \texttt{archives.<source>.stage1\_batch\_size} или одноимённый CLI override; default равен 128. Plan и execution report записываются инкрементально во временные artifacts и атомарно публикуются после нормального завершения. В памяти удерживается только текущая batch и небольшое состояние summary; exact RSS не фиксирован, но объём archive records не удерживается целиком. Явный \cli{stage1-plan} сохраняет прежний materialized preview/export режим.
 
 Перед каждым missing-asset download и каждой записью Stage~1 product выполняется disk preflight. Для каждого filesystem requirements агрегируются, а операция разрешается только если \texttt{free >= required + stage1\_disk\_reserve\_bytes}. Для download учитывается peak \texttt{.part}; для product учитываются временный product и небольшой provenance overhead. Если размер remote asset или output неизвестен, используется консервативная внутренняя оценка. При нехватке места операция останавливается до создания target directory или начала записи. Это safety guard, а не quota manager и не транзакционная reservation: внешний потребитель диска всё ещё может изменить free space после проверки.
+
+\section{MASTER cache retention и orphan parts}
+
+Основной \texttt{assets.cache\_root} является Grandgousier-owned cache boundary. При первом явном Stage~1 maintenance/download в нём создаётся ownership marker \texttt{.grandgousier-master-cache.json}; дополнительные \texttt{assets.search\_roots} являются read-only lookup roots и никогда не очищаются. Raw MASTER archive не является cache root. Cleanup fail-safe: неизвестный marker, symlink/junction root, symlinked directory или path вне canonical root не удаляется.
+
+Cache maintenance запускается bounded образом между Stage~1 batches и дополнительно перед download при disk pressure. \texttt{stage1\_cache\_max\_bytes} является optional quota; обязательный minimum free-space threshold по умолчанию наследует \texttt{stage1\_disk\_reserve\_bytes}. Старые reusable assets выбираются детерминированно по mtime, начиная с oldest; retention и grace period защищают свежие файлы. Traversal использует lazy \texttt{os.scandir()}, а candidate heap имеет bounded capacity.
+
+Download \texttt{.part} получает owner metadata с remote identity и сохраняется, если его можно использовать для HTTP Range resume. Unknown или повреждённый download part не удаляется generic reaper'ом. Atomic product \texttt{.part} обрабатывается отдельной policy под configured ProductStore root: старый inactive part может быть удалён, свежий и final product сохраняются. Report/provenance и checkpoint \texttt{.part} не входят в generic cache cleanup; checkpoint recovery остаётся authority модуля \texttt{stage1\_checkpoint}.
+
+Каждый maintenance pass возвращает structured summary: scanned, eligible, removed, bytes\_freed, preserved\_active, preserved\_resumable, skipped\_unsafe и failures. Если eligible deletion не освобождает требуемое место, повторный disk guard остаётся финальным safe outcome; cleanup failure одного файла не прерывает обработку остальных кандидатов.
 
 \section{Exact Stage 1 -> Stage 2 handoff (0.6.2.x)}
 

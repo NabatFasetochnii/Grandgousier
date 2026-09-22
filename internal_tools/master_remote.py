@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import getpass
 import hashlib
+import json
 import math
 import os
 import re
@@ -21,6 +22,7 @@ MASTER_DB_ENV = "GRANDGOUSIER_MASTER_DATABASE_URL"
 MASTER_HTTP_USER_ENV = "GRANDGOUSIER_MASTER_HTTP_USER"
 MASTER_HTTP_PASSWORD_ENV = "GRANDGOUSIER_MASTER_HTTP_PASSWORD"
 MASTER_HTTP_BASE_URL_ENV = "GRANDGOUSIER_MASTER_HTTP_BASE_URL"
+MASTER_CACHE_MARKER_SCHEMA = "grandgousier.stage1.master-cache.v1"
 
 INVENTORY_COLUMNS = [
     "processed_frame_id",
@@ -1125,6 +1127,9 @@ def download_master_task(
     final_path = task.local_path
     final_path.parent.mkdir(parents=True, exist_ok=True)
     if final_path.exists() and final_path.is_file() and final_path.stat().st_size > 0 and not overwrite:
+        final_part = final_path.with_name(final_path.name + ".part")
+        final_part.unlink(missing_ok=True)
+        final_part.with_name(final_part.name + ".meta.json").unlink(missing_ok=True)
         return MasterDownloadResult(
             remote_path=task.remote_path,
             url=task.url,
@@ -1136,12 +1141,27 @@ def download_master_task(
         )
 
     part_path = final_path.with_name(final_path.name + ".part")
+    metadata_path = part_path.with_name(part_path.name + ".meta.json")
     if overwrite and part_path.exists():
         part_path.unlink()
+        metadata_path.unlink(missing_ok=True)
     resume_from = part_path.stat().st_size if part_path.exists() else 0
     headers = {"Range": f"bytes={resume_from}-"} if resume_from > 0 else {}
 
     try:
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "schema": MASTER_CACHE_MARKER_SCHEMA,
+                    "remote_path": task.remote_path,
+                    "url": task.url,
+                    "roles": list(task.roles),
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         with session.get(
             task.url,
             stream=True,
@@ -1164,6 +1184,7 @@ def download_master_task(
         if part_path.stat().st_size <= 0:
             raise RuntimeError("Downloaded file is empty")
         os.replace(part_path, final_path)
+        metadata_path.unlink(missing_ok=True)
         return MasterDownloadResult(
             remote_path=task.remote_path,
             url=task.url,

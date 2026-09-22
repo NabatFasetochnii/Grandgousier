@@ -498,6 +498,9 @@ def test_master_runtime_separates_metadata_and_asset_cache_roots(tmp_path: Path)
                         "backend": "master-cache",
                         "cache_root": str(asset_cache),
                         "fetch_missing": False,
+                        "stage1_cache_max_bytes": 1234,
+                        "stage1_cache_min_free_bytes": 5678,
+                        "stage1_cache_retention_days": 3,
                     },
                 }
             }
@@ -510,3 +513,6 @@ def test_master_runtime_separates_metadata_and_asset_cache_roots(tmp_path: Path)
     assert runtime.asset_provider.materialize(raw_ref).path == raw_path
     header_ref = next(ref for ref in record.assets if ref.role == "processing_header")
     assert runtime.asset_provider.materialize(header_ref).path == header_path
+    assert runtime.asset_provider.cache_policy.max_bytes == 1234
+    assert runtime.asset_provider.cache_policy.min_free_bytes == 5678
+    assert runtime.asset_provider.cache_policy.retention_days == 3

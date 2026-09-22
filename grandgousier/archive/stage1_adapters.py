@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import math
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -17,10 +18,18 @@ from grandgousier.archive.manifest import manifest_path_to_local, iter_archive_m
 from grandgousier.archive.disk_guard import (
     DEFAULT_STAGE1_DISK_RESERVE_BYTES,
     DEFAULT_UNKNOWN_ASSET_BYTES,
+    DiskSpaceGuardError,
     DiskRequirement,
     check_disk_budget,
     estimate_size,
     normalize_disk_reserve,
+)
+from grandgousier.archive.stage1_cache import (
+    Stage1CacheCleanupSummary,
+    Stage1CachePolicy,
+    claim_cache_root,
+    cleanup_master_cache,
+    normalize_cache_policy,
 )
 from grandgousier.archive.stage1_contract import (
     ArchiveRequest,
@@ -465,6 +474,7 @@ class MasterCacheAssetProvider(AssetProvider):
         timeout_connect: float = 15.0,
         timeout_read: float = 180.0,
         disk_reserve_bytes: int | str | None = None,
+        cache_policy: Stage1CachePolicy | None = None,
     ) -> None:
         self.source_id = source_id
         self.cache_root = Path(cache_root)
@@ -478,8 +488,12 @@ class MasterCacheAssetProvider(AssetProvider):
         self.timeout_connect = float(timeout_connect)
         self.timeout_read = float(timeout_read)
         self.disk_reserve_bytes = normalize_disk_reserve(disk_reserve_bytes)
+        self.cache_policy = cache_policy or normalize_cache_policy(
+            default_min_free_bytes=self.disk_reserve_bytes
+        )
         self._session = None
         self._transport = None
+        self._last_cache_maintenance = 0.0
 
     def _existing_path(self, locator: str) -> Path | None:
         for root in self.search_roots:
@@ -536,16 +550,21 @@ class MasterCacheAssetProvider(AssetProvider):
         required_bytes = estimate_size(
             ref.metadata.get("size_bytes"), fallback=DEFAULT_UNKNOWN_ASSET_BYTES
         )
-        check_disk_budget(
-            (
-                DiskRequirement(
-                    target=target,
-                    required_bytes=required_bytes,
-                    label=f"MASTER asset {ref.role}",
-                ),
-            ),
-            reserve_bytes=self.disk_reserve_bytes,
+        if self.cache_root.exists():
+            self.maintain_cache(required_bytes=required_bytes)
+        requirement = DiskRequirement(
+            target=target,
+            required_bytes=required_bytes,
+            label=f"MASTER asset {ref.role}",
         )
+        try:
+            check_disk_budget((requirement,), reserve_bytes=self.disk_reserve_bytes)
+        except DiskSpaceGuardError:
+            if self.cache_root.exists():
+                self.maintain_cache(required_bytes=required_bytes, force=True)
+            check_disk_budget((requirement,), reserve_bytes=self.disk_reserve_bytes)
+        if not claim_cache_root(self.cache_root, source_id=self.source_id):
+            raise RuntimeError(f"MASTER cache root is not safely owned: {self.cache_root}")
         task = transport.MasterFetchTask(
             remote_path=ref.locator,
             url=url,
@@ -566,6 +585,35 @@ class MasterCacheAssetProvider(AssetProvider):
                 f"Failed to materialize MASTER asset {ref.role} {ref.locator}: {detail}"
             )
         return target
+
+    def maintain_cache(
+        self,
+        *,
+        required_bytes: int = 0,
+        force: bool = False,
+        dry_run: bool = False,
+    ) -> Stage1CacheCleanupSummary:
+        now = time.monotonic()
+        if (
+            not force
+            and self.cache_policy.cleanup_interval_seconds > 0
+            and now - self._last_cache_maintenance < self.cache_policy.cleanup_interval_seconds
+        ):
+            return Stage1CacheCleanupSummary(dry_run=dry_run)
+        if not self.cache_root.exists():
+            return Stage1CacheCleanupSummary(dry_run=dry_run)
+        if not claim_cache_root(self.cache_root, source_id=self.source_id):
+            return Stage1CacheCleanupSummary(skipped_unsafe=1, dry_run=dry_run)
+        summary = cleanup_master_cache(
+            self.cache_root,
+            policy=self.cache_policy,
+            required_bytes=required_bytes,
+            source_id=self.source_id,
+            dry_run=dry_run,
+            now=time.time(),
+        )
+        self._last_cache_maintenance = now
+        return summary
 
     def materialize(self, ref: AssetRef, destination: str | Path | None = None) -> LocalAsset:
         del destination
@@ -682,6 +730,26 @@ def build_product_store(payload: Mapping[str, Any]) -> ProductStore:
     )
 
 
+def _master_cache_policy(
+    raw: Mapping[str, Any],
+    assets: Mapping[str, Any],
+    *,
+    disk_reserve_bytes: int,
+) -> Stage1CachePolicy:
+    cache = assets.get("cache") if isinstance(assets.get("cache"), Mapping) else {}
+    values = {**dict(raw), **dict(assets), **dict(cache)}
+    return normalize_cache_policy(
+        max_bytes=values.get("stage1_cache_max_bytes"),
+        min_free_bytes=values.get("stage1_cache_min_free_bytes"),
+        retention_days=values.get("stage1_cache_retention_days"),
+        cleanup_grace_seconds=values.get("stage1_cache_cleanup_grace_seconds"),
+        cleanup_interval_seconds=values.get("stage1_cache_cleanup_interval_seconds"),
+        cleanup_margin_bytes=values.get("stage1_cache_cleanup_margin_bytes"),
+        candidate_limit=values.get("stage1_cache_candidate_limit"),
+        default_min_free_bytes=disk_reserve_bytes,
+    )
+
+
 def _fits_factory(source_id: str, raw: Mapping[str, Any]) -> ArchiveSourceRuntime:
     profile_value = raw.get("instrument_profile")
     if profile_value in {None, ""}:
@@ -737,6 +805,7 @@ def _master_manifest_factory(source_id: str, raw: Mapping[str, Any]) -> ArchiveS
     asset_cache_root = assets.get("cache_root") or metadata_cache_root
     if asset_cache_root in {None, ""}:
         raise ValueError(f"archives.{source_id}.assets.cache_root is required")
+    disk_reserve_bytes = normalize_disk_reserve(assets.get("stage1_disk_reserve_bytes"))
     configured_search_roots = assets.get("search_roots") or ()
     if isinstance(configured_search_roots, (str, Path)):
         configured_search_roots = (configured_search_roots,)
@@ -762,6 +831,7 @@ def _master_manifest_factory(source_id: str, raw: Mapping[str, Any]) -> ArchiveS
         disk_reserve_bytes=assets.get(
             "stage1_disk_reserve_bytes", DEFAULT_STAGE1_DISK_RESERVE_BYTES
         ),
+        cache_policy=_master_cache_policy(raw, assets, disk_reserve_bytes=disk_reserve_bytes),
     )
     descriptor = ArchiveSourceDescriptor(
         source_id=source_id,

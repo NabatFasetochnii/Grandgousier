@@ -25,6 +25,7 @@ from grandgousier.archive.stage1_checkpoint import (
     Stage1Checkpoint,
     item_fingerprint,
 )
+from grandgousier.archive.stage1_cache import cleanup_atomic_output_parts
 from grandgousier.archive.master_reduction import (
     REDUCTION_ALGORITHM,
     MasterReductionResult,
@@ -1091,6 +1092,12 @@ def execute_stage1_stream(
         counts[status] = counts.get(status, 0) + 1
 
     try:
+        product_root = getattr(product_store, "root", None)
+        if product_root is not None:
+            cache_policy = getattr(asset_provider, "cache_policy", None)
+            part_grace = float(getattr(cache_policy, "cleanup_grace_seconds", 3600.0))
+            cleanup_atomic_output_parts(product_root, grace_seconds=part_grace)
+        maintain_cache = getattr(asset_provider, "maintain_cache", None)
         for plan_batch in iter_stage1_plan_batches(
             request=request,
             source=source,
@@ -1100,6 +1107,8 @@ def execute_stage1_stream(
         ):
             if stop_requested.is_set():
                 raise Stage1StopRequested("Stage-1 stop requested before the next batch")
+            if callable(maintain_cache):
+                maintain_cache()
             discovered_records = plan_batch.discovered_records
             if checkpoint is not None:
                 checkpoint.record_discovery(
