@@ -70,6 +70,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_reset_derived.set_defaults(func=cmd_reset_derived_data)
 
+    p_reclaim = sub.add_parser(
+        "reclaim-stage1-products",
+        help="Plan or execute safe reclaim of managed Stage-1 products for one completed series",
+    )
+    p_reclaim.add_argument("--series-id", type=int, required=True, help="Exactly one field_series.series_id")
+    p_reclaim.add_argument("--processed-root", required=True, help="Managed Stage-1 product root")
+    p_reclaim.add_argument(
+        "--manifest-root", required=True, help="Directory for reclaim intent/final manifests"
+    )
+    p_reclaim.add_argument(
+        "--report-out", default=None, help="Machine-readable PLAN report path"
+    )
+    p_reclaim.add_argument("--execute", action="store_true", help="Delete after all safety checks pass")
+    p_reclaim.add_argument("--format", choices=("table", "json"), default="table")
+    p_reclaim.set_defaults(func=cmd_reclaim_stage1_products)
+
     p_schema_status = sub.add_parser(
         "schema-status", help="Show schema migration ledger and checksum status"
     )
@@ -2377,6 +2393,37 @@ def cmd_reset_derived_data(args: argparse.Namespace) -> int:
     )
     print("Preserved archive/catalog/object identity and schema migration ledger.")
     return 0
+
+
+def cmd_reclaim_stage1_products(args: argparse.Namespace) -> int:
+    from grandgousier.archive.stage1_reclaim import reclaim_series
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        result = reclaim_series(
+            session,
+            series_id=args.series_id,
+            processed_root=args.processed_root,
+            manifest_root=args.manifest_root,
+            execute=args.execute,
+            report_path=args.report_out,
+        )
+    payload = {"execute": bool(args.execute), **result.to_dict()}
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Stage-1 reclaim {result.status.lower()}: series={result.series_id}, "
+            f"frames={result.summary.get('total_series_frames', 0)}, "
+            f"reclaimable={result.summary.get('reclaimable_frames', 0)}, "
+            f"already_reclaimed={result.summary.get('already_reclaimed_frames', 0)}, "
+            f"blocked={result.summary.get('blocked_frames', 0)}, "
+            f"reclaimable_bytes={result.summary.get('reclaimable_bytes', 0)}, "
+            f"reasons={','.join(result.reason_codes) or 'none'}"
+        )
+        if not args.execute:
+            print("PLAN ONLY: no files were changed.")
+    return 0 if result.status in {"RECLAIMABLE", "RECLAIMED", "ALREADY_RECLAIMED"} else 2
 
 
 def cmd_schema_status(args: argparse.Namespace) -> int:
