@@ -86,6 +86,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_reclaim.add_argument("--format", choices=("table", "json"), default="table")
     p_reclaim.set_defaults(func=cmd_reclaim_stage1_products)
 
+    p_legacy_cleanup = sub.add_parser(
+        "legacy-prune-stage1-products",
+        help="Plan or execute explicit cleanup of audited legacy Stage-1 FITS; never uses strict reclaim eligibility",
+    )
+    p_legacy_cleanup.add_argument("--processed-root", required=True, help="Exact legacy Stage-1 product root")
+    p_legacy_cleanup.add_argument("--manifest-root", required=True, help="Directory for frozen cleanup evidence")
+    p_legacy_cleanup.add_argument("--field-id", type=int, default=None, help="Expected legacy field id")
+    p_legacy_cleanup.add_argument("--object-name", default="GPX_TF17_2", help="Expected legacy GPX object")
+    p_legacy_cleanup.add_argument("--execute", action="store_true", help="Delete only the frozen DB-linked allowlist")
+    p_legacy_cleanup.add_argument("--format", choices=("table", "json"), default="table")
+    p_legacy_cleanup.set_defaults(func=cmd_legacy_prune_stage1_products)
+
     p_schema_status = sub.add_parser(
         "schema-status", help="Show schema migration ledger and checksum status"
     )
@@ -2424,6 +2436,49 @@ def cmd_reclaim_stage1_products(args: argparse.Namespace) -> int:
         if not args.execute:
             print("PLAN ONLY: no files were changed.")
     return 0 if result.status in {"RECLAIMABLE", "RECLAIMED", "ALREADY_RECLAIMED"} else 2
+
+
+def cmd_legacy_prune_stage1_products(args: argparse.Namespace) -> int:
+    from sqlalchemy.engine import make_url
+
+    from grandgousier.archive.legacy_stage1_cleanup import (
+        build_plan,
+        execute_plan,
+        write_plan,
+    )
+
+    Session = make_session_factory(args.database_url)
+    manifest_root = Path(args.manifest_root).absolute()
+    database_url = args.database_url or get_settings().database_url
+    database_identity = "unknown"
+    if database_url:
+        url = make_url(str(database_url))
+        database_identity = ":".join(
+            str(part) for part in (url.get_backend_name(), url.host or "local", url.port or "default", url.database or "none")
+        )
+    with Session() as session:
+        if args.execute:
+            result = execute_plan(session, manifest_root, database_identity=database_identity)
+            payload = {"execute": True, **result}
+        else:
+            plan = build_plan(session, args.processed_root, field_id=args.field_id, object_name=args.object_name)
+            write_plan(manifest_root, plan, database_identity=database_identity)
+            payload = {"execute": False, **plan}
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    else:
+        summary = payload.get("summary", payload)
+        print(
+            "Legacy Stage-1 cleanup " + ("executed" if args.execute else "planned") + ": "
+            f"db_linked={summary.get('db_linked_products', summary.get('planned_files', 0))}, "
+            f"reclaimable={summary.get('legacy_reclaimable', summary.get('deleted_files', 0))}, "
+            f"blocked={summary.get('blocked', 0)}, "
+            f"unlinked={summary.get('unlinked', 0)}, "
+            f"bytes={summary.get('reclaimable_bytes', summary.get('deleted_bytes', 0))}"
+        )
+        if not args.execute:
+            print("PLAN ONLY: no files were changed.")
+    return 0
 
 
 def cmd_schema_status(args: argparse.Namespace) -> int:
