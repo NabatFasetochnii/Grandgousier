@@ -21,6 +21,7 @@ from grandgousier.db.models import (
     FieldSeriesFrame,
     Frame,
     FrameLocation,
+    CalibrationVersion,
     Measurement,
     Object,
     Observation,
@@ -257,7 +258,7 @@ def build_plan(session: Session, root: str | Path, *, field_id: int | None = Non
 
 
 def _snapshot(session: Session) -> dict[str, int]:
-    tables = {"frames": Frame, "observations": Observation, "measurements": Measurement, "science_photometry": SciencePhotometry, "calibration_state": PipelineRun}
+    tables = {"frames": Frame, "observations": Observation, "measurements": Measurement, "science_photometry": SciencePhotometry, "calibration_state": CalibrationVersion, "pipeline_runs": PipelineRun}
     return {name: int(session.scalar(select(func.count()).select_from(model)) or 0) for name, model in tables.items()}
 
 
