@@ -316,6 +316,15 @@ def execute_plan(session: Session, manifest_root: Path, *, database_identity: st
             header, error = _read_header(path)
             if error or header.get("GGSTAGE") != "1B" or header.get("GGALG") != "MASTER_DARK_FLAT_V1" or str(header.get("UNIQNUM", "")) != str(row["uniqnum"]):
                 raise RuntimeError(f"pre-delete FITS identity gate failed ordinal={row['ordinal']} path={path}")
+            db_rows = session.execute(
+                select(Frame, Observation, FieldSeriesFrame, FrameLocation)
+                .join(FieldSeriesFrame, FieldSeriesFrame.frame_id == Frame.frame_id)
+                .join(Observation, Observation.observation_id == Frame.observation_id)
+                .join(FrameLocation, (FrameLocation.frame_id == Frame.frame_id) & FrameLocation.is_primary.is_(True))
+                .where(Frame.frame_id == int(row["frame_id"]), FieldSeriesFrame.series_id == int(row["series_id"]))
+            ).all()
+            if len(db_rows) != 1 or str(Path(db_rows[0][3].locator).absolute()).casefold() != str(path.absolute()).casefold() or db_rows[0][1].observation_uid != row["physical_identity"]:
+                raise RuntimeError(f"pre-delete DB identity gate failed ordinal={row['ordinal']} path={path}")
             durability = _series_durability(session, int(row["series_id"]), [int(row["frame_id"])])
             if not durability["pipeline"]["durable"]:
                 raise RuntimeError(f"pre-delete pipeline gate failed ordinal={row['ordinal']} series={row['series_id']}")
