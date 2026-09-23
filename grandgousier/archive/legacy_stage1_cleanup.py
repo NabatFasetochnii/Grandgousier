@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from grandgousier.db.models import (
     Frame,
     FrameLocation,
     Measurement,
+    Object,
     Observation,
     PipelineRun,
     PipelineRunStep,
@@ -251,12 +253,24 @@ def build_plan(session: Session, root: str | Path, *, field_id: int | None = Non
         "field_count": len({s.field_id for s in series_meta.values()}),
         "filters": sorted({str(s.filter_name) for s in series_meta.values()}),
     }
-    return {"schema": SCHEMA, "generated_at_utc": _now(), "legacy_root": str(root), "field_id": field_id, "object_name": object_name, "summary": summary, "series_durability": durability, "candidates": candidates}
+    return {"schema": SCHEMA, "generated_at_utc": _now(), "legacy_root": str(root), "field_id": field_id, "object_name": object_name, "summary": summary, "series_durability": durability, "pre_delete_db_snapshot": _snapshot(session), "pre_delete_filesystem_snapshot": _filesystem_snapshot(root), "pre_delete_downstream_smoke": _downstream_smoke(session), "candidates": candidates}
 
 
 def _snapshot(session: Session) -> dict[str, int]:
     tables = {"frames": Frame, "observations": Observation, "measurements": Measurement, "science_photometry": SciencePhotometry, "calibration_state": PipelineRun}
     return {name: int(session.scalar(select(func.count()).select_from(model)) or 0) for name, model in tables.items()}
+
+
+def _filesystem_snapshot(root: Path) -> dict[str, int]:
+    files = [path for path in root.glob("**/*_processed.fits") if path.is_file()]
+    return {"free_bytes": shutil.disk_usage(root).free, "fits_count": len(files), "fits_bytes": sum(path.stat().st_size for path in files)}
+
+
+def _downstream_smoke(session: Session) -> dict[str, Any]:
+    science = int(session.scalar(select(func.count()).select_from(SciencePhotometry)) or 0)
+    objects = int(session.scalar(select(func.count()).select_from(Object)) or 0)
+    sample = session.scalar(select(SciencePhotometry.base_measurement_id).limit(1))
+    return {"science_photometry_rows": science, "object_rows": objects, "science_sample_read": sample is not None}
 
 
 def write_plan(root: Path, plan: dict[str, Any], *, database_identity: str) -> None:
@@ -284,12 +298,15 @@ def execute_plan(session: Session, manifest_root: Path, *, database_identity: st
     rows = [r for r in plan["candidates"] if r["classification"] == "LEGACY_RECLAIMABLE"]
     if plan["summary"]["blocked"] != 0:
         raise RuntimeError("unexpected BLOCKED rows prevent first legacy cleanup execution")
-    intent = {"schema": SCHEMA, "plan_sha256": plan_hash, "contract_sha256": contract_hash, "git_head": _git_head(), "version": __version__, "started_at_utc": _now(), "database": database_identity, "intended_deletions": len(rows), "intended_bytes": sum(int(r["size"]) for r in rows)}
+    root = Path(plan["legacy_root"])
+    db_before = _snapshot(session)
+    if db_before != plan.get("pre_delete_db_snapshot"):
+        raise RuntimeError("database snapshot changed after plan construction")
+    intent = {"schema": SCHEMA, "plan_sha256": plan_hash, "contract_sha256": contract_hash, "git_head": _git_head(), "version": __version__, "started_at_utc": _now(), "database": database_identity, "intended_deletions": len(rows), "intended_bytes": sum(int(r["size"]) for r in rows), "db_snapshot_before": db_before, "filesystem_snapshot_before": _filesystem_snapshot(root), "downstream_smoke_before": _downstream_smoke(session)}
     _atomic_json(manifest_root / "cleanup_intent.json", intent)
     progress_path = manifest_root / "cleanup_progress.jsonl"
     deleted = 0
     deleted_bytes = 0
-    root = Path(plan["legacy_root"])
     with progress_path.open("a", encoding="utf-8") as log:
         for row in rows:
             path = Path(row["product_path"])
@@ -310,6 +327,6 @@ def execute_plan(session: Session, manifest_root: Path, *, database_identity: st
             log.write(json.dumps({"ordinal": row["ordinal"], "product_path": str(path), "sha256": row["sha256"], "bytes": row["size"], "status": "DELETED", "timestamp": _now()}) + "\n")
             log.flush()
             os.fsync(log.fileno())
-    final = {"schema": SCHEMA, "plan_sha256": plan_hash, "started_at_utc": intent["started_at_utc"], "ended_at_utc": _now(), "planned_files": len(rows), "deleted_files": deleted, "failed_files": [], "planned_bytes": intent["intended_bytes"], "deleted_bytes": deleted_bytes, "database": database_identity, "source_commit": _git_head(), "db_snapshot_after": _snapshot(session)}
+    final = {"schema": SCHEMA, "plan_sha256": plan_hash, "started_at_utc": intent["started_at_utc"], "ended_at_utc": _now(), "planned_files": len(rows), "deleted_files": deleted, "failed_files": [], "planned_bytes": intent["intended_bytes"], "deleted_bytes": deleted_bytes, "database": database_identity, "source_commit": _git_head(), "db_snapshot_before": db_before, "db_snapshot_after": _snapshot(session), "filesystem_snapshot_before": intent["filesystem_snapshot_before"], "filesystem_snapshot_after": _filesystem_snapshot(root), "downstream_smoke_after": _downstream_smoke(session)}
     _atomic_json(manifest_root / "cleanup_final.json", final)
     return final
