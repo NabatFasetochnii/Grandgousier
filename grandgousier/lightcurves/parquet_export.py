@@ -380,7 +380,7 @@ def export_series(session, series_ids: list[int], out: str | Path, *, logical_db
             chunk = result.fetchmany(batch_size)
             if not chunk:
                 break
-            keys = {(int(row[4].object_id), int(row[3].calibration_version_id)) for row in chunk}
+            keys = {(int(row[7].object_id), int(row[6].calibration_version_id)) for row in chunk}
             object_ids = {key[0] for key in keys}
             cv_chunk = {key[1] for key in keys}
             qc_stmt = select(ObjectQc.object_id, ObjectQc.calibration_version_id,

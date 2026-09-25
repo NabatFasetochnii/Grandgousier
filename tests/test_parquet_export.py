@@ -43,6 +43,20 @@ def test_utc_observing_night_uses_noon_boundary():
     assert export.observing_night(None) is None
 
 
+def test_photometry_qc_key_uses_base_measurement_and_science_slots():
+    from types import SimpleNamespace
+
+    # Match photometry_iterator's SELECT order: BASE Measurement is slot 7,
+    # SciencePhotometry is slot 6; slots 3 and 4 are identity strings.
+    row = (
+        "object-uid", "observation-uid", "frame-uid", "MASTER_UNIQNUM",
+        "204_1", "series-uid", SimpleNamespace(calibration_version_id=23),
+        SimpleNamespace(object_id=17), "calibration-name", None, {},
+    )
+    key = (int(row[7].object_id), int(row[6].calibration_version_id))
+    assert key == (17, 23)
+
+
 def test_explicit_schema_round_trip_nullable_and_zero_measurement_frame(tmp_path):
     pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
