@@ -2,6 +2,7 @@
 
 - HEAD base `4e2daab`, source candidate version 0.7.0.10 (uncommitted). New Stage-2 runs default to `adaptive_ellipse` per star; `circular` remains explicit. Adaptive base radius is 3 pixels, capped at 2.5×, with the existing flagged circular fallback. No Stage-2/Stage-3 recipe formula changes.
 - Stage-1 handoff inherits the archive-path default. Effective estimator is persisted in `pipeline_runs.recipe_json` through `FieldPipelineConfig`; the frozen `stage3_scale_v1` still requires its other scientific settings. No real science/DB validation of this candidate; no DB writes or reruns authorized here.
+- Module source candidate revision `0.7.0.10-native-id-selector` implements repeatable `process-archive-path --native-observation-id` selection before archive indexing. Focused/full source tests pass; no database connection or live execution was performed. This is not a package-version bump.
 - Older dated sections below are historical snapshots, not current execution instructions.
 
 ## 0.7.0.9 clean SCIENCE parity hotfix (2026-09-21)

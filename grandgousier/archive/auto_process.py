@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -286,6 +287,7 @@ def process_archive_path(
     recursive: bool = True,
     extensions: Iterable[str] = DEFAULT_EXTENSIONS,
     exact_paths: Iterable[str | Path] | None = None,
+    native_observation_ids: Iterable[str] | None = None,
     limit: int | None = None,
     series_ids: Iterable[int] | None = None,
     min_frames_per_series: int = 10,
@@ -462,6 +464,49 @@ def process_archive_path(
         groups=groups,
         warnings=warnings,
     )
+
+    requested_native_ids = (
+        tuple(str(value) for value in native_observation_ids)
+        if native_observation_ids is not None else None
+    )
+    if requested_native_ids is not None:
+        result.observation_selection_results.append({
+            "mode": "EXACT_NATIVE_OBSERVATION_IDS",
+            "requested_native_observation_ids": list(requested_native_ids),
+            "selected_native_observation_ids": [],
+        })
+        selector_row = result.observation_selection_results[-1]
+        detected_native_ids = [item.native_identity for item in detected]
+        detected_native_counts = Counter(detected_native_ids)
+        errors = []
+        if len(set(requested_native_ids)) != len(requested_native_ids):
+            errors.append("requested native observation IDs contain duplicates")
+        if not requested_native_ids:
+            errors.append("at least one native observation ID is required")
+        if any(item.profile_name != "MASTER" for item in detected):
+            errors.append("--native-observation-id is supported only for MASTER sources")
+        selected_candidates = [
+            item for item in detected if item.native_identity in requested_native_ids
+        ]
+        if any(item.observation_identity_status != "READY" for item in selected_candidates):
+            errors.append("requested observations must all have identity READY")
+        if any(not native for native in detected_native_ids):
+            errors.append("detected file is missing native observation identity")
+        found = [native for native in detected_native_ids if native in requested_native_ids]
+        if found != list(requested_native_ids):
+            errors.append("requested IDs were not found exactly once in requested scanner order")
+        if any(detected_native_counts[native] != 1 for native in requested_native_ids):
+            errors.append("each requested native observation ID must be detected exactly once")
+        if errors:
+            result.status = "FAILED_PRECONDITION_NATIVE_OBSERVATION_SELECTION"
+            result.warnings.extend(errors)
+            selector_row["errors"] = errors
+            _write_manifest_if_requested(result, manifest_out, session=session)
+            return result
+        detected = [item for item in detected if item.native_identity in requested_native_ids]
+        selector_row["selected_native_observation_ids"] = [item.native_identity for item in detected]
+        result.detected_files = len(detected)
+        result.groups = _build_group_plans(detected, profiles=profiles, example_limit=5)
 
     if (
         target_source_id is None

@@ -1406,6 +1406,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_process_path.add_argument("--path", required=True, help="Directory with FITS files")
     p_process_path.add_argument("--series-id", dest="series_ids", type=int, action="append", help="Execute only this existing field_series among frames under --path; may be repeated; selective mode does not create new series")
+    p_process_path.add_argument("--native-observation-id", dest="native_observation_ids", action="append", help="Restrict detected MASTER FITS to this exact ordered native observation ID list; repeat once per ID")
     p_process_path.add_argument("--catalog-name", default=None, help="Catalog namespace already imported; omitted means auto_catalog_* with Gaia DR3 fetch")
     p_process_path.add_argument("--execute", action="store_true", help="Write to DB and run pipelines; omitted means plan-only")
     p_process_path.add_argument("--plan-only", action="store_true", help="Alias for the default non-writing planning mode")
@@ -5980,6 +5981,7 @@ def cmd_process_archive_path(args: argparse.Namespace) -> int:
             extensions=_parse_extensions_arg(args.extensions),
             limit=args.limit,
             series_ids=args.series_ids,
+            native_observation_ids=args.native_observation_ids,
             min_frames_per_series=args.min_frames_per_series,
             max_field_separation_arcmin=args.max_field_separation_arcmin,
             max_series_gap_minutes=args.max_series_gap_minutes,

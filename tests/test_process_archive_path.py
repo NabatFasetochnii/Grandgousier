@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,8 @@ from grandgousier.archive.auto_process import (
     _merge_current_series_ids,
     _prepare_auto_catalog,
     discover_fits_files,
+    DetectedArchiveFile,
+    process_archive_path,
     scan_archive_path,
 )
 from grandgousier.io.archive_indexer import index_archive_paths
@@ -133,6 +136,95 @@ def test_index_archive_paths_supports_explicit_mixed_file_lists(tmp_path):
     assert result.inserted == 1
     assert result.failed == 0
     assert session.commits >= 1
+
+
+def _detected_master(native_id, *, status="READY"):
+    return DetectedArchiveFile(
+        path=f"C:/archive/{native_id}.fits", profile_name="MASTER", instrument="MASTER",
+        site="site", tube="tube", camera="204", filter_name="V", object_name="field",
+        date_obs=None, mjd=None, image_type="LIGHT", observation_uid=f"master:{native_id}",
+        identity_scheme="MASTER_UNIQNUM", native_identity=native_id,
+        observation_identity_status=status,
+    )
+
+
+def _patch_native_scan(monkeypatch, ids):
+    from grandgousier.archive import auto_process
+
+    monkeypatch.setattr(auto_process, "scan_archive_path", lambda *_a, **_k: (
+        [_detected_master(value) for value in ids], [], []
+    ))
+    monkeypatch.setattr(auto_process, "load_auto_profiles", lambda **_k: {
+        "MASTER": InstrumentProfile.from_yaml("configs/master.yaml")
+    })
+
+
+def test_native_selector_indexes_only_exact_247_requested_ids(monkeypatch):
+    ids = [f"U{i:03}" for i in range(272)]
+    requested = ids[25:]
+    _patch_native_scan(monkeypatch, ids)
+    observed = []
+
+    def index_spy(*, paths, **_kwargs):
+        observed.extend(str(path) for path in paths)
+        raise RuntimeError("index boundary reached")
+
+    monkeypatch.setattr("grandgousier.archive.auto_process.index_archive_paths", index_spy)
+    with pytest.raises(RuntimeError, match="index boundary reached"):
+        process_archive_path(
+            FakeSession(), root="C:/archive", execute=True,
+            native_observation_ids=requested,
+        )
+    assert observed == [str(Path(f"C:/archive/{value}.fits")) for value in requested]
+    assert len(observed) == 247
+    assert all(str(Path(f"C:/archive/{value}.fits")) not in observed for value in ids[:25])
+
+
+@pytest.mark.parametrize("requested", [
+    ["U000", "U003"],                 # requested ID missing
+    ["U000", "U001", "U001"],       # duplicate request
+    ["U000", "U001", "OTHER"],      # unrequested identity
+    ["U001", "U000"],                 # wrong order
+])
+def test_native_selector_rejects_invalid_lists_before_index(monkeypatch, requested):
+    _patch_native_scan(monkeypatch, ["U000", "U001", "U002"])
+    calls = []
+    monkeypatch.setattr(
+        "grandgousier.archive.auto_process.index_archive_paths",
+        lambda **kwargs: calls.append(kwargs) or SimpleNamespace(
+            discovered=0, inserted=0, skipped_existing=0, failed=0
+        ),
+    )
+    result = process_archive_path(
+        FakeSession(), root="C:/archive", execute=True,
+        native_observation_ids=requested,
+    )
+    assert result.status == "FAILED_PRECONDITION_NATIVE_OBSERVATION_SELECTION"
+    assert calls == []
+
+
+def test_native_selector_rejects_non_master_and_non_ready_before_index(monkeypatch):
+    from grandgousier.archive import auto_process
+
+    _patch_native_scan(monkeypatch, ["U000"])
+    monkeypatch.setattr(auto_process, "scan_archive_path", lambda *a, **k: (
+        [replace(_detected_master("U000"), profile_name="RoboPhot")], [], []
+    ))
+    calls = []
+    monkeypatch.setattr("grandgousier.archive.auto_process.index_archive_paths", lambda **k: calls.append(k))
+    result = process_archive_path(FakeSession(), root="C:/archive", execute=True,
+                                  native_observation_ids=["U000"])
+    assert result.status == "FAILED_PRECONDITION_NATIVE_OBSERVATION_SELECTION"
+    assert calls == []
+
+    _patch_native_scan(monkeypatch, ["U000"])
+    monkeypatch.setattr(auto_process, "scan_archive_path", lambda *a, **k: (
+        [_detected_master("U000", status="INVALID")], [], []
+    ))
+    result = process_archive_path(FakeSession(), root="C:/archive", execute=True,
+                                  native_observation_ids=["U000"])
+    assert result.status == "FAILED_PRECONDITION_NATIVE_OBSERVATION_SELECTION"
+    assert calls == []
 
 
 def test_default_auto_prefix_contains_instrument_date_field_filter_and_series_id():
