@@ -367,6 +367,9 @@ class MasterManifestMetadataProvider(MetadataProvider):
         if not self.manifest.is_file():
             raise ValueError(f"MASTER inventory does not exist: {self.manifest}")
         emitted = 0
+        exact = request.native_observation_ids
+        selected: list[ObservationRecord] = []
+        seen: set[str] = set()
         for row in iter_archive_manifest_csv(self.manifest):
             cached_header = self._cached_header(row)
             uniqnum = _first_nonempty(row.get("uniqnum"), row.get("UNIQNUM"))
@@ -429,12 +432,28 @@ class MasterManifestMetadataProvider(MetadataProvider):
                 },
                 **identity,
             )
+            if exact and uniqnum is not None and str(uniqnum).strip() in exact:
+                if record.identity_status != "READY" or not _request_matches(record, request):
+                    raise ValueError("MASTER exact selection has invalid requested observation")
             if not _request_matches(record, request):
+                continue
+            if exact:
+                native = record.native_observation_id
+                if native not in exact:
+                    continue
+                if native in seen or record.identity_status != "READY":
+                    raise ValueError("MASTER exact selection has duplicate or invalid requested observation")
+                seen.add(native)
+                selected.append(record)
                 continue
             yield record
             emitted += 1
             if request.limit is not None and emitted >= request.limit:
                 break
+        if exact:
+            if tuple(record.native_observation_id for record in selected) != exact:
+                raise ValueError("MASTER exact selection is missing or reordered")
+            yield from selected
 
 
 class FilesystemAssetProvider(AssetProvider):

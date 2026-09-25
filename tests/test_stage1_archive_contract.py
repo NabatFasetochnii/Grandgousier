@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -122,6 +123,87 @@ def test_master_manifest_and_filesystem_map_to_same_p4_identity(tmp_path: Path) 
     assert local_record.observation_uid == master_record.observation_uid
     assert local_record.filter_name == master_record.filter_name == "V"
     assert local_record.exptime == master_record.exptime == 50.0
+
+
+def test_master_exact_selection_preflights_entire_filtered_window(tmp_path: Path) -> None:
+    manifest = tmp_path / "master.csv"
+    rows = [
+        {"uniqnum": native, "datetime": "2018-09-07T17:04:22", "filter": filter_name,
+         "raw_path": f"/master/raw/{index}.fit.gz", "header_path": f"/master/proc/{index}.fits",
+         "dark_path": "/master/raw/dark.fit.gz", "flat_path": "/master/raw/flat.fit.gz"}
+        for index, (native, filter_name) in enumerate(
+            [("204_0", "V"), ("204_1", "V"), ("203_1", "R"),
+             ("204_9", "V"), ("204_2", "V"), ("204_8", "V")]
+        )
+    ]
+    _write_manifest(manifest, rows)
+    provider = MasterManifestMetadataProvider(
+        source_id="master", manifest=manifest, profile=load_instrument_profile("MASTER"),
+    )
+
+    def request(*ids: str) -> ArchiveRequest:
+        return ArchiveRequest(source_id="master", filters=("V",),
+                              datetime_start="2018-09-07T00:00:00Z",
+                              datetime_end="2018-09-08T00:00:00Z",
+                              native_observation_ids=ids)
+
+    assert [r.native_observation_id for r in provider.search(request("204_1", "204_2"))] == [
+        "204_1", "204_2"
+    ]
+    assert [r.filter_name for r in provider.search(request("204_1", "204_2"))] == ["V", "V"]
+    for ids in (("204_2", "204_1"), ("204_1", "204_3")):
+        with pytest.raises(ValueError, match="exact selection"):
+            list(provider.search(request(*ids)))
+    assert [r.native_observation_id for r in provider.search(request("204_1"))] == ["204_1"]
+    rows.append({**rows[-1], "uniqnum": "204_3"})
+    _write_manifest(manifest, rows)
+    assert [r.native_observation_id for r in provider.search(request("204_1", "204_2"))] == [
+        "204_1", "204_2"
+    ]
+    rows[-1] = {**rows[-1], "uniqnum": "204_2"}
+    _write_manifest(manifest, rows)
+    with pytest.raises(ValueError, match="exact selection"):
+        list(provider.search(request("204_1", "204_2")))
+    iterator = iter(provider.search(request("204_1", "204_2")))
+    with pytest.raises(ValueError, match="exact selection"):
+        next(iterator)  # No partial result even though both requested rows preceded the duplicate.
+    rows[-1] = {**rows[-1], "uniqnum": "204_3"}
+    rows[1] = {**rows[1], "filter": "R"}
+    _write_manifest(manifest, rows)
+    with pytest.raises(ValueError, match="exact selection"):
+        next(iter(provider.search(request("204_1", "204_2"))))
+
+
+def test_real_master_inventory_exact_gpx_v25_read_only_if_available() -> None:
+    manifest = Path(r"C:\master\gpx\gpx_tf17_full_inventory.csv")
+    cache = Path(r"C:\master\gpx\smoke")
+    if not manifest.is_file() or not cache.is_dir():
+        pytest.skip("Local MASTER inventory and header cache unavailable")
+    ids = tuple(f"204_{n}" for n in (*range(15814, 15829), *range(15832, 15842)))
+    provider = MasterManifestMetadataProvider(
+        source_id="master-full-20180907", manifest=manifest,
+        profile=load_instrument_profile("MASTER"), cache_root=cache,
+    )
+    request = ArchiveRequest(
+        source_id="master-full-20180907", filters=("V",),
+        datetime_start="2018-09-07T00:00:00Z", datetime_end="2018-09-08T00:00:00Z",
+        native_observation_ids=ids,
+    )
+    selected = list(provider.search(request))  # Metadata only: no plan, artifact, asset or DB.
+    assert len(selected) == 25
+    assert tuple(row.native_observation_id for row in selected) == ids
+    assert all(row.identity_status == "READY" and row.filter_name == "V" for row in selected)
+    assert hashlib.sha256("\n".join(ids).encode("ascii")).hexdigest() == (
+        "71e2ee69ae0762230f28100de82b07f878b583c386a9833620feef430ac6f5eb"
+    )
+
+
+def test_exact_selection_rejects_unsafe_requests() -> None:
+    for ids in (("204_*",), ("204_1", "204_1"), ("",)):
+        with pytest.raises(ValueError):
+            ArchiveRequest(source_id="master", native_observation_ids=ids)
+    with pytest.raises(ValueError, match="limit"):
+        ArchiveRequest(source_id="master", native_observation_ids=("204_1",), limit=25)
 
 
 def test_filesystem_relocation_does_not_change_source_identity(tmp_path: Path) -> None:

@@ -45,13 +45,14 @@ def test_pre_qc_excess_detection_limit_scales_only_for_large_detectors():
     assert _effective_max_local_maxima(None, n_pix=4098 * 4098) is None
 
 
-def test_working_catalog_tag_changes_default_calibration_names():
+def test_working_catalog_tag_changes_explicit_circular_calibration_names():
     cfg = FieldPipelineConfig(
         catalog_name="cat",
         calibration_prefix="prefix",
         working_catalog_mag_limit=19.0,
         max_working_sources_per_frame=2000,
         catalog_edge_margin_pix=20.0,
+        photometry_estimator="circular",
     )
 
     names = _calibration_names(cfg)

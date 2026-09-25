@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import pytest
 
 from grandgousier.photometry.adaptive_aperture import (
     AdaptiveApertureGeometry,
@@ -92,6 +93,16 @@ def test_interpolation_tracks_local_orientation_and_clamps_geometry():
     assert geom.equivalent_radius_pix <= 4.5 + 1e-12
     # Ellipse orientation is axial (180-degree periodic), so compare modulo 180.
     assert abs(((geom.theta_deg - 60.0 + 90.0) % 180.0) - 90.0) < 1e-6
+
+
+def test_default_adaptive_radius_has_three_pixel_floor_and_2_5_scale_cap():
+    for sigma, expected in ((0.3, 3.0), (10.0, 7.5)):
+        refs = [_PsfReference(float(x), float(y), sigma**2, sigma**2, 0.0, 4.0)
+                for x, y in ((10, 10), (20, 20), (30, 30))]
+        geometry = interpolate_adaptive_geometry(refs, x=20.0, y=20.0, base_radius_pix=3.0)
+        assert geometry is not None
+        assert geometry.equivalent_radius_pix == pytest.approx(expected)
+        assert geometry.radius_clipped is (sigma == 10.0)
 
 
 def test_dynamic_background_annulus_moves_outside_long_axis():

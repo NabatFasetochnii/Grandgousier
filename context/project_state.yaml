@@ -1,7 +1,20 @@
 schema_version: 2
+current_state_2026_09_25:
+  status: IMPLEMENTED_NOT_REAL_VALIDATED
+  source_base_head: 4e2daab
+  source_candidate_version: 0.7.0.10
+  change: bounded_parquet_product_writer_source_implementation
+  effective_estimator_lineage: pipeline_runs.recipe_json.photometry_estimator
+  stage3_scale_v1_unchanged: true
+  generic_adaptive_stage3_ready: false
+  database_writes_authorized: false
+  execution_authorized: false
+  parquet_live_export_validated: false
+  parquet_writer_requires_optional_pyarrow: true
+  note: source-level writer only; CLI/database integration and live science acceptance are not claimed
 project: Grandgousier
-version: 0.7.0.9
-updated: '2026-09-21'
+version: 0.7.0.10
+updated: '2026-09-25'
 
 active_work:
   status: gpx_full_rebuild_science_parity_hotfix_0_7_0_9_candidate

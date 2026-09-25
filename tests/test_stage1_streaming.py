@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -247,3 +248,43 @@ def test_stream_failure_isolated_to_one_item(monkeypatch, tmp_path: Path) -> Non
     assert len(processed) == 8
     assert summary.failed_items == 1
     assert summary.counts["SKIPPED_EXISTING"] == 7
+
+
+def test_opt_in_stops_on_blocked_batch_without_executing_later_items(
+    monkeypatch, tmp_path: Path
+) -> None:
+    def records():
+        for index, record in enumerate(_records(3)):
+            if index == 1:
+                record = replace(
+                    record, required_asset_roles=("processed", "missing"),
+                )
+            yield record
+
+    calls = []
+    monkeypatch.setattr(
+        "grandgousier.archive.stage1_execution._execute_item",
+        lambda item, **kwargs: calls.append(item) or None,
+    )
+    summary = execute_stage1_stream(
+        request=ArchiveRequest(source_id="stream"),
+        source=_source(),
+        metadata_provider=_SinglePassProvider(records()),
+        asset_provider=object(),
+        product_store=_Store(),
+        batch_size=3,
+        plan_json_path=tmp_path / "plan.json",
+        report_json_path=tmp_path / "report.json",
+        stop_on_first_failure=True,
+    )
+    assert not calls
+    assert summary.status == summary.plan_status == "BLOCKED"
+    assert json.loads((tmp_path / "plan.json").read_text(encoding="utf-8"))["summary"] == {
+        "discovered_records": 3,
+        "science_items": 3,
+        "ready_items": 2,
+        "blocked_items": 1,
+        "attempted_items": 0,
+        "reported_items": 1,
+        "stopped_early": True,
+    }

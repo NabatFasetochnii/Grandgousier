@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "grandgousier"
-version = "0.7.0.9"
+version = "0.7.0.10"
 description = "Astronomical archive photometry and calibration engine"
 readme = "README_PUBLIC.md"
 requires-python = ">=3.11"
@@ -36,6 +36,9 @@ photometry = [
 gaia = [
     "astroquery>=0.4.7",
     "requests>=2.31",
+]
+parquet = [
+    "pyarrow>=15.0",
 ]
 dev = [
     "pytest>=8.0",

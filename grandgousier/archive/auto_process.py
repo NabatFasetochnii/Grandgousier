@@ -299,7 +299,7 @@ def process_archive_path(
     file_log_level: str = "INFO",
     no_file_log: bool = False,
     aperture_radius_pix: float = 3.0,
-    photometry_estimator: str = "circular",
+    photometry_estimator: str = "adaptive_ellipse",
     adaptive_detection_algorithm: str = "numpy_localmax_v1",
     adaptive_min_psf_snr: float = 20.0,
     adaptive_max_psf_sources_per_frame: int = 500,
@@ -490,7 +490,69 @@ def process_archive_path(
         warning = _observation_selection_warning(observation_plan.summary, mode="plan")
         if warning:
             result.warnings.append(warning)
-        result.status = "PLAN"
+        requested_series_ids = sorted({int(v) for v in (series_ids or [])})
+        if requested_series_ids:
+            scoped_paths = [item.path for item in detected]
+            represented_ids = set(_series_ids_for_paths(session, scoped_paths))
+            by_series = _frame_ids_by_series_for_paths(session, scoped_paths)
+            membership = _requested_series_membership(session, requested_series_ids)
+            identities_by_path = {item.path: item.observation_uid for item in detected}
+            scoped_identity_rows = _series_frame_identities_for_paths(session, scoped_paths)
+            selection_rows = []
+            failed = False
+            for series_id in requested_series_ids:
+                selected = set(by_series.get(series_id, []))
+                all_frames = membership.get(series_id, {})
+                selected_identities = {
+                    frame_id: (path, uid)
+                    for sid, frame_id, path, uid in scoped_identity_rows
+                    if sid == series_id and frame_id in selected
+                }
+                mismatched = sorted(
+                    frame_id for frame_id, (path, uid) in selected_identities.items()
+                    if not uid or not identities_by_path.get(path)
+                    or identities_by_path[path] != uid or all_frames.get(frame_id) != uid
+                )
+                missing = sorted(set(all_frames) - selected)
+                invalid = (
+                    series_id not in represented_ids
+                    or not selected
+                    or not all_frames
+                    or not selected.issubset(all_frames)
+                    or set(selected_identities) != selected
+                    or bool(mismatched)
+                )
+                failed |= invalid
+                selection_rows.append({
+                    "series_id": series_id,
+                    "status": "FAILED_PRECONDITION_SERIES_SELECTION" if invalid else "REPRESENTED",
+                    "selected_frame_count": len(selected),
+                    "total_series_frame_count": len(all_frames),
+                    "selected_frame_ids": sorted(selected),
+                    "missing_series_frame_ids": missing,
+                    "coverage": "SUBSET" if missing else "COMPLETE",
+                    "matched_observation_identity_count": len(selected_identities) - len(mismatched),
+                    "selected_observation_uids": sorted(
+                        uid for fid, (_path, uid) in selected_identities.items()
+                        if fid not in mismatched and uid is not None
+                    ),
+                    "identity_mismatch_frame_ids": mismatched,
+                })
+            result.observation_selection_results.append({
+                "mode": "PLAN_REQUESTED_SERIES",
+                "requested_series_ids": requested_series_ids,
+                "selected_series_ids": [] if failed else requested_series_ids,
+                "rows": selection_rows,
+            })
+            if failed:
+                result.warnings.append(
+                    "requested --series-id selection has missing paths, series membership, "
+                    "or mismatched physical observation identities; no series selected"
+                )
+        result.status = (
+            "FAILED_PRECONDITION_SERIES_SELECTION"
+            if requested_series_ids and failed else "PLAN"
+        )
         _write_manifest_if_requested(result, manifest_out, session=session)
         return result
 
@@ -1990,6 +2052,44 @@ def _frame_ids_by_series_for_paths(session: Session, raw_paths: list[str]) -> di
     for row in session.execute(stmt, {"raw_paths": raw_paths}).all():
         out.setdefault(int(row[0]), []).append(int(row[1]))
     return out
+
+
+def _requested_series_membership(session: Session, series_ids: list[int]) -> dict[int, dict[int, str | None]]:
+    stmt = text(
+        """
+        SELECT sf.series_id, sf.frame_id, o.observation_uid
+        FROM field_series_frames sf
+        JOIN field_series s ON s.series_id = sf.series_id
+        JOIN frames fr ON fr.frame_id = sf.frame_id
+        LEFT JOIN observations o ON o.observation_id = fr.observation_id
+        WHERE sf.series_id IN :series_ids
+        ORDER BY sf.series_id, sf.frame_id
+        """
+    ).bindparams(bindparam("series_ids", expanding=True))
+    out: dict[int, dict[int, str | None]] = {}
+    for sid, fid, uid in session.execute(stmt, {"series_ids": series_ids}).all():
+        out.setdefault(int(sid), {})[int(fid)] = uid
+    return out
+
+
+def _series_frame_identities_for_paths(
+    session: Session, raw_paths: list[str]
+) -> list[tuple[int, int, str, str | None]]:
+    if not raw_paths:
+        return []
+    stmt = text(
+        """
+        SELECT sf.series_id, fr.frame_id, fl.locator, o.observation_uid
+        FROM field_series_frames sf
+        JOIN frames fr ON fr.frame_id = sf.frame_id
+        JOIN frame_locations fl ON fl.frame_id = fr.frame_id AND fl.is_primary
+        LEFT JOIN observations o ON o.observation_id = fr.observation_id
+        WHERE fl.locator IN :raw_paths
+        ORDER BY sf.series_id, fr.frame_id
+        """
+    ).bindparams(bindparam("raw_paths", expanding=True))
+    return [(int(sid), int(fid), path, uid) for sid, fid, path, uid in
+            session.execute(stmt, {"raw_paths": raw_paths}).all()]
 
 
 def _load_series_for_pipeline(session: Session, series_ids: list[int]) -> list[dict[str, Any]]:

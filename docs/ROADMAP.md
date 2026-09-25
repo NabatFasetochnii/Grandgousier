@@ -1,5 +1,11 @@
 # Grandgousier — план перехода к 0.7 clean rebuild
 
+Current gate (2026-09-24): **IMPLEMENTED_NOT_REAL_VALIDATED** source candidate 0.7.0.10
+sets `adaptive_ellipse` as the new Stage-2 estimator default, with explicit circular
+override and unchanged radius/fallback and `stage3_scale_v1` recipe. DB-free tests only;
+real photometric acceptance, DB execution, deployment, and release remain separate gates.
+The dated milestones below are retained as historical plans, not current instructions.
+
 Актуально на **2026-09-21**. Current source candidate: **0.7.0.9 clean SCIENCE parity hotfix**. Phase A–D и 0.7.0.4 REAL-VALIDATED на Windows/CPython 3.11; 0.7.0.4 gate: `723 passed, 1 skipped`, packaging/install smoke OK. Frozen production/reference baseline: **0.6.4.5.1**, ≈43 GB. Fresh DB `grandgousier_070_fresh` bootstrap READY; seed V/R Stage2 is DONE on 0.7.0.6, and storage audit found stale durable rows on failed intermediate generations that 0.7.0.7 prevents and repairs. Full clean rebuild now uses `grandgousier_070_gpx_full`; all full Stage2 dates through 2018-09-23 are complete; the remaining blocker is a pre-Stage3 parity reader that still referenced retired `science_measurements`, fixed in 0.7.0.9.
 
 ## 0. Неподвижные условия

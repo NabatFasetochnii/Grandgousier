@@ -49,6 +49,8 @@ def build_stage1_plan(
             f"source descriptor {source.source_id!r}"
         )
     del asset_provider
+    if request.native_observation_ids and source.adapter != "master-manifest":
+        raise ValueError("exact native observation selection requires master-manifest")
     records = list(metadata_provider.search(request))
     items: list[CalibrationPlanItem] = []
     for record in records:
@@ -84,6 +86,8 @@ def iter_stage1_plan_batches(
             f"source descriptor {source.source_id!r}"
         )
     size = normalize_stage1_batch_size(batch_size)
+    if request.native_observation_ids and source.adapter != "master-manifest":
+        raise ValueError("exact native observation selection requires master-manifest")
     batch: list[CalibrationPlanItem] = []
     discovered = 0
     for record in metadata_provider.search(request):

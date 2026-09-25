@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from grandgousier.archive.observation_selection import (
@@ -20,6 +22,7 @@ from grandgousier.archive.stage1_execution import (
     STAGE1_PROVENANCE_SCHEMA,
 )
 from grandgousier.io.frame_locations import add_or_touch_frame_location, find_frame_by_locator
+from grandgousier.db.models import FieldSeriesFrame, Frame, FrameLocation, make_frame_location_uid
 
 STAGE1_HANDOFF_SCHEMA = "grandgousier.stage1.handoff.v1"
 _SUCCESS_EXECUTION_STATUSES = {
@@ -33,6 +36,7 @@ _HARD_BLOCK_ACTIONS = {
     ObservationScienceAction.MISSING_OBSERVATION_ID.value,
     ObservationScienceAction.IDENTITY_CONFLICT.value,
 }
+_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def _utc_now() -> str:
@@ -77,7 +81,7 @@ class ValidatedStage1Product:
     product_path: Path
     product_checksum_sha256: str
     provenance_path: Path
-    fingerprint: str | None
+    fingerprint: str
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -195,12 +199,14 @@ def load_validated_stage1_products(path: str | Path) -> tuple[ValidatedStage1Pro
         product_text = str(row.get("product_path") or "").strip()
         checksum = str(row.get("product_checksum_sha256") or "").strip().casefold()
         provenance_text = str(row.get("provenance_path") or "").strip()
-        if not product_text or not checksum or not provenance_text:
+        if not product_text or not _SHA256.fullmatch(checksum) or not provenance_text:
             raise ValueError(
                 f"Stage-1 execution result #{index} lacks product_path/checksum/provenance_path"
             )
         product_path = Path(product_text)
         provenance_path = Path(provenance_text)
+        if provenance_path != product_path.with_name(product_path.name + ".provenance.json"):
+            raise ValueError(f"Stage-1 provenance path does not match product: {product_path}")
         if not product_path.is_file():
             raise FileNotFoundError(f"Stage-1 product is missing: {product_path}")
         if not provenance_path.is_file():
@@ -226,19 +232,24 @@ def load_validated_stage1_products(path: str | Path) -> tuple[ValidatedStage1Pro
             raise ValueError(
                 f"Stage-1 provenance/report checksum mismatch for product: {product_path}"
             )
+        if provenance_product.get("size_bytes") != product_path.stat().st_size:
+            raise ValueError(f"Stage-1 provenance product size mismatch: {product_path}")
+        if not provenance_product.get("locator") or Path(str(provenance_product["locator"])).name != product_path.name:
+            raise ValueError(f"Stage-1 provenance product locator mismatch: {product_path}")
         report_product = row.get("product")
-        if report_product is not None:
-            if not isinstance(report_product, Mapping):
-                raise ValueError(f"Stage-1 execution product section is invalid: {product_path}")
-            for key in ("store_id", "backend", "locator"):
-                report_value = report_product.get(key)
-                provenance_value = provenance_product.get(key)
-                if report_value not in (None, "") and str(report_value) != str(provenance_value):
-                    raise ValueError(
-                        f"Stage-1 provenance/report product {key} mismatch for product: {product_path}"
-                    )
-        report_fingerprint = str(row.get("fingerprint") or "").strip() or None
-        provenance_fingerprint = str(provenance.get("fingerprint") or "").strip() or None
+        if not isinstance(report_product, Mapping):
+            raise ValueError(f"Stage-1 execution product section is invalid: {product_path}")
+        for key in ("store_id", "backend", "locator"):
+            report_value = report_product.get(key)
+            provenance_value = provenance_product.get(key)
+            if not report_value or not provenance_value or str(report_value) != str(provenance_value):
+                raise ValueError(
+                    f"Stage-1 provenance/report product {key} mismatch for product: {product_path}"
+                )
+        report_fingerprint = str(row.get("fingerprint") or "").strip()
+        provenance_fingerprint = str(provenance.get("fingerprint") or "").strip()
+        if not _SHA256.fullmatch(report_fingerprint) or not _SHA256.fullmatch(provenance_fingerprint):
+            raise ValueError(f"Stage-1 fingerprint is not SHA-256: {product_path}")
         if report_fingerprint != provenance_fingerprint:
             raise ValueError(f"Stage-1 provenance/report fingerprint mismatch: {product_path}")
         provenance_obs = provenance.get("observation")
@@ -247,10 +258,12 @@ def load_validated_stage1_products(path: str | Path) -> tuple[ValidatedStage1Pro
         for key in ("source_observation_uid", "observation_uid", "native_observation_id"):
             report_value = row.get(key)
             provenance_value = provenance_obs.get(key)
-            if report_value not in (None, "") and str(report_value) != str(provenance_value):
+            if not report_value or not provenance_value or str(report_value) != str(provenance_value):
                 raise ValueError(
                     f"Stage-1 provenance/report {key} mismatch for product: {product_path}"
                 )
+        if product_path.name != f"{row['source_observation_uid']}_processed.fits":
+            raise ValueError(f"Stage-1 product filename/source identity mismatch: {product_path}")
 
         products.append(
             ValidatedStage1Product(
@@ -265,6 +278,115 @@ def load_validated_stage1_products(path: str | Path) -> tuple[ValidatedStage1Pro
             )
         )
     return tuple(products)
+
+
+def _check_frame_evidence(frame: Frame, product: ValidatedStage1Product) -> None:
+    observation = frame.observation
+    if (observation is None or observation.observation_uid != product.observation_uid
+            or observation.native_identity != product.native_observation_id):
+        raise ValueError(f"Stage-1 product Frame observation mismatch: {product.product_path}")
+    for metadata in (frame.header_json or {}, frame.quality_flags or {}):
+        existing = metadata.get("stage1_fingerprint")
+        if existing is not None and existing != product.fingerprint:
+            raise ValueError(f"Stage-1 product Frame fingerprint conflict: {product.product_path}")
+        source_uid = metadata.get("source_observation_uid")
+        if source_uid is not None and source_uid != product.source_observation_uid:
+            raise ValueError(f"Stage-1 product Frame source identity conflict: {product.product_path}")
+
+
+def _persist_selected_evidence(
+    session: Session, items: Sequence[Stage1HandoffItem], indexed_ids: Sequence[int],
+) -> None:
+    """Validate every selected exact locator before mutating any Frame metadata."""
+    selected = [item for item in items if item.status == "SELECTED_FOR_STAGE2"]
+    updates: list[tuple[Frame, ValidatedStage1Product]] = []
+    used_ids: set[int] = set()
+    with session.no_autoflush:
+        for item in selected:
+            product = item.product
+            locator_uid = make_frame_location_uid(str(product.product_path))
+            matches = session.scalars(
+                select(Frame).join(FrameLocation, FrameLocation.frame_id == Frame.frame_id)
+                .where(FrameLocation.locator_uid == locator_uid)
+            ).all()
+            if len(matches) != 1:
+                raise ValueError(f"Stage-1 product has no unique exact Frame location: {product.product_path}")
+            frame = matches[0]
+            if int(frame.frame_id) not in indexed_ids or int(frame.frame_id) in used_ids:
+                raise ValueError(f"Stage-1 product not uniquely indexed: {product.product_path}")
+            if item.selected_frame_id is not None and frame.frame_id != item.selected_frame_id:
+                raise ValueError(f"Stage-1 product selected Frame mismatch: {product.product_path}")
+            _check_frame_evidence(frame, product)
+            location = next(
+                loc for loc in frame.locations if loc.locator_uid == locator_uid
+            )
+            if location.content_sha256 and location.content_sha256.casefold() != product.product_checksum_sha256:
+                raise ValueError(f"Stage-1 product location checksum conflict: {product.product_path}")
+            used_ids.add(int(frame.frame_id))
+            updates.append((frame, product))
+        if len(updates) != len(selected):
+            raise ValueError("Stage-1 product mapping is incomplete")
+        for frame, product in updates:
+            add_or_touch_frame_location(
+                frame, locator=str(product.product_path),
+                content_sha256=product.product_checksum_sha256, make_primary=True,
+            )
+            frame.header_json = {**(frame.header_json or {}), "stage1_fingerprint": product.fingerprint,
+                                 "source_observation_uid": product.source_observation_uid}
+    session.commit()
+
+
+def _validate_executed_stage2(
+    session: Session, items: Sequence[Stage1HandoffItem], result: Mapping[str, Any],
+) -> None:
+    """Gate evidence on complete, selected, successfully processed science work.
+
+    This checks result and series membership, not independent durable science state.
+    Stage-2 commits independently; failure here cannot roll those commits back.
+    """
+    selected = [item for item in items if item.status == "SELECTED_FOR_STAGE2"]
+    if result.get("execute") is not True or result.get("status") != "DONE" or result.get("warnings"):
+        raise ValueError("Stage-2 execution is not a warning-free DONE")
+    if result.get("failed_files") != 0 or result.get("discovered_files") != len(selected) or result.get("detected_files") != len(selected):
+        raise ValueError("Stage-2 did not detect every selected product")
+    indexes = result.get("index_results")
+    if not isinstance(indexes, list) or not indexes or any(
+        not isinstance(row, Mapping) or row.get("failed") != 0 for row in indexes
+    ) or sum(row.get("discovered", -1) for row in indexes) != len(selected):
+        raise ValueError("Stage-2 did not index every selected product")
+    indexed = result.get("indexed_frame_ids")
+    if not isinstance(indexed, list) or len(indexed) != len(selected) or len(set(indexed)) != len(selected):
+        raise ValueError("Stage-2 indexed Frame coverage is incomplete")
+    selections = result.get("observation_selection_results")
+    if not isinstance(selections, list) or len(selections) != 1 or selections[0].get("mode") != "EXECUTE_PERSISTED_FRAMES":
+        raise ValueError("Stage-2 persisted-frame selection is missing")
+    rows = selections[0].get("rows")
+    if not isinstance(rows, list):
+        raise ValueError("Stage-2 persisted-frame selection rows are missing")
+    selected_ids = [row.get("selected_frame_id") for row in rows if row.get("action") in {
+        ObservationScienceAction.SELECTED.value,
+        ObservationScienceAction.SELECTED_LEGACY_NO_OBSERVATION_ID.value,
+    }]
+    if len(selected_ids) != len(selected) or set(selected_ids) != set(indexed):
+        raise ValueError("Stage-2 did not select every indexed Frame for science")
+    created = result.get("created_series_ids")
+    processed = result.get("processed_series_ids")
+    pipelines = result.get("pipeline_results")
+    if (not isinstance(created, list) or not created or len(set(created)) != len(created)
+            or not isinstance(processed, list) or set(processed) != set(created)
+            or len(processed) != len(created) or not isinstance(pipelines, list)
+            or len(pipelines) != len(created) or {row.get("series_id") for row in pipelines} != set(created)
+            or any(row.get("status") != "DONE" or row.get("science_status") != "OK" for row in pipelines)):
+        raise ValueError("Stage-2 did not complete exactly the intended series with OK science")
+    with session.no_autoflush:
+        memberships = session.execute(
+            select(FieldSeriesFrame.series_id, FieldSeriesFrame.frame_id).where(
+                FieldSeriesFrame.series_id.in_(created)
+            )
+        ).all()
+    if ({frame_id for _series_id, frame_id in memberships} != set(indexed)
+            or {series_id for series_id, _frame_id in memberships} != set(created)):
+        raise ValueError("Stage-2 completed series do not exactly cover selected Frames")
 
 
 def _candidate_from_detected(item: Any) -> ScienceFileIdentityCandidate:
@@ -294,6 +416,7 @@ def handoff_stage1_execution(
     master_profile: str | Path | None = None,
     robophot_profile: str | Path | None = None,
     min_frames_per_series: int = 10,
+    ensemble_min_ref_stars_per_frame: int = 30,
     max_field_separation_arcmin: float = 30.0,
     max_series_gap_minutes: float = 60.0,
     out_root: str | Path = "exports",
@@ -363,6 +486,9 @@ def handoff_stage1_execution(
             errors=tuple(identity_errors),
         )
 
+    if len(candidates) != len(products) or len({str(Path(c.path).resolve()).casefold() for c in candidates}) != len(products):
+        raise ValueError("Stage-2 scan did not return each exact Stage-1 product once")
+
     selection = plan_file_science_selection(session, candidates, allow_reassign_existing_frame=False)
     product_by_path = {str(item.product_path): item for item in products}
     items: list[Stage1HandoffItem] = []
@@ -407,6 +533,9 @@ def handoff_stage1_execution(
             )
         )
 
+    if len(items) != len(products) or len({str(item.product.product_path.resolve()).casefold() for item in items}) != len(products):
+        raise ValueError("P4 selection did not account for every Stage-1 product exactly once")
+
     if any(item.status == "BLOCKED" for item in items):
         return Stage1HandoffReport(
             execution_report_path=str(execution_report_path),
@@ -414,6 +543,22 @@ def handoff_stage1_execution(
             execute=bool(execute),
             items=tuple(items),
         )
+
+    # Existing locators may refer to an already indexed selected product. Refuse
+    # contradictory provenance before the nested Stage-2 workflow can commit work.
+    for item in items:
+        if item.status != "SELECTED_FOR_STAGE2":
+            continue
+        frame = find_frame_by_locator(session, str(item.product.product_path))
+        if frame is not None:
+            _check_frame_evidence(frame, item.product)
+            location = next(
+                loc for loc in frame.locations
+                if loc.locator_uid == make_frame_location_uid(str(item.product.product_path))
+            )
+            if (location.content_sha256 and
+                    location.content_sha256.casefold() != item.product.product_checksum_sha256):
+                raise ValueError(f"Stage-1 product location checksum conflict: {item.product.product_path}")
 
     stage2_result: Mapping[str, Any] | None = None
     if execute and selected_paths:
@@ -431,6 +576,7 @@ def handoff_stage1_execution(
                 robophot_profile=robophot_profile,
                 recursive=False,
                 min_frames_per_series=min_frames_per_series,
+                ensemble_min_ref_stars_per_frame=ensemble_min_ref_stars_per_frame,
                 max_field_separation_arcmin=max_field_separation_arcmin,
                 max_series_gap_minutes=max_series_gap_minutes,
                 include_assigned=False,
@@ -446,20 +592,18 @@ def handoff_stage1_execution(
                 items=tuple(items),
                 errors=(f"Stage-2 handoff failed: {type(exc).__name__}: {exc}",),
             )
-        # Stage-1 provides an exact SHA-256, so retain it as location/content
-        # evidence without turning the checksum into physical-observation identity.
-        for product in products:
-            frame = find_frame_by_locator(session, str(product.product_path))
-            if frame is None:
-                continue
-            add_or_touch_frame_location(
-                frame,
-                locator=str(product.product_path),
-                content_sha256=product.product_checksum_sha256,
-                make_primary=True,
+        try:
+            result_dict = result.to_dict()
+            _validate_executed_stage2(session, items, result_dict)
+            _persist_selected_evidence(session, items, result_dict.get("indexed_frame_ids", []))
+        except Exception as exc:
+            session.rollback()
+            return Stage1HandoffReport(
+                execution_report_path=str(execution_report_path), generated_at_utc=_utc_now(),
+                execute=True, items=tuple(items),
+                errors=(f"Stage-1 evidence handoff failed: {type(exc).__name__}: {exc}",),
             )
-        session.commit()
-        stage2_result = result.to_dict()
+        stage2_result = result_dict
 
     return Stage1HandoffReport(
         execution_report_path=str(execution_report_path),

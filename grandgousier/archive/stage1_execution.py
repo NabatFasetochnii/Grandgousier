@@ -237,6 +237,8 @@ class Stage1StreamingExecutionSummary:
     discovered_records: int
     planned_items: int
     counts: Mapping[str, int]
+    attempted_items: int | None = None
+    stopped_early: bool = False
     schema: str = STAGE1_EXECUTION_SCHEMA
 
     @property
@@ -253,9 +255,28 @@ class Stage1StreamingExecutionSummary:
             return "FAILED"
         if self.blocked_items:
             return "BLOCKED"
+        if self.stopped_early:
+            return "FAILED"
         return "READY"
 
     def to_dict(self) -> dict[str, Any]:
+        summary = {
+            "discovered_records": self.discovered_records,
+            "items": self.planned_items,
+            "successful_items": sum(
+                value for key, value in self.counts.items() if key in _SUCCESS_STATUSES
+            ),
+            "blocked_items": self.blocked_items,
+            "failed_items": self.failed_items,
+            "reduced": int(self.counts.get("REDUCED", 0)),
+            "imported": int(self.counts.get("IMPORTED", 0)),
+            "skipped_existing": int(self.counts.get("SKIPPED_EXISTING", 0)),
+            "adopted_existing": int(self.counts.get("ADOPTED_EXISTING", 0)),
+        }
+        if self.attempted_items is not None:
+            summary["attempted_items"] = self.attempted_items
+            summary["reported_items"] = sum(self.counts.values())
+            summary["stopped_early"] = self.stopped_early
         return {
             "schema": self.schema,
             "generated_at_utc": self.generated_at_utc,
@@ -263,21 +284,7 @@ class Stage1StreamingExecutionSummary:
             "source_id": self.source_id,
             "plan_schema": "grandgousier.stage1.plan.v1",
             "plan_status": self.plan_status,
-            "summary": {
-                "discovered_records": self.discovered_records,
-                "items": self.planned_items,
-                "successful_items": sum(
-                    value
-                    for key, value in self.counts.items()
-                    if key in _SUCCESS_STATUSES
-                ),
-                "blocked_items": self.blocked_items,
-                "failed_items": self.failed_items,
-                "reduced": int(self.counts.get("REDUCED", 0)),
-                "imported": int(self.counts.get("IMPORTED", 0)),
-                "skipped_existing": int(self.counts.get("SKIPPED_EXISTING", 0)),
-                "adopted_existing": int(self.counts.get("ADOPTED_EXISTING", 0)),
-            },
+            "summary": summary,
             "items": [],
         }
 
@@ -963,6 +970,7 @@ def execute_stage1_stream(
     max_dark_temperature_delta_c: float | None = 5.0,
     checkpoint: Stage1Checkpoint | None = None,
     run_fingerprint: str | None = None,
+    stop_on_first_failure: bool = False,
 ) -> Stage1StreamingExecutionSummary:
     """Stream Stage-1 planning, execution, and reports in bounded batches."""
     from grandgousier.archive.stage1_contract import STAGE1_PLAN_SCHEMA
@@ -1028,6 +1036,9 @@ def execute_stage1_stream(
     discovered_records = 0
     planned_items = 0
     blocked_plan_items = 0
+    planned_blocked_items = 0
+    attempted_items = 0
+    stopped_early = False
     counts: dict[str, int] = {}
     checkpoint_discovered = 0
     stop_requested = threading.Event()
@@ -1119,6 +1130,7 @@ def execute_stage1_stream(
             if not plan_batch.items:
                 continue
             planned_items += len(plan_batch.items)
+            planned_blocked_items += sum(item.status != "READY" for item in plan_batch.items)
             for item in plan_batch.items:
                 write_plan_item(item)
             context = None
@@ -1152,6 +1164,7 @@ def execute_stage1_stream(
                         context = _ExecutionContext(asset_provider)
                     if checkpoint is not None:
                         checkpoint.mark_attempted()
+                    attempted_items += 1
                     result = _execute_item(
                         item,
                         context=context,
@@ -1168,17 +1181,37 @@ def execute_stage1_stream(
                 if result.status == "BLOCKED":
                     blocked_plan_items += 1
                 write_result(result)
+                if stop_on_first_failure and result.status in {"FAILED", "BLOCKED"}:
+                    stopped_early = True
+                    break
             context = None
+            if stopped_early:
+                break
 
-        plan_status = "EMPTY" if planned_items == 0 else ("BLOCKED" if blocked_plan_items else "READY")
+        plan_blocked_count = planned_blocked_items if stop_on_first_failure else blocked_plan_items
+        plan_status = (
+            "FAILED" if stopped_early and counts.get("FAILED", 0)
+            else "EMPTY" if planned_items == 0
+            else "BLOCKED" if plan_blocked_count else "READY"
+        )
+        if stopped_early and plan_status == "READY":
+            plan_status = "BLOCKED"
         plan_status_value = plan_status
         plan_json.finalize(
             {
                 "summary": {
                     "discovered_records": discovered_records,
                     "science_items": planned_items,
-                    "ready_items": planned_items - blocked_plan_items,
-                    "blocked_items": blocked_plan_items,
+                    "ready_items": planned_items - plan_blocked_count,
+                    "blocked_items": plan_blocked_count,
+                    **(
+                        {
+                            "attempted_items": attempted_items,
+                            "reported_items": sum(counts.values()),
+                            "stopped_early": stopped_early,
+                        }
+                        if stop_on_first_failure else {}
+                    ),
                 },
                 "status": plan_status_value,
             }
@@ -1190,6 +1223,8 @@ def execute_stage1_stream(
             discovered_records=discovered_records,
             planned_items=planned_items,
             counts=dict(counts),
+            attempted_items=attempted_items if stop_on_first_failure else None,
+            stopped_early=stopped_early,
         )
         if checkpoint is not None:
             checkpoint.set_terminal_status("COMPLETE" if summary.status == "READY" else "FAILED")

@@ -1,5 +1,14 @@
 # Grandgousier
 
+For new Stage-2 runs, `adaptive_ellipse` is the default per-star forced-flux estimator in
+`run-field-pipeline`, `process-archive-path`, `run-forced-photometry`, and the Stage-1 handoff
+to archive processing. Use `--photometry-estimator circular` to request the historical
+circular estimator explicitly. The adaptive equal-area radius has a 3-pixel base floor
+and a 2.5× base-radius cap; unavailable/invalid local PSF geometry uses the existing
+flagged circular fallback. The effective estimator is stored in Stage-2 recipe lineage.
+This source candidate is **IMPLEMENTED_NOT_REAL_VALIDATED**; this default alone does not
+make a generic run `stage3_scale_v1` compatible or establish photometric acceptance.
+
 Grandgousier is a Python/PostgreSQL pipeline for calibrated astronomical time-series photometry.
 
 The public distribution contains the scientific photometry/calibration pipeline, instrument profiles,

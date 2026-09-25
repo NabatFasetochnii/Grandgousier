@@ -36,11 +36,20 @@ class ArchiveRequest:
     dec_deg: float | None = None
     radius_deg: float | None = None
     limit: int | None = None
+    native_observation_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _clean_token(self.source_id, name="source_id")
         if self.limit is not None and self.limit <= 0:
             raise ValueError("limit must be positive")
+        if self.native_observation_ids:
+            if self.limit is not None:
+                raise ValueError("exact native observation selection cannot use limit")
+            if any(not value or value != value.strip() or any(c in value for c in "*?[]")
+                   for value in self.native_observation_ids):
+                raise ValueError("exact native observation IDs must be nonempty literals without wildcards")
+            if len(set(self.native_observation_ids)) != len(self.native_observation_ids):
+                raise ValueError("exact native observation IDs must be unique")
         if (self.ra_deg is None) != (self.dec_deg is None):
             raise ValueError("ra_deg and dec_deg must be supplied together")
         if self.ra_deg is not None and not 0.0 <= float(self.ra_deg) < 360.0:
@@ -63,6 +72,7 @@ class ArchiveRequest:
             "dec_deg": self.dec_deg,
             "radius_deg": self.radius_deg,
             "limit": self.limit,
+            "native_observation_ids": list(self.native_observation_ids),
         }
 
 

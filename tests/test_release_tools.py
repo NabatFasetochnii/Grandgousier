@@ -24,7 +24,7 @@ snapshot = _load("gg_snapshot_environment", ROOT / "tools" / "snapshot_environme
 
 def test_release_version_consistency_matches_project():
     pyproject_version, init_version = release_check.read_versions()
-    assert pyproject_version == "0.7.0.9"
+    assert pyproject_version == "0.7.0.10"
     assert init_version == pyproject_version
 
 

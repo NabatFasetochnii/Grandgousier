@@ -232,10 +232,120 @@ def test_stage1_execute_resume_modes_are_mutually_exclusive() -> None:
     assert resumed.restart_run is False
     assert restarted.resume is False
     assert restarted.restart_run is True
+    assert resumed.stop_on_first_failure is False
+    assert parser.parse_args(
+        ["stage1-execute", "--source", "master-smoke", "--stop-on-first-failure"]
+    ).stop_on_first_failure is True
     with pytest.raises(SystemExit):
         parser.parse_args(
             ["stage1-execute", "--source", "master-smoke", "--resume", "--restart-run"]
         )
+
+
+@pytest.mark.parametrize("batch_size, planned", [(1, 2), (3, 3)])
+def test_stop_on_first_failure_persists_partial_report_and_resumes(
+    monkeypatch, tmp_path: Path, batch_size: int, planned: int
+) -> None:
+    import hashlib
+
+    checkpoint_path = tmp_path / "run.sqlite3"
+    fingerprint = _fingerprint(tmp_path, batch_size=batch_size)
+    calls: list[str] = []
+    fail_middle = True
+
+    def fake_execute(item, **kwargs):
+        del kwargs
+        native = str(item.observation.native_observation_id)
+        calls.append(native)
+        if fail_middle and native == "native-00001":
+            return Stage1ExecutionItemResult(
+                source_observation_uid=item.observation.source_observation_uid,
+                native_observation_id=native,
+                observation_uid=item.observation.observation_uid,
+                action=item.action,
+                status="FAILED",
+                product=item.product,
+                error="synthetic failure",
+            )
+        product = tmp_path / f"{native}.fits"
+        product.write_bytes(native.encode())
+        checksum = hashlib.sha256(product.read_bytes()).hexdigest()
+        provenance = product.with_name(product.name + ".provenance.json")
+        provenance.write_text(json.dumps({
+            "schema": STAGE1_PROVENANCE_SCHEMA,
+            "fingerprint": "synthetic-fingerprint",
+            "product": {"checksum_sha256": checksum},
+        }), encoding="utf-8")
+        return Stage1ExecutionItemResult(
+            source_observation_uid=item.observation.source_observation_uid,
+            native_observation_id=native,
+            observation_uid=item.observation.observation_uid,
+            action=item.action,
+            status="IMPORTED",
+            product=item.product,
+            product_path=str(product),
+            product_checksum_sha256=checksum,
+            provenance_path=str(provenance),
+            fingerprint="synthetic-fingerprint",
+        )
+
+    monkeypatch.setattr("grandgousier.archive.stage1_execution._execute_item", fake_execute)
+
+    def run(checkpoint, *, prefix):
+        return execute_stage1_stream(
+            request=ArchiveRequest(source_id="checkpoint"),
+            source=_source(),
+            metadata_provider=_Provider(_records(3)),
+            asset_provider=object(),
+            product_store=_Store(),
+            batch_size=batch_size,
+            plan_json_path=tmp_path / f"{prefix}-plan.json",
+            report_json_path=tmp_path / f"{prefix}-report.json",
+            checkpoint=checkpoint,
+            run_fingerprint=fingerprint,
+            stop_on_first_failure=True,
+        )
+
+    with Stage1Checkpoint.open(checkpoint_path, source_id="checkpoint",
+                               config_fingerprint=fingerprint, resume=False, restart=False) as checkpoint:
+        first = run(checkpoint, prefix="first")
+        state = checkpoint.state()
+        assert (state.status, state.attempted, state.completed, state.failed) == (
+            "FAILED", 2, 1, 1,
+        )
+    assert calls == ["native-00000", "native-00001"]
+    assert not (tmp_path / "native-00002.fits").exists()
+    assert first.status == first.plan_status == "FAILED"
+    assert first.to_dict()["summary"]["attempted_items"] == 2
+    report = json.loads((tmp_path / "first-report.json").read_text(encoding="utf-8"))
+    plan = json.loads((tmp_path / "first-plan.json").read_text(encoding="utf-8"))
+    assert (report["status"], report["plan_status"], plan["status"]) == (
+        "FAILED", "FAILED", "FAILED",
+    )
+    assert (plan["summary"]["science_items"], plan["summary"]["attempted_items"]) == (
+        planned, 2,
+    )
+    assert (report["summary"]["items"], report["summary"]["reported_items"]) == (
+        planned, 2,
+    )
+    assert [row["status"] for row in report["items"]] == ["IMPORTED", "FAILED"]
+    assert len((tmp_path / "first-report.csv").read_text(encoding="utf-8").splitlines()) == 3
+    assert not (tmp_path / "first-report.json.part").exists()
+
+    fail_middle = False
+    with Stage1Checkpoint.open(checkpoint_path, source_id="checkpoint",
+                               config_fingerprint=fingerprint, resume=True, restart=False) as checkpoint:
+        second = run(checkpoint, prefix="second")
+        state = checkpoint.state()
+        assert (state.status, state.attempted, state.completed, state.failed) == (
+            "COMPLETE", 4, 3, 1,
+        )
+    assert calls == ["native-00000", "native-00001", "native-00001", "native-00002"]
+    assert second.status == "READY"
+    assert second.to_dict()["summary"]["attempted_items"] == 2
+    assert [row["status"] for row in json.loads(
+        (tmp_path / "second-report.json").read_text(encoding="utf-8")
+    )["items"]] == ["IMPORTED"] * 3
 
 
 def test_synthetic_10000_resume_reexecutes_only_unconfirmed_items(monkeypatch, tmp_path: Path) -> None:

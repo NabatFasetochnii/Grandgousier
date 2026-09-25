@@ -406,8 +406,12 @@ normalized detector Y.
 --photometry-estimator spatial_psf
 --photometry-estimator empirical_psf
 \end{lstlisting}
-Значение \texttt{circular} является стандартным и сохраняет прежнее поведение. Начиная с
-0.5.44.3 summary команды \texttt{process-archive-path} дополнительно показывает effective
+В source-кандидате 0.7.0.10 для новых запусков Stage~2 без этого параметра default ---
+\texttt{adaptive\_ellipse} для каждого источника (с явно отмеченным circular fallback при
+отсутствии надёжной локальной геометрии). Для прежнего circular-поведения укажите
+\texttt{--photometry-estimator circular} явно в командах выше; для
+\texttt{process-archive-path} без \texttt{--execute} остаётся только план.
+Начиная с 0.5.44.3 summary команды \texttt{process-archive-path} дополнительно показывает effective
 \texttt{photometry\_estimator} для каждой pipeline-серии. Режим
 \texttt{adaptive\_ellipse} автоматически требует source detection и строит локальную PSF-модель
 по bright isolated detections. Основные параметры настройки:
@@ -596,3 +600,10 @@ grandgousier acceptance-check `
 \end{lstlisting}
 
 Команда read-only по PostgreSQL. Без \cli{--out-root} временные M5 products удаляются после сравнения; JSON report содержит все checks и фактически измеренные значения.
+\subsection{Компактный научный экспорт Parquet (source candidate)}
+
+Для Parquet требуется необязательная зависимость: \texttt{pip install grandgousier[parquet]}.
+Продукт состоит из разреженной фотометрии SCIENCE, источников, кадров, сводки серий и
+dataset-манифеста; отсутствующие source-frame точки не генерируются. Ночь наблюдений
+определяется как дата UTC-времени \texttt{DATE-OBS} минус 12 часов. Это описание
+контракта исходного кода, а не подтверждение успешного экспорта из рабочей БД.

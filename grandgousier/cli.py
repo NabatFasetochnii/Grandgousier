@@ -70,6 +70,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_reset_derived.set_defaults(func=cmd_reset_derived_data)
 
+    p_parquet = sub.add_parser(
+        "export-science-parquet", help="Export immutable final SCIENCE products as read-only Parquet"
+    )
+    p_parquet.add_argument("--database-url", required=True, help="Explicit PostgreSQL URL (read-only transaction)")
+    p_parquet.add_argument("--series-id", type=int, action="append", required=True, help="field_series.series_id; repeatable")
+    p_parquet.add_argument("--calibration-version-id", type=int, default=None, help="Disambiguate a series with multiple published SCIENCE heads")
+    p_parquet.add_argument("--interseries-generation-id", type=int, default=None, help="Explicit Stage 3 generation; omitted exports Stage 2 only")
+    p_parquet.add_argument("--out", required=True, help="Absolute output path; must not already exist")
+    p_parquet.add_argument("--db-logical-id", default="unspecified", help="Non-secret logical DB label for manifest")
+    p_parquet.add_argument("--batch-size", type=int, default=4096)
+    p_parquet.set_defaults(func=cmd_export_science_parquet)
+
     p_reclaim = sub.add_parser(
         "reclaim-stage1-products",
         help="Plan or execute safe reclaim of managed Stage-1 products for one completed series",
@@ -219,6 +231,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Grandgousier YAML/JSON config containing archives/products sections",
     )
     p_stage1_plan.add_argument("--source", required=True, help="Configured archives.<source-id>")
+    p_stage1_plan.add_argument("--native-observation-id", action="append", default=[],
+                               help="Exact ordered MASTER UNIQNUM; repeat for every selected observation")
     p_stage1_plan.add_argument(
         "--filter", dest="stage1_filters", action="append", default=[],
         help="Normalized filter; repeatable",
@@ -256,6 +270,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Grandgousier YAML/JSON config containing archives/products sections",
     )
     p_stage1_execute.add_argument("--source", required=True, help="Configured archives.<source-id>")
+    p_stage1_execute.add_argument("--native-observation-id", action="append", default=[],
+                                  help="Exact ordered MASTER UNIQNUM; repeat for every selected observation")
     p_stage1_execute.add_argument(
         "--filter", dest="stage1_filters", action="append", default=[],
         help="Normalized filter; repeatable",
@@ -301,6 +317,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bounded Stage-1 metadata/execution batch size; config default is 128",
     )
     p_stage1_execute.add_argument(
+        "--stop-on-first-failure", action="store_true",
+        help="Stop after the first failed or blocked item; finalize partial plan/report and allow --resume",
+    )
+    p_stage1_execute.add_argument(
         "--checkpoint", default=None,
         help="Durable Stage-1 checkpoint path; default is next to --report-out",
     )
@@ -340,6 +360,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_stage1_handoff.add_argument("--master-profile", default=None, help="Override MASTER YAML profile path")
     p_stage1_handoff.add_argument("--robophot-profile", default=None, help="Override RoboPhot YAML profile path")
     p_stage1_handoff.add_argument("--min-frames-per-series", type=int, default=10)
+    p_stage1_handoff.add_argument(
+        "--ensemble-min-ref-stars-per-frame", type=int, default=30,
+        help="Stage-2 ensemble reference threshold; specify 20 for the canonical GPX stage3_scale_v1 run",
+    )
     p_stage1_handoff.add_argument("--max-field-separation-arcmin", type=float, default=30.0)
     p_stage1_handoff.add_argument("--max-series-gap-minutes", type=float, default=60.0)
     p_stage1_handoff.add_argument(
@@ -699,7 +723,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_phot.add_argument("--instrument-unit-id", type=int, default=None, help="Filter frames by instrument unit")
     p_phot.add_argument("--all-wcs-statuses", action="store_true", help="Do not require wcs_status=HEADER_WCS_OK")
     p_phot.add_argument("--aperture-radius-pix", type=float, default=3.0, help="Circular aperture radius in pixels; floor/equal-area baseline for adaptive_ellipse")
-    p_phot.add_argument("--photometry-estimator", choices=("circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"), default="circular", help="Base flux estimator")
+    p_phot.add_argument("--photometry-estimator", choices=("circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"), default="adaptive_ellipse", help="Base flux estimator")
     p_phot.add_argument("--adaptive-min-psf-snr", type=float, default=20.0, help="Minimum detection S/N for adaptive-aperture PSF references")
     p_phot.add_argument("--adaptive-max-psf-sources-per-frame", type=int, default=500, help="Maximum PSF references used per frame")
     p_phot.add_argument("--adaptive-psf-cutout-radius-pix", type=int, default=7, help="PSF second-moment cutout radius used by adaptive photometry")
@@ -1139,7 +1163,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_field_pipeline.add_argument("--out-dir", default=None, help="Optional directory for field QC JSON/CSV outputs")
     p_field_pipeline.add_argument("--margin-pix", type=float, default=2.0, help="Catalog-to-frame footprint margin")
     p_field_pipeline.add_argument("--aperture-radius-pix", type=float, default=3.0, help="Forced-photometry aperture radius")
-    p_field_pipeline.add_argument("--photometry-estimator", choices=("circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"), default="circular", help="Base science flux estimator; adaptive_ellipse uses a local PSF-aligned elliptical aperture and keeps circular as fallback")
+    p_field_pipeline.add_argument("--photometry-estimator", choices=("circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"), default="adaptive_ellipse", help="Base science flux estimator; adaptive_ellipse uses a local PSF-aligned elliptical aperture and keeps circular as fallback")
     p_field_pipeline.add_argument("--adaptive-min-psf-snr", type=float, default=20.0, help="Minimum detection S/N for adaptive-aperture PSF references")
     p_field_pipeline.add_argument("--adaptive-max-psf-sources-per-frame", type=int, default=500, help="Maximum PSF reference detections used per frame by adaptive photometry")
     p_field_pipeline.add_argument("--adaptive-psf-cutout-radius-pix", type=int, default=7, help="PSF second-moment cutout radius used by adaptive photometry")
@@ -1403,7 +1427,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_process_path.add_argument("--file-log-level", default="INFO", help="File log level")
     p_process_path.add_argument("--no-file-log", action="store_true", help="Do not write run.log/run.jsonl/errors.log")
     p_process_path.add_argument("--aperture-radius-pix", type=float, default=3.0, help="Forced-photometry aperture radius")
-    p_process_path.add_argument("--photometry-estimator", choices=("circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"), default="circular", help="Base science flux estimator; adaptive_ellipse runs the complete Stage-2 chain from a local PSF-aligned elliptical aperture")
+    p_process_path.add_argument("--photometry-estimator", choices=("circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"), default="adaptive_ellipse", help="Base science flux estimator; adaptive_ellipse runs the complete Stage-2 chain from a local PSF-aligned elliptical aperture")
     p_process_path.add_argument("--adaptive-min-psf-snr", type=float, default=20.0, help="Minimum detection S/N for adaptive-aperture PSF references")
     p_process_path.add_argument("--adaptive-max-psf-sources-per-frame", type=int, default=500, help="Maximum PSF reference detections used per frame by adaptive photometry")
     p_process_path.add_argument("--adaptive-psf-cutout-radius-pix", type=int, default=7, help="PSF second-moment cutout radius used by adaptive photometry")
@@ -2659,6 +2683,7 @@ def cmd_stage1_plan(args: argparse.Namespace) -> int:
             dec_deg=args.dec,
             radius_deg=args.radius_deg,
             limit=args.limit,
+            native_observation_ids=tuple(args.native_observation_id),
         )
         plan = build_stage1_plan(
             request=request,
@@ -2735,6 +2760,7 @@ def cmd_stage1_execute(args: argparse.Namespace) -> int:
             dec_deg=args.dec,
             radius_deg=args.radius_deg,
             limit=args.limit,
+            native_observation_ids=tuple(args.native_observation_id),
         )
         source_config = payload.get("archives", {}).get(args.source, {})
         configured_batch_size = args.stage1_batch_size
@@ -2784,6 +2810,7 @@ def cmd_stage1_execute(args: argparse.Namespace) -> int:
                 max_dark_temperature_delta_c=args.max_dark_temperature_delta_c,
                 checkpoint=checkpoint,
                 run_fingerprint=run_fingerprint,
+                stop_on_first_failure=bool(args.stop_on_first_failure),
             )
         finally:
             close_provider = getattr(runtime.asset_provider, "close", None)
@@ -2849,6 +2876,7 @@ def cmd_stage1_handoff(args: argparse.Namespace) -> int:
                 master_profile=args.master_profile,
                 robophot_profile=args.robophot_profile,
                 min_frames_per_series=args.min_frames_per_series,
+                ensemble_min_ref_stars_per_frame=args.ensemble_min_ref_stars_per_frame,
                 max_field_separation_arcmin=args.max_field_separation_arcmin,
                 max_series_gap_minutes=args.max_series_gap_minutes,
                 out_root=out_root,
@@ -9449,6 +9477,28 @@ def cmd_db_summary(args: argparse.Namespace) -> int:
     for status, count in by_wcs:
         print(f"  {status}: {count}")
     return 0
+
+
+def cmd_export_science_parquet(args: argparse.Namespace) -> int:
+    from sqlalchemy import create_engine
+    from grandgousier.lightcurves.parquet_export import export_series
+
+    engine = create_engine(args.database_url, pool_pre_ping=True, future=True)
+    try:
+        with engine.connect() as connection:
+            with connection.begin():
+                # PostgreSQL enforces this transaction setting before any data query.
+                from sqlalchemy.orm import Session
+                with Session(bind=connection, autoflush=False, expire_on_commit=False) as session:
+                    manifest = export_series(
+                        session, args.series_id, args.out, logical_db_id=args.db_logical_id,
+                        calibration_version_id=args.calibration_version_id,
+                        interseries_generation_id=args.interseries_generation_id, batch_size=args.batch_size,
+                    )
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+        return 0
+    finally:
+        engine.dispose()
 
 
 def main(argv: list[str] | None = None) -> int:

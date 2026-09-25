@@ -224,7 +224,7 @@ def run_forced_aperture_photometry(
     instrument_unit_id: int | None = None,
     only_wcs_ok: bool = True,
     aperture_radius_pix: float = 3.0,
-    photometry_estimator: str = "circular",
+    photometry_estimator: str = "adaptive_ellipse",
     adaptive_detection_algorithm: str = "numpy_localmax_v1",
     adaptive_min_psf_snr: float = 20.0,
     adaptive_max_psf_sources_per_frame: int = 500,

@@ -101,20 +101,20 @@ Forced photometry не требует самостоятельной детек�
 Основной численный kernel находится в модуле
 \texttt{grandgousier/photometry/forced\_aperture.py}. Для каждого catalog-frame link известна позиция $(x,y)$ в пиксельных координатах массива FITS. В текущем алгоритме измерение выполняется в этой позиции без обязательного повторного centroid fit.
 
-По умолчанию рабочая апертура имеет радиус $r_{\rm ap}=3$ pix, а локальный фон оценивается в кольце $8\le r\le12$ pix. Это параметры, а не фундаментальные константы: instrument profile или CLI может задавать другие значения.
+В версии 0.7.0.10 новый Stage~2 по умолчанию выбирает \texttt{adaptive\_ellipse} для каждого источника: базовый радиус $r_0=3$ pix задаёт нижнюю границу эквивалентного радиуса $r_{\rm eq}$, а ограничение $2.5r_0$ даёт при этих параметрах верхнюю границу $7.5$ pix. Геометрия зависит от локальной PSF; при невозможности построить её используется явно отмеченный circular fallback. Поэтому не каждое измерение по умолчанию является эллиптическим. Для явного \texttt{circular} рабочий радиус по умолчанию равен $r_{\rm ap}=3$ pix, а локальный фон оценивается в кольце $8\le r\le12$ pix. Эти параметры можно переопределить через instrument profile или CLI.
 
 \subsection{Геометрия апертуры}
 
-Пиксель относится к aperture set $A$, если его центр удовлетворяет условию
+Для явно выбранного circular estimator (и circular fallback) пиксель относится к aperture set $A$, если его центр удовлетворяет условию
 \begin{equation}
   (p-x)^2+(q-y)^2 \le r_{\rm ap}^2.
 \end{equation}
-Для sky annulus $S$ используется
+Для circular sky annulus $S$ используется
 \begin{equation}
   r_{\rm in}^2 \le (p-x)^2+(q-y)^2 \le r_{\rm out}^2.
 \end{equation}
 
-Таким образом, текущая реализация использует бинарное включение пикселя по положению его центра. Это важно отличать, например, от fractional/exact aperture weighting, доступного в Photutils~\cite{photutils_aperture}. Для временных рядов \program{} приоритетом является одинаковая и воспроизводимая геометрия для всех кадров одной серии.
+Это circular-формулы, а не универсальная геометрия нового Stage~2 default: adaptive-эллипс и его annulus определяются локальной PSF (см. раздел~\ref{sec:adaptive-aperture-stage2}). Маски используют включение пикселя по положению его центра, в отличие от fractional/exact aperture weighting в Photutils~\cite{photutils_aperture}. Геометрия adaptive aperture может различаться между источниками и кадрами.
 
 \subsection{Локальный фон}
 
@@ -807,9 +807,10 @@ AP/adaptive-AP/PSF estimators и выбору \texttt{primary\_method} запл�
 Начиная с версии 0.5.44.2 adaptive elliptical aperture может использоваться не только для
 диагностического CSV-сравнения, но и как отдельный источник базовой фотометрии полного Stage~2.
 Режим выбирается параметром
-\texttt{--photometry-estimator adaptive\_ellipse}. По умолчанию по-прежнему используется
-\texttt{circular}; поэтому существующий workflow и имена circular calibration generations не
-изменяются.
+\texttt{--photometry-estimator adaptive\_ellipse}. В версии 0.5.44.2 по умолчанию ещё использовался
+\texttt{circular}, поэтому тогда существующий workflow и имена circular calibration generations не
+изменялись; в текущем source-кандидате 0.7.0.10 default нового Stage~2 ---
+\texttt{adaptive\_ellipse}, а \texttt{circular} доступен явным выбором.
 
 При adaptive-режиме source detection является обязательным внутренним prerequisite: из ярких
 изолированных detections строится local PSF covariance field. Для каждого forced catalog source

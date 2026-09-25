@@ -1,5 +1,13 @@
 # Grandgousier — текущая и одобренная целевая архитектура
 
+Current source candidate (2026-09-24, **IMPLEMENTED_NOT_REAL_VALIDATED**): new Stage-2
+defaults select per-star `adaptive_ellipse` with explicit `circular` override, 3-pixel
+base floor, 2.5× cap, and existing flagged circular fallback. `FieldPipelineConfig`
+records the effective estimator in `pipeline_runs.recipe_json`; Stage-1 handoff inherits
+`process_archive_path` defaults. Frozen `stage3_scale_v1` selection/Stage-3 formulas are
+unchanged; generic adaptive runs are not automatically Stage-3 recipe-ready. Historical
+dated architecture below describes earlier baselines, not acceptance of this candidate.
+
 Актуально на **2026-09-21**. Current source candidate: **0.7.0.9 clean SCIENCE parity hotfix**. Phase A–D и 0.7.0.4 user-real-validated на Windows/CPython 3.11; последний validated baseline — 0.7.0.4 (`723 passed, 1 skipped`). Frozen production/reference DB остаётся **0.6.4.5.1**, ≈43 GB. 0.7 — fresh-baseline schema epoch; frozen 0.6 DB не мигрируется in-place.
 
 
@@ -242,3 +250,27 @@ context/project_state.yaml    machine-readable state
 ```
 
 Legacy `NEXT_CHAT_PROMPT.md` deprecated и не должен заменять canonical context.
+# Portable science product (source implementation; live validation pending)
+
+`grandgousier export-science-parquet --database-url URL --series-id N --out ABSOLUTE_PATH`
+
+The export is bounded and read-only. Stage 3 values are included only when an
+explicit `--interseries-generation-id N` is supplied and its immutable generation
+contains a matching SCIENCE-calibration row for every requested series. Without
+that option, global magnitudes/errors are null and the product is explicitly
+Stage-2-only (`NOT_REQUESTED`); calibrated magnitudes are not presented as global.
+exports one or more explicit series via a PostgreSQL READ ONLY transaction. PyArrow
+is optional (`pip install grandgousier[parquet]`). Output contains explicitly typed
+`sources.parquet`, `frames.parquet`, sparse `photometry.parquet`, `series.parquet`,
+and `manifest.json`. Frames are selected from series membership independently of
+photometry, so zero-measurement frames remain represented without synthetic science
+rows. Object and physical-observation UIDs, not database surrogate IDs, are the
+portable keys. Observing-night convention is `date(DATE-OBS_UTC - 12 hours)`.
+The writer streams query results in batches, stages under a sibling temporary
+directory, hashes files incrementally, refuses existing output, and promotes by
+same-volume rename. Point acceptance delegates to the shared light-curve product
+rejection contract rather than defining exporter-specific veto rules. Database-backed
+validation and real export remain pending. FrameQc rows are aggregated in the frame
+query; QC category counts remain null when persisted classifications are unavailable.
+Global Stage-3 values are explicitly `NOT_EXPORTED`; they are not implied absent or
+zero. This implementation is not production/live-export readiness evidence.

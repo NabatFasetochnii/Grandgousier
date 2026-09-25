@@ -484,6 +484,7 @@ def test_run_field_pipeline_skips_candidate_recalibration_when_exclusions_are_no
         skip_wcs=True,
         skip_catalog_frame_match=True,
         skip_detection=True,
+        photometry_estimator="circular",
         skip_detection_catalog_match=True,
         skip_forced_photometry=True,
         skip_aperture_correction=True,
