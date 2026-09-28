@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -11,7 +11,7 @@ def _tables():
         "sources.parquet": iter([{"object_uid": "opaque-a", "ra_deg": 12.5, "dec_deg": None,
             "identity_scheme": "INTERNAL_UUID_V1", "catalog_links_json": '[{"catalog_name":"Gaia","source_id":"42"}]'}]),
         "frames.parquet": iter([{"series_uid": "series-a", "observation_uid": "obs-a", "frame_uid": "frame-a",
-            "identity_scheme": "MASTER_UNIQNUM", "native_identity": "204_1", "date_obs": datetime(2024, 1, 2, 11, tzinfo=timezone.utc),
+            "identity_scheme": "MASTER_UNIQNUM", "native_identity": "204_1", "date_obs": datetime(2024, 1, 2, 11, tzinfo=UTC),
             "observing_night": "2024-01-01", "filter_name": "V", "instrument": "MASTER", "site": None,
             "tube": None, "camera": None, "exptime": 30.0, "frame_quality_flags_json": "{}", "frame_qc_json": "{}"},
             {"series_uid": "series-a", "observation_uid": "obs-zero", "frame_uid": "frame-zero", "identity_scheme": None,
@@ -39,7 +39,7 @@ def _tables():
 
 def test_utc_observing_night_uses_noon_boundary():
     assert export.observing_night("2024-01-02T11:59:59Z") == "2024-01-01"
-    assert export.observing_night(datetime(2024, 1, 2, 12, tzinfo=timezone.utc)) == "2024-01-02"
+    assert export.observing_night(datetime(2024, 1, 2, 12, tzinfo=UTC)) == "2024-01-02"
     assert export.observing_night(None) is None
 
 
@@ -95,9 +95,53 @@ def test_shared_science_rejection_and_global_offset_contract():
 
 
 def test_frame_qc_summary_uses_nested_quality_flags_status():
-    flags = {"PHOTOMETRIC_FRAME_QC": {"status": "BAD", "metric": 1}}
+    from grandgousier.calibration.photometric_frame_qc import PHOTOMETRIC_FRAME_QC_FLAG
+
+    flags = {PHOTOMETRIC_FRAME_QC_FLAG: {"status": "BAD", "metric": 1}}
     encoded, counts = export._frame_qc_summary(flags)
     assert '"metric": 1' in encoded and counts == {"GOOD": 0, "SUSPECT": 0, "BAD": 1}
+
+
+def test_frame_qc_count_query_reuses_jsonb_status_expression():
+    from sqlalchemy.dialects import postgresql
+
+    from grandgousier.db.models import FieldSeriesFrame, Frame
+
+    statement = export._frame_qc_counts_statement([1, 2], FieldSeriesFrame, Frame)
+    selected_status = statement.selected_columns[1]
+    grouped_status = tuple(statement._group_by_clauses)[1]
+    assert selected_status is grouped_status
+
+    compiled = statement.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert "frames.quality_flags[" in sql and "->>" in sql
+    assert sql.count("frames.quality_flags[") == 2
+    assert compiled.params["quality_flags_1"] == "frame_photometric_qc_v1"
+
+
+def test_persisted_frame_qc_statuses_count_13_10_2_and_bad_rejects():
+    from grandgousier.calibration.photometric_frame_qc import (
+        BAD_FRAME_REJECT_FLAG,
+        PHOTOMETRIC_FRAME_QC_FLAG,
+    )
+
+    frame_flags = [
+        {PHOTOMETRIC_FRAME_QC_FLAG: {"status": status}, BAD_FRAME_REJECT_FLAG: status == "BAD"}
+        for status, count in (("GOOD", 13), ("SUSPECT", 10), ("BAD", 2))
+        for _ in range(count)
+    ]
+    summaries = [export._frame_qc_summary(flags)[1] for flags in frame_flags]
+    counts = {status: sum(row[status] for row in summaries) for status in ("GOOD", "SUSPECT", "BAD")}
+    assert counts == {"GOOD": 13, "SUSPECT": 10, "BAD": 2}
+    assert export._series_qc_status(counts, 25) == "DEGRADED"
+
+    rejected = _science_row_from_db(
+        {"measurement_flags": {}, "object_qc_flags": {}, "frame_quality_flags": frame_flags[-1],
+         "mag_cal": 12.0, "mag_err": .1},
+        reject_flags=light_curve_reject_flags(extra_flags=BAD_FRAME_REJECT_FLAG),
+    )
+    assert rejected["is_rejected"] is True
+    assert BAD_FRAME_REJECT_FLAG in rejected["reject_reasons_list"]
 
 
 @pytest.mark.parametrize(("counts", "frame_count", "expected"), [
@@ -159,7 +203,7 @@ def test_schema_and_manifest_contract_does_not_expose_surrogate_cv_ids():
 
 
 def test_photometry_identity_distinguishes_frames_and_requires_frame_uid(tmp_path):
-    pytest.importorskip("pyarrow")
+    pa = pytest.importorskip("pyarrow")
     tables = _tables()
     row = next(iter(tables["photometry.parquet"]))
     duplicate_observation = {**row, "frame_uid": "frame-b"}
@@ -172,7 +216,7 @@ def test_photometry_identity_distinguishes_frames_and_requires_frame_uid(tmp_pat
     missing_row = dict(next(iter(missing["photometry.parquet"])))
     missing_row["frame_uid"] = None
     missing["photometry.parquet"] = iter([missing_row])
-    with pytest.raises(Exception):
+    with pytest.raises(pa.ArrowInvalid, match="non-nullable"):
         export.export_parquet_product(missing, tmp_path / "missing-frame", metadata={})
 
 

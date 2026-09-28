@@ -39,3 +39,8 @@ artifacts/context/*.md
 
 # Local validated release snapshots
 /release/validated_windows_py311*/
+
+# Specific local reference artifacts
+/MASTER.pdf
+/master_psql.txt
+/stage1_v25_plan_20260923_4e2daab_a1/

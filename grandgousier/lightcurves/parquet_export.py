@@ -7,9 +7,10 @@ import json
 import os
 import shutil
 import tempfile
-from datetime import date, datetime, timedelta, timezone
+from collections.abc import Iterable
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 SCHEMA_VERSION = "1.0"
 OBSERVING_NIGHT_DEFINITION = "date(DATE-OBS_UTC - 12 hours); DATE-OBS is UTC"
@@ -19,10 +20,10 @@ def observing_night(value: datetime | str | None) -> str | None:
     if value is None:
         return None
     if isinstance(value, str):
-        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        value = datetime.fromisoformat(value)
     if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return (value.astimezone(timezone.utc) - timedelta(hours=12)).date().isoformat()
+        value = value.replace(tzinfo=UTC)
+    return (value.astimezone(UTC) - timedelta(hours=12)).date().isoformat()
 
 
 def _json_default(value: Any) -> Any:
@@ -153,9 +154,11 @@ def _validate_stage3_generation(generation: Any) -> None:
 
 
 def _frame_qc_summary(flags: dict[str, Any] | None) -> tuple[str, dict[str, int]]:
-    """Summarize persisted PHOTOMETRIC_FRAME_QC flags, not metric rows."""
+    """Summarize persisted photometric frame-QC flags, not metric rows."""
+    from grandgousier.calibration.photometric_frame_qc import PHOTOMETRIC_FRAME_QC_FLAG
+
     flags = flags or {}
-    record = flags.get("PHOTOMETRIC_FRAME_QC")
+    record = flags.get(PHOTOMETRIC_FRAME_QC_FLAG)
     counts = {"GOOD": 0, "SUSPECT": 0, "BAD": 0}
     status = str(record.get("status") or "").upper() if isinstance(record, dict) else ""
     if status in counts:
@@ -175,6 +178,22 @@ def _series_qc_status(counts: dict[str, int], frame_count: int) -> str:
     if counts.get("SUSPECT", 0) + counts.get("BAD", 0) > 0:
         return "DEGRADED"
     return "GOOD"
+
+
+def _frame_qc_counts_statement(series_ids, field_series_frame, frame):
+    """Build per-series frame-QC counts using one shared JSONB status expression."""
+    from sqlalchemy import func, select
+
+    from grandgousier.calibration.photometric_frame_qc import PHOTOMETRIC_FRAME_QC_FLAG
+
+    status = frame.quality_flags[PHOTOMETRIC_FRAME_QC_FLAG]["status"].astext
+    return select(
+        field_series_frame.series_id,
+        status,
+        func.count(field_series_frame.frame_id),
+    ).join(frame, frame.frame_id == field_series_frame.frame_id).where(
+        field_series_frame.series_id.in_(series_ids)
+    ).group_by(field_series_frame.series_id, status)
 
 
 def _effective_detection_support(policy: dict[str, Any] | None) -> bool:
@@ -222,7 +241,7 @@ def export_parquet_product(
         identity_digest.update(b"\n")
         for filename, schema in schemas.items():
             path = temp / filename
-            def identified_rows(rows):
+            def identified_rows(rows, filename=filename):
                 for row in rows:
                     identity = {key: row.get(key) for key in
                         ("object_uid", "observation_uid", "frame_uid", "identity_scheme",
@@ -235,7 +254,7 @@ def export_parquet_product(
             files[filename] = {"sha256": _sha256(path), "bytes": path.stat().st_size}
         manifest = {
             "manifest_type": "DATASET_MANIFEST_NOT_STEP_LOG", "schema_version": SCHEMA_VERSION,
-            "generated_at_utc": datetime.now(timezone.utc).isoformat(), "observing_night_definition": OBSERVING_NIGHT_DEFINITION,
+            "generated_at_utc": datetime.now(UTC).isoformat(), "observing_night_definition": OBSERVING_NIGHT_DEFINITION,
             "row_counts": counts, "identity_set_sha256": identity_digest.hexdigest(), "files": files, **metadata,
         }
         (temp / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2, default=_json_default), encoding="utf-8")
@@ -250,13 +269,27 @@ def export_parquet_product(
 
 def export_series(session, series_ids: list[int], out: str | Path, *, logical_db_id: str, calibration_version_id: int | None = None, interseries_generation_id: int | None = None, batch_size: int = 4096) -> dict[str, Any]:
     """Run export inside a PostgreSQL READ ONLY transaction; no ORM-wide materialization."""
-    from sqlalchemy import select, func
+    from sqlalchemy import func, select
     from sqlalchemy.dialects.postgresql import aggregate_order_by
+
     from grandgousier.db.models import (
-        CalibrationProductAlias, CalibrationVersion, Field, FieldSeries, FieldSeriesFrame,
-        Frame, FrameQc, Measurement, Object, ObjectCatalogLink, CatalogSource, Observation,
-        ObjectQc, PipelineRun, SciencePhotometry, InterseriesCalibrationGeneration,
+        CalibrationProductAlias,
+        CalibrationVersion,
+        CatalogSource,
+        Field,
+        FieldSeries,
+        FieldSeriesFrame,
+        Frame,
+        FrameQc,
+        InterseriesCalibrationGeneration,
         InterseriesCalibrationSeries,
+        Measurement,
+        Object,
+        ObjectCatalogLink,
+        ObjectQc,
+        Observation,
+        PipelineRun,
+        SciencePhotometry,
     )
 
     if Path(out).exists():
@@ -373,8 +406,8 @@ def export_series(session, series_ids: list[int], out: str | Path, *, logical_db
             Observation.identity_scheme, Observation.native_identity, FieldSeries.series_uid, SciencePhotometry,
             Measurement, CalibrationVersion.name, Frame.date_obs, Frame.quality_flags).join(Measurement, Measurement.measurement_id == SciencePhotometry.base_measurement_id).join(Object, Object.object_id == Measurement.object_id).join(Frame, Frame.frame_id == Measurement.frame_id).join(CalibrationVersion, CalibrationVersion.calibration_version_id == SciencePhotometry.calibration_version_id).join(FieldSeriesFrame, FieldSeriesFrame.frame_id == Frame.frame_id).join(FieldSeries, FieldSeries.series_id == FieldSeriesFrame.series_id).where(SciencePhotometry.calibration_version_id.in_(cv_ids)).order_by(FieldSeries.series_id, Measurement.measurement_id)
         stmt = stmt.where(CalibrationVersion.series_id == FieldSeries.series_id).outerjoin(Observation, Observation.observation_id == Frame.observation_id)
-        from grandgousier.lightcurves.product import light_curve_reject_flags
         from grandgousier.calibration.photometric_frame_qc import BAD_FRAME_REJECT_FLAG
+        from grandgousier.lightcurves.product import light_curve_reject_flags
         result = session.execute(stmt).yield_per(batch_size)
         while True:
             chunk = result.fetchmany(batch_size)
@@ -443,17 +476,13 @@ def export_series(session, series_ids: list[int], out: str | Path, *, logical_db
         science_counts = dict(session.execute(select(
             SciencePhotometry.calibration_version_id, func.count(SciencePhotometry.base_measurement_id)
         ).where(SciencePhotometry.calibration_version_id.in_(cv_ids)).group_by(
-            SciencePhotometry.calibration_version_id)))
+            SciencePhotometry.calibration_version_id)).tuples().all())
         frame_counts_by_series = dict(session.execute(select(
             FieldSeriesFrame.series_id, func.count(FieldSeriesFrame.frame_id)
-        ).where(FieldSeriesFrame.series_id.in_(series_ids)).group_by(FieldSeriesFrame.series_id)))
-        frame_qc_rows = session.execute(select(
-            FieldSeriesFrame.series_id,
-            Frame.quality_flags["PHOTOMETRIC_FRAME_QC"]["status"].astext,
-            func.count(FieldSeriesFrame.frame_id),
-        ).join(Frame, Frame.frame_id == FieldSeriesFrame.frame_id).where(
-            FieldSeriesFrame.series_id.in_(series_ids)
-        ).group_by(FieldSeriesFrame.series_id, Frame.quality_flags["PHOTOMETRIC_FRAME_QC"]["status"].astext))
+        ).where(FieldSeriesFrame.series_id.in_(series_ids)).group_by(FieldSeriesFrame.series_id)).tuples().all())
+        frame_qc_rows = session.execute(
+            _frame_qc_counts_statement(series_ids, FieldSeriesFrame, Frame)
+        )
         frame_qc_by_series = {sid: {"GOOD": 0, "SUSPECT": 0, "BAD": 0} for sid in series_ids}
         for sid, status, count in frame_qc_rows:
             if status and status.upper() in frame_qc_by_series[sid]:
