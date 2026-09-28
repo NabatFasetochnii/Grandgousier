@@ -32,6 +32,22 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Not JSON serializable: {type(value).__name__}")
 
 
+def _measurement_flags_json(flags: dict[str, Any] | None) -> str:
+    """Serialize portable measurement flags without database-local catalog source IDs."""
+    def strip_catalog_source_ids(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: strip_catalog_source_ids(item)
+                for key, item in value.items()
+                if key != "catalog_source_id"
+            }
+        if isinstance(value, (list, tuple)):
+            return [strip_catalog_source_ids(item) for item in value]
+        return value
+
+    return json.dumps(strip_catalog_source_ids(flags or {}), sort_keys=True, default=_json_default)
+
+
 def _schemas():
     try:
         import pyarrow as pa
@@ -467,7 +483,7 @@ def export_series(session, series_ids: list[int], out: str | Path, *, logical_db
                     "interseries_offset_err": derived["interseries_offset_err"],
                     "interseries_offset_status": derived["interseries_offset_status"],
                     "local_zp_correction": science.local_zp_correction, "aperture_radius_pix": base.aperture_radius_pix,
-                    "measurement_flags_json": json.dumps(base.flags or {}, sort_keys=True, default=_json_default),
+                    "measurement_flags_json": _measurement_flags_json(base.flags),
                     "object_qc_flags_json": json.dumps(qc, sort_keys=True, default=_json_default),
                     "quality_flags_json": json.dumps(derived["quality_flags"], sort_keys=True, default=_json_default),
                     "is_rejected": derived["is_rejected"], "reject_reasons_json": json.dumps(derived["reject_reasons"]),

@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -41,6 +42,37 @@ def test_utc_observing_night_uses_noon_boundary():
     assert export.observing_night("2024-01-02T11:59:59Z") == "2024-01-01"
     assert export.observing_night(datetime(2024, 1, 2, 12, tzinfo=UTC)) == "2024-01-02"
     assert export.observing_night(None) is None
+
+
+def test_measurement_flags_json_omits_internal_catalog_source_ids():
+    flags = {
+        "catalog_source_id": 17,
+        "catalog_name": "Gaia",
+        "source_id": "Gaia DR3 42",
+        "forced_aperture": True,
+        "aperture": {
+            "catalog_source_id": 23,
+            "catalog_name": "Pan-STARRS",
+            "source_id": "PS1 99",
+            "radius_pix": 3.0,
+            "nested": [{"catalog_source_id": 42, "retained": "value"}],
+        },
+    }
+
+    encoded = export._measurement_flags_json(flags)
+    portable = json.loads(encoded)
+
+    assert "catalog_source_id" not in portable
+    assert portable["catalog_name"] == "Gaia"
+    assert portable["source_id"] == "Gaia DR3 42"
+    assert portable["forced_aperture"] is True
+    assert "catalog_source_id" not in portable["aperture"]
+    assert portable["aperture"]["catalog_name"] == "Pan-STARRS"
+    assert portable["aperture"]["source_id"] == "PS1 99"
+    assert portable["aperture"]["radius_pix"] == 3.0
+    assert portable["aperture"]["nested"] == [{"retained": "value"}]
+    assert flags["catalog_source_id"] == 17
+    assert flags["aperture"]["catalog_source_id"] == 23
 
 
 def test_photometry_qc_key_uses_base_measurement_and_science_slots():
