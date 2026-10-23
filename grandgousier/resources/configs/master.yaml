@@ -36,11 +36,9 @@ header_aliases:
   tube: [AXIS, TUBE, TEL, TELESCOP, MASTERID]
   camera: [ID_CAM, CAMERA, CCDID]
 
-  # pointing: prefer solved WCS center when available; ALPHA/DELTA are commanded target coordinates.
+  # Pointing aliases for catalog-search context; these are never target identity.
   ra_center: [CRVAL1, ALPHA, RA]
   dec_center: [CRVAL2, DELTA, DEC]
-  ra_requested: [ALPHA, RA]
-  dec_requested: [DELTA, DEC]
 
   # image geometry
   naxis1: [NAXIS1]

@@ -178,6 +178,18 @@ python -m grandgousier.cli process-archive-path `
   --manifest-out reports\series.json
 \end{lstlisting}
 
+\subsection{Необязательный target product}
+
+Целевой объект не является обязательным аргументом обработки поля. В \cli{process-archive-path} selector задаётся явно и нужен только для optional target product:
+
+\begin{itemize}
+  \item \cli{--target-object-id ID} --- внутренний \texttt{object\_id};
+  \item \cli{--target-source-id SOURCE\_ID} --- внешний ID в выбранном каталоге; эквивалентность разных releases не предполагается;
+  \item пара \cli{--target-ra-deg RA} и \cli{--target-dec-deg Dec}.
+\end{itemize}
+
+Селекторы можно использовать отдельно или сочетать, если все они указывают на один объект; координаты RA и Dec всегда указываются парой. Без selector target resolver возвращает \texttt{not\_requested}; объект не выводится из frame-center, MASTER \cli{ALPHA/DELTA}, \cli{CRVAL/WCS} или \cli{coord2000}. Field processing и ensemble продолжаются без target-specific exclusions; target export и отметка \texttt{FIELD\_TARGET} не создаются, существующие target CSV/JSON/PNG не удаляются только из-за такого запуска. Отсутствие target само по себе не означает неготовность поля; готовность optional target product проверяется отдельно.
+
 \subsection{Selective rerun и conventional ensemble threshold (0.5.45.1)}
 
 Для повторной обработки только существующей series среди кадров указанного пути:

@@ -141,6 +141,8 @@ python -m grandgousier.cli process-archive-path `
   --manifest-out reports\process_archive_color_manifest.json
 \end{lstlisting}
 
+Обработка поля на Stage~1 и Stage~2 не требует target/object selector: он нужен только для отдельного downstream-продукта объекта. Для \cli{process-archive-path} доступны явные \cli{--target-object-id}, \cli{--target-source-id} или только парные \cli{--target-ra-deg} и \cli{--target-dec-deg}. Без selector объект не выбирается автоматически по ближайшему центру кадра, \cli{ALPHA/DELTA}, \cli{CRVAL/WCS} или \cli{coord2000}. В таком запуске target export и отметка \texttt{FIELD\_TARGET} не создаются, существующие target CSV/JSON/PNG не удаляются только из-за отсутствия target; это само по себе не делает поле unready. Готовность обработки поля и отдельного target product различается.
+
 
 \section{Объединённая кривая после Stage 3}
 

@@ -15,6 +15,12 @@ FIELD
 
 После этого долговременная кривая любого объекта строится применением уже найденной поправки соответствующей series.
 
+\section{Необязательный выбор объекта}
+
+Для Stage~1 и Stage~2 не требуется задавать target: поле обрабатывается и калибруется независимо от выбора отдельного объекта. Явный \cli{--target-object-id}, \cli{--target-source-id} либо пара \cli{--target-ra-deg}/\cli{--target-dec-deg} в \cli{process-archive-path} нужна только для downstream target product. Поиск ближайшего к центру объекта или использование \cli{ALPHA/DELTA}, \cli{CRVAL/WCS} либо \cli{coord2000} как target не выполняется; без selector ensemble получает пустой target-exclusion set, а существующие reference-star критерии не меняются.
+
+Без selector target export и отметка \texttt{FIELD\_TARGET} не создаются, существующие target CSV/JSON/PNG не удаляются из-за no-target run, а само отсутствие target не делает поле неготовым. Одно откалиброванное поле может обслуживать несколько последующих object selections: полную Stage~2 нельзя повторять отдельно для каждого target. Immutable BASE и текущая validated SCIENCE сохраняются долговременно; временные и superseded products требуют bounded lifecycle, а reduced Stage~1 FITS reclaimable только по действующей policy после durable Stage~2 validation.
+
 \section{Ограничения первого MVP}
 
 Первый вариант Stage 3 намеренно ограничен наиболее проверяемым случаем:

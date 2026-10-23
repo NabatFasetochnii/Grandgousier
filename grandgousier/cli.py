@@ -1507,9 +1507,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_process_path.set_defaults(psf_diagnostics_render_plots=True)
     p_process_path.add_argument("--require-detection-support", dest="require_detection_support", action="store_true", default=None, help="Reject weak/no detection-support objects in science light curves and candidate triage")
     p_process_path.add_argument("--no-require-detection-support", dest="require_detection_support", action="store_false", help="Treat weak/no detection support as diagnostic only, not as a science-light-curve rejection flag")
-    p_process_path.add_argument("--target-source-id", default=None, help="Explicit external source_id/Gaia DR3 source_id for the field target")
+    p_process_path.add_argument("--target-source-id", default=None, help="Explicit source_id in the selected catalog namespace (no release equivalence implied)")
     p_process_path.add_argument("--target-object-id", type=int, default=None, help="Explicit internal objects.object_id for the field target")
-    p_process_path.add_argument("--target-max-sep-arcsec", type=float, default=120.0, help="Maximum allowed auto-resolved target distance from the mean frame centre")
+    p_process_path.add_argument("--target-ra-deg", type=float, default=None, help="Explicit target sky RA in degrees [0, 360); requires --target-dec-deg")
+    p_process_path.add_argument("--target-dec-deg", type=float, default=None, help="Explicit target sky Dec in degrees [-90, 90]; requires --target-ra-deg")
+    p_process_path.add_argument("--target-max-sep-arcsec", type=float, default=120.0, help="Deprecated positive center limit is ignored; negative disables target resolution without an explicit ID/coordinate pair. Explicit sky matching uses 2 arcsec")
     p_process_path.add_argument("--no-target-light-curve", dest="export_target_light_curve", action="store_false", help="Do not export a separate target light curve")
     p_process_path.set_defaults(export_target_light_curve=True)
     p_process_path.add_argument("--no-candidate-light-curves", dest="export_candidate_light_curves", action="store_false", help="Do not export per-candidate accepted light curves")
@@ -5967,6 +5969,14 @@ def cmd_process_archive_path(args: argparse.Namespace) -> int:
         print("--execute and --plan-only cannot be combined", file=sys.stderr)
         return 2
 
+    from grandgousier.lightcurves.target import validate_target_coordinates
+
+    try:
+        validate_target_coordinates(args.target_ra_deg, args.target_dec_deg)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     Session = make_session_factory(args.database_url)
     with Session() as session:
         result = process_archive_path(
@@ -6054,6 +6064,8 @@ def cmd_process_archive_path(args: argparse.Namespace) -> int:
             require_detection_support=args.require_detection_support,
             target_source_id=args.target_source_id,
             target_object_id=args.target_object_id,
+            target_ra_deg=args.target_ra_deg,
+            target_dec_deg=args.target_dec_deg,
             target_max_sep_arcsec=args.target_max_sep_arcsec,
             export_target_light_curve=args.export_target_light_curve,
             export_candidate_light_curves=args.export_candidate_light_curves,

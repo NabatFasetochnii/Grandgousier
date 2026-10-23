@@ -407,8 +407,11 @@ def test_quality_policy_records_noop_candidate_exclusion_guard():
     assert qp["final_ensemble_calibration"] == "initial_ensemble"
 
 
-def test_run_field_pipeline_skips_candidate_recalibration_when_exclusions_are_not_references(monkeypatch):
+def test_run_field_pipeline_without_target_keeps_artifacts_and_skips_target_export(
+    monkeypatch, tmp_path
+):
     calls = {"ensemble": 0, "object_qc": 0, "field_report": 0}
+    observed = {"ensemble_exclusions": [], "qc_target_ids": [], "field_target_ids": []}
 
     class FakeSession:
         def rollback(self):
@@ -416,6 +419,7 @@ def test_run_field_pipeline_skips_candidate_recalibration_when_exclusions_are_no
 
     def fake_ensemble(*args, **kwargs):
         calls["ensemble"] += 1
+        observed["ensemble_exclusions"].append(kwargs["exclude_reference_object_ids"])
         return EnsembleCalibrationResult(
             target_calibration_name=kwargs["target_calibration_name"],
             reference_candidates=2,
@@ -428,10 +432,12 @@ def test_run_field_pipeline_skips_candidate_recalibration_when_exclusions_are_no
 
     def fake_object_qc(*args, **kwargs):
         calls["object_qc"] += 1
+        observed["qc_target_ids"].append(kwargs["target_object_ids"])
         return {"objects": 3}
 
     def fake_field_report(*args, **kwargs):
         calls["field_report"] += 1
+        observed["field_target_ids"].append(kwargs["target_object_ids"])
         return SimpleNamespace(
             summary_rows=[],
             rms_bins=[],
@@ -457,7 +463,16 @@ def test_run_field_pipeline_skips_candidate_recalibration_when_exclusions_are_no
     monkeypatch.setattr(
         runner_module,
         "resolve_target_object",
-        lambda *args, **kwargs: TargetResolution(resolved=False, reason="test"),
+        lambda *args, **kwargs: TargetResolution(
+            resolved=False,
+            method="not_requested",
+            reason="no target selector was supplied",
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "export_target_light_curve_product",
+        lambda *_args, **_kwargs: pytest.fail("unresolved target must not be exported"),
     )
     monkeypatch.setattr(
         runner_module,
@@ -493,27 +508,35 @@ def test_run_field_pipeline_skips_candidate_recalibration_when_exclusions_are_no
         ensemble_min_ref_stars_per_frame=2,
         exclude_candidates_from_ensemble=True,
         candidate_ensemble_until_converged=True,
-        export_target_light_curve=False,
+        export_target_light_curve=True,
         export_candidate_light_curves=False,
         record_run=False,
         no_file_log=True,
+        out_dir=str(tmp_path),
     )
 
-    result = runner_module.run_field_pipeline(FakeSession(), config)
+    artifact_bytes = {
+        suffix: f"p_target_light_curve.{suffix}".encode("ascii")
+        for suffix in ("csv", "json", "png")
+    }
+    for suffix, content in artifact_bytes.items():
+        (tmp_path / f"p_target_light_curve.{suffix}").write_bytes(content)
 
-    step_names = [step.step_name for step in result.steps]
+    candidate_result = runner_module.run_field_pipeline(FakeSession(), config)
+
+    step_names = [step.step_name for step in candidate_result.steps]
     selection = next(
         step.result
-        for step in result.steps
+        for step in candidate_result.steps
         if step.step_name == "select_candidate_reference_exclusions"
     )
     convergence = next(
         step.result
-        for step in result.steps
+        for step in candidate_result.steps
         if step.step_name == "candidate_ensemble_convergence"
     )
 
-    assert result.status == "DONE"
+    assert candidate_result.status == "DONE"
     assert calls == {"ensemble": 1, "object_qc": 1, "field_report": 1}
     assert "ensemble_calibrate_candidate_excluded" not in step_names
     assert "compute_object_qc_candidate_excluded" not in step_names
@@ -522,4 +545,31 @@ def test_run_field_pipeline_skips_candidate_recalibration_when_exclusions_are_no
     assert selection["will_run_iteration"] is False
     assert convergence["iterations_executed"] == 0
     assert convergence["stop_status"] == "NO_USABLE_REFERENCE_EXCLUSIONS"
-    assert result.calibration_names["ensemble"].endswith("_ensemble_g_v1")
+    assert candidate_result.calibration_names["ensemble"].endswith("_ensemble_g_v1")
+    assert observed == {
+        "ensemble_exclusions": [[]],
+        "qc_target_ids": [[]],
+        "field_target_ids": [[]],
+    }
+    assert "export_target_light_curve" not in step_names
+    assert all(
+        (tmp_path / f"p_target_light_curve.{suffix}").read_bytes() == content
+        for suffix, content in artifact_bytes.items()
+    )
+
+    # With candidate exclusion disabled, target export would otherwise be eligible;
+    # unresolved/not-requested target identity must still skip it without touching files.
+    config.exclude_candidates_from_ensemble = False
+    field_result = runner_module.run_field_pipeline(FakeSession(), config)
+    assert field_result.status == "DONE"
+    assert "export_target_light_curve" not in [step.step_name for step in field_result.steps]
+    assert calls == {"ensemble": 2, "object_qc": 2, "field_report": 2}
+    assert observed == {
+        "ensemble_exclusions": [[], []],
+        "qc_target_ids": [[], []],
+        "field_target_ids": [[], []],
+    }
+    assert all(
+        (tmp_path / f"p_target_light_curve.{suffix}").read_bytes() == content
+        for suffix, content in artifact_bytes.items()
+    )

@@ -1,5 +1,9 @@
+from types import SimpleNamespace
+
 from grandgousier.db.models import CalibrationVersion, ObjectQc
+from grandgousier.quality import object_quality as object_quality_module
 from grandgousier.quality.object_quality import (
+    ObjectQcSupportSnapshot,
     _infer_source_aperture_calibration_name,
     _merge_preserved_qc_details,
     _preserve_aperture_stability_flags,
@@ -102,3 +106,80 @@ def test_infer_source_aperture_calibration_name_avoids_self_reference():
     )
 
     assert _infer_source_aperture_calibration_name(cv, "same") is None
+
+
+def test_empty_target_ids_do_not_set_field_target(monkeypatch):
+    row = SimpleNamespace(
+        object_id=10,
+        source_id=None,
+        mag_rms=0.01,
+        mag_err_median=0.01,
+        n_measurements=5,
+        mag_median=12.0,
+        mag_mad=0.01,
+        ref_mag=None,
+        mag_err_systematic_median=None,
+        ra_deg=None,
+        dec_deg=None,
+        color=None,
+        catalog_name="cat",
+        instrument_unit_id=1,
+        reference_catalog_name=None,
+        reference_band=None,
+    )
+    analysis_snapshot = SimpleNamespace(
+        timings_sec={"_runner_cache_hit": 1.0},
+        algorithm="test",
+        materialization_source=None,
+        measurement_rows=[],
+        object_rows=[row],
+        measurement_geometry={},
+        matches=lambda **_kwargs: True,
+    )
+    support_snapshot = ObjectQcSupportSnapshot(
+        catalog_name="cat",
+        instrument_unit_id=1,
+        frame_ids=None,
+        target_source_ids=(),
+        catalog_sources_by_id={},
+        neighbor_stats={},
+        neighbor_diagnostics={
+            "algorithm": "test",
+            "catalog_sources": 0,
+            "target_sources": 0,
+            "pair_evaluations": 0,
+            "cache_hit": False,
+        },
+        detection_stats={},
+        timings_sec={"_runner_cache_hit": 1.0},
+    )
+    session = SimpleNamespace(
+        scalar=lambda _statement: SimpleNamespace(calibration_version_id=1)
+    )
+    monkeypatch.setattr(object_quality_module, "load_object_qc_map", lambda *_a, **_k: {})
+    monkeypatch.setattr(object_quality_module, "resolve_source_calibration", lambda *_a: None)
+    monkeypatch.setattr(object_quality_module, "get_source_calibration_name", lambda *_a: None)
+    monkeypatch.setattr(object_quality_module, "get_source_calibration_version_id", lambda *_a: None)
+    observed_flags = {}
+
+    def capture_flags(_existing_qc, flags):
+        observed_flags.update(flags)
+        return False
+
+    monkeypatch.setattr(
+        object_quality_module, "_preserve_aperture_stability_flags", capture_flags
+    )
+
+    result = object_quality_module.compute_object_qc(
+        session,
+        calibration_name="synthetic",
+        catalog_name="cat",
+        instrument_unit_id=1,
+        target_object_ids=[],
+        analysis_snapshot=analysis_snapshot,
+        support_snapshot=support_snapshot,
+        dry_run=True,
+    )
+
+    assert result.checked_objects == 1
+    assert "FIELD_TARGET" not in observed_flags

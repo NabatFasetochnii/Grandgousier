@@ -10,13 +10,20 @@ from typing import Any, Iterable
 from sqlalchemy import bindparam, select, text
 from sqlalchemy.orm import Session
 
-from grandgousier.db.models import CalibrationVersion, Object
-from grandgousier.photometry.calibration_view import load_calibration_photometry_view
-
+from grandgousier.db.models import (
+    CalibrationVersion,
+    CatalogSource,
+    Frame,
+    Object,
+    ObjectCatalogLink,
+)
 from grandgousier.lightcurves.product import (
+    LightCurveSelectionError,
+    _load_calibration_rows,
     export_science_light_curve_csv,
     load_science_light_curve_rows,
 )
+from grandgousier.photometry.calibration_view import load_calibration_photometry_view
 
 
 @dataclass
@@ -30,6 +37,7 @@ class TargetResolution:
     dec_deg: float | None = None
     target_ra_deg: float | None = None
     target_dec_deg: float | None = None
+    coordinate_provenance: str | None = None
     sep_arcsec: float | None = None
     n_measurements: int = 0
     method: str = "unresolved"
@@ -53,6 +61,7 @@ class TargetResolution:
             "dec_deg": self.dec_deg,
             "target_ra_deg": self.target_ra_deg,
             "target_dec_deg": self.target_dec_deg,
+            "coordinate_provenance": self.coordinate_provenance,
             "sep_arcsec": self.sep_arcsec,
             "n_measurements": self.n_measurements,
             "method": self.method,
@@ -119,13 +128,21 @@ def resolve_target_object(
     frame_ids: list[int] | None = None,
     target_source_id: str | None = None,
     target_object_id: int | None = None,
+    target_ra_deg: float | None = None,
+    target_dec_deg: float | None = None,
     max_sep_arcsec: float | None = 120.0,
 ) -> TargetResolution:
-    """Resolve the science target through the storage-independent photometry view."""
+    """Resolve a measured Object; frame pointing is never target identity."""
+
+    explicit_coords = validate_target_coordinates(target_ra_deg, target_dec_deg)
+    target_coords = explicit_coords
+    if frame_ids is not None and not frame_ids:
+        return TargetResolution(resolved=False, method="frame_scope", reason="empty frame scope")
 
     if (
         target_object_id is None
         and not target_source_id
+        and explicit_coords is None
         and max_sep_arcsec is not None
         and float(max_sep_arcsec) < 0
     ):
@@ -136,8 +153,28 @@ def resolve_target_object(
             reason="target resolution disabled by negative max_sep_arcsec",
         )
 
-    cv = session.scalar(
-        select(CalibrationVersion).where(CalibrationVersion.name == str(calibration_name))
+    if target_object_id is None and not target_source_id and explicit_coords is None:
+        return TargetResolution(
+            resolved=False,
+            catalog_name=catalog_name,
+            method="not_requested",
+            reason="no target selector was supplied",
+        )
+
+    calibration_rows = _load_calibration_rows(
+        session,
+        calibration_names=[str(calibration_name)],
+        calibration_prefixes=[],
+        model_name=None,
+    )
+    if len(calibration_rows) > 1:
+        raise LightCurveSelectionError(
+            f"Calibration name {calibration_name!r} resolved to multiple calibration products"
+        )
+    cv = (
+        session.get(CalibrationVersion, int(calibration_rows[0]["calibration_version_id"]))
+        if calibration_rows
+        else None
     )
     if cv is None:
         return TargetResolution(
@@ -158,100 +195,335 @@ def resolve_target_object(
         if not catalog_name or (row.flags or {}).get("catalog_name") == catalog_name
     ]
     identities = _identity_rows_from_photometry_view(session, filtered)
-
-    if target_object_id is not None:
-        row = identities.get(int(target_object_id))
-        if row is None:
-            return TargetResolution(
-                resolved=False,
-                object_id=int(target_object_id),
-                catalog_name=catalog_name,
-                method="target_object_id",
-                reason="target object has no measurements in selected calibration/frame set",
-            )
-        row = dict(row)
-        row["sep_arcsec"] = 0.0
-        return _resolution_from_row(row, method="target_object_id")
-
-    if target_source_id:
-        matches = [
-            row
-            for row in identities.values()
-            if str(row.get("source_id") or "") == str(target_source_id)
-        ]
-        matches.sort(key=lambda row: (-int(row.get("n_measurements") or 0), int(row["object_id"])))
-        if not matches:
-            return TargetResolution(
-                resolved=False,
-                source_id=str(target_source_id),
-                catalog_name=catalog_name,
-                method="target_source_id",
-                reason="target source_id has no measurements in selected calibration/frame set",
-            )
-        row = dict(matches[0])
-        row["sep_arcsec"] = 0.0
-        return _resolution_from_row(row, method="target_source_id")
-
-    target_center = _mean_frame_center(session, frame_ids=frame_ids)
-    if target_center is None:
+    # Use the instrument of the selected, measured Frames, never a caller's profile
+    # or the field/pointing coordinates. Check even unmeasured explicitly selected frames.
+    selected_ids = {int(row.frame_id) for row in view.rows}
+    if frame_ids is not None:
+        selected_ids.update(int(frame_id) for frame_id in frame_ids)
+    instrument = _measured_scope_instrument(session, selected_ids)
+    if instrument is None:
         return TargetResolution(
             resolved=False,
             catalog_name=catalog_name,
-            method="nearest_to_frame_center",
-            reason="selected frames do not have usable RA/Dec centres",
+            method="frame_scope",
+            reason="selected frame instruments are missing, unknown or mixed",
         )
-    target_ra, target_dec = target_center
-    candidates: list[dict[str, Any]] = []
-    cos_dec = math.cos(math.radians(float(target_dec)))
-    for item in identities.values():
-        if not _is_finite(item.get("ra_deg")) or not _is_finite(item.get("dec_deg")):
-            continue
-        dra = (float(item["ra_deg"]) - float(target_ra)) * cos_dec
-        ddec = float(item["dec_deg"]) - float(target_dec)
-        row = dict(item)
-        row["sep_arcsec"] = math.hypot(dra, ddec) * 3600.0
-        candidates.append(row)
-    candidates.sort(
-        key=lambda row: (
-            float(row["sep_arcsec"]),
-            -int(row.get("n_measurements") or 0),
-            int(row["object_id"]),
-        )
+
+    target_method = "explicit_object_coordinates" if explicit_coords is not None else None
+    target_coordinate_provenance = (
+        "explicit_object_coordinates" if explicit_coords is not None else None
     )
-    if not candidates:
-        return TargetResolution(
-            resolved=False,
-            catalog_name=catalog_name,
-            target_ra_deg=target_ra,
-            target_dec_deg=target_dec,
-            method="nearest_to_frame_center",
-            reason="no measured catalog object is available for target resolution",
-        )
 
-    res = _resolution_from_row(candidates[0], method="nearest_to_frame_center")
-    res.target_ra_deg = target_ra
-    res.target_dec_deg = target_dec
-    if (
-        max_sep_arcsec is not None
-        and res.sep_arcsec is not None
-        and float(res.sep_arcsec) > float(max_sep_arcsec)
-    ):
+    source_matches: list[tuple[int, int, float, float]] = []
+    catalog_coords: tuple[float, float] | None = None
+    object_coords: tuple[float, float] | None = None
+    catalog_sep_arcsec: float | None = None
+    if target_source_id:
+        if not catalog_name:
+            return TargetResolution(
+                resolved=False, source_id=str(target_source_id), method="target_source_id",
+                reason="catalog_name is required to scope target_source_id",
+            )
+        source_matches = session.execute(
+            select(
+                ObjectCatalogLink.object_id, CatalogSource.catalog_source_id,
+                CatalogSource.ra_deg, CatalogSource.dec_deg,
+            )
+            .join(CatalogSource, ObjectCatalogLink.catalog_source_id == CatalogSource.catalog_source_id)
+            .where(
+                CatalogSource.catalog_name == catalog_name,
+                CatalogSource.source_id == str(target_source_id),
+            )
+        ).all()
+        if len(source_matches) != 1 or int(source_matches[0][0]) not in identities:
+            return TargetResolution(
+                resolved=False, source_id=str(target_source_id), catalog_name=catalog_name,
+                method="target_source_id",
+                reason="target source has no unique catalog link to a measured object in scope",
+            )
+        object_id, catalog_source_id, catalog_ra, catalog_dec = source_matches[0]
+        object_row = identities[int(object_id)]
+        if any(
+            int(row.object_id) == int(object_id)
+            and not _measured_source_agrees(
+                row.flags, source_id=str(target_source_id),
+                catalog_source_id=int(catalog_source_id),
+            )
+            for row in filtered
+        ):
+            return TargetResolution(
+                resolved=False, source_id=str(target_source_id), catalog_name=catalog_name,
+                method="unresolved", reason="measured source flags contradict the catalog link",
+            )
+        catalog_coords, catalog_position_error = _coordinate_pair_status(
+            catalog_ra, catalog_dec
+        )
+        object_coords, object_position_error = _coordinate_pair_status(
+            object_row.get("ra_deg"), object_row.get("dec_deg")
+        )
+        if catalog_position_error or object_position_error:
+            return TargetResolution(
+                resolved=False, source_id=str(target_source_id), catalog_name=catalog_name,
+                method="unresolved",
+                reason="catalog or object sky coordinates are partially populated or invalid",
+            )
+        if catalog_coords is not None and object_coords is not None:
+            catalog_sep_arcsec = _sky_separation_arcsec(*catalog_coords, *object_coords)
+            # No epoch propagation is justified here. Refuse distant links rather than
+            # assuming distinct catalog releases or epochs describe one sky position.
+            if catalog_sep_arcsec > 2.0:
+                return TargetResolution(
+                    resolved=False, source_id=str(target_source_id), catalog_name=catalog_name,
+                    method="unresolved", reason="catalog and object positions differ by over 2 arcsec",
+                )
+        if target_coords is not None:
+            identity_coords = catalog_coords or object_coords
+            if identity_coords is None:
+                return TargetResolution(
+                    resolved=False,
+                    source_id=str(target_source_id),
+                    catalog_name=catalog_name,
+                    target_ra_deg=target_coords[0],
+                    target_dec_deg=target_coords[1],
+                    coordinate_provenance=target_coordinate_provenance,
+                    method="unresolved",
+                    reason="cannot compare explicit target coordinates: catalog and object positions are unavailable",
+                )
+            if _sky_separation_arcsec(*target_coords, *identity_coords) > 2.0:
+                return TargetResolution(
+                    resolved=False, source_id=str(target_source_id), catalog_name=catalog_name,
+                    target_ra_deg=target_coords[0], target_dec_deg=target_coords[1],
+                    coordinate_provenance=target_coordinate_provenance, method="unresolved",
+                    reason="explicit target coordinates disagree with the catalog position",
+                )
+
+    if target_object_id is not None and target_source_id and int(target_object_id) != int(source_matches[0][0]):
+        return TargetResolution(
+            resolved=False, method="conflicting_target_overrides",
+            reason="target_object_id disagrees with scoped target_source_id",
+        )
+    selected_id = (
+        int(target_object_id) if target_object_id is not None
+        else int(source_matches[0][0]) if source_matches else None
+    )
+    selected_row = identities.get(selected_id) if selected_id is not None else None
+    if selected_id is not None and selected_row is None:
         return TargetResolution(
             resolved=False,
-            catalog_name=catalog_name or res.catalog_name,
-            target_ra_deg=target_ra,
-            target_dec_deg=target_dec,
-            method="nearest_to_frame_center",
-            reason=f"nearest object is farther than max_sep_arcsec={max_sep_arcsec:g}",
-            nearest_object_id=res.object_id,
-            nearest_source_id=res.source_id,
-            nearest_catalog_source_id=res.catalog_source_id,
-            nearest_ra_deg=res.ra_deg,
-            nearest_dec_deg=res.dec_deg,
-            nearest_sep_arcsec=res.sep_arcsec,
-            nearest_n_measurements=res.n_measurements,
+            object_id=selected_id,
+            catalog_name=catalog_name,
+            method="target_object_id" if target_object_id is not None else "catalog_identifier",
+            reason="target object has no measurements in selected calibration/frame set",
         )
-    return res
+    if selected_row is not None and target_object_id is not None and not target_source_id:
+        object_coords, object_position_error = _coordinate_pair_status(
+            selected_row.get("ra_deg"), selected_row.get("dec_deg")
+        )
+        if object_position_error:
+            return TargetResolution(
+                resolved=False,
+                object_id=selected_id,
+                method="target_object_id",
+                reason="explicit object has partially populated or invalid sky coordinates",
+            )
+
+    identity_coords = catalog_coords or object_coords
+
+    coordinate_matches: list[dict[str, Any]] = []
+    nearest: dict[str, Any] | None = None
+    identity_coordinate_sep: float | None = None
+    if target_coords is not None:
+        ra, dec = target_coords
+        candidates = []
+        for item in identities.values():
+            if not _valid_sky_position(item.get("ra_deg"), item.get("dec_deg")):
+                continue
+            row = dict(item)
+            row["sep_arcsec"] = _sky_separation_arcsec(
+                ra, dec, float(row["ra_deg"]), float(row["dec_deg"])
+            )
+            candidates.append(row)
+        candidates.sort(key=lambda row: (row["sep_arcsec"], row["object_id"]))
+        nearest = candidates[0] if candidates else None
+        # The established unique-object radius is independent of max_sep_arcsec.
+        coordinate_matches = [row for row in candidates if row["sep_arcsec"] <= 2.0]
+        if len(coordinate_matches) > 1:
+            return TargetResolution(
+                resolved=False, catalog_name=catalog_name,
+                target_ra_deg=ra, target_dec_deg=dec,
+                coordinate_provenance=target_coordinate_provenance,
+                method=target_method or "explicit_object_coordinates",
+                reason="multiple measured objects within 2 arcsec of target coordinates",
+                nearest_object_id=nearest["object_id"] if nearest else None,
+                nearest_source_id=nearest.get("source_id") if nearest else None,
+                nearest_catalog_source_id=nearest.get("catalog_source_id") if nearest else None,
+                nearest_ra_deg=nearest.get("ra_deg") if nearest else None,
+                nearest_dec_deg=nearest.get("dec_deg") if nearest else None,
+                nearest_sep_arcsec=nearest["sep_arcsec"] if nearest else None,
+                nearest_n_measurements=nearest.get("n_measurements") if nearest else None,
+            )
+        if coordinate_matches and selected_id is not None:
+            if coordinate_matches[0]["object_id"] != selected_id:
+                return TargetResolution(
+                    resolved=False, target_ra_deg=ra, target_dec_deg=dec,
+                    coordinate_provenance=target_coordinate_provenance,
+                    method="conflicting_target_overrides",
+                    reason="explicit target identity disagrees with target coordinates",
+                )
+        elif not coordinate_matches:
+            if selected_id is None:
+                return TargetResolution(
+                    resolved=False, catalog_name=catalog_name,
+                    target_ra_deg=ra, target_dec_deg=dec,
+                    coordinate_provenance=target_coordinate_provenance,
+                    method=target_method or "explicit_object_coordinates",
+                    reason="no measured object within 2 arcsec of target coordinates",
+                    nearest_object_id=nearest["object_id"] if nearest else None,
+                    nearest_source_id=nearest.get("source_id") if nearest else None,
+                    nearest_catalog_source_id=nearest.get("catalog_source_id") if nearest else None,
+                    nearest_ra_deg=nearest.get("ra_deg") if nearest else None,
+                    nearest_dec_deg=nearest.get("dec_deg") if nearest else None,
+                    nearest_sep_arcsec=nearest["sep_arcsec"] if nearest else None,
+                    nearest_n_measurements=nearest.get("n_measurements") if nearest else None,
+                )
+            if identity_coords is None:
+                return TargetResolution(
+                    resolved=False, object_id=selected_id,
+                    source_id=str(target_source_id) if target_source_id else None,
+                    catalog_name=catalog_name, target_ra_deg=ra, target_dec_deg=dec,
+                    coordinate_provenance=target_coordinate_provenance,
+                    method=target_method or "target_object_id",
+                    reason="cannot compare explicit target coordinates with identity: sky coordinates are unavailable",
+                    nearest_object_id=nearest["object_id"] if nearest else None,
+                    nearest_source_id=nearest.get("source_id") if nearest else None,
+                    nearest_catalog_source_id=nearest.get("catalog_source_id") if nearest else None,
+                    nearest_ra_deg=nearest.get("ra_deg") if nearest else None,
+                    nearest_dec_deg=nearest.get("dec_deg") if nearest else None,
+                    nearest_sep_arcsec=nearest["sep_arcsec"] if nearest else None,
+                    nearest_n_measurements=nearest.get("n_measurements") if nearest else None,
+                )
+            identity_coordinate_sep = _sky_separation_arcsec(
+                *target_coords, *identity_coords
+            )
+            if identity_coordinate_sep > 2.0:
+                return TargetResolution(
+                    resolved=False, object_id=selected_id,
+                    source_id=str(target_source_id) if target_source_id else None,
+                    catalog_name=catalog_name, target_ra_deg=ra, target_dec_deg=dec,
+                    coordinate_provenance=target_coordinate_provenance,
+                    method="conflicting_target_overrides",
+                    reason="explicit target coordinates disagree with the selected identity",
+                    nearest_object_id=nearest["object_id"] if nearest else None,
+                    nearest_source_id=nearest.get("source_id") if nearest else None,
+                    nearest_catalog_source_id=nearest.get("catalog_source_id") if nearest else None,
+                    nearest_ra_deg=nearest.get("ra_deg") if nearest else None,
+                    nearest_dec_deg=nearest.get("dec_deg") if nearest else None,
+                    nearest_sep_arcsec=nearest["sep_arcsec"] if nearest else None,
+                    nearest_n_measurements=nearest.get("n_measurements") if nearest else None,
+                )
+
+    if selected_id is not None:
+        row = dict(selected_row)
+        row["sep_arcsec"] = (
+            coordinate_matches[0]["sep_arcsec"] if coordinate_matches
+            else catalog_sep_arcsec if catalog_sep_arcsec is not None
+            else identity_coordinate_sep
+        )
+        if source_matches:
+            row.update(source_id=str(target_source_id), catalog_name=catalog_name,
+                       catalog_source_id=int(source_matches[0][1]))
+        res = _resolution_from_row(row, method=("target_object_id" if target_object_id is not None
+                                                else "catalog_identifier"))
+        if target_coords is not None:
+            res.target_ra_deg, res.target_dec_deg = target_coords
+            res.coordinate_provenance = target_coordinate_provenance
+        elif catalog_coords is not None:
+            res.target_ra_deg, res.target_dec_deg = catalog_coords
+            res.coordinate_provenance = "catalog_identifier"
+        elif object_coords is not None:
+            res.target_ra_deg = float(row["ra_deg"])
+            res.target_dec_deg = float(row["dec_deg"])
+            res.coordinate_provenance = "object_record"
+        return res
+
+    if coordinate_matches:
+        res = _resolution_from_row(
+            coordinate_matches[0], method=target_method or "explicit_object_coordinates"
+        )
+        res.target_ra_deg, res.target_dec_deg = target_coords
+        res.coordinate_provenance = target_coordinate_provenance
+        return res
+
+    return TargetResolution(
+        resolved=False, catalog_name=catalog_name, method="unresolved",
+        reason="RoboPhot target identity is not supplied; frame center is pointing only",
+    )
+
+
+def _measured_source_agrees(
+    flags: Any, *, source_id: str, catalog_source_id: int
+) -> bool:
+    if not isinstance(flags, dict):
+        return True
+    if flags.get("source_id") is not None and str(flags["source_id"]) != source_id:
+        return False
+    stored_id = flags.get("catalog_source_id")
+    return (stored_id is None
+            or (not isinstance(stored_id, bool) and isinstance(stored_id, (int, str))
+                and str(stored_id).strip().isdigit()
+                and int(str(stored_id).strip()) == catalog_source_id))
+
+
+def validate_target_coordinates(
+    ra_deg: float | None, dec_deg: float | None
+) -> tuple[float, float] | None:
+    """Validate paired ICRS-degree input before any archive/pipeline writes."""
+    if ra_deg is None and dec_deg is None:
+        return None
+    if ra_deg is None or dec_deg is None:
+        raise ValueError("target RA and Dec must be supplied together in degrees")
+    ra, dec = float(ra_deg), float(dec_deg)
+    if not _valid_sky_position(ra, dec):
+        raise ValueError("target RA must be finite in [0, 360), Dec finite in [-90, 90] degrees")
+    return ra, dec
+
+
+def _valid_sky_position(ra: Any, dec: Any) -> bool:
+    return (_is_finite(ra) and _is_finite(dec)
+            and 0 <= float(ra) < 360 and -90 <= float(dec) <= 90)
+
+
+def _coordinate_pair_status(
+    ra: Any, dec: Any
+) -> tuple[tuple[float, float] | None, bool]:
+    if ra is None and dec is None:
+        return None, False
+    if not _valid_sky_position(ra, dec):
+        return None, True
+    return (float(ra), float(dec)), False
+
+
+def _sky_separation_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    ddec = math.radians(dec2 - dec1)
+    dra = math.radians((ra2 - ra1 + 180) % 360 - 180)
+    a = (math.sin(ddec / 2) ** 2
+         + math.cos(math.radians(dec1)) * math.cos(math.radians(dec2))
+         * math.sin(dra / 2) ** 2)
+    return math.degrees(2 * math.atan2(math.sqrt(min(1.0, a)),
+                                        math.sqrt(max(0.0, 1 - a)))) * 3600
+
+
+def _measured_scope_instrument(session: Session, frame_ids: set[int]) -> str | None:
+    if not frame_ids:
+        return None
+    rows = session.execute(
+        select(Frame.frame_id, Frame.instrument).where(Frame.frame_id.in_(sorted(frame_ids)))
+    ).all()
+    if (len(rows) != len(frame_ids) or
+            {int(row[0]) for row in rows} != frame_ids):
+        return None
+    instruments = {row[1] for row in rows}
+    return next(iter(instruments)) if len(instruments) == 1 and instruments <= {"MASTER", "RoboPhot"} else None
 
 
 def _identity_rows_from_photometry_view(
@@ -512,28 +784,6 @@ def _load_measurement_identity_row(
         stmt = stmt.bindparams(bindparam("frame_ids", expanding=True))
     row = session.execute(stmt, params).mappings().first()
     return dict(row) if row is not None else None
-
-
-def _mean_frame_center(session: Session, *, frame_ids: list[int] | None) -> tuple[float, float] | None:
-    where = ["ra_center_deg IS NOT NULL", "dec_center_deg IS NOT NULL"]
-    params: dict[str, Any] = {}
-    if frame_ids:
-        where.append("frame_id IN :frame_ids")
-        params["frame_ids"] = list(frame_ids)
-    stmt = text(
-        f"""
-        SELECT AVG(ra_center_deg)::double precision AS ra_deg,
-               AVG(dec_center_deg)::double precision AS dec_deg
-        FROM frames
-        WHERE {' AND '.join(where)}
-        """
-    )
-    if frame_ids:
-        stmt = stmt.bindparams(bindparam("frame_ids", expanding=True))
-    row = session.execute(stmt, params).mappings().first()
-    if row is None or row["ra_deg"] is None or row["dec_deg"] is None:
-        return None
-    return float(row["ra_deg"]), float(row["dec_deg"])
 
 
 def _resolution_from_row(row: dict[str, Any], *, method: str) -> TargetResolution:

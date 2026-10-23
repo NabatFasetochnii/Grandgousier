@@ -86,9 +86,9 @@ from grandgousier.lightcurves.product import light_curve_reject_flags
 from grandgousier.lightcurves.candidates import export_accepted_candidate_light_curves
 from grandgousier.lightcurves.target import (
     TargetResolution,
-    cleanup_target_light_curve_artifacts,
     export_target_light_curve_product,
     resolve_target_object,
+    validate_target_coordinates,
 )
 from grandgousier.logging_utils import PipelineFileLogger
 from grandgousier.archive.fields_series import (
@@ -369,6 +369,8 @@ class FieldPipelineConfig:
     require_detection_support: bool | None = None
     target_source_id: str | None = None
     target_object_id: int | None = None
+    target_ra_deg: float | None = None
+    target_dec_deg: float | None = None
     target_max_sep_arcsec: float | None = 120.0
     export_target_light_curve: bool = True
     export_candidate_light_curves: bool = True
@@ -419,6 +421,8 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
     the generated calibration names, and per-step result counters in `pipeline_runs` and
     `pipeline_run_steps`.
     """
+
+    validate_target_coordinates(config.target_ra_deg, config.target_dec_deg)
 
     if config.materialize_intermediate_calibrations:
         raise ValueError(
@@ -524,7 +528,10 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
         "require_detection_support_effective": require_detection_support_effective,
         "target_source_id": config.target_source_id,
         "target_object_id": config.target_object_id,
+        "target_ra_deg": config.target_ra_deg,
+        "target_dec_deg": config.target_dec_deg,
         "target_provenance_status": _target_provenance_status(config),
+        "target_requested_provenance_status": _target_provenance_status(config),
         "export_target_light_curve": config.export_target_light_curve,
         "exclude_candidates_from_ensemble": config.exclude_candidates_from_ensemble,
         "intermediate_measurement_materialization": "NORMALIZED_ONLY",
@@ -1376,6 +1383,8 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                     frame_ids=_frame_ids_for_step(selected_frame_ids),
                     target_source_id=config.target_source_id,
                     target_object_id=config.target_object_id,
+                    target_ra_deg=config.target_ra_deg,
+                    target_dec_deg=config.target_dec_deg,
                     max_sep_arcsec=config.target_max_sep_arcsec,
                 )
                 target_resolution = target.to_dict()
@@ -1383,21 +1392,6 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                 return dict(target_resolution)
 
             add_step("resolve_target_object", _resolve_target_step)
-
-        target_artifacts_should_exist = bool(
-            config.export_target_light_curve
-            and target_resolution.get("resolved")
-            and not stop_due_to_no_usable_frames
-        )
-        if config.out_dir and not target_artifacts_should_exist:
-            add_step(
-                "cleanup_target_light_curve_artifacts",
-                lambda: cleanup_target_light_curve_artifacts(
-                    out_dir=config.out_dir,
-                    calibration_prefix=config.calibration_prefix,
-                    dry_run=config.dry_run,
-                ),
-            )
 
         def _publish_photometric_qc_ensemble_base(
             _session: Session,
@@ -3151,9 +3145,17 @@ def _target_provenance_status(config: FieldPipelineConfig) -> str:
         return "EXPLICIT_OBJECT_ID"
     if config.target_source_id:
         return "EXPLICIT_SOURCE_ID"
+    if config.target_ra_deg is not None or config.target_dec_deg is not None:
+        return "EXPLICIT_OBJECT_COORDINATES"
     if config.target_max_sep_arcsec is not None and float(config.target_max_sep_arcsec) < 0:
         return "DISABLED_UNRESOLVED"
-    return "AUTO_NEAREST_TO_FIELD_CENTER"
+    return "UNRESOLVED_NO_TRUSTED_TARGET_INPUT"
+
+
+def _target_resolution_provenance_status(
+    config: FieldPipelineConfig, target_result: dict[str, Any]
+) -> str:
+    return _target_provenance_status(config)
 
 
 def _detection_branch_enabled(config: FieldPipelineConfig) -> bool:
@@ -3441,12 +3443,29 @@ def _quality_policy_summary(config: FieldPipelineConfig, result: PipelineRunResu
         "require_detection_support_effective": _effective_require_detection_support(config),
         "target_source_id": config.target_source_id,
         "target_object_id_requested": config.target_object_id,
-        "target_provenance_status": _target_provenance_status(config),
+        "target_ra_deg": config.target_ra_deg,
+        "target_dec_deg": config.target_dec_deg,
+        "target_requested_ra_deg": config.target_ra_deg,
+        "target_requested_dec_deg": config.target_dec_deg,
+        "target_requested_provenance_status": _target_provenance_status(config),
+        "target_provenance_status": _target_resolution_provenance_status(
+            config, target_result
+        ),
         "target_resolved": target_resolved,
+        "target_effective_ra_deg": (
+            target_result.get("target_ra_deg") if target_resolved else None
+        ),
+        "target_effective_dec_deg": (
+            target_result.get("target_dec_deg") if target_resolved else None
+        ),
+        "target_resolution_ra_deg": target_result.get("target_ra_deg"),
+        "target_resolution_dec_deg": target_result.get("target_dec_deg"),
         "target_object_id": target_result.get("object_id") if target_resolved else None,
         "target_catalog_source_id": target_result.get("catalog_source_id") if target_resolved else None,
         "target_sep_arcsec": target_result.get("sep_arcsec") if target_resolved else None,
         "target_resolution_method": target_result.get("method"),
+        "target_coordinate_provenance": target_result.get("coordinate_provenance"),
+        "target_resolution_reason": target_result.get("reason"),
         "nearest_target_candidate_object_id": target_result.get("nearest_object_id"),
         "nearest_target_candidate_source_id": target_result.get("nearest_source_id"),
         "nearest_target_candidate_catalog_source_id": target_result.get("nearest_catalog_source_id"),

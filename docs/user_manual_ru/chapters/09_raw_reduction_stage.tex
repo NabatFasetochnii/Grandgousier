@@ -370,6 +370,12 @@ Primary HDU содержит calibrated image в \cli{float32}. Отрицате
 
 В primary header также записываются provenance cards \cli{GGSTAGE}, \cli{GGALG}, \cli{GGVER}, \cli{GGRAW}, \cli{GGHDR}; \cli{DARK}/\cli{FLAT} указывают применённые MASTER products. \cli{GGDRKSC=F} фиксирует отсутствие dark scaling, \cli{GGFLNRM=F} --- отсутствие дополнительной нормировки flat. \cli{GGMSMETA=T} явно помечает ZEROPOI/BACKGRND/SEX* и другие скопированные MASTER processing metadata как reference provenance: Grandgousier не пересчитывает эти поля на Stage~1B. При записи FITS рассчитываются стандартные \cli{CHECKSUM}/\cli{DATASUM}; publication выполняется через временный \cli{.part} и atomic rename. Начиная с 0.5.42.1 длинные path-valued cards \cli{DARK}, \cli{FLAT}, \cli{GGRAW}, \cli{GGHDR} записываются без FITS comment: значение пути сохраняется полностью, а лишний комментарий не провоцирует \cli{VerifyWarning} о превышении 80-символьной FITS card.
 
+\subsection{Заголовочные metadata и target identity}
+
+Карты MASTER processing header, включая \cli{ALPHA/DELTA}, могут сохраняться в FITS как исходные pointing/processing metadata, но не являются authoritative target selector. Stage~1 и field-based Stage~2 не требуют target; optional target выбирается только явно через object ID, catalog source ID или парную caller RA/Dec. Без selector текущий resolver возвращает \texttt{not\_requested} до calibration/frame/header DB queries и не выполняет inference по ближайшему центру кадра, \cli{ALPHA/DELTA}, \cli{CRVAL/WCS} или \cli{coord2000}. Target export и отметка \texttt{FIELD\_TARGET} пропускаются, существующие target CSV/JSON/PNG не удаляются только из-за no-target run; отсутствие target само по себе не делает поле неготовым.
+
+\cli{coord2000} остаётся optional archive/search/frame metadata; его значения меняются от кадра к кадру и не задают постоянную identity цели. Текущий parenthesized вид \cli{coord2000::text} не разбирается Stage~1 parser, а окончательные семантика и конверсия этой optional ветки остаются открытыми. Это ограничение archive/search metadata path, а не global blocker field science.
+
 \subsection{DQ extension}
 
 Второй HDU \cli{DQ} содержит unsigned 8-bit bitmask; в primary header это фиксируется как \cli{GGDQSCH=MASTER\_DQ\_V2} и \cli{GGDQDT=UINT8}:

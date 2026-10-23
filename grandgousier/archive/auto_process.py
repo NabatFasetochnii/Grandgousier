@@ -359,6 +359,8 @@ def process_archive_path(
     require_detection_support: bool | None = None,
     target_source_id: str | None = None,
     target_object_id: int | None = None,
+    target_ra_deg: float | None = None,
+    target_dec_deg: float | None = None,
     target_max_sep_arcsec: float | None = 120.0,
     export_target_light_curve: bool = True,
     export_candidate_light_curves: bool = True,
@@ -428,6 +430,9 @@ def process_archive_path(
     allow_empty_catalog: bool = False,
     manifest_out: str | Path | None = None,
 ) -> ProcessArchiveResult:
+    from grandgousier.lightcurves.target import validate_target_coordinates
+
+    validate_target_coordinates(target_ra_deg, target_dec_deg)
     exact_path_list = [Path(value) for value in exact_paths] if exact_paths is not None else None
     if exact_path_list is None:
         detected, groups, warnings = scan_archive_path(
@@ -511,12 +516,13 @@ def process_archive_path(
     if (
         target_source_id is None
         and target_object_id is None
+        and target_ra_deg is None
         and target_max_sep_arcsec is not None
         and float(target_max_sep_arcsec) < 0
     ):
         result.warnings.append(
             "target provenance disabled: --target-max-sep-arcsec is negative and neither "
-            "--target-source-id nor --target-object-id was supplied"
+            "--target-source-id, --target-object-id nor paired sky coordinates were supplied"
         )
 
     if not execute:
@@ -895,6 +901,8 @@ def process_archive_path(
             require_detection_support=require_detection_support,
             target_source_id=target_source_id,
             target_object_id=target_object_id,
+            target_ra_deg=target_ra_deg,
+            target_dec_deg=target_dec_deg,
             target_max_sep_arcsec=target_max_sep_arcsec,
             export_target_light_curve=export_target_light_curve,
             export_candidate_light_curves=export_candidate_light_curves,
@@ -1023,6 +1031,8 @@ def process_archive_path(
                 "require_detection_support": require_detection_support,
                 "target_source_id": target_source_id,
                 "target_object_id": target_object_id,
+                "target_ra_deg": target_ra_deg,
+                "target_dec_deg": target_dec_deg,
                 "target_max_sep_arcsec": target_max_sep_arcsec,
                 "export_target_light_curve": export_target_light_curve,
                 "export_candidate_light_curves": export_candidate_light_curves,

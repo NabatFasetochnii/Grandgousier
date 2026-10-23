@@ -9,6 +9,7 @@ pytest.importorskip("astropy")
 from astropy.io import fits
 import numpy as np
 
+from grandgousier.archive import auto_process as auto_process_module
 from grandgousier.archive.auto_process import (
     _catalog_precondition_ok,
     _classify_science_status,
@@ -112,6 +113,61 @@ def test_scan_archive_path_auto_detects_master_and_robophot(tmp_path):
     keys = {(g.profile_name, g.filter_name, g.camera, g.n_files) for g in groups}
     assert ("MASTER", "I", "204", 1) in keys
     assert ("RoboPhot", "g", "ML0742515", 1) in keys
+
+
+def test_target_coordinate_pair_rejected_before_archive_scan(monkeypatch, tmp_path):
+    monkeypatch.setattr(auto_process_module, "scan_archive_path",
+                        lambda *_a, **_kw: pytest.fail("archive scanner must not run"))
+    with pytest.raises(ValueError, match="supplied together"):
+        process_archive_path(object(), root=tmp_path, target_ra_deg=20.0)
+
+
+def test_process_archive_path_plan_accepts_degree_pair_without_processing(monkeypatch, tmp_path):
+    monkeypatch.setattr(auto_process_module, "scan_archive_paths",
+                        lambda *_a, **_kw: ([], [], []))
+    monkeypatch.setattr(auto_process_module, "load_auto_profiles", lambda **_kw: {})
+    monkeypatch.setattr(auto_process_module, "_default_auto_catalog_name",
+                        lambda *_a, **_kw: "local_catalog")
+    monkeypatch.setattr(auto_process_module, "plan_file_science_selection",
+                        lambda *_a, **_kw: SimpleNamespace(summary={}, rows=[]))
+    result = process_archive_path(object(), root=tmp_path, exact_paths=[], execute=False,
+                                  target_ra_deg=0.0, target_dec_deg=90.0)
+    assert result.status == "PLAN"
+    assert not result.pipeline_results
+
+
+def test_process_archive_path_cli_passes_coordinate_pair_before_db_open(monkeypatch):
+    from grandgousier import cli
+
+    parser = cli.build_parser()
+    args = parser.parse_args(["process-archive-path", "--path", "synthetic",
+                              "--target-ra-deg", "22.5", "--target-dec-deg", "67.25"])
+    args.target_dec_deg = None
+    monkeypatch.setattr(cli, "make_session_factory",
+                        lambda *_a, **_kw: pytest.fail("invalid pair must not open DB"))
+    assert cli.cmd_process_archive_path(args) == 2
+    args.target_dec_deg = 67.25
+
+    class FakeSessionContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(cli, "make_session_factory", lambda *_a: FakeSessionContext)
+    observed = {}
+
+    def fake_process(*_args, **kwargs):
+        observed.update(kwargs)
+        raise RuntimeError("synthetic handoff reached")
+
+    monkeypatch.setattr(auto_process_module, "process_archive_path", fake_process)
+    with pytest.raises(RuntimeError, match="synthetic handoff reached"):
+        cli.cmd_process_archive_path(args)
+    assert observed["target_ra_deg"] == 22.5
+    assert observed["target_dec_deg"] == 67.25
+    assert observed["execute"] is False
 
 
 def test_discover_fits_files_is_suffix_based_and_sorted(tmp_path):
