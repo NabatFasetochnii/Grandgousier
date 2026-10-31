@@ -329,6 +329,9 @@ def aperture_zp_calibrate(
     measurements are copied, not overwritten.
     """
 
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("explicit frame_ids selection must not be empty")
+
     total_started = perf_counter()
     result = ApertureZpCalibrationResult(
         source_calibration_name=source_calibration_name,

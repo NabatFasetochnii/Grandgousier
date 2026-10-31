@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping
 
@@ -722,7 +722,30 @@ class FilesystemProductStore(ProductStore):
     def resolve(self, ref: ProductRef) -> Path:
         if ref.store_id != self.store_id or ref.backend != "filesystem":
             raise ValueError("Product ref is not owned by this filesystem store")
-        return self.root.joinpath(*PurePosixPath(ref.locator).parts)
+        locator_text = str(ref.locator).strip()
+        posix_locator = PurePosixPath(locator_text.replace("\\", "/"))
+        windows_locator = PureWindowsPath(locator_text)
+        if (
+            not posix_locator.parts
+            or posix_locator.is_absolute()
+            or any(part == ".." for part in posix_locator.parts)
+            or windows_locator.drive
+            or windows_locator.root
+        ):
+            raise ValueError("Product locator must be a safe relative path")
+
+        product_path = self.root.joinpath(*posix_locator.parts)
+        try:
+            resolved_root = self.root.resolve(strict=False)
+            resolved_product = product_path.resolve(strict=False)
+            resolved_product.relative_to(resolved_root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(
+                "Product locator resolves outside the filesystem product store root"
+            ) from exc
+        if resolved_product == resolved_root:
+            raise ValueError("Product locator must name a path beneath the store root")
+        return product_path
 
 
 @dataclass(frozen=True)
@@ -894,6 +917,48 @@ def _master_manifest_factory(source_id: str, raw: Mapping[str, Any]) -> ArchiveS
     return ArchiveSourceRuntime(descriptor, provider, asset_provider)
 
 
+def _master_physical_factory(source_id: str, raw: Mapping[str, Any]) -> ArchiveSourceRuntime:
+    from grandgousier.archive.master_physical_archive import (
+        MasterPhysicalAssetProvider,
+        MasterPhysicalMetadataProvider,
+    )
+
+    profile = load_instrument_profile(str(raw.get("instrument_profile") or "MASTER"))
+    if profile.name != "MASTER":
+        raise ValueError("master-physical adapter requires the MASTER instrument profile")
+    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), Mapping) else {}
+    assets = raw.get("assets") if isinstance(raw.get("assets"), Mapping) else {}
+    metadata_backend = str(metadata.get("backend") or "physical-imdata-headers").strip().casefold()
+    asset_backend = str(assets.get("backend") or "master-physical").strip().casefold()
+    if metadata_backend != "physical-imdata-headers":
+        raise ValueError("master-physical adapter requires metadata.backend=physical-imdata-headers")
+    if asset_backend != "master-physical":
+        raise ValueError("master-physical adapter requires assets.backend=master-physical")
+    imdata_root = metadata.get("imdata_root")
+    if not isinstance(imdata_root, (str, Path)) or not str(imdata_root).strip():
+        raise ValueError(f"archives.{source_id}.metadata.imdata_root is required")
+    raw_keys = metadata.get("raw_relative_physical_keys")
+    provider = MasterPhysicalMetadataProvider(
+        source_id=source_id,
+        imdata_root=str(imdata_root),
+        raw_relative_physical_keys=raw_keys,
+        profile=profile,
+    )
+    asset_provider = MasterPhysicalAssetProvider(
+        source_id=source_id,
+        imdata_root=str(imdata_root),
+    )
+    descriptor = ArchiveSourceDescriptor(
+        source_id=source_id,
+        adapter="master-physical",
+        instrument_profile="MASTER",
+        metadata_backend="physical-imdata-headers",
+        asset_backend="master-physical",
+        public_config=_public_mapping(raw),
+    )
+    return ArchiveSourceRuntime(descriptor, provider, asset_provider)
+
+
 def _master_coord_pair(row: Mapping[str, Any]) -> tuple[float | None, float | None]:
     ra = _optional_float(row.get("ra_deg"))
     dec = _optional_float(row.get("dec_deg"))
@@ -931,6 +996,7 @@ def _first_nonempty(*values: Any) -> Any:
 
 register_archive_source_adapter("fits-filesystem", _fits_factory)
 register_archive_source_adapter("master-manifest", _master_manifest_factory)
+register_archive_source_adapter("master-physical", _master_physical_factory)
 
 
 __all__ = [

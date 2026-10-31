@@ -59,6 +59,9 @@ from grandgousier.db.models import (
 from grandgousier.identity.object import get_or_create_object_for_catalog_source
 
 
+FORCED_PHOTOMETRY_FAILURE_SAMPLE_LIMIT = 20
+
+
 @dataclass
 class ForcedPhotometryResult:
     selected_frames: int = 0
@@ -93,6 +96,8 @@ class ForcedPhotometryResult:
     skipped_missing_file: int = 0
     failed_frames: int = 0
     failed_measurements: int = 0
+    failure_samples: list[dict[str, Any]] = field(default_factory=list)
+    failure_samples_truncated: int = 0
     calibration_version_id: int | None = None
     calibration_name: str | None = None
     dry_run: bool = False
@@ -146,6 +151,35 @@ class ForcedPhotometryResult:
     timings_sec: dict[str, float] = field(default_factory=dict)
     frame_timing_summary: dict[str, dict[str, float]] = field(default_factory=dict)
     throughput: dict[str, float] = field(default_factory=dict)
+
+
+def _record_failure_sample(
+    result: ForcedPhotometryResult,
+    *,
+    frame_id: int,
+    stage: str,
+    reason: str,
+    exception: Exception | None = None,
+    frame_catalog_link_id: int | None = None,
+    catalog_source_id: int | None = None,
+) -> None:
+    """Keep a bounded, path-free sample of failures for pipeline diagnostics."""
+
+    if len(result.failure_samples) >= FORCED_PHOTOMETRY_FAILURE_SAMPLE_LIMIT:
+        result.failure_samples_truncated += 1
+        return
+
+    sample: dict[str, Any] = {
+        "frame_id": int(frame_id),
+        "stage": str(stage),
+        "reason": str(reason),
+        "exception_class": type(exception).__name__ if exception is not None else None,
+    }
+    if frame_catalog_link_id is not None:
+        sample["frame_catalog_link_id"] = int(frame_catalog_link_id)
+    if catalog_source_id is not None:
+        sample["catalog_source_id"] = int(catalog_source_id)
+    result.failure_samples.append(sample)
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +322,9 @@ def run_forced_aperture_photometry(
     Coordinates are taken from frame_catalog_links.x/y and are interpreted as 0-based
     FITS array pixel coordinates produced by astropy.wcs.world_to_pixel_values().
     """
+
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("An explicit frame_ids selection must not be empty")
 
     photometry_estimator = str(photometry_estimator or "circular").strip().lower()
     if photometry_estimator not in {"circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"}:
@@ -670,9 +707,22 @@ def run_forced_aperture_photometry(
                     pass
             if data.ndim != 2:
                 result.failed_frames += 1
+                _record_failure_sample(
+                    result,
+                    frame_id=frame_id,
+                    stage="image_geometry",
+                    reason="expected_two_dimensional_image",
+                )
                 continue
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - FITS failures are counted and safely sampled.
             result.failed_frames += 1
+            _record_failure_sample(
+                result,
+                frame_id=frame_id,
+                stage="fits_read",
+                reason="fits_read_failed",
+                exception=exc,
+            )
             continue
 
         phase_started = _timing_start()
@@ -720,11 +770,23 @@ def run_forced_aperture_photometry(
                     result.adaptive_frames_fallback += 1
                     if not adaptive_fallback_to_circular:
                         result.failed_frames += 1
+                        _record_failure_sample(
+                            result,
+                            frame_id=frame_id,
+                            stage="psf_model",
+                            reason="adaptive_psf_model_unavailable_fallback_disabled",
+                        )
                         continue
                 elif photometry_estimator == "spatial_psf":
                     result.psf_frames_fallback += 1
                     if not adaptive_fallback_to_circular:
                         result.failed_frames += 1
+                        _record_failure_sample(
+                            result,
+                            frame_id=frame_id,
+                            stage="psf_model",
+                            reason="spatial_psf_model_unavailable_fallback_disabled",
+                        )
                         continue
 
         if photometry_estimator == "empirical_psf":
@@ -749,6 +811,12 @@ def run_forced_aperture_photometry(
                 adaptive_frame_fallback_reason = adaptive_frame_fallback_reason or "empirical_psf_model_unavailable"
                 if adaptive_psf_field is None and not adaptive_fallback_to_circular:
                     result.failed_frames += 1
+                    _record_failure_sample(
+                        result,
+                        frame_id=frame_id,
+                        stage="psf_model",
+                        reason="empirical_psf_model_unavailable_fallback_disabled",
+                    )
                     continue
 
         frame_selected_errors: list[float] = []
@@ -770,6 +838,7 @@ def run_forced_aperture_photometry(
         frame_diagnostics_row_build_sec = 0.0
         source_loop_started = _timing_start()
         for link, source in links:
+            failure_stage = "object_identity"
             try:
                 phase_started = _timing_start()
                 object_id = object_cache.get(source.catalog_source_id)
@@ -784,6 +853,7 @@ def run_forced_aperture_photometry(
                 frame_object_identity_sec += object_identity_elapsed
 
                 source_kernel_timings: dict[str, float] | None = {} if diagnose_performance else None
+                failure_stage = "source_measurement"
                 phase_started = _timing_start()
                 if photometry_estimator in {"adaptive_ellipse", "spatial_psf", "empirical_psf"} and (adaptive_psf_field is not None or empirical_psf_field is not None):
                     geometry = (
@@ -855,6 +925,14 @@ def run_forced_aperture_photometry(
                                 measurement.flags["empirical_psf_failure_flags"] = empirical_failure_flags
                             else:
                                 result.failed_measurements += 1
+                                _record_failure_sample(
+                                    result,
+                                    frame_id=frame_id,
+                                    stage="source_measurement",
+                                    reason="empirical_psf_measurement_failed_fallback_disabled",
+                                    frame_catalog_link_id=link.frame_catalog_link_id,
+                                    catalog_source_id=source.catalog_source_id,
+                                )
                                 continue
                     elif geometry is not None and photometry_estimator == "spatial_psf":
                         measurement = measure_spatial_psf_source(
@@ -950,6 +1028,22 @@ def run_forced_aperture_photometry(
                         measurement.flags["photometry_estimator"] = f"circular_fallback_from_{photometry_estimator}"
                     else:
                         result.failed_measurements += 1
+                        _record_failure_sample(
+                            result,
+                            frame_id=frame_id,
+                            stage=(
+                                "psf_model"
+                                if photometry_estimator != "circular"
+                                else "source_measurement"
+                            ),
+                            reason=(
+                                f"{photometry_estimator}_model_unavailable_fallback_disabled"
+                                if photometry_estimator != "circular"
+                                else "measurement_unavailable_fallback_disabled"
+                            ),
+                            frame_catalog_link_id=link.frame_catalog_link_id,
+                            catalog_source_id=source.catalog_source_id,
+                        )
                         continue
                 else:
                     measurement = measure_one_source(
@@ -1064,6 +1158,7 @@ def run_forced_aperture_photometry(
                 frame_scintillation_available.append(scintillation_available)
                 if dry_run or object_id is None:
                     continue
+                failure_stage = "measurement_row_build"
                 rows.append(
                     {
                         "object_id": object_id,
@@ -1110,9 +1205,22 @@ def run_forced_aperture_photometry(
                 )
                 diagnostics_row_elapsed = _timing_add("diagnostics_and_row_build", phase_started)
                 frame_diagnostics_row_build_sec += diagnostics_row_elapsed
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - a bad source row must not abort the frame.
                 result.failed_measurements += 1
-                # Store nothing in this MVP path; detailed per-source failures can be added later.
+                failure_reason = {
+                    "object_identity": "object_identity_failed",
+                    "source_measurement": "source_measurement_failed",
+                    "measurement_row_build": "measurement_row_build_failed",
+                }.get(failure_stage, "measurement_processing_failed")
+                _record_failure_sample(
+                    result,
+                    frame_id=frame_id,
+                    stage=failure_stage,
+                    reason=failure_reason,
+                    exception=exc,
+                    frame_catalog_link_id=link.frame_catalog_link_id,
+                    catalog_source_id=source.catalog_source_id,
+                )
                 continue
 
         source_loop_elapsed = _timing_add("source_loop", source_loop_started)

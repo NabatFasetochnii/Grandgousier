@@ -16,11 +16,17 @@ from sqlalchemy.orm import Session
 
 from grandgousier.lightcurves.product import (
     DEFAULT_REJECT_FLAGS,
+    LightCurveSelectionError,
     export_science_light_curve_csv,
     load_science_light_curve_rows,
+    preflight_science_light_curve_selection,
 )
 from grandgousier.quality.candidate_triage import LOW_AMPLITUDE_DIAGNOSTIC_COLUMNS
 from grandgousier.quality.candidate_axis_correlation import CANDIDATE_AXIS_CORRELATION_COLUMNS
+from grandgousier.visualization.lightcurve_plot import (
+    format_lightcurve_identity_subtitle,
+    set_lightcurve_plot_title,
+)
 
 
 CANDIDATE_SUMMARY_COLUMNS: tuple[str, ...] = (
@@ -62,6 +68,7 @@ CANDIDATE_SUMMARY_COLUMNS: tuple[str, ...] = (
     "n_points",
     "n_accepted",
     "n_rejected",
+    "interseries_generation_ids",
     "mag_median",
     "mag_rms",
     "mag_mad",
@@ -134,6 +141,8 @@ class CandidateLightCurveProduct:
     target_diagnostics_csv: str | None = None
     target_diagnostics_json: str | None = None
     membership_history_json: str | None = None
+    interseries_generation_ids: list[int] = field(default_factory=list)
+    interseries_generation_scopes: list[dict[str, Any]] = field(default_factory=list)
     summary_rows: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -168,6 +177,8 @@ class CandidateLightCurveProduct:
             "target_diagnostics_csv": self.target_diagnostics_csv,
             "target_diagnostics_json": self.target_diagnostics_json,
             "membership_history_json": self.membership_history_json,
+            "interseries_generation_ids": list(self.interseries_generation_ids),
+            "interseries_generation_scopes": list(self.interseries_generation_scopes),
             "summary_rows": self.summary_rows,
             "warnings": list(self.warnings),
         }
@@ -185,6 +196,7 @@ def export_accepted_candidate_light_curves(
     catalog_name: str | None = None,
     series_id: int | None = None,
     frame_ids: list[int] | None = None,
+    interseries_generation_ids: list[int] | None = None,
     reject_flags: set[str] | None = None,
     out_dir: str | Path,
     limit: int | None = None,
@@ -199,6 +211,15 @@ def export_accepted_candidate_light_curves(
     """
 
     final_out_path = Path(out_dir)
+    scope_series_id = None if frame_ids else series_id
+    selection_scope = preflight_science_light_curve_selection(
+        session,
+        calibration_names=[calibration_name],
+        catalog_name=catalog_name,
+        series_id=scope_series_id,
+        frame_ids=frame_ids,
+        interseries_generation_ids=interseries_generation_ids,
+    )
     final_out_path.parent.mkdir(parents=True, exist_ok=True)
     staging_out_path = final_out_path.with_name(
         f".{final_out_path.name}.staging-{uuid.uuid4().hex}"
@@ -214,12 +235,14 @@ def export_accepted_candidate_light_curves(
             catalog_name=catalog_name,
             series_id=series_id,
             frame_ids=frame_ids,
+            interseries_generation_ids=interseries_generation_ids,
             reject_flags=reject_flags,
             out_dir=staging_out_path,
             public_out_dir=final_out_path,
             limit=limit,
             export_plots=export_plots,
             membership_history=membership_history,
+            selection_scope=selection_scope,
         )
         _replace_directory_tree(staging_out_path, final_out_path)
         return product
@@ -237,12 +260,14 @@ def _export_accepted_candidate_light_curves_impl(
     catalog_name: str | None = None,
     series_id: int | None = None,
     frame_ids: list[int] | None = None,
+    interseries_generation_ids: list[int] | None = None,
     reject_flags: set[str] | None = None,
     out_dir: str | Path,
     public_out_dir: str | Path,
     limit: int | None = None,
     export_plots: bool = True,
     membership_history: list[dict[str, Any]] | None = None,
+    selection_scope: Any | None = None,
 ) -> CandidateLightCurveProduct:
     """Export one CSV/JSON light curve per accepted variable candidate.
 
@@ -253,6 +278,10 @@ def _export_accepted_candidate_light_curves_impl(
     """
 
     product = CandidateLightCurveProduct(rows_total=len(candidate_rows))
+    if selection_scope is not None:
+        product.interseries_generation_ids = list(selection_scope.interseries_generation_ids)
+        product.interseries_generation_scopes = list(selection_scope.interseries_generation_scopes)
+        product.warnings.extend(selection_scope.warnings)
     out_path = Path(out_dir)
     public_out_path = Path(public_out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -311,16 +340,35 @@ def _export_accepted_candidate_light_curves_impl(
             )
             if candidate_reject_override:
                 row["candidate_reject_override"] = candidate_reject_override
-            _scope, lc_rows = load_science_light_curve_rows(
+            light_curve_scope, lc_rows = load_science_light_curve_rows(
                 session,
                 calibration_names=[calibration_name],
                 catalog_name=catalog_name,
                 object_id=object_id,
                 series_id=scope_series_id,
                 frame_ids=frame_ids,
+                interseries_generation_ids=(
+                    interseries_generation_ids
+                    if interseries_generation_ids is not None
+                    else (product.interseries_generation_ids or None)
+                ),
                 reject_flags=candidate_reject_flags,
                 exclude_rejected=False,
             )
+            if (
+                light_curve_scope is not None
+                and (
+                    list(getattr(light_curve_scope, "interseries_generation_ids", []) or [])
+                    != product.interseries_generation_ids
+                    or list(
+                        getattr(light_curve_scope, "interseries_generation_scopes", []) or []
+                    )
+                    != product.interseries_generation_scopes
+                )
+            ):
+                raise LightCurveSelectionError(
+                    "M4 generation selection changed after candidate-export preflight; refusing staged output"
+                )
             lc_summary = _summarize_light_curve(lc_rows)
             export_status = _candidate_export_status_for_row(row, lc_summary)
             lc_summary["candidate_export_status"] = export_status
@@ -343,6 +391,9 @@ def _export_accepted_candidate_light_curves_impl(
                     _append_plot_warning(product, plot_warning)
 
             science_candidate_row = _candidate_row_with_light_curve_metrics(row, lc_summary)
+            science_candidate_row["interseries_generation_ids"] = ",".join(
+                str(value) for value in product.interseries_generation_ids
+            )
             json_payload = {
                 "candidate": _json_safe(science_candidate_row),
                 "candidate_export_status": export_status,
@@ -371,6 +422,8 @@ def _export_accepted_candidate_light_curves_impl(
                     product.rejected_no_accepted_points += 1
                 elif export_status.endswith("NO_POINTS"):
                     product.rejected_no_points += 1
+        except LightCurveSelectionError:
+            raise
         except SQLAlchemyError:
             # A database error is not a per-candidate cosmetic failure.  On
             # PostgreSQL it also aborts the current transaction, so swallowing
@@ -691,7 +744,7 @@ def _export_candidate_light_curve_plot(
     source_id = candidate_row.get("source_id") or "unknown source"
     object_id = candidate_row.get("object_id") or "unknown object"
     origin = candidate_row.get("candidate_origin") or "candidate"
-    ax.set_title(f"object {object_id} / {source_id} / {origin}")
+    plot_title = f"object {object_id} / {source_id} / {origin}"
     ax.set_xlabel(f"MJD - {x0:.0f}")
     ax.set_ylabel("Calibrated magnitude")
     ax.grid(True, alpha=0.3)
@@ -717,9 +770,20 @@ def _export_candidate_light_curve_plot(
         fontsize=8,
         bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.75, "edgecolor": "0.7"},
     )
+    set_lightcurve_plot_title(
+        fig,
+        ax,
+        title=plot_title,
+        subtitle=format_lightcurve_identity_subtitle(
+            ra_deg=candidate_row.get("ra_deg"),
+            dec_deg=candidate_row.get("dec_deg"),
+            catalog_name=candidate_row.get("catalog_name"),
+            source_id=candidate_row.get("source_id"),
+            coordinate_label="Catalog coordinates",
+        ),
+    )
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
@@ -924,6 +988,8 @@ def _summary_counts(product: CandidateLightCurveProduct) -> dict[str, Any]:
         "target_diagnostics_csv": product.target_diagnostics_csv,
         "target_diagnostics_json": product.target_diagnostics_json,
         "membership_history_json": product.membership_history_json,
+        "interseries_generation_ids": list(product.interseries_generation_ids),
+        "interseries_generation_scopes": list(product.interseries_generation_scopes),
         "warnings": list(product.warnings),
     }
 

@@ -329,12 +329,13 @@ def build_field_status(
         generation_id = int(generation["interseries_generation_id"])
         verification = verify_interseries_generation(session, generation_id=generation_id)
         source_rows = load_interseries_generation_series(session, generation_id=generation_id)
-        source_series = {int(row["series_id"]) for row in source_rows}
+        orphan_source = any(row["series_id"] is None for row in source_rows)
+        source_series = {int(row["series_id"]) for row in source_rows if row["series_id"] is not None}
         filter_name = str(generation.get("filter_name") or "")
         instrument_unit_id = generation.get("instrument_unit_id")
         scope = (filter_name, int(instrument_unit_id) if instrument_unit_id is not None else None)
         expected_series = ready_by_scope.get(scope, set())
-        scope_matches = bool(expected_series) and source_series == expected_series
+        scope_matches = bool(expected_series) and not orphan_source and source_series == expected_series
         if filter_name:
             covered_scopes.add(scope)
         if verification.status != "OK" or not scope_matches:

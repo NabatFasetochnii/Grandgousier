@@ -155,6 +155,19 @@ python -m grandgousier.cli export-global-object-light-curve `
   --out-root reports\object_12345_global
 \end{lstlisting}
 
+\texttt{--out-root} здесь является именем финального bundle-каталога. В нём остаются
+стабильные basenames \texttt{object\_12345\_global.csv},
+\texttt{object\_12345\_global\_summary.json}, per-filter plot CSV/image и, при запросе,
+\texttt{object\_12345\_global\_rejections.csv}. Существующий каталог и старые flat
+files рядом с ним блокируют запуск без перезаписи. Файлы сначала полностью собираются в
+скрытом staging sibling, затем публикуются одной same-filesystem native no-replace rename.
+После аварии staging-каталог вида \texttt{.object\_12345\_global.m5-staging-*} может
+остаться; он не является финальным output и автоматически не очищается/не переиспользуется.
+Поддерживаются Windows \texttt{os.rename}, Linux libc
+\texttt{renameat2(RENAME\_NOREPLACE)} и macOS libc \texttt{renamex\_np(RENAME\_EXCL)};
+неподдерживаемые платформы, символы и файловые системы fail closed, без ordinary-rename
+fallback. Это атомарная публикация namespace, но не гарантия fsync/power-loss durability.
+
 Если экспорт сообщает 0 accepted points, начиная с 0.5.47.1 summary печатает причины rejection. Для построчного diagnostic CSV добавьте \texttt{--include-rejected-debug}; plots при этом не строятся, пока нет accepted points.
 
 Основной CSV содержит точные Stage~2 \texttt{SCIENCE} points с применённым M4 offset и по умолчанию не подвергается downsampling. Графики используют только accepted points. Если число exact linked source rows до QC больше \texttt{--plot-max-points} (по умолчанию 5000 на фильтр), plot-layer консервативно переходит к временному биннингу. Начиная с 0.5.47.2 этот лимит является жёстким верхним пределом числа plot points на фильтр. По умолчанию \texttt{--plot-time-axis auto} также сжимает большие пустые интервалы между наблюдательными сериями и помечает разрывы \texttt{//}; исходный MJD в CSV не изменяется. Фильтры не смешиваются.

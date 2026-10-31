@@ -47,6 +47,7 @@ def export_lightcurve_plot(
     x_key: str = "mjd_zero",
     y_key: str = "mag_cal",
     title: str | None = None,
+    subtitle: str | None = None,
     dpi: int = 150,
     figsize: tuple[float, float] = (8.0, 4.8),
     invert_y: bool | None = None,
@@ -123,10 +124,7 @@ def export_lightcurve_plot(
     ax.set_ylabel(_axis_label(y_key))
     ax.grid(True, alpha=0.3)
 
-    if title:
-        ax.set_title(title)
-    else:
-        ax.set_title(_default_title(rows_list))
+    plot_title = title or _default_title(rows_list)
 
     if show_stats:
         ax.text(
@@ -157,7 +155,7 @@ def export_lightcurve_plot(
     if invert_y:
         ax.invert_yaxis()
 
-    fig.tight_layout()
+    set_lightcurve_plot_title(fig, ax, title=plot_title, subtitle=subtitle)
     fig.savefig(path, dpi=dpi)
     plt.close(fig)
 
@@ -178,6 +176,7 @@ def export_global_lightcurve_plot(
     path: str | Path,
     *,
     title: str | None = None,
+    subtitle: str | None = None,
     dpi: int = 160,
     figsize: tuple[float, float] = (9.2, 5.2),
     reduction_mode: str = "raw",
@@ -303,7 +302,7 @@ def export_global_lightcurve_plot(
     ax.set_ylabel("Global calibrated magnitude")
     ax.grid(True, alpha=0.3)
     ax.invert_yaxis()
-    ax.set_title(title or "M5 global object light curve")
+    plot_title = title or "M5 global object light curve"
     if not archive_overview:
         ax.legend(fontsize=8, ncol=2 if len(grouped) > 6 else 1)
     note_x, note_y, note_va, note_ha = (0.99, 0.99, "top", "right") if axis["mode"] == "compressed" else (0.01, 0.01, "bottom", "left")
@@ -317,7 +316,7 @@ def export_global_lightcurve_plot(
         fontsize=8,
         alpha=0.75,
     )
-    fig.tight_layout()
+    set_lightcurve_plot_title(fig, ax, title=plot_title, subtitle=subtitle)
     fig.savefig(path, dpi=dpi)
     plt.close(fig)
 
@@ -337,6 +336,61 @@ def export_global_lightcurve_plot(
         n_time_breaks=len(axis["break_positions"]),
         plot_style="archive_overview" if archive_overview else "series_detailed",
     )
+
+
+def format_lightcurve_identity_subtitle(
+    *,
+    object_uid: object = None,
+    ra_deg: object = None,
+    dec_deg: object = None,
+    catalog_name: object = None,
+    source_id: object = None,
+    coordinate_label: str = "Stored coordinates",
+) -> str | None:
+    """Format offline object-identifying anchors for a light-curve subtitle.
+
+    Coordinates are labeled only as stored coordinates; no frame or epoch is
+    implied.  Each value is handled independently so partial metadata still
+    contributes useful anchors.
+    """
+
+    parts: list[str] = []
+    coordinates = []
+    if _is_finite(ra_deg):
+        coordinates.append(f"RA={float(ra_deg):.6f}")
+    if _is_finite(dec_deg):
+        coordinates.append(f"Dec={float(dec_deg):+.6f}")
+    if coordinates:
+        parts.append(f"{coordinate_label} (deg): " + ", ".join(coordinates))
+
+    uid = _nonempty_text(object_uid)
+    if uid:
+        parts.append(f"object_uid={uid}")
+
+    source = _nonempty_text(source_id)
+    if source:
+        catalog = _nonempty_text(catalog_name)
+        parts.append(f"source_id={catalog + ':' if catalog else ''}{source}")
+
+    return " | ".join(parts) or None
+
+
+def set_lightcurve_plot_title(
+    fig,
+    ax,
+    *,
+    title: str,
+    subtitle: str | None = None,
+) -> None:
+    """Set a light-curve title and, when available, its consistent subtitle."""
+
+    if subtitle:
+        fig.suptitle(title)
+        ax.set_title(subtitle, fontsize=8, pad=8)
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.9))
+        return
+    ax.set_title(title)
+    fig.tight_layout()
 
 
 def _build_global_time_axis(rows: Sequence[dict], *, requested_mode: str = "auto") -> dict[str, object]:
@@ -734,3 +788,10 @@ def _first_nonempty(values) -> str | None:
         if text:
             return text
     return None
+
+
+def _nonempty_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None

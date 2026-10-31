@@ -41,6 +41,7 @@ class FramePreQcResult:
     # never become persistent QC payload.
     detection_seeds: dict[int, dict[str, Any]] = field(default_factory=dict, repr=False)
     dry_run: bool = False
+    selected_frame_ids: list[int] = field(default_factory=list, repr=False)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -86,6 +87,9 @@ def run_frame_pre_qc(
     and when it has 50000 ice/noise candidates).
     """
 
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("explicit frame_ids selection must not be empty")
+
     if threshold_sigma <= 0:
         raise ValueError("threshold_sigma must be positive")
     if detection_cap <= 0:
@@ -99,6 +103,7 @@ def run_frame_pre_qc(
         only_wcs_ok=only_wcs_ok,
     )
     result.selected_frames = len(frames)
+    result.selected_frame_ids = [int(frame.frame_id) for frame in frames]
 
     for frame in tqdm(frames, desc="Pre-photometry frame QC", unit="frame"):
         result.checked_frames += 1
@@ -330,7 +335,7 @@ def _select_frames(
     only_wcs_ok: bool,
 ) -> list[Frame]:
     stmt = select(Frame).order_by(Frame.frame_id)
-    if frame_ids:
+    if frame_ids is not None:
         stmt = stmt.where(Frame.frame_id.in_(frame_ids))
     if instrument_unit_id is not None:
         stmt = stmt.where(Frame.instrument_unit_id == instrument_unit_id)

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -90,7 +90,11 @@ from grandgousier.lightcurves.target import (
     resolve_target_object,
     validate_target_coordinates,
 )
-from grandgousier.logging_utils import PipelineFileLogger
+from grandgousier.logging_utils import (
+    PipelineFileLogger,
+    sanitize_diagnostic_text,
+    sanitize_jsonable_context,
+)
 from grandgousier.archive.fields_series import (
     load_series_selection,
     mark_series_pipeline_result,
@@ -111,6 +115,12 @@ class EnsemblePreconditionError(RuntimeError):
     def __init__(self, message: str, diagnostics: dict[str, Any]):
         super().__init__(message)
         self.diagnostics = dict(diagnostics)
+
+
+class FramePreQcExclusionPreconditionError(RuntimeError):
+    """Raised when pre-QC exclusion cannot establish a safe frame scope."""
+
+    status = "FAILED_PRECONDITION"
 
 
 def _ensemble_precondition_diagnostics(base_result: Any, *, min_ref_stars_per_frame: int) -> dict[str, Any]:
@@ -375,6 +385,7 @@ class FieldPipelineConfig:
     export_target_light_curve: bool = True
     export_candidate_light_curves: bool = True
     export_candidate_plots: bool = True
+    interseries_generation_ids: list[int] | None = None
     candidate_light_curve_limit: int | None = None
     exclude_candidates_from_ensemble: bool = False
     candidate_ensemble_max_iterations: int = 2
@@ -413,7 +424,82 @@ class FieldPipelineConfig:
     environment_json: dict[str, Any] = field(default_factory=dict)
 
 
+def _check_open_series_admission(session: Session, config: FieldPipelineConfig) -> None:
+    """Reject requested invocation scopes that include an OPEN field series."""
+
+    if config.series_id is not None:
+        return
+
+    with session.no_autoflush:
+        if config.frame_ids is not None:
+            frame_ids = sorted({int(frame_id) for frame_id in config.frame_ids})
+            if not frame_ids:
+                raise ValueError("An explicit frame_ids selection must not be empty")
+            statement = text(
+                """
+                SELECT fs.series_id
+                FROM field_series_frames AS fsf
+                JOIN field_series AS fs ON fs.series_id = fsf.series_id
+                WHERE fsf.frame_id IN :frame_ids
+                  AND UPPER(fs.status) = 'OPEN'
+                LIMIT 1
+                """
+            ).bindparams(bindparam("frame_ids", expanding=True))
+            open_series_id = session.execute(
+                statement, {"frame_ids": frame_ids}
+            ).scalar_one_or_none()
+            if open_series_id is not None:
+                raise ValueError(
+                    "one or more requested frame_ids belong to an OPEN field_series; "
+                    "explicitly finalize before Stage 2: "
+                    f"series_id={int(open_series_id)}, frame_ids={frame_ids}"
+                )
+            return
+
+        raise ValueError(
+            "run_field_pipeline requires either series_id or explicit frame_ids; "
+            "field_id and instrument_unit_id alone are not an executable scope"
+        )
+
+
 def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> PipelineRunResult:
+    """Run the field pipeline, applying pre-QC exclusion safety gates first."""
+
+    validate_target_coordinates(config.target_ra_deg, config.target_dec_deg)
+
+    pre_qc_exclusion_target = bool(
+        config.run_pre_photometry_qc and config.exclude_bad_pre_qc_frames
+    )
+    if (
+        pre_qc_exclusion_target
+        and not config.dry_run
+        and config.series_id is None
+        and config.frame_ids is None
+    ):
+        raise FramePreQcExclusionPreconditionError(
+            "pre-photometry QC frame exclusion requires an explicit series or frame_ids "
+            "scope for ordinary runs"
+        )
+
+    if pre_qc_exclusion_target and config.dry_run:
+        if config.record_run:
+            raise FramePreQcExclusionPreconditionError(
+                "pre-photometry QC exclusion dry-run requires record_run=False"
+            )
+        if session.new or session.dirty or session.deleted:
+            raise FramePreQcExclusionPreconditionError(
+                "pre-photometry QC exclusion dry-run requires a Session with no pending ORM state"
+            )
+        # Accepted target dry-runs may read through the Session, but must never
+        # autoflush caller state. Keep this context active through the complete
+        # runner call, including every downstream diagnostic and exception path.
+        with session.no_autoflush:
+            return _run_field_pipeline(session, config)
+
+    return _run_field_pipeline(session, config)
+
+
+def _run_field_pipeline(session: Session, config: FieldPipelineConfig) -> PipelineRunResult:
     """Run the main field-processing chain and optionally record its provenance.
 
     The runner intentionally orchestrates the already-tested low-level steps instead of
@@ -422,7 +508,14 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
     `pipeline_run_steps`.
     """
 
-    validate_target_coordinates(config.target_ra_deg, config.target_dec_deg)
+    if config.frame_ids is not None and not config.frame_ids:
+        raise ValueError("An explicit frame_ids selection must not be empty")
+
+    pre_qc_exclusion_zero_write_dry_run = bool(
+        config.run_pre_photometry_qc
+        and config.exclude_bad_pre_qc_frames
+        and config.dry_run
+    )
 
     if config.materialize_intermediate_calibrations:
         raise ValueError(
@@ -437,6 +530,17 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
             "spatial ensemble changes magnitudes, while photometric frame QC is the conservative production path"
         )
 
+    series = None
+    if config.series_id is not None:
+        series = load_series_selection(session, int(config.series_id))
+        if str(series.get("status", "")).upper() == "OPEN":
+            raise ValueError(
+                f"field_series is OPEN and must be explicitly finalized before Stage 2: "
+                f"series_id={config.series_id}"
+            )
+
+    _check_open_series_admission(session, config)
+
     run_uid = config.run_uid or _make_run_uid(config.calibration_prefix)
     calibration_names = _calibration_names(config)
     outputs: dict[str, str] = {}
@@ -444,9 +548,14 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
     artifact_publication_root = Path(config.out_dir) if config.out_dir else None
     artifact_publication_baseline = capture_tree_state(artifact_publication_root)
 
-    selected_frame_ids = list(config.frame_ids or [])
     has_explicit_frame_selection = config.frame_ids is not None
+    selected_frame_ids = (
+        [int(frame_id) for frame_id in config.frame_ids]
+        if has_explicit_frame_selection
+        else []
+    )
     stop_due_to_no_usable_frames = False
+    pre_qc_resolved_runtime_scope = False
     pre_qc_detection_seeds: dict[int, dict[str, Any]] = {}
     target_resolution: dict[str, Any] = {"resolved": False, "method": "not_run"}
     target_object_ids: list[int] = []
@@ -481,11 +590,18 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
     field_id = config.field_id
     series_id = config.series_id
     if series_id is not None:
-        series = load_series_selection(session, int(series_id))
+        assert series is not None
         series_frame_ids = [int(fid) for fid in series["frame_ids"]]
+        if not series_frame_ids:
+            raise ValueError(f"field_series has no selected frames: series_id={series_id}")
         if has_explicit_frame_selection:
             series_frame_id_set = set(series_frame_ids)
             selected_frame_ids = [int(fid) for fid in selected_frame_ids if int(fid) in series_frame_id_set]
+            if not selected_frame_ids:
+                raise ValueError(
+                    "The explicit frame_ids selection has no frames in "
+                    f"series_id={series_id}"
+                )
         else:
             selected_frame_ids = series_frame_ids
         field_id = int(series["field_id"])
@@ -858,11 +974,16 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
         event_type="run_started",
         message="field pipeline run started",
         context={"run_uid": run_uid, "field_id": field_id, "series_id": series_id, "n_selected_frames": len(selected_frame_ids) if selected_frame_ids else None, "calibration_names": calibration_names},
+        write_db_event=not pre_qc_exclusion_zero_write_dry_run,
     )
 
     def add_step(step_name: str, fn: Callable[[], Any]) -> None:
         order_index = len(result.steps) + 1
-        step_id = _insert_pipeline_step(session, pipeline_run_id, step_name, order_index) if pipeline_run_id else None
+        step_id = (
+            _insert_pipeline_step(session, pipeline_run_id, step_name, order_index)
+            if pipeline_run_id and not pre_qc_exclusion_zero_write_dry_run
+            else None
+        )
         _emit_pipeline_log(
             session,
             file_logger,
@@ -873,6 +994,7 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
             event_type="step_started",
             message=f"step {step_name} started",
             context={"order_index": order_index},
+            write_db_event=not pre_qc_exclusion_zero_write_dry_run,
         )
         started = time.perf_counter()
         try:
@@ -880,18 +1002,24 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
             elapsed_sec = float(time.perf_counter() - started)
             payload_dict = _result_to_dict(payload)
             payload_dict["elapsed_sec"] = elapsed_sec
-            _finish_pipeline_step(session, step_id, "DONE", payload_dict, None)
-            result.steps.append(PipelineStepRecord(step_name=step_name, status="DONE", result=payload_dict, elapsed_sec=elapsed_sec))
+            step_status = _completed_step_status(step_name, payload_dict)
+            if not pre_qc_exclusion_zero_write_dry_run:
+                _finish_pipeline_step(session, step_id, step_status, payload_dict, None)
+            result.steps.append(PipelineStepRecord(step_name=step_name, status=step_status, result=payload_dict, elapsed_sec=elapsed_sec))
+            log_level, event_type, message = _completed_step_log(
+                step_name, step_status, payload_dict
+            )
             _emit_pipeline_log(
                 session,
                 file_logger,
                 pipeline_run_id=pipeline_run_id,
                 pipeline_run_step_id=step_id,
                 step_name=step_name,
-                level="INFO",
-                event_type="step_done",
-                message=f"step {step_name} finished",
+                level=log_level,
+                event_type=event_type,
+                message=message,
                 context=_compact_log_context(payload_dict),
+                write_db_event=not pre_qc_exclusion_zero_write_dry_run,
             )
         except Exception as exc:  # noqa: BLE001 - runner must persist failure context before returning.
             elapsed_sec = float(time.perf_counter() - started)
@@ -904,8 +1032,9 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
             # Roll back the failed step before trying to persist its diagnostics;
             # the step-start record and all earlier successful steps were already
             # committed independently.
-            session.rollback()
-            _finish_pipeline_step(session, step_id, "FAILED", failure_payload, error_message)
+            if not pre_qc_exclusion_zero_write_dry_run:
+                session.rollback()
+                _finish_pipeline_step(session, step_id, "FAILED", failure_payload, error_message)
             result.steps.append(
                 PipelineStepRecord(step_name=step_name, status="FAILED", result=failure_payload, error_message=error_message, elapsed_sec=elapsed_sec)
             )
@@ -919,15 +1048,18 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                     step_name=step_name,
                     context={"order_index": order_index, **failure_payload},
                 )
-            _insert_pipeline_log_event(
-                session,
-                pipeline_run_id=pipeline_run_id,
-                pipeline_run_step_id=step_id,
-                level="ERROR",
-                event_type="step_failed",
-                message=error_message,
-                context_json={"step_name": step_name, "order_index": order_index, **failure_payload},
-            )
+            if not pre_qc_exclusion_zero_write_dry_run:
+                _insert_pipeline_log_event(
+                    session,
+                    pipeline_run_id=pipeline_run_id,
+                    pipeline_run_step_id=step_id,
+                    level="ERROR",
+                    event_type="step_failed",
+                    message=error_message,
+                    context_json={"step_name": step_name, "order_index": order_index, **failure_payload},
+                )
+            if getattr(exc, "status", None) == "FAILED_PRECONDITION":
+                raise
             if not config.continue_on_error:
                 raise
 
@@ -938,7 +1070,11 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                 lambda: check_frames_wcs(
                     session,
                     instrument_unit_id=config.instrument_unit_id,
-                    frame_ids=_frame_ids_for_step(selected_frame_ids),
+                    frame_ids=(
+                        _frame_ids_for_step(selected_frame_ids)
+                        if series_id is not None or has_explicit_frame_selection
+                        else None
+                    ),
                     current_status=None,
                     dry_run=config.dry_run,
                     update_center=True,
@@ -949,10 +1085,15 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
         if config.run_pre_photometry_qc:
             def _pre_qc_step() -> dict[str, Any]:
                 nonlocal selected_frame_ids, stop_due_to_no_usable_frames, pre_qc_detection_seeds
+                nonlocal pre_qc_resolved_runtime_scope
                 res = run_frame_pre_qc(
                     session,
                     instrument_unit_id=config.instrument_unit_id,
-                    frame_ids=_frame_ids_for_step(selected_frame_ids),
+                    frame_ids=(
+                        _frame_ids_for_step(selected_frame_ids)
+                        if series_id is not None or has_explicit_frame_selection
+                        else None
+                    ),
                     threshold_sigma=config.detection_threshold_sigma,
                     detection_cap=config.detection_max_sources_per_frame,
                     max_local_maxima=config.pre_qc_max_local_maxima,
@@ -968,12 +1109,34 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                     len(seed.get("candidates") or ())
                     for seed in pre_qc_detection_seeds.values()
                 )
-                if config.exclude_bad_pre_qc_frames and not config.dry_run:
-                    before = len(selected_frame_ids)
-                    selected_frame_ids = filter_bad_pre_qc_frame_ids(session, selected_frame_ids)
-                    payload["excluded_bad_frames"] = before - len(selected_frame_ids)
-                    payload["remaining_frames"] = len(selected_frame_ids)
-                    if before > 0 and not selected_frame_ids:
+                if config.exclude_bad_pre_qc_frames:
+                    resolved_frame_ids = [
+                        int(frame_id) for frame_id in res.selected_frame_ids
+                    ]
+                    if not resolved_frame_ids:
+                        raise FramePreQcExclusionPreconditionError(
+                            "pre-photometry QC exclusion resolved zero eligible input frames"
+                        )
+                    if pre_qc_exclusion_zero_write_dry_run:
+                        bad_frame_ids = {int(frame_id) for frame_id in res.bad_frame_ids}
+                        selected_frame_ids = [
+                            frame_id
+                            for frame_id in resolved_frame_ids
+                            if frame_id not in bad_frame_ids
+                        ]
+                        pre_qc_resolved_runtime_scope = True
+                        payload["excluded_bad_frames"] = (
+                            len(resolved_frame_ids) - len(selected_frame_ids)
+                        )
+                        payload["remaining_frames"] = len(selected_frame_ids)
+                    else:
+                        before = len(selected_frame_ids)
+                        selected_frame_ids = filter_bad_pre_qc_frame_ids(
+                            session, selected_frame_ids
+                        )
+                        payload["excluded_bad_frames"] = before - len(selected_frame_ids)
+                        payload["remaining_frames"] = len(selected_frame_ids)
+                    if not selected_frame_ids:
                         stop_due_to_no_usable_frames = True
                         payload["stop_reason"] = "all selected frames rejected by pre-photometry QC"
                 return payload
@@ -997,7 +1160,15 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                     session,
                     catalog_name=config.catalog_name,
                     instrument_unit_id=config.instrument_unit_id,
-                    frame_ids=_frame_ids_for_step(selected_frame_ids),
+                    frame_ids=(
+                        _frame_ids_for_step(selected_frame_ids)
+                        if (
+                            series_id is not None
+                            or has_explicit_frame_selection
+                            or pre_qc_resolved_runtime_scope
+                        )
+                        else None
+                    ),
                     margin_pix=config.margin_pix,
                     mag_key=config.mag_key,
                     working_mag_limit=config.working_catalog_mag_limit,
@@ -1015,7 +1186,11 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                 lambda: detect_sources_in_frames(
                     session,
                     instrument_unit_id=config.instrument_unit_id,
-                    frame_ids=_frame_ids_for_step(selected_frame_ids),
+                    frame_ids=(
+                        _frame_ids_for_step(selected_frame_ids)
+                        if selected_frame_ids
+                        else None
+                    ),
                     threshold_sigma=config.detection_threshold_sigma,
                     max_sources_per_frame=config.detection_max_sources_per_frame,
                     min_separation_pix=config.detection_min_separation_pix,
@@ -1037,7 +1212,11 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                     session,
                     catalog_name=config.catalog_name,
                     instrument_unit_id=config.instrument_unit_id,
-                    frame_ids=_frame_ids_for_step(selected_frame_ids),
+                    frame_ids=(
+                        _frame_ids_for_step(selected_frame_ids)
+                        if selected_frame_ids
+                        else None
+                    ),
                     radius_arcsec=config.detection_match_radius_arcsec,
                     mag_key=config.mag_key,
                     replace_existing=config.replace_detection_matches,
@@ -1089,7 +1268,11 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                     session,
                     catalog_name=config.catalog_name,
                     instrument_unit_id=config.instrument_unit_id,
-                    frame_ids=_frame_ids_for_step(selected_frame_ids),
+                    frame_ids=(
+                        _frame_ids_for_step(selected_frame_ids)
+                        if selected_frame_ids
+                        else None
+                    ),
                     aperture_radius_pix=config.aperture_radius_pix,
                     photometry_estimator=config.photometry_estimator,
                     adaptive_detection_algorithm=config.adaptive_detection_algorithm,
@@ -1623,6 +1806,7 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                     catalog_name=config.catalog_name,
                     series_id=series_id,
                     frame_ids=_frame_ids_for_step(selected_frame_ids),
+                    interseries_generation_ids=config.interseries_generation_ids,
                     reject_flags=_science_reject_flags(config, require_detection_support_effective),
                     out_csv=csv_path,
                     out_json=json_path,
@@ -2243,6 +2427,7 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                         catalog_name=config.catalog_name,
                         series_id=series_id,
                         frame_ids=_frame_ids_for_step(selected_frame_ids),
+                        interseries_generation_ids=config.interseries_generation_ids,
                         reject_flags=_science_reject_flags(config, require_detection_support_effective),
                         out_csv=csv_path,
                         out_json=json_path,
@@ -2277,6 +2462,7 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                     aperture_context_frames_csv=outputs.get("aperture_correction_context_frames_csv"),
                     diagnostic_calibration_names=[validation_calibration, current_ensemble_name],
                     analysis_snapshot=_analysis_snapshot_for(validation_calibration),
+                    annotate_residual_floor=not pre_qc_exclusion_zero_write_dry_run,
                 )
                 if validation.summary_json:
                     outputs["random_error_validation_summary_json"] = (
@@ -2316,6 +2502,7 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                     catalog_name=config.catalog_name,
                     series_id=series_id,
                     frame_ids=_frame_ids_for_step(selected_frame_ids),
+                    interseries_generation_ids=config.interseries_generation_ids,
                     reject_flags=_science_reject_flags(config, require_detection_support_effective),
                     out_csv=csv_path,
                     out_json=json_path,
@@ -2359,6 +2546,7 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                     catalog_name=config.catalog_name,
                     series_id=series_id,
                     frame_ids=_frame_ids_for_step(selected_frame_ids),
+                    interseries_generation_ids=config.interseries_generation_ids,
                     reject_flags=_science_reject_flags(config, require_detection_support_effective),
                     out_dir=candidates_dir,
                     limit=config.candidate_light_curve_limit,
@@ -2424,7 +2612,11 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                 science_result = materialize_science_photometry(
                     session,
                     calibration_name=science_name,
-                    frame_ids=_frame_ids_for_step(selected_frame_ids),
+                    frame_ids=(
+                        _frame_ids_for_step(selected_frame_ids)
+                        if series_id is not None or has_explicit_frame_selection
+                        else None
+                    ),
                     insert_batch_size=config.bulk_insert_batch_size,
                 )
                 outputs["science_photometry_calibration"] = science_name
@@ -2444,19 +2636,19 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
             add_step("materialize_science_photometry", _science_materialization_step)
 
         result.quality_policy = _quality_policy_summary(config, result)
-        failed = [s for s in result.steps if s.status == "FAILED"]
-        if failed:
-            result.status = "FAILED"
-        elif stop_due_to_no_usable_frames:
-            result.status = NO_USABLE_FRAMES_STATUS
-        else:
-            result.status = "DONE"
+        result.status = _pipeline_status_from_steps(
+            result.steps,
+            stop_due_to_no_usable_frames=stop_due_to_no_usable_frames,
+        )
+
+        _attach_pipeline_warning_summary(result)
 
     except Exception as exc:
         result.status = getattr(exc, "status", "FAILED")
         # Also recover failures raised outside add_step(), so logging the
         # original exception never degrades into PendingRollbackError.
-        session.rollback()
+        if not pre_qc_exclusion_zero_write_dry_run:
+            session.rollback()
         if file_logger is not None:
             file_logger.exception(
                 exc=exc,
@@ -2464,25 +2656,26 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
                 message="field pipeline run failed",
                 pipeline_run_id=pipeline_run_id,
             )
-        _insert_pipeline_log_event(
-            session,
-            pipeline_run_id=pipeline_run_id,
-            pipeline_run_step_id=None,
-            level="ERROR",
-            event_type="run_failed",
-            message=f"{type(exc).__name__}: {exc}",
-            context_json={
-                "run_uid": run_uid,
-                **(getattr(exc, "diagnostics", {}) if isinstance(getattr(exc, "diagnostics", None), dict) else {}),
-            },
-        )
-        try:
-            _snapshot_run_artifacts()
-        except Exception as artifact_exc:  # noqa: BLE001 - never mask the original pipeline failure.
-            session.rollback()
-            result.outputs["artifact_registry_status"] = "FAILED"
-            result.outputs["artifact_registry_error"] = f"{type(artifact_exc).__name__}: {artifact_exc}"
-        _finish_pipeline_run(session, pipeline_run_id, result.status, _compact_run_summary(result))
+        if not pre_qc_exclusion_zero_write_dry_run:
+            _insert_pipeline_log_event(
+                session,
+                pipeline_run_id=pipeline_run_id,
+                pipeline_run_step_id=None,
+                level="ERROR",
+                event_type="run_failed",
+                message=f"{type(exc).__name__}: {exc}",
+                context_json={
+                    "run_uid": run_uid,
+                    **(getattr(exc, "diagnostics", {}) if isinstance(getattr(exc, "diagnostics", None), dict) else {}),
+                },
+            )
+            try:
+                _snapshot_run_artifacts()
+            except Exception as artifact_exc:  # noqa: BLE001 - never mask the original pipeline failure.
+                session.rollback()
+                result.outputs["artifact_registry_status"] = "FAILED"
+                result.outputs["artifact_registry_error"] = f"{type(artifact_exc).__name__}: {artifact_exc}"
+            _finish_pipeline_run(session, pipeline_run_id, result.status, _compact_run_summary(result))
         if series_id is not None and pipeline_run_id is not None and not config.dry_run:
             mark_series_pipeline_result(
                 session,
@@ -2504,6 +2697,7 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
         event_type="run_done",
         message=f"field pipeline run finished with status={result.status}",
         context=_compact_log_context(_run_summary(result)),
+        write_db_event=not pre_qc_exclusion_zero_write_dry_run,
     )
     _snapshot_run_artifacts()
     _finish_pipeline_run(session, pipeline_run_id, result.status, _compact_run_summary(result))
@@ -2858,6 +3052,7 @@ def _emit_pipeline_log(
     event_type: str,
     message: str,
     context: dict[str, Any] | None = None,
+    write_db_event: bool = True,
 ) -> None:
     if file_logger is not None:
         file_logger.log(
@@ -2869,15 +3064,16 @@ def _emit_pipeline_log(
             step_name=step_name,
             context=_compact_log_context(context or {}),
         )
-    _insert_pipeline_log_event(
-        session,
-        pipeline_run_id=pipeline_run_id,
-        pipeline_run_step_id=pipeline_run_step_id,
-        level=level,
-        event_type=event_type,
-        message=message,
-        context_json=_compact_log_context(context or {}),
-    )
+    if write_db_event:
+        _insert_pipeline_log_event(
+            session,
+            pipeline_run_id=pipeline_run_id,
+            pipeline_run_step_id=pipeline_run_step_id,
+            level=level,
+            event_type=event_type,
+            message=message,
+            context_json=_compact_log_context(context or {}),
+        )
 
 
 def _insert_pipeline_log_event(
@@ -2892,6 +3088,8 @@ def _insert_pipeline_log_event(
 ) -> None:
     if pipeline_run_id is None:
         return
+    safe_message = sanitize_diagnostic_text(message)
+    safe_context = sanitize_jsonable_context(_to_jsonable(context_json or {}))
     try:
         session.execute(
             text(
@@ -2907,8 +3105,8 @@ def _insert_pipeline_log_event(
                 "pipeline_run_step_id": pipeline_run_step_id,
                 "level": level,
                 "event_type": event_type,
-                "message": message,
-                "context_json": json.dumps(_to_jsonable(context_json or {}), ensure_ascii=False),
+                "message": safe_message,
+                "context_json": json.dumps(safe_context, ensure_ascii=False),
             },
         )
         session.commit()
@@ -3168,15 +3366,124 @@ def _effective_require_detection_support(config: FieldPipelineConfig) -> bool:
     return _detection_branch_enabled(config)
 
 
+def _forced_photometry_failure_counts(payload: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for key in ("failed_frames", "failed_measurements"):
+        try:
+            counts[key] = max(0, int(payload.get(key) or 0))
+        except (TypeError, ValueError):
+            counts[key] = 0
+    return counts
+
+
+def _completed_step_status(step_name: str, payload: dict[str, Any]) -> str:
+    if step_name != "run_forced_photometry":
+        return "DONE"
+    counts = _forced_photometry_failure_counts(payload)
+    return (
+        "DONE_WITH_WARNINGS"
+        if counts["failed_frames"] or counts["failed_measurements"]
+        else "DONE"
+    )
+
+
+def _completed_step_log(
+    step_name: str, status: str, payload: dict[str, Any]
+) -> tuple[str, str, str]:
+    if status != "DONE_WITH_WARNINGS":
+        return "INFO", "step_done", f"step {step_name} finished"
+    counts = _forced_photometry_failure_counts(payload)
+    return (
+        "WARNING",
+        "step_done_with_warnings",
+        (
+            f"step {step_name} finished with failures: "
+            f"failed_frames={counts['failed_frames']}, "
+            f"failed_measurements={counts['failed_measurements']}"
+        ),
+    )
+
+
+def _pipeline_status_from_steps(
+    steps: list[PipelineStepRecord], *, stop_due_to_no_usable_frames: bool
+) -> str:
+    if any(step.status == "FAILED" for step in steps):
+        return "FAILED"
+    if stop_due_to_no_usable_frames:
+        return NO_USABLE_FRAMES_STATUS
+    if any(step.status == "DONE_WITH_WARNINGS" for step in steps):
+        return "DONE_WITH_WARNINGS"
+    return "DONE"
+
+
+def _pipeline_warning_summary(steps: list[PipelineStepRecord]) -> dict[str, Any] | None:
+    warning_steps = [step for step in steps if step.status == "DONE_WITH_WARNINGS"]
+    if not warning_steps:
+        return None
+
+    sample_limit = 20
+    failure_samples: list[dict[str, Any]] = []
+    failure_samples_truncated = 0
+    warning_step_rows: list[dict[str, Any]] = []
+    total_failed_frames = 0
+    total_failed_measurements = 0
+    for step in warning_steps:
+        counts = _forced_photometry_failure_counts(step.result)
+        total_failed_frames += counts["failed_frames"]
+        total_failed_measurements += counts["failed_measurements"]
+        raw_samples = step.result.get("failure_samples") or []
+        samples = [item for item in raw_samples if isinstance(item, dict)]
+        remaining = max(0, sample_limit - len(failure_samples))
+        failure_samples.extend(samples[:remaining])
+        failure_samples_truncated += max(
+            0, int(step.result.get("failure_samples_truncated") or 0)
+        )
+        failure_samples_truncated += max(0, len(samples) - remaining)
+        warning_step_rows.append(
+            {
+                "step_name": step.step_name,
+                "status": step.status,
+                "failed_frames": counts["failed_frames"],
+                "failed_measurements": counts["failed_measurements"],
+                "failure_samples_count": len(samples),
+            }
+        )
+
+    return {
+        "requested_pipeline_status": "DONE_WITH_WARNINGS",
+        "warning_step_count": len(warning_steps),
+        "warning_steps": warning_step_rows,
+        "failed_frames": total_failed_frames,
+        "failed_measurements": total_failed_measurements,
+        "failure_samples": failure_samples,
+        "failure_samples_truncated": failure_samples_truncated,
+    }
+
+
+def _attach_pipeline_warning_summary(result: PipelineRunResult) -> dict[str, Any] | None:
+    summary = _pipeline_warning_summary(result.steps)
+    if summary is None:
+        return None
+    summary["pipeline_run_status"] = result.status
+    summary["pipeline_status_rollup_applied"] = result.status == "DONE_WITH_WARNINGS"
+    result.quality_policy["pipeline_warning_summary"] = summary
+    return summary
+
+
 def _step_result(result: PipelineRunResult, step_name: str) -> dict[str, Any] | None:
     for step in result.steps:
-        if step.step_name == step_name and step.status == "DONE":
+        if step.step_name == step_name and step.status in {"DONE", "DONE_WITH_WARNINGS"}:
             return step.result
     return None
 
 
 def _step_results_with_prefix(result: PipelineRunResult, step_name_prefix: str) -> list[dict[str, Any]]:
-    return [step.result for step in result.steps if step.status == "DONE" and step.step_name.startswith(step_name_prefix)]
+    return [
+        step.result
+        for step in result.steps
+        if step.status in {"DONE", "DONE_WITH_WARNINGS"}
+        and step.step_name.startswith(step_name_prefix)
+    ]
 
 
 def _effective_reference_exclusion_ids(

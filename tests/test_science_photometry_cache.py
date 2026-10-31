@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from grandgousier.photometry import science_photometry as module
 
 
@@ -21,6 +23,9 @@ class _Result:
 
     def mappings(self):
         return _Mappings(self._rows)
+
+    def all(self):
+        return list(self._rows)
 
     def scalar_one(self):
         return self._scalar
@@ -156,6 +161,81 @@ def test_materialize_science_rejects_non_final_product(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="COMPLETE_IMMUTABLE SCIENCE"):
         module.materialize_science_photometry(NoWriteSession(), calibration_version_id=77)
+
+
+@pytest.mark.parametrize(
+    ("frame_ids", "message"),
+    [
+        ([], "must not be empty"),
+        ([10], "exactly match"),
+        ([10, 99], "exactly match"),
+    ],
+)
+def test_materialize_science_rejects_incomplete_explicit_scope_before_delete(
+    monkeypatch, frame_ids, message
+):
+    from grandgousier.photometry import science_materialization as legacy
+
+    target = SimpleNamespace(
+        calibration_version_id=42,
+        name="science42",
+        series_id=5,
+        product_role="SCIENCE",
+        lifecycle_status="COMPLETE_IMMUTABLE",
+    )
+    monkeypatch.setattr(legacy, "_resolve_cv", lambda *args, **kwargs: target)
+
+    class Session:
+        def __init__(self):
+            self.deleted = False
+            self.statements = []
+
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            self.statements.append(sql)
+            if "FROM field_series_frames" in sql:
+                assert params == {"series_id": 5}
+                return _Result(rows=[(10,), (11,)])
+            if sql.startswith("DELETE FROM science_photometry"):
+                self.deleted = True
+                raise AssertionError("scope validation must precede durable DELETE")
+            raise AssertionError(sql)
+
+    session = Session()
+    with pytest.raises(ValueError, match=message):
+        module.materialize_science_photometry(
+            session,
+            calibration_version_id=42,
+            frame_ids=frame_ids,
+        )
+    assert not session.deleted
+    assert not any(sql.startswith("DELETE FROM science_photometry") for sql in session.statements)
+
+
+def test_materialize_science_rejects_explicit_scope_without_series_identity_before_delete(
+    monkeypatch,
+):
+    from grandgousier.photometry import science_materialization as legacy
+
+    target = SimpleNamespace(
+        calibration_version_id=42,
+        name="science42",
+        series_id=None,
+        product_role="SCIENCE",
+        lifecycle_status="COMPLETE_IMMUTABLE",
+    )
+    monkeypatch.setattr(legacy, "_resolve_cv", lambda *args, **kwargs: target)
+
+    class NoWriteSession:
+        def execute(self, *args, **kwargs):  # pragma: no cover
+            raise AssertionError("explicit unidentifiable scope must reject before SQL")
+
+    with pytest.raises(ValueError, match="completeness cannot be established"):
+        module.materialize_science_photometry(
+            NoWriteSession(),
+            calibration_version_id=42,
+            frame_ids=[10],
+        )
 
 
 def test_pipeline_publishes_durable_science_after_candidate_export() -> None:

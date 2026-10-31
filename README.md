@@ -1,10 +1,16 @@
 # Grandgousier
 
-Версия: **0.7.0.1**
+Версия пакета: **0.7.0.10**
 
 Grandgousier - Python-пакет для индексирования FITS-архивов, forced-aperture фотометрии, локальной и ensemble-калибровки, reference/color calibration, QC объектов, проверки event coverage и отбора кандидатов в переменные объекты.
 
-Текущий source-кандидат: 0.7.0.1 (Phase B detection storage normalization). Phase A (`0.7.0`) user-real-validated на Windows/CPython 3.11 (`704 passed, 1 skipped`); последний production runtime и frozen reference DB остаются на 0.6.4.5.1. 0.7.x предназначен только для новой пустой БД после завершения Phase A–D: in-place migration frozen 0.6 database запрещена. Phase B факторизует повторяющиеся detection algorithm/config/provenance в `detection_runs` и frame-level status/diagnostics в `detection_run_frames`; high-cardinality `source_detections` и `detection_catalog_matches` оставляют только row-specific state, при этом исторические photometric match snapshots сохраняются. `frame_catalog_links` намеренно не ужимается до реального PostgreSQL EXPLAIN/physical benchmark. Stage 2/Stage 3 production-v1 scientific formulas не меняются. См. `CONTEXT.md`, `docs/CURRENT_ARCHITECTURE.md` и `docs/ROADMAP.md`.
+Актуальное ограниченное live-состояние на 2026-09-28: в `grandgousier_070_gpx_full` все 18 текущих Stage-2 heads имеют статус `READY_STAGE3_RECIPE`; M4 V generation 3 и R generation 4 независимо проверены; M5 экспортировал 134 уникальных candidate ID. Parquet exporter проверен на двух сериях, но full 18-series export, archive-scale performance, полный test suite и release acceptance не проходили. Candidate IDs не означают научно подтверждённые переменные звёзды. Stage 1 reprocess за 2018-09-16 остаётся частичным: 544 raw скачано, 186/544 новых reduced products готовы, 358 осталось; эта работа не меняла БД или aliases. Подробности и точные пределы — в `CONTEXT.md` и `docs/ROADMAP.md`. 0.7 — fresh-baseline schema epoch; frozen 0.6 database не мигрируется in-place.
+
+Версионные заметки 0.5.x/0.6.x ниже сохранены как историческая документация. Они не заменяют текущие инструкции 0.7 и могут описывать уже superseded workflow или storage.
+
+## Исторические заметки 0.6.x по science storage (superseded)
+
+Следующие записи сохраняют исторический переходный контракт 0.6; они не описывают актуальную clean-baseline схему 0.7.
 
 0.6.4.0 вводит additive `science_photometry_cache`: rebuildable Stage-3 cache только из `calibration_version_id`, `base_measurement_id`, `mag_cal`, `mag_err_random`. Он не является новым authoritative science layer. Полный science state по-прежнему определяется immutable BASE + normalized calibration terms; V1 `science_measurements` пока сохраняется как compatibility baseline и не удаляется этим патчем.
 
@@ -16,6 +22,8 @@ Grandgousier - Python-пакет для индексирования FITS-арх
 
 0.6.4.4 adds controlled retirement of legacy wide `science_measurements`. `retire-science-measurements` re-runs the exact all-row scalar/identity/flag proof, requires row-for-row compact cache coverage and a `COMPLETE_EXACT` historical override manifest, then deletes only that calibration's V1 rows and marks its manifest `RETIRED_EXACT`. Cache completeness after retirement is checked against the preserved manifest `source_row_count`, so a partial cache can never become authoritative merely because V1 is gone. The command does not run `VACUUM FULL`, `pg_repack` or any physical table rewrite.
 
+
+## Исторические заметки 0.5.x по сервисам и observation identity (superseded where 0.7 differs)
 
 ## Production service/job layer
 
@@ -116,14 +124,14 @@ from grandgousier.api import compute_aperture_error_budget
 49. Candidate-excluded ensemble по умолчанию использует growth policy `initial_only`: исходный accepted set исключается один раз, а новые candidates последующих итераций сохраняются как suppressed diagnostics без каскадного расширения reference exclusions.
 50. Target provenance явно различает source ID, object ID, auto-nearest и disabled-unresolved режимы.
 
-## Установка
+## Установка и проверка разработки
 
 Рекомендуемый способ на Windows:
 
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m pip install -e .
 ```
 
@@ -143,13 +151,11 @@ $env:GRANDGOUSIER_DATABASE_URL="postgresql+psycopg://USER:PASSWORD@localhost:543
 
 ```powershell
 .\.venv\Scripts\python.exe -m grandgousier.cli init-db
+.\.venv\Scripts\python.exe -m grandgousier.cli schema-status
+.\.venv\Scripts\python.exe -m grandgousier.cli doctor --strict-optional
 ```
 
-Полная MVP5-схема требует SQL migrations, потому что поздние таблицы event/field/pipeline layers пока живут не в ORM-модели, а в migration scripts:
-
-```powershell
-psql -U grandgousier -d grandgousier -h localhost -f scripts\migrate_all.sql
-```
+Для 0.7 выполняйте этот порядок только на новой пустой clean-базе: `init-db`, затем `schema-status`, затем `doctor --strict-optional`. Не запускайте `scripts\migrate_all.sql` для bootstrap 0.7 и не применяйте миграции in-place к frozen 0.6 reference database.
 
 ## Упрощенный one-command workflow
 

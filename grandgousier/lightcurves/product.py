@@ -7,11 +7,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from sqlalchemy import bindparam, or_, select, text
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from grandgousier.db.models import (
     CalibrationVersion,
+    CalibrationProductAlias,
     Field,
     FieldSeries,
     FieldSeriesFrame,
@@ -20,6 +21,7 @@ from grandgousier.db.models import (
     InterseriesCalibrationGeneration,
     InterseriesCalibrationSeries,
     ObjectQc,
+    PipelineRun,
 )
 from grandgousier.photometry.calibration_view import load_calibration_photometry_view
 from grandgousier.quality.field_report import _calibration_chain_names, _resolve_field_series_filter
@@ -91,6 +93,7 @@ SCIENCE_LIGHT_CURVE_COLUMNS: tuple[str, ...] = (
     "interseries_offset_err",
     "interseries_offset_status",
     "interseries_algorithm",
+    "interseries_generation_id",
     "aperture_radius_pix",
     "local_background",
     "local_zp_correction",
@@ -126,8 +129,14 @@ OBJECT_COLUMNS: tuple[str, ...] = (
     "mag_global_mad",
     "mag_err_median",
     "mag_err_systematic_median",
+    "interseries_generation_ids",
+    "interseries_status",
     "filters",
 )
+
+
+class LightCurveSelectionError(ValueError):
+    """A fail-closed selection or M4 provenance error in a light-curve request."""
 
 
 @dataclass
@@ -143,6 +152,10 @@ class LightCurveScope:
     frame_selection_mode: str = "calibration_scope"
     selected_frame_ids: list[int] = field(default_factory=list)
     selected_frame_ids_count: int | None = None
+    current_science_calibration_version_ids: list[int] = field(default_factory=list)
+    interseries_generation_ids: list[int] = field(default_factory=list)
+    interseries_generation_scopes: list[dict[str, Any]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -156,6 +169,10 @@ class LightCurveScope:
             "field_name": self.field_name,
             "frame_selection_mode": self.frame_selection_mode,
             "selected_frame_ids_count": self.selected_frame_ids_count,
+            "current_science_calibration_version_ids": self.current_science_calibration_version_ids,
+            "interseries_generation_ids": self.interseries_generation_ids,
+            "interseries_generation_scopes": self.interseries_generation_scopes,
+            "warnings": self.warnings,
         }
 
 
@@ -254,6 +271,38 @@ def resolve_light_curve_scope(
     if not calibration_rows:
         raise ValueError("No calibration versions matched the light-curve selection")
 
+    current_science_ids = [
+        int(row["calibration_version_id"])
+        for row in calibration_rows
+        if row.get("is_current_alias_head") and row.get("product_role") == "SCIENCE"
+    ]
+    science_heads_by_series: dict[int, list[int]] = {}
+    for row in calibration_rows:
+        if not row.get("is_current_alias_head") or row.get("product_role") != "SCIENCE":
+            continue
+        if row.get("series_id") is None:
+            raise LightCurveSelectionError(
+                "Current SCIENCE alias head "
+                f"{row['calibration_version_id']} has no series_id; refusing ambiguous light-curve scope"
+            )
+        science_heads_by_series.setdefault(int(row["series_id"]), []).append(
+            int(row["calibration_version_id"])
+        )
+    ambiguous_heads = {
+        series_id: sorted(set(version_ids))
+        for series_id, version_ids in science_heads_by_series.items()
+        if len(set(version_ids)) > 1
+    }
+    if ambiguous_heads and not names:
+        details = "; ".join(
+            f"series {series_id}: {', '.join(str(value) for value in version_ids)}"
+            for series_id, version_ids in sorted(ambiguous_heads.items())
+        )
+        raise LightCurveSelectionError(
+            "Multiple current SCIENCE alias heads match one series; select one exact calibration "
+            f"name instead of using a broad prefix/model selector ({details})"
+        )
+
     calibration_version_ids = [int(row["calibration_version_id"]) for row in calibration_rows]
     resolved_names = [str(row["name"]) for row in calibration_rows]
     source_chain_names: list[str] = []
@@ -295,6 +344,7 @@ def resolve_light_curve_scope(
         frame_selection_mode=frame_selection_mode,
         selected_frame_ids=selected_frame_ids,
         selected_frame_ids_count=len(selected_frame_ids) if selected_frame_ids else None,
+        current_science_calibration_version_ids=sorted(set(current_science_ids)),
     )
 
 
@@ -313,6 +363,7 @@ def load_science_light_curve_rows(
     frame_ids: list[int] | None = None,
     object_qc_algorithm: str = "object_qc_v1",
     offset_algorithm: str = "interseries_graph_median_v1",
+    interseries_generation_ids: list[int] | None = None,
     reject_flags: set[str] | None = None,
     exclude_rejected: bool = False,
     limit: int | None = None,
@@ -335,6 +386,7 @@ def load_science_light_curve_rows(
         object_id=object_id,
         object_qc_algorithm=object_qc_algorithm,
         offset_algorithm=offset_algorithm,
+        interseries_generation_ids=interseries_generation_ids,
     )
     processed: list[dict[str, Any]] = []
     effective_reject_flags = reject_flags if reject_flags is not None else set(DEFAULT_REJECT_FLAGS)
@@ -375,6 +427,7 @@ def build_light_curve_summary(
     frame_ids: list[int] | None = None,
     object_qc_algorithm: str = "object_qc_v1",
     offset_algorithm: str = "interseries_graph_median_v1",
+    interseries_generation_ids: list[int] | None = None,
     reject_flags: set[str] | None = None,
 ) -> LightCurveSummary:
     scope, rows = load_science_light_curve_rows(
@@ -389,6 +442,7 @@ def build_light_curve_summary(
         frame_ids=frame_ids,
         object_qc_algorithm=object_qc_algorithm,
         offset_algorithm=offset_algorithm,
+        interseries_generation_ids=interseries_generation_ids,
         reject_flags=reject_flags,
         exclude_rejected=False,
         limit=None,
@@ -433,6 +487,16 @@ def light_curve_summary_rows(summary: LightCurveSummary) -> list[dict[str, Any]]
         {"section": "coverage", "metric": "n_calibrations", "value": summary.n_calibrations},
         {"section": "interseries", "metric": "with_offset", "value": summary.n_with_interseries_offset},
         {"section": "interseries", "metric": "without_offset", "value": summary.n_without_interseries_offset},
+        {
+            "section": "interseries",
+            "metric": "generation_ids",
+            "value": ",".join(str(value) for value in scope.interseries_generation_ids),
+        },
+        {
+            "section": "interseries",
+            "metric": "warnings",
+            "value": "; ".join(scope.warnings),
+        },
     ]
     for flag, count in summary.n_reject_reasons.items():
         rows.append({"section": "reject_reasons", "metric": flag, "value": count})
@@ -460,6 +524,7 @@ def list_light_curve_objects(
     frame_ids: list[int] | None = None,
     object_qc_algorithm: str = "object_qc_v1",
     offset_algorithm: str = "interseries_graph_median_v1",
+    interseries_generation_ids: list[int] | None = None,
     reject_flags: set[str] | None = None,
     min_points: int = 1,
     exclude_rejected: bool = False,
@@ -477,6 +542,7 @@ def list_light_curve_objects(
         frame_ids=frame_ids,
         object_qc_algorithm=object_qc_algorithm,
         offset_algorithm=offset_algorithm,
+        interseries_generation_ids=interseries_generation_ids,
         reject_flags=reject_flags,
         exclude_rejected=exclude_rejected,
         limit=None,
@@ -508,6 +574,25 @@ def list_light_curve_objects(
                 "mag_global_mad": _mad(mags),
                 "mag_err_median": _median(errs),
                 "filters": ",".join(sorted({str(row.get("filter_name")) for row in group if row.get("filter_name")})),
+                "interseries_generation_ids": ",".join(
+                    str(value)
+                    for value in sorted(
+                        {
+                            int(row["interseries_generation_id"])
+                            for row in group
+                            if row.get("interseries_generation_id") is not None
+                        }
+                    )
+                ),
+                "interseries_status": ",".join(
+                    sorted(
+                        {
+                            str(row["interseries_offset_status"])
+                            for row in group
+                            if row.get("interseries_offset_status")
+                        }
+                    )
+                ),
             }
         )
     out.sort(key=lambda row: (-int(row["n_points"]), str(row.get("source_id") or ""), int(row["object_id"])))
@@ -523,32 +608,171 @@ def _load_calibration_rows(
     calibration_prefixes: list[str],
     model_name: str | None,
 ) -> list[dict[str, Any]]:
-    """Load selected calibrations without PostgreSQL array-bind ambiguity.
+    """Resolve exact logical names and generic selectors to calibration products.
 
-    Psycopg array adaptation for raw ``ANY(:names)`` binds is driver/type
-    dependent (notably varchar/text arrays).  Use SQLAlchemy expanding ``IN``
-    expressions instead so the ordinary light-curve path behaves identically
-    on PostgreSQL and the SQLite test backend.
+    Exact logical names resolve through their alias head. If a name is not a
+    logical alias, it remains an explicit physical-name read (including archived
+    immutable generations). Prefix/model searches intentionally inspect alias
+    heads only, so stale physical rows can never become a fallback candidate.
+    Selector predicates retain their prior intersection behavior.
     """
 
-    stmt = select(
-        CalibrationVersion.calibration_version_id.label("calibration_version_id"),
-        CalibrationVersion.name.label("name"),
-        CalibrationVersion.model_name.label("model_name"),
-        CalibrationVersion.instrument_unit_id.label("instrument_unit_id"),
-    )
-    if calibration_names:
-        stmt = stmt.where(CalibrationVersion.name.in_([str(v) for v in calibration_names]))
-    if calibration_prefixes:
-        stmt = stmt.where(
-            or_(
-                *[CalibrationVersion.name.like(f"{str(prefix)}%") for prefix in calibration_prefixes]
+    exact_ids: set[int] = set()
+    logical_alias_names: set[str] = set()
+    normalized_names = [str(value).strip() for value in calibration_names if str(value).strip()]
+    if normalized_names:
+        alias_rows = session.execute(
+            select(
+                CalibrationProductAlias.logical_name.label("logical_name"),
+                CalibrationProductAlias.head_calibration_version_id.label("head_id"),
+            ).where(CalibrationProductAlias.logical_name.in_(normalized_names))
+        ).mappings().all()
+        alias_by_name = {str(row["logical_name"]): row.get("head_id") for row in alias_rows}
+        logical_alias_names = set(alias_by_name)
+        empty_aliases = sorted(name for name, head_id in alias_by_name.items() if head_id is None)
+        if empty_aliases:
+            raise LightCurveSelectionError(
+                "Logical calibration alias has no current head: " + ", ".join(empty_aliases)
+            )
+        exact_ids.update(int(alias_by_name[name]) for name in logical_alias_names)
+
+        physical_names = [name for name in normalized_names if name not in logical_alias_names]
+        if physical_names:
+            physical_rows = session.execute(
+                select(CalibrationVersion.calibration_version_id.label("calibration_version_id"))
+                .where(CalibrationVersion.name.in_(physical_names))
+            ).mappings().all()
+            exact_ids.update(int(row["calibration_version_id"]) for row in physical_rows)
+
+    generic_requested = bool(calibration_prefixes or model_name)
+    generic_ids: set[int] = set()
+    if generic_requested:
+        generic_stmt = (
+            select(
+                CalibrationVersion.calibration_version_id.label("calibration_version_id")
+            )
+            .join(
+                CalibrationProductAlias,
+                CalibrationProductAlias.head_calibration_version_id
+                == CalibrationVersion.calibration_version_id,
             )
         )
-    if model_name:
-        stmt = stmt.where(CalibrationVersion.model_name == str(model_name))
-    stmt = stmt.order_by(CalibrationVersion.created_at, CalibrationVersion.calibration_version_id)
-    return [dict(row) for row in session.execute(stmt).mappings().all()]
+        if calibration_prefixes:
+            generic_stmt = generic_stmt.where(
+                or_(
+                    *[
+                        CalibrationVersion.name.like(f"{str(prefix)}%")
+                        for prefix in calibration_prefixes
+                    ]
+                )
+            )
+        if model_name:
+            generic_stmt = generic_stmt.where(CalibrationVersion.model_name == str(model_name))
+        generic_rows = session.execute(generic_stmt).mappings().all()
+        generic_ids = {int(row["calibration_version_id"]) for row in generic_rows}
+
+    selected_ids = generic_ids if not normalized_names else exact_ids
+    if normalized_names and generic_requested:
+        selected_ids = exact_ids & generic_ids
+    if not selected_ids:
+        return []
+
+    version_rows = session.execute(
+        select(
+            CalibrationVersion.calibration_version_id.label("calibration_version_id"),
+            CalibrationVersion.name.label("name"),
+            CalibrationVersion.model_name.label("model_name"),
+            CalibrationVersion.instrument_unit_id.label("instrument_unit_id"),
+            CalibrationVersion.field_id.label("field_id"),
+            CalibrationVersion.series_id.label("series_id"),
+            CalibrationVersion.product_role.label("product_role"),
+            CalibrationVersion.created_at.label("created_at"),
+        ).where(CalibrationVersion.calibration_version_id.in_(sorted(selected_ids)))
+    ).mappings().all()
+    alias_rows = session.execute(
+        select(
+            CalibrationProductAlias.head_calibration_version_id.label("head_id"),
+            CalibrationProductAlias.logical_name.label("logical_name"),
+        ).where(CalibrationProductAlias.head_calibration_version_id.in_(sorted(selected_ids)))
+    ).mappings().all()
+    alias_names_by_id: dict[int, list[str]] = {}
+    for row in alias_rows:
+        alias_names_by_id.setdefault(int(row["head_id"]), []).append(str(row["logical_name"]))
+
+    rows_by_id = {
+        int(row["calibration_version_id"]): dict(row)
+        for row in version_rows
+    }
+    missing_ids = sorted(selected_ids - set(rows_by_id))
+    if missing_ids:
+        raise LightCurveSelectionError(
+            "Calibration selector resolved missing version IDs: "
+            + ", ".join(str(value) for value in missing_ids)
+        )
+    result = []
+    for calibration_version_id, row in rows_by_id.items():
+        row["is_current_alias_head"] = calibration_version_id in alias_names_by_id
+        row["alias_logical_names"] = sorted(alias_names_by_id.get(calibration_version_id, []))
+        result.append(row)
+    result.sort(
+        key=lambda row: (
+            str(row.get("created_at") or ""),
+            int(row["calibration_version_id"]),
+        )
+    )
+    return result
+
+
+def preflight_science_light_curve_selection(
+    session: Session,
+    *,
+    calibration_names: list[str] | None = None,
+    calibration_prefixes: list[str] | None = None,
+    model_name: str | None = None,
+    catalog_name: str | None = None,
+    instrument_unit_id: int | None = None,
+    series_id: int | None = None,
+    field_series_name: str | None = None,
+    frame_ids: list[int] | None = None,
+    offset_algorithm: str = "interseries_graph_median_v1",
+    interseries_generation_ids: list[int] | None = None,
+) -> LightCurveScope:
+    """Validate calibration/M4 selection before callers create output products."""
+
+    scope = resolve_light_curve_scope(
+        session,
+        calibration_names=calibration_names,
+        calibration_prefixes=calibration_prefixes,
+        model_name=model_name,
+        catalog_name=catalog_name,
+        instrument_unit_id=instrument_unit_id,
+        series_id=series_id,
+        field_series_name=field_series_name,
+        frame_ids=frame_ids,
+    )
+    contexts = _load_calibration_scope_contexts(
+        session,
+        calibration_version_ids=scope.calibration_version_ids,
+        scope=scope,
+        virtual_rows=[],
+    )
+    generation_records = _load_interseries_generation_records(
+        session,
+        scope_contexts=contexts,
+        explicit_generation_ids=interseries_generation_ids,
+    )
+    offset_selection = _resolve_interseries_generation_selection(
+        scope_contexts=contexts,
+        current_science_calibration_version_ids=set(
+            scope.current_science_calibration_version_ids
+        ),
+        generation_records=generation_records,
+        offset_algorithm=offset_algorithm,
+        explicit_generation_ids=interseries_generation_ids,
+    )
+    _apply_interseries_selection_to_scope(scope, offset_selection)
+    return scope
+
 
 def _load_raw_light_curve_rows(
     session: Session,
@@ -558,6 +782,7 @@ def _load_raw_light_curve_rows(
     object_id: int | None,
     object_qc_algorithm: str,
     offset_algorithm: str,
+    interseries_generation_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     # 0.7 has one BASE Measurement layer; every derived/science representation
     # is consumed through the storage-independent calibration view.
@@ -568,6 +793,7 @@ def _load_raw_light_curve_rows(
         object_id=object_id,
         object_qc_algorithm=object_qc_algorithm,
         offset_algorithm=offset_algorithm,
+        interseries_generation_ids=interseries_generation_ids,
     )
 
 
@@ -579,6 +805,7 @@ def _load_raw_light_curve_rows_virtual(
     object_id: int | None,
     object_qc_algorithm: str,
     offset_algorithm: str,
+    interseries_generation_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the public light-curve row shape from normalized calibration state."""
 
@@ -612,6 +839,27 @@ def _load_raw_light_curve_rows_virtual(
             if object_id is not None and int(row.object_id) != int(object_id):
                 continue
             virtual_rows.append((cv, row))
+    contexts = _load_calibration_scope_contexts(
+        session,
+        calibration_version_ids=cv_ids,
+        scope=scope,
+        virtual_rows=virtual_rows,
+    )
+    generation_records = _load_interseries_generation_records(
+        session,
+        scope_contexts=contexts,
+        explicit_generation_ids=interseries_generation_ids,
+    )
+    offset_selection = _resolve_interseries_generation_selection(
+        scope_contexts=contexts,
+        current_science_calibration_version_ids=set(
+            scope.current_science_calibration_version_ids
+        ),
+        generation_records=generation_records,
+        offset_algorithm=offset_algorithm,
+        explicit_generation_ids=interseries_generation_ids,
+    )
+    _apply_interseries_selection_to_scope(scope, offset_selection)
     if not virtual_rows:
         return []
 
@@ -665,35 +913,6 @@ def _load_raw_light_curve_rows_virtual(
         )
         qc_by_key[key] = qc
 
-    offset_sql = """
-        SELECT DISTINCT ON (ics.science_calibration_version_id, ics.series_id)
-            ics.science_calibration_version_id AS calibration_version_id,
-            ics.series_id,
-            ics.offset_mag,
-            ics.offset_err_mag AS offset_err,
-            g.reliability_status AS status,
-            g.analysis_algorithm AS algorithm
-        FROM interseries_calibration_series ics
-        JOIN interseries_calibration_generations g
-          ON g.interseries_generation_id = ics.interseries_generation_id
-        WHERE ics.science_calibration_version_id IN :cv_ids
-          AND g.lifecycle_status = 'COMPLETE_IMMUTABLE'
-    """
-    offset_params: dict[str, Any] = {"cv_ids": cv_ids}
-    if offset_algorithm:
-        offset_sql += " AND g.analysis_algorithm = :algorithm"
-        offset_params["algorithm"] = str(offset_algorithm)
-    offset_sql += """
-        ORDER BY ics.science_calibration_version_id, ics.series_id,
-                 g.created_at DESC, g.interseries_generation_id DESC
-    """
-    offset_stmt = text(offset_sql).bindparams(bindparam("cv_ids", expanding=True))
-    offset_rows = session.execute(offset_stmt, offset_params).mappings().all()
-    offsets_by_key = {
-        (int(value["calibration_version_id"]), int(value["series_id"])): value
-        for value in offset_rows
-    }
-
     result: list[dict[str, Any]] = []
     for cv, measurement in virtual_rows:
         frame = frames.get(int(measurement.frame_id))
@@ -715,9 +934,26 @@ def _load_raw_light_curve_rows_virtual(
             )
         )
         offset = (
-            offsets_by_key.get((int(cv.calibration_version_id), int(series_id_value)))
+            offset_selection["source_offsets"].get(
+                (
+                    int(offset_selection["generation_by_scope"][contexts[int(cv.calibration_version_id)]["scope_key"]]["interseries_generation_id"]),
+                    int(series_id_value),
+                    int(cv.calibration_version_id),
+                )
+            )
             if series_id_value is not None
+            and int(cv.calibration_version_id) in contexts
+            and contexts[int(cv.calibration_version_id)]["scope_key"]
+            in offset_selection["generation_by_scope"]
             else None
+        )
+        offset_status = (
+            offset["status"]
+            if offset is not None
+            else offset_selection["status_by_scope"].get(
+                contexts.get(int(cv.calibration_version_id), {}).get("scope_key"),
+                "NO_M4_SOURCE_MATCH",
+            )
         )
         result.append(
             {
@@ -757,8 +993,9 @@ def _load_raw_light_curve_rows_virtual(
                 "object_qc_flags": dict(qc.flags or {}) if qc is not None else {},
                 "interseries_offset_mag": offset["offset_mag"] if offset is not None else None,
                 "interseries_offset_err": offset["offset_err"] if offset is not None else None,
-                "interseries_offset_status": offset["status"] if offset is not None else None,
+                "interseries_offset_status": offset_status,
                 "interseries_algorithm": offset["algorithm"] if offset is not None else None,
+                "interseries_generation_id": offset["interseries_generation_id"] if offset is not None else None,
             }
         )
     result.sort(
@@ -771,6 +1008,435 @@ def _load_raw_light_curve_rows_virtual(
         )
     )
     return result
+
+
+def _load_calibration_scope_contexts(
+    session: Session,
+    *,
+    calibration_version_ids: list[int],
+    scope: LightCurveScope,
+    virtual_rows: list[tuple[CalibrationVersion, Any]],
+) -> dict[int, dict[str, Any]]:
+    if not calibration_version_ids:
+        return {}
+    stmt = (
+        select(
+            CalibrationVersion.calibration_version_id.label("calibration_version_id"),
+            CalibrationVersion.product_role.label("product_role"),
+            CalibrationVersion.field_id.label("calibration_field_id"),
+            CalibrationVersion.series_id.label("calibration_series_id"),
+            CalibrationVersion.instrument_unit_id.label("calibration_instrument_unit_id"),
+            CalibrationVersion.used_catalogs.label("used_catalogs"),
+            FieldSeries.field_id.label("series_field_id"),
+            FieldSeries.instrument_unit_id.label("series_instrument_unit_id"),
+            FieldSeries.filter_name.label("series_filter_name"),
+            PipelineRun.catalog_name.label("pipeline_catalog_name"),
+        )
+        .outerjoin(FieldSeries, FieldSeries.series_id == CalibrationVersion.series_id)
+        .outerjoin(PipelineRun, PipelineRun.pipeline_run_id == CalibrationVersion.pipeline_run_id)
+        .where(CalibrationVersion.calibration_version_id.in_(calibration_version_ids))
+    )
+    rows = session.execute(stmt).mappings().all()
+    catalog_names_by_cv: dict[int, set[str]] = {}
+    for cv, measurement in virtual_rows:
+        flags = measurement.flags if isinstance(measurement.flags, dict) else {}
+        value = flags.get("catalog_name")
+        if value not in (None, ""):
+            catalog_names_by_cv.setdefault(int(cv.calibration_version_id), set()).add(str(value))
+
+    current_head_ids = set(scope.current_science_calibration_version_ids)
+    contexts: dict[int, dict[str, Any]] = {}
+    returned_ids: set[int] = set()
+    for row in rows:
+        cv_id = int(row["calibration_version_id"])
+        returned_ids.add(cv_id)
+        cv_field = _int_or_none(row.get("calibration_field_id"))
+        series_field = _int_or_none(row.get("series_field_id"))
+        cv_series = _int_or_none(row.get("calibration_series_id"))
+        series_id = cv_series if cv_series is not None else scope.series_id
+        field_id = cv_field if cv_field is not None else series_field
+        if (
+            cv_id in current_head_ids
+            and cv_field is not None
+            and series_field is not None
+            and cv_field != series_field
+        ):
+            raise LightCurveSelectionError(
+                f"Current SCIENCE alias head {cv_id} has a field_id inconsistent with its series"
+            )
+        cv_unit = _int_or_none(row.get("calibration_instrument_unit_id"))
+        series_unit = _int_or_none(row.get("series_instrument_unit_id"))
+        if (
+            cv_id in current_head_ids
+            and cv_unit is not None
+            and series_unit is not None
+            and cv_unit != series_unit
+        ):
+            raise LightCurveSelectionError(
+                f"Current SCIENCE alias head {cv_id} has an instrument scope inconsistent with its series"
+            )
+        instrument_unit_id = (
+            cv_unit
+            if cv_unit is not None
+            else (series_unit if series_unit is not None else scope.instrument_unit_id)
+        )
+        actual_catalogs = catalog_names_by_cv.get(cv_id, set())
+        if len(actual_catalogs) > 1:
+            raise LightCurveSelectionError(
+                f"Calibration version {cv_id} has multiple catalog namespaces in the selected rows"
+            )
+        used_catalogs = row.get("used_catalogs")
+        used_catalog_name = (
+            used_catalogs.get("catalog_name") if isinstance(used_catalogs, dict) else None
+        )
+        catalog_name = (
+            scope.catalog_name
+            or next(iter(actual_catalogs), None)
+            or row.get("pipeline_catalog_name")
+            or used_catalog_name
+        )
+        scope_key = (
+            field_id,
+            instrument_unit_id,
+            _str_or_none(row.get("series_filter_name")),
+            _str_or_none(catalog_name),
+        )
+        if cv_id in current_head_ids and (series_id is None or field_id is None):
+            raise LightCurveSelectionError(
+                f"Current SCIENCE alias head {cv_id} lacks field/series scope required for M4 matching"
+            )
+        contexts[cv_id] = {
+            "calibration_version_id": cv_id,
+            "product_role": str(row.get("product_role") or ""),
+            "series_id": series_id,
+            "scope_key": scope_key,
+            "is_current_alias_head": cv_id in current_head_ids,
+        }
+
+    missing_current_ids = current_head_ids - returned_ids
+    if missing_current_ids:
+        raise LightCurveSelectionError(
+            "Current SCIENCE alias heads disappeared while resolving scope: "
+            + ", ".join(str(value) for value in sorted(missing_current_ids))
+        )
+    return contexts
+
+
+def _load_interseries_generation_records(
+    session: Session,
+    *,
+    scope_contexts: dict[int, dict[str, Any]],
+    explicit_generation_ids: list[int] | None,
+) -> dict[int, dict[str, Any]]:
+    generation_ids = _normalize_interseries_generation_ids(explicit_generation_ids)
+    field_ids = sorted(
+        {
+            int(context["scope_key"][0])
+            for context in scope_contexts.values()
+            if context["scope_key"][0] is not None
+        }
+    )
+    if generation_ids is None and not field_ids:
+        return {}
+
+    stmt = select(
+        InterseriesCalibrationGeneration.interseries_generation_id.label(
+            "interseries_generation_id"
+        ),
+        InterseriesCalibrationGeneration.field_id.label("field_id"),
+        InterseriesCalibrationGeneration.instrument_unit_id.label("instrument_unit_id"),
+        InterseriesCalibrationGeneration.filter_name.label("filter_name"),
+        InterseriesCalibrationGeneration.catalog_name.label("catalog_name"),
+        InterseriesCalibrationGeneration.analysis_algorithm.label("analysis_algorithm"),
+        InterseriesCalibrationGeneration.lifecycle_status.label("lifecycle_status"),
+        InterseriesCalibrationGeneration.reliability_status.label("reliability_status"),
+        InterseriesCalibrationGeneration.n_series.label("n_series"),
+        InterseriesCalibrationSeries.field_id.label("membership_field_id"),
+        InterseriesCalibrationSeries.series_id.label("series_id"),
+        InterseriesCalibrationSeries.science_calibration_version_id.label(
+            "science_calibration_version_id"
+        ),
+        InterseriesCalibrationSeries.offset_mag.label("offset_mag"),
+        InterseriesCalibrationSeries.offset_err_mag.label("offset_err"),
+    ).outerjoin(
+        InterseriesCalibrationSeries,
+        InterseriesCalibrationSeries.interseries_generation_id
+        == InterseriesCalibrationGeneration.interseries_generation_id,
+    )
+    if generation_ids is not None and field_ids:
+        stmt = stmt.where(
+            or_(
+                InterseriesCalibrationGeneration.field_id.in_(field_ids),
+                InterseriesCalibrationGeneration.interseries_generation_id.in_(generation_ids),
+            )
+        )
+    elif generation_ids is not None:
+        stmt = stmt.where(
+            InterseriesCalibrationGeneration.interseries_generation_id.in_(generation_ids)
+        )
+    else:
+        stmt = stmt.where(InterseriesCalibrationGeneration.field_id.in_(field_ids))
+
+    records: dict[int, dict[str, Any]] = {}
+    for row in session.execute(stmt).mappings().all():
+        generation_id = int(row["interseries_generation_id"])
+        record = records.setdefault(
+            generation_id,
+            {
+                "interseries_generation_id": generation_id,
+                "field_id": int(row["field_id"]),
+                "instrument_unit_id": _int_or_none(row.get("instrument_unit_id")),
+                "filter_name": _str_or_none(row.get("filter_name")),
+                "catalog_name": _str_or_none(row.get("catalog_name")),
+                "analysis_algorithm": str(row["analysis_algorithm"]),
+                "lifecycle_status": str(row["lifecycle_status"]),
+                "reliability_status": str(row["reliability_status"]),
+                "expected_n_series": row.get("n_series"),
+                "broken_membership": False,
+                "scope_key": (
+                    int(row["field_id"]),
+                    _int_or_none(row.get("instrument_unit_id")),
+                    _str_or_none(row.get("filter_name")),
+                    _str_or_none(row.get("catalog_name")),
+                ),
+                "sources": {},
+            },
+        )
+        if (row.get("series_id") is None) != (row.get("science_calibration_version_id") is None):
+            record["broken_membership"] = True
+            continue
+        if (row.get("membership_field_id") is not None
+                and int(row["membership_field_id"]) != int(row["field_id"])):
+            record["broken_membership"] = True
+            continue
+        if row.get("series_id") is not None:
+            source_key = (
+                int(row["series_id"]),
+                int(row["science_calibration_version_id"]),
+            )
+            if source_key in record["sources"]:
+                raise LightCurveSelectionError(
+                    f"M4 generation {generation_id} has duplicate source identity {source_key}"
+                )
+            record["sources"][source_key] = {
+                "interseries_generation_id": generation_id,
+                "series_id": source_key[0],
+                "calibration_version_id": source_key[1],
+                "offset_mag": row.get("offset_mag"),
+                "offset_err": row.get("offset_err"),
+                "status": str(row["reliability_status"]),
+                "algorithm": str(row["analysis_algorithm"]),
+            }
+    for record in records.values():
+        expected_count = record["expected_n_series"]
+        if expected_count is not None and len(record["sources"]) != int(expected_count):
+            record["broken_membership"] = True
+    return records
+
+
+def _resolve_interseries_generation_selection(
+    *,
+    scope_contexts: dict[int, dict[str, Any]],
+    current_science_calibration_version_ids: set[int],
+    generation_records: dict[int, dict[str, Any]],
+    offset_algorithm: str,
+    explicit_generation_ids: list[int] | None,
+) -> dict[str, Any]:
+    algorithm = str(offset_algorithm or "").strip()
+    if not algorithm:
+        raise LightCurveSelectionError("offset_algorithm must be a non-empty exact algorithm name")
+    requested_ids = _normalize_interseries_generation_ids(explicit_generation_ids)
+
+    science_contexts = {
+        cv_id: context
+        for cv_id, context in scope_contexts.items()
+        if context.get("product_role") == "SCIENCE" and context.get("series_id") is not None
+    }
+    contexts_by_scope: dict[tuple[Any, ...], dict[int, dict[str, Any]]] = {}
+    for cv_id, context in science_contexts.items():
+        contexts_by_scope.setdefault(context["scope_key"], {})[cv_id] = context
+    if not contexts_by_scope:
+        if requested_ids:
+            raise LightCurveSelectionError(
+                "Explicit interseries generation IDs cannot be matched to a selected SCIENCE scope"
+            )
+        return {
+            "generation_by_scope": {},
+            "source_offsets": {},
+            "status_by_scope": {},
+            "warnings": [],
+        }
+
+    explicit_by_scope: dict[tuple[Any, ...], dict[str, Any]] = {}
+    if requested_ids is not None:
+        for generation_id in requested_ids:
+            record = generation_records.get(generation_id)
+            if record is None:
+                raise LightCurveSelectionError(
+                    f"Explicit interseries generation {generation_id} does not exist"
+                )
+            key = record["scope_key"]
+            if key not in contexts_by_scope:
+                raise LightCurveSelectionError(
+                    f"Explicit interseries generation {generation_id} is outside the selected field/instrument/filter/catalog scopes"
+                )
+            if record["lifecycle_status"] != "COMPLETE_IMMUTABLE":
+                raise LightCurveSelectionError(
+                    f"Explicit interseries generation {generation_id} is not COMPLETE_IMMUTABLE"
+                )
+            if record["analysis_algorithm"] != algorithm:
+                raise LightCurveSelectionError(
+                    f"Explicit interseries generation {generation_id} uses algorithm "
+                    f"{record['analysis_algorithm']!r}, not {algorithm!r}"
+                )
+            if record.get("broken_membership"):
+                raise LightCurveSelectionError(
+                    f"Explicit M4 generation {generation_id} has orphaned or incomplete membership"
+                )
+            if key in explicit_by_scope:
+                previous = int(explicit_by_scope[key]["interseries_generation_id"])
+                raise LightCurveSelectionError(
+                    f"Multiple explicit M4 generations ({previous}, {generation_id}) target one scope"
+                )
+            explicit_by_scope[key] = record
+
+    generation_by_scope: dict[tuple[Any, ...], dict[str, Any]] = {}
+    source_offsets: dict[tuple[int, int, int], dict[str, Any]] = {}
+    status_by_scope: dict[tuple[Any, ...], str] = {}
+    warnings_out: list[str] = []
+
+    for scope_key, cv_contexts in contexts_by_scope.items():
+        required_sources = {
+            (int(context["series_id"]), cv_id)
+            for cv_id, context in cv_contexts.items()
+        }
+        explicit_record = explicit_by_scope.get(scope_key)
+        if explicit_record is not None:
+            selected = explicit_record
+            missing = sorted(required_sources - set(selected["sources"]))
+            if missing:
+                raise LightCurveSelectionError(
+                    f"Explicit M4 generation {selected['interseries_generation_id']} does not cover "
+                    f"every selected SCIENCE source in scope {scope_key}: {missing}"
+                )
+        else:
+            in_scope = [
+                record
+                for record in generation_records.values()
+                if record["scope_key"] == scope_key
+                and record["lifecycle_status"] == "COMPLETE_IMMUTABLE"
+                and record["analysis_algorithm"] == algorithm
+            ]
+            if any(record.get("broken_membership") for record in in_scope):
+                raise LightCurveSelectionError(
+                    f"M4 generation in scope {scope_key} has orphaned or incomplete membership"
+                )
+            eligible = [
+                record
+                for record in in_scope
+                if required_sources.issubset(set(record["sources"]))
+            ]
+            if len(eligible) > 1:
+                ids = sorted(int(record["interseries_generation_id"]) for record in eligible)
+                raise LightCurveSelectionError(
+                    f"Multiple eligible M4 generations {ids} match scope {scope_key}; "
+                    "supply --interseries-generation-id explicitly"
+                )
+            if len(eligible) == 1:
+                selected = eligible[0]
+            elif in_scope:
+                available_ids = sorted(
+                    int(record["interseries_generation_id"]) for record in in_scope
+                )
+                raise LightCurveSelectionError(
+                    f"No complete M4 generation among {available_ids} covers every selected "
+                    f"SCIENCE source in scope {scope_key}; refusing partial output"
+                )
+            else:
+                status_by_scope[scope_key] = "NO_M4_GENERATION"
+                warnings_out.append(
+                    f"NO_M4_GENERATION for field/instrument/filter/catalog scope {scope_key}; "
+                    "returning Stage-2-only rows"
+                )
+                continue
+
+        generation_by_scope[scope_key] = selected
+        status_by_scope[scope_key] = "NO_M4_SOURCE_MATCH"
+        for (series_id, calibration_version_id), source in selected["sources"].items():
+            source_offsets[
+                (
+                    int(selected["interseries_generation_id"]),
+                    int(series_id),
+                    int(calibration_version_id),
+                )
+            ] = source
+
+    return {
+        "generation_by_scope": generation_by_scope,
+        "source_offsets": source_offsets,
+        "status_by_scope": status_by_scope,
+        "warnings": warnings_out,
+    }
+
+
+def _apply_interseries_selection_to_scope(
+    scope: LightCurveScope,
+    selection: dict[str, Any],
+) -> None:
+    scope.interseries_generation_ids = sorted(
+        int(record["interseries_generation_id"])
+        for record in selection["generation_by_scope"].values()
+    )
+    scope.interseries_generation_scopes = [
+        {
+            "interseries_generation_id": int(record["interseries_generation_id"]),
+            "field_id": record["field_id"],
+            "instrument_unit_id": record["instrument_unit_id"],
+            "filter_name": record["filter_name"],
+            "catalog_name": record["catalog_name"],
+            "analysis_algorithm": record["analysis_algorithm"],
+        }
+        for _key, record in sorted(
+            selection["generation_by_scope"].items(),
+            key=lambda item: (
+                tuple("" if value is None else str(value) for value in item[0]),
+                int(item[1]["interseries_generation_id"]),
+            ),
+        )
+    ]
+    scope.warnings = list(selection["warnings"])
+
+
+def _normalize_interseries_generation_ids(values: list[int] | None) -> list[int] | None:
+    if values is None:
+        return None
+    try:
+        generation_ids = [int(value) for value in values]
+    except (TypeError, ValueError) as exc:
+        raise LightCurveSelectionError(
+            "interseries_generation_ids must contain integer IDs"
+        ) from exc
+    if not generation_ids:
+        raise LightCurveSelectionError(
+            "interseries_generation_ids must not be empty when explicitly provided"
+        )
+    if any(value <= 0 for value in generation_ids):
+        raise LightCurveSelectionError("interseries_generation_ids must contain positive IDs")
+    if len(set(generation_ids)) != len(generation_ids):
+        raise LightCurveSelectionError("interseries_generation_ids must not contain duplicate IDs")
+    return generation_ids
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _str_or_none(value: Any) -> str | None:
+    return str(value) if value is not None else None
+
 
 def _science_row_from_db(row: dict[str, Any], *, reject_flags: set[str]) -> dict[str, Any]:
     measurement_flags = _dict_or_empty(row.get("measurement_flags"))
@@ -820,7 +1486,7 @@ def _science_row_from_db(row: dict[str, Any], *, reject_flags: set[str]) -> dict
     mag_global_err_systematic = combine_mag_error(systematic_err, row.get("interseries_offset_err"))
     mag_global_err = combine_mag_error(mag_global_err_random, mag_global_err_systematic)
     if row.get("interseries_offset_mag") is None:
-        interseries_status = "NO_INTERSERIES_OFFSET"
+        interseries_status = row.get("interseries_offset_status") or "NO_INTERSERIES_OFFSET"
     else:
         interseries_status = row.get("interseries_offset_status") or "OFFSET_APPLIED"
 
@@ -867,6 +1533,7 @@ def _science_row_from_db(row: dict[str, Any], *, reject_flags: set[str]) -> dict
         "interseries_offset_err": row.get("interseries_offset_err"),
         "interseries_offset_status": interseries_status,
         "interseries_algorithm": row.get("interseries_algorithm"),
+        "interseries_generation_id": row.get("interseries_generation_id"),
         "aperture_radius_pix": row.get("aperture_radius_pix"),
         "local_background": row.get("local_background"),
         "local_zp_correction": row.get("local_zp_correction"),

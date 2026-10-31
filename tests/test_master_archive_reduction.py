@@ -83,6 +83,8 @@ def _headers() -> tuple[dict[str, object], dict[str, object], dict[str, object],
         "CRPIX2": 1.5,
         "CRVAL1": 327.52,
         "CRVAL2": 72.18,
+        "ALPHA": "21 50 25",
+        "DELTA": "+72 11 00",
         "CD1_1": -0.0005,
         "CD1_2": 0.0,
         "CD2_1": 0.0,
@@ -440,6 +442,10 @@ def test_reduce_master_task_end_to_end_with_astropy(tmp_path: Path) -> None:
         np.testing.assert_allclose(hdul[0].data, [[90.0, 200.0], [50.0, 110.0]])
         assert hdul[0].data.dtype.kind == "f"
         assert hdul[0].header["CTYPE1"] == "RA---TAN-SIP"
+        assert hdul[0].header["ALPHA"] == "21 50 25"
+        assert hdul[0].header["DELTA"] == "+72 11 00"
+        assert hdul[0].header["GGHDR"] == task.header_remote_path
+        assert hdul[0].header["GGMSMETA"] is True
         assert hdul[0].header["GGALG"] == "MASTER_DARK_FLAT_V1"
         assert hdul[0].header["GGDRKSC"] is False
         assert hdul[0].header["GGFLNRM"] is False

@@ -12,6 +12,7 @@ from sqlalchemy import (
     Enum as SAEnum,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -174,6 +175,7 @@ class InstrumentUnit(Base):
             "filter_name",
             "observing_mode",
             name="uq_instrument_units_identity",
+            postgresql_nulls_not_distinct=True,
         ),
         Index("ix_instrument_units_identity", "instrument", "site", "tube", "camera", "filter_name"),
     )
@@ -948,6 +950,7 @@ class ObjectQc(Base):
             "calibration_version_id",
             "algorithm",
             name="uq_object_qc_identity",
+            postgresql_nulls_not_distinct=True,
         ),
         Index("ix_object_qc_object", "object_id"),
         Index("ix_object_qc_catalog", "catalog_name"),
@@ -1237,6 +1240,9 @@ class CalibrationVersion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
+        UniqueConstraint("calibration_version_id", "field_id", name="uq_calibration_versions_id_field"),
+        UniqueConstraint("calibration_version_id", "field_id", "series_id",
+                         name="uq_calibration_versions_id_field_series"),
         Index("ix_calibration_versions_source", "source_calibration_version_id"),
         Index("ix_calibration_versions_pipeline_run", "pipeline_run_id"),
         Index("ix_calibration_versions_field_series", "field_id", "series_id"),
@@ -1433,7 +1439,7 @@ class InterseriesCalibrationGeneration(Base):
     analysis_algorithm: Mapped[str] = mapped_column(String(64), nullable=False)
     sign_convention: Mapped[str] = mapped_column(Text, nullable=False)
     reference_series_id: Mapped[int] = mapped_column(
-        ForeignKey("field_series.series_id", ondelete="CASCADE"), nullable=False
+        BigInteger, nullable=False
     )
     analysis_status: Mapped[str] = mapped_column(String(48), nullable=False)
     graph_status: Mapped[str] = mapped_column(String(48), nullable=False)
@@ -1456,6 +1462,22 @@ class InterseriesCalibrationGeneration(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
+        UniqueConstraint(
+            "interseries_generation_id", "field_id", name="uq_interseries_generations_id_field"
+        ),
+        ForeignKeyConstraint(
+            ["reference_series_id", "field_id"],
+            ["field_series.series_id", "field_series.field_id"],
+            name="fk_interseries_generations_reference_series_field",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["interseries_generation_id", "reference_series_id"],
+            ["interseries_calibration_series.interseries_generation_id",
+             "interseries_calibration_series.series_id"],
+            name="fk_interseries_generations_reference_member",
+            ondelete="NO ACTION", onupdate="NO ACTION", deferrable=True, initially="DEFERRED",
+        ),
         CheckConstraint("n_series >= 2", name="ck_interseries_generations_n_series"),
         CheckConstraint("n_edges >= 1", name="ck_interseries_generations_n_edges"),
         CheckConstraint("graph_dof >= 0", name="ck_interseries_generations_graph_dof"),
@@ -1472,10 +1494,9 @@ class InterseriesCalibrationSeries(Base):
     __tablename__ = "interseries_calibration_series"
 
     interseries_series_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    interseries_generation_id: Mapped[int] = mapped_column(
-        ForeignKey("interseries_calibration_generations.interseries_generation_id", ondelete="CASCADE"), nullable=False
-    )
-    series_id: Mapped[int] = mapped_column(ForeignKey("field_series.series_id", ondelete="CASCADE"), nullable=False)
+    interseries_generation_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    field_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    series_id: Mapped[int | None] = mapped_column(BigInteger)
     science_calibration_version_id: Mapped[int] = mapped_column(
         ForeignKey("calibration_versions.calibration_version_id", ondelete="RESTRICT"), nullable=False
     )
@@ -1494,6 +1515,34 @@ class InterseriesCalibrationSeries(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["interseries_generation_id", "field_id"],
+            [
+                "interseries_calibration_generations.interseries_generation_id",
+                "interseries_calibration_generations.field_id",
+            ],
+            name="fk_interseries_series_generation_field",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["series_id", "field_id"],
+            ["field_series.series_id", "field_series.field_id"],
+            name="fk_interseries_series_series_field",
+            ondelete="SET NULL (series_id)",
+        ),
+        ForeignKeyConstraint(
+            ["science_calibration_version_id", "field_id"],
+            ["calibration_versions.calibration_version_id", "calibration_versions.field_id"],
+            name="fk_interseries_series_science_cv_field",
+            ondelete="NO ACTION", onupdate="NO ACTION", deferrable=False,
+        ),
+        ForeignKeyConstraint(
+            ["science_calibration_version_id", "field_id", "series_id"],
+            ["calibration_versions.calibration_version_id", "calibration_versions.field_id",
+             "calibration_versions.series_id"],
+            name="fk_interseries_series_science_cv_field_series",
+            ondelete="NO ACTION", onupdate="NO ACTION", deferrable=False,
+        ),
         UniqueConstraint(
             "interseries_generation_id", "series_id", name="uq_interseries_calibration_series_generation_series"
         ),
@@ -1516,8 +1565,24 @@ class InterseriesCalibrationEdge(Base):
     interseries_generation_id: Mapped[int] = mapped_column(
         ForeignKey("interseries_calibration_generations.interseries_generation_id", ondelete="CASCADE"), nullable=False
     )
-    left_series_id: Mapped[int] = mapped_column(ForeignKey("field_series.series_id", ondelete="CASCADE"), nullable=False)
-    right_series_id: Mapped[int] = mapped_column(ForeignKey("field_series.series_id", ondelete="CASCADE"), nullable=False)
+    left_series_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "field_series.series_id",
+            name="fk_interseries_edges_left_series_restrict",
+            ondelete="RESTRICT",
+            deferrable=False,
+        ),
+        nullable=False,
+    )
+    right_series_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "field_series.series_id",
+            name="fk_interseries_edges_right_series_restrict",
+            ondelete="RESTRICT",
+            deferrable=False,
+        ),
+        nullable=False,
+    )
     measured_delta_mag: Mapped[float | None] = mapped_column(Float)
     measured_err_mag: Mapped[float | None] = mapped_column(Float)
     scatter_mag: Mapped[float | None] = mapped_column(Float)
@@ -1535,6 +1600,26 @@ class InterseriesCalibrationEdge(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["interseries_generation_id", "left_series_id"],
+            ["interseries_calibration_series.interseries_generation_id",
+             "interseries_calibration_series.series_id"],
+            name="fk_interseries_edges_left_generation_member",
+            ondelete="NO ACTION",
+            onupdate="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        ForeignKeyConstraint(
+            ["interseries_generation_id", "right_series_id"],
+            ["interseries_calibration_series.interseries_generation_id",
+             "interseries_calibration_series.series_id"],
+            name="fk_interseries_edges_right_generation_member",
+            ondelete="NO ACTION",
+            onupdate="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         CheckConstraint("left_series_id < right_series_id", name="ck_interseries_calibration_edges_series_order"),
         UniqueConstraint(
             "interseries_generation_id", "left_series_id", "right_series_id",
@@ -1652,6 +1737,7 @@ class FieldSeries(Base):
     )
 
     __table_args__ = (
+        UniqueConstraint("series_id", "field_id", name="uq_field_series_series_field"),
         Index("ix_field_series_field", "field_id"),
         Index("ix_field_series_instrument_unit", "instrument_unit_id"),
         Index("ix_field_series_status", "status"),
@@ -2119,6 +2205,7 @@ class EventFrameCoverage(Base):
             "object_id",
             "calibration_version_id",
             name="uq_event_frame_coverage",
+            postgresql_nulls_not_distinct=True,
         ),
         Index("ix_event_frame_coverage_event", "event_id"),
         Index("ix_event_frame_coverage_frame", "frame_id"),

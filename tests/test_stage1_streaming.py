@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -19,6 +20,8 @@ from grandgousier.archive.stage1_execution import (
     execute_stage1_stream,
 )
 from grandgousier.archive.stage1_planner import (
+    DEFAULT_STAGE1_BATCH_SIZE,
+    MAX_STAGE1_BATCH_SIZE,
     iter_stage1_plan_batches,
     normalize_stage1_batch_size,
 )
@@ -145,6 +148,126 @@ def test_stream_execution_starts_before_source_is_exhausted_and_writes_bounded_r
     assert len(report["items"]) == total
 
 
+def test_stream_execution_at_max_batch_preserves_order_status_counts_and_csv_schema(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from grandgousier.archive import stage1_planner
+
+    original_iterator = stage1_planner.iter_stage1_plan_batches
+    batch_lengths: list[int] = []
+
+    def observe_batches(**kwargs):
+        for batch in original_iterator(**kwargs):
+            batch_lengths.append(len(batch.items))
+            yield batch
+
+    monkeypatch.setattr(stage1_planner, "iter_stage1_plan_batches", observe_batches)
+    monkeypatch.setattr(
+        "grandgousier.archive.stage1_execution._execute_item",
+        lambda item, **kwargs: Stage1ExecutionItemResult(
+            source_observation_uid=item.observation.source_observation_uid,
+            native_observation_id=item.observation.native_observation_id,
+            observation_uid=item.observation.observation_uid,
+            action=item.action,
+            status="SKIPPED_EXISTING",
+            product=item.product,
+        ),
+    )
+
+    total = MAX_STAGE1_BATCH_SIZE + 1
+    summary = execute_stage1_stream(
+        request=ArchiveRequest(source_id="stream"),
+        source=_source(),
+        metadata_provider=_SinglePassProvider(_records(total)),
+        asset_provider=object(),
+        product_store=_Store(),
+        batch_size=MAX_STAGE1_BATCH_SIZE,
+        plan_json_path=tmp_path / "max-plan.json",
+        report_json_path=tmp_path / "max-report.json",
+    )
+
+    expected_ids = [f"native-{index:06d}" for index in range(total)]
+    plan = json.loads((tmp_path / "max-plan.json").read_text(encoding="utf-8"))
+    report = json.loads((tmp_path / "max-report.json").read_text(encoding="utf-8"))
+    with (tmp_path / "max-plan.csv").open(encoding="utf-8", newline="") as handle:
+        plan_rows = list(csv.DictReader(handle))
+    with (tmp_path / "max-report.csv").open(encoding="utf-8", newline="") as handle:
+        report_rows = list(csv.DictReader(handle))
+
+    assert batch_lengths == [MAX_STAGE1_BATCH_SIZE, 1]
+    assert summary.status == summary.plan_status == "READY"
+    assert summary.discovered_records == summary.planned_items == total
+    assert summary.counts == {"SKIPPED_EXISTING": total}
+    assert [item["observation"]["native_observation_id"] for item in plan["items"]] == expected_ids
+    assert [item["native_observation_id"] for item in report["items"]] == expected_ids
+    assert plan["summary"] == {
+        "discovered_records": total,
+        "science_items": total,
+        "ready_items": total,
+        "blocked_items": 0,
+    }
+    assert report["summary"]["items"] == total
+    assert report["summary"]["skipped_existing"] == total
+    assert [row["native_observation_id"] for row in plan_rows] == expected_ids
+    assert [row["native_observation_id"] for row in report_rows] == expected_ids
+    assert list(plan_rows[0]) == [
+        "source_id",
+        "native_observation_id",
+        "source_observation_uid",
+        "observation_uid",
+        "identity_status",
+        "instrument",
+        "camera",
+        "filter",
+        "observed_at",
+        "action",
+        "status",
+        "input_state",
+        "product_locator",
+        "asset_roles",
+        "missing_asset_roles",
+        "issues",
+    ]
+    assert list(report_rows[0]) == [
+        "native_observation_id",
+        "source_observation_uid",
+        "observation_uid",
+        "action",
+        "status",
+        "product_locator",
+        "product_path",
+        "product_checksum_sha256",
+        "provenance_path",
+        "fingerprint",
+        "error",
+    ]
+
+
+def test_stream_execution_normalizes_default_before_iterating(monkeypatch, tmp_path: Path) -> None:
+    from grandgousier.archive import stage1_planner
+
+    original_iterator = stage1_planner.iter_stage1_plan_batches
+    received_batch_sizes: list[int] = []
+
+    def observe_batches(**kwargs):
+        received_batch_sizes.append(kwargs["batch_size"])
+        yield from original_iterator(**kwargs)
+
+    monkeypatch.setattr(stage1_planner, "iter_stage1_plan_batches", observe_batches)
+    summary = execute_stage1_stream(
+        request=ArchiveRequest(source_id="stream"),
+        source=_source(),
+        metadata_provider=_SinglePassProvider(iter(())),
+        asset_provider=object(),
+        product_store=_Store(),
+        plan_json_path=tmp_path / "default-plan.json",
+        report_json_path=tmp_path / "default-report.json",
+    )
+
+    assert received_batch_sizes == [DEFAULT_STAGE1_BATCH_SIZE]
+    assert summary.plan_status == "EMPTY"
+
+
 def test_stream_empty_and_partial_batches(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         "grandgousier.archive.stage1_execution._execute_item",
@@ -184,11 +307,47 @@ def test_stream_empty_and_partial_batches(monkeypatch, tmp_path: Path) -> None:
     assert empty.status == "READY"
 
 
-def test_invalid_batch_size_is_rejected() -> None:
-    with pytest.raises(ValueError, match="positive"):
-        normalize_stage1_batch_size(0)
-    with pytest.raises(ValueError, match="positive"):
-        normalize_stage1_batch_size(-1)
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, DEFAULT_STAGE1_BATCH_SIZE),
+        (1, 1),
+        (MAX_STAGE1_BATCH_SIZE, MAX_STAGE1_BATCH_SIZE),
+        (str(MAX_STAGE1_BATCH_SIZE), MAX_STAGE1_BATCH_SIZE),
+    ],
+)
+def test_batch_size_normalization_accepts_default_and_inclusive_bounds(value, expected) -> None:
+    assert normalize_stage1_batch_size(value) == expected
+
+
+@pytest.mark.parametrize("value", [0, -1, MAX_STAGE1_BATCH_SIZE + 1])
+def test_batch_size_normalization_rejects_out_of_range_values(value) -> None:
+    with pytest.raises(ValueError, match="1 through 512"):
+        normalize_stage1_batch_size(value)
+
+
+def test_stream_execution_rejects_oversized_batch_before_search_or_staging(
+    tmp_path: Path,
+) -> None:
+    provider = _SinglePassProvider(_records(1))
+    plan_path = tmp_path / "nested" / "plan.json"
+    report_path = tmp_path / "nested" / "report.json"
+
+    with pytest.raises(ValueError, match="1 through 512"):
+        execute_stage1_stream(
+            request=ArchiveRequest(source_id="stream"),
+            source=_source(),
+            metadata_provider=provider,
+            asset_provider=object(),
+            product_store=_Store(),
+            batch_size=MAX_STAGE1_BATCH_SIZE + 1,
+            plan_json_path=plan_path,
+            report_json_path=report_path,
+        )
+
+    assert provider.calls == 0
+    assert not plan_path.parent.exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_batch_order_is_deterministic() -> None:

@@ -140,7 +140,19 @@ def persist_interseries_calibration(
     max_clip_iterations: int = 5,
     allow_sparse_graph: bool = False,
     required_stage2_recipe: str | None = None,
+    science_calibration_version_ids: list[int] | None = None,
 ) -> PersistedInterseriesGeneration:
+    if required_stage2_recipe is None:
+        raise ValueError(
+            "required_stage2_recipe is required for M4 persistence; "
+            "currently supported recipe: 'stage3_scale_v1'"
+        )
+    if required_stage2_recipe != "stage3_scale_v1":
+        raise ValueError(
+            "Unsupported required_stage2_recipe for M4 persistence: "
+            f"{required_stage2_recipe!r}; currently supported recipe: 'stage3_scale_v1'"
+        )
+
     analysis = analyze_interseries_calibration(
         session,
         field_id=field_id,
@@ -154,6 +166,7 @@ def persist_interseries_calibration(
         clip_sigma=clip_sigma,
         max_clip_iterations=max_clip_iterations,
         required_stage2_recipe=required_stage2_recipe,
+        science_calibration_version_ids=science_calibration_version_ids,
     )
     if analysis.status != "READY_M1_M3" or analysis.graph_solution is None:
         raise ValueError(
@@ -257,6 +270,7 @@ def persist_interseries_calibration(
             series_rows.append(
                 {
                     "generation_id": generation_id,
+                    "field_id": int(analysis.field_id),
                     "series_id": int(series_id),
                     "science_calibration_version_id": int(summary.calibration_version_id),
                     "offset_mag": float(offset.offset_mag),
@@ -277,12 +291,12 @@ def persist_interseries_calibration(
             text(
                 """
                 INSERT INTO interseries_calibration_series (
-                    interseries_generation_id, series_id, science_calibration_version_id,
+                    interseries_generation_id, field_id, series_id, science_calibration_version_id,
                     offset_mag, offset_err_mag, is_reference_series, n_incident_edges,
                     n_frames, n_science_points, n_objects, n_state_objects,
                     n_ensemble_references, n_reference_eligible, median_within_series_robust_sigma_mag, details
                 ) VALUES (
-                    :generation_id, :series_id, :science_calibration_version_id,
+                    :generation_id, :field_id, :series_id, :science_calibration_version_id,
                     :offset_mag, :offset_err_mag, :is_reference_series, :n_incident_edges,
                     :n_frames, :n_science_points, :n_objects, :n_state_objects,
                     :n_ensemble_references, :n_reference_eligible, :median_within_series_robust_sigma_mag,
@@ -468,7 +482,7 @@ def load_interseries_generation_series(session: Session, *, generation_id: int) 
         for row in session.execute(
             text(
                 """
-                SELECT s.interseries_generation_id, s.series_id, s.science_calibration_version_id,
+                SELECT s.interseries_generation_id, s.field_id, s.series_id, s.science_calibration_version_id,
                        cv.name AS science_calibration_name,
                        s.offset_mag, s.offset_err_mag, s.is_reference_series, s.n_incident_edges,
                        s.n_frames, s.n_science_points, s.n_ensemble_references, s.n_reference_eligible,
@@ -526,7 +540,30 @@ def verify_interseries_generation(session: Session, *, generation_id: int, toler
     fingerprint_ok = generation_fingerprint(snapshot) == generation["fingerprint_sha256"]
 
     series_rows = load_interseries_generation_series(session, generation_id=generation_id)
-    source_cv_ids = [int(row["science_calibration_version_id"]) for row in series_rows]
+    orphan_rows = [row for row in series_rows if row["series_id"] is None]
+    if orphan_rows:
+        return InterseriesVerification(
+            interseries_generation_id=int(generation_id),
+            generation_uid=str(generation["generation_uid"]),
+            status="FAILED",
+            fingerprint_ok=fingerprint_ok,
+            source_calibrations_ok=False,
+            graph_ok=False,
+            n_series=len(series_rows),
+            n_ok_edges=0,
+            graph_dof=0,
+            reliability_status=str(generation["reliability_status"]),
+            details={
+                "failure_reason": "ORPHAN_M4_SERIES",
+                "orphan_memberships": [
+                    {
+                        "field_id": row.get("field_id"),
+                        "science_calibration_version_id": row["science_calibration_version_id"],
+                    }
+                    for row in orphan_rows
+                ],
+            },
+        )
     source_checks = []
     source_ok = True
     for row in series_rows:
@@ -550,6 +587,8 @@ def verify_interseries_generation(session: Session, *, generation_id: int, toler
             and check["field_id"] is not None
             and int(check["series_id"]) == int(row["series_id"])
             and int(check["field_id"]) == int(generation["field_id"])
+            and row.get("field_id") is not None
+            and int(row["field_id"]) == int(generation["field_id"])
             and check["product_role"] == "SCIENCE"
             and check["lifecycle_status"] == LIFECYCLE_COMPLETE
             and int(check["n_science_rows"] or 0) == int(row["n_science_points"])
@@ -588,6 +627,10 @@ def verify_interseries_generation(session: Session, *, generation_id: int, toler
     for row in ok_edges:
         left = int(row["left_series_id"])
         right = int(row["right_series_id"])
+        if left not in offsets or right not in offsets:
+            graph_ok = False
+            edge_checks.append({"left_series_id": left, "right_series_id": right, "ok": False})
+            continue
         predicted = offsets[left] - offsets[right]
         measured = float(row["measured_delta_mag"])
         err = float(row["measured_err_mag"])

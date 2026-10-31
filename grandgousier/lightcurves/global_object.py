@@ -1,24 +1,38 @@
 from __future__ import annotations
 
 import csv
+import ctypes
+import io
 import json
 import math
+import os
+import shutil
+import stat
+import sys
+import tempfile
 from collections import defaultdict
+from collections.abc import Iterable, Iterator
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field
+from itertools import islice
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from grandgousier.calibration.reconstruction import _chain_from_base, _latest_iteration
+from grandgousier.db.models import CalibrationVersion
 from grandgousier.interseries.planning import _load_series_candidates
-from grandgousier.photometry.calibration_view import load_calibration_photometry_view
 from grandgousier.lightcurves.product import (
     _science_row_from_db,
     light_curve_reject_flags,
 )
-from grandgousier.visualization.lightcurve_plot import export_global_lightcurve_plot
-
+from grandgousier.photometry.calibration_view import load_calibration_photometry_view
+from grandgousier.visualization.lightcurve_plot import (
+    export_global_lightcurve_plot,
+    format_lightcurve_identity_subtitle,
+)
 
 M5_ALGORITHM = "global_object_lightcurve_v2"
 M5_LINK_STATUS = "M4_EXACT_SOURCE_MATCH"
@@ -108,6 +122,26 @@ PLOT_DATA_COLUMNS: tuple[str, ...] = (
     "interseries_reliability",
 )
 
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+_RENAME_EXCL = 0x00000004
+
+# Opt-in policy ceilings, not measured database counts or an RSS guarantee.
+_M5_BUDGET_CSV_BYTES = 32 * 1024 * 1024
+_M5_BUDGET_SUMMARY_BYTES = 1024 * 1024
+_M5_BUDGET_JSON_BYTES = 64 * 1024 * 1024
+_M5_BUDGET_ITEM_BYTES = 64 * 1024
+
+
+@dataclass
+class _M5ExportBudget:
+    payload_bytes: int = 0
+    science_rows: int = 0
+    object_rows: int = 0
+    weighted_base_rows: int = 0
+    frame_terms: int = 0
+    object_terms: int = 0
+
 
 @dataclass(frozen=True)
 class M5Generation:
@@ -175,9 +209,10 @@ class GlobalObjectLightCurveResult:
     plot_policy: dict[str, Any] = field(default_factory=dict)
     series_coverage: list[SeriesCoverage] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    selection_provenance: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "object_id": self.object_id,
             "field_id": self.field_id,
             "field_name": self.field_name,
@@ -214,6 +249,9 @@ class GlobalObjectLightCurveResult:
                 "mag_err_effective": "convenience sqrt(mag_err_random^2 + mag_err_series_zp^2); not independent point noise",
             },
         }
+        if self.selection_provenance is not None:
+            result["selection_provenance"] = self.selection_provenance
+        return result
 
 
 @dataclass
@@ -313,8 +351,10 @@ def resolve_m5_generations(
                 g.filter_name,
                 g.catalog_name,
                 g.reference_series_id,
+                g.n_series,
                 g.reliability_status,
                 g.graph_dof,
+                s.field_id AS membership_field_id,
                 s.series_id,
                 s.science_calibration_version_id
             FROM interseries_calibration_generations g
@@ -342,6 +382,13 @@ def resolve_m5_generations(
     generations: list[M5Generation] = []
     for generation_id, group in grouped.items():
         first = group[0]
+        if (any(row.get("series_id") is None or row.get("science_calibration_version_id") is None
+                or (row.get("membership_field_id") is not None
+                    and int(row["membership_field_id"]) != int(row["field_id"]))
+                for row in group)
+                or (first.get("n_series") is not None
+                    and len(group) != int(first["n_series"]))):
+            raise ValueError(f"M4 generation {generation_id} has orphaned or incomplete membership")
         generations.append(
             M5Generation(
                 interseries_generation_id=generation_id,
@@ -402,8 +449,10 @@ def inspect_m5_series_coverage(
     field_id: int,
     object_id: int,
     generations: Iterable[M5Generation],
+    science_calibration_version_ids: list[int] | None = None,
 ) -> list[SeriesCoverage]:
     selected_sources: dict[int, int] = {}
+    generations = list(generations)
     for generation in generations:
         for series_id, cv_id in generation.series_sources:
             selected_sources[series_id] = cv_id
@@ -414,7 +463,32 @@ def inspect_m5_series_coverage(
         instrument_unit_id=None,
         filter_name=None,
         catalog_name=None,
+        **({"science_calibration_version_ids": science_calibration_version_ids}
+           if science_calibration_version_ids is not None else {}),
     )
+    if science_calibration_version_ids is not None:
+        if (len(current_rows) != len(selected_sources)
+                or {int(row["series_id"]) for row in current_rows} != set(selected_sources)):
+            raise ValueError("M5 explicit M4 sources do not cover every field series")
+        scopes = {
+            series_id: generation
+            for generation in generations
+            for series_id, _cv_id in generation.series_sources
+        }
+        for row in current_rows:
+            series_id = int(row["series_id"])
+            generation = scopes[series_id]
+            if (row.get("_selection_status") is not None
+                    or _int_or_none(row.get("calibration_version_id")) != selected_sources[series_id]):
+                raise ValueError(f"M5 explicit M4 source is not the current SCIENCE head: {series_id}")
+            if (generation.field_id != int(field_id)
+                    or (generation.instrument_unit_id is not None
+                        and _int_or_none(row.get("instrument_unit_id")) != generation.instrument_unit_id)
+                    or (generation.filter_name is not None
+                        and not _m5_same_scope_text(row.get("filter_name"), generation.filter_name))
+                    or (generation.catalog_name is not None
+                        and not _m5_same_scope_text(row.get("catalog_name"), generation.catalog_name))):
+                raise ValueError(f"M5 explicit M4 source is outside generation scope: {series_id}")
     current_cv_ids = [
         int(row["calibration_version_id"])
         for row in current_rows
@@ -467,6 +541,381 @@ def inspect_m5_series_coverage(
     return coverage
 
 
+def _m5_same_scope_text(actual: Any, required: str) -> bool:
+    return actual is not None and str(actual).strip().casefold() == required.strip().casefold()
+
+
+def _m5_explicit_m4_source_ids(
+    session: Session, *, field_id: int, generations: list[M5Generation],
+) -> list[int]:
+    sources: dict[int, int] = {}
+    for generation in generations:
+        if generation.field_id != field_id:
+            raise ValueError("M5 explicit M4 source belongs to another field")
+        for series_id, cv_id in generation.series_sources:
+            if series_id in sources or cv_id <= 0 or series_id <= 0:
+                raise ValueError("M5 explicit M4 source repeats a series or has an invalid ID")
+            sources[series_id] = cv_id
+    ids = list(sources.values())
+    if not 1 <= len(ids) <= 18 or len(set(ids)) != len(ids):
+        raise ValueError("M5 explicit M4 sources require 1..18 distinct series and CV IDs")
+    rows = session.execute(text(
+        "SELECT calibration_version_id, field_id, series_id, instrument_unit_id, "
+        "product_role, lifecycle_status FROM calibration_versions "
+        "WHERE calibration_version_id = ANY(:ids)"
+    ), {"ids": ids}).mappings().all()
+    by_id = {int(row["calibration_version_id"]): row for row in rows}
+    if len(rows) != len(ids) or len(by_id) != len(ids):
+        raise ValueError("M5 explicit M4 source calibration metadata is missing or duplicated")
+    for generation in generations:
+        for series_id, cv_id in generation.series_sources:
+            cv = by_id[cv_id]
+            if (cv["field_id"] is None or int(cv["field_id"]) != field_id
+                    or cv["series_id"] is None or int(cv["series_id"]) != series_id
+                    or cv["product_role"] != "SCIENCE"
+                    or cv["lifecycle_status"] != "COMPLETE_IMMUTABLE"
+                    or (generation.instrument_unit_id is not None
+                        and (cv["instrument_unit_id"] is None
+                             or int(cv["instrument_unit_id"]) != generation.instrument_unit_id))):
+                raise ValueError(f"M5 explicit M4 source CV is invalid or outside scope: {cv_id}")
+    return ids
+
+
+def _m5_budget_probe(
+    session: Session,
+    budget: _M5ExportBudget,
+    source_sql: str,
+    params: dict[str, Any],
+    *,
+    label: str,
+    maximum: int,
+    minimum: int = 0,
+    json_columns: tuple[str, ...] = (),
+    text_columns: tuple[str, ...] = (),
+) -> int:
+    """Exact scoped counts and decoded text sizes, before loading any payload rows.
+
+    All SQL fragments here are internal constant column/relation names, never user input.
+    pg_column_size is deliberately NOT used: TOAST-compressed JSON can expand on read.
+    """
+    lengths = [f"COALESCE(octet_length(({col})::text), 0)" for col in json_columns]
+    lengths += [f"octet_length(COALESCE({col}, ''))" for col in text_columns]
+    largest = f"GREATEST(0, {', '.join(lengths)})" if lengths else "0"
+    total = " + ".join(lengths) if lengths else "0"
+    row = session.execute(
+        text(
+            f"SELECT COUNT(*)::bigint AS n, COALESCE(MAX({largest}), 0)::bigint AS largest, "
+            f"COALESCE(SUM({total}), 0)::bigint AS payload_bytes {source_sql}"
+        ),
+        params,
+    ).mappings().first()
+    if row is None:
+        raise ValueError(f"M5 budget: missing {label} preflight result")
+    count = int(row["n"])
+    if not minimum <= count <= maximum:
+        raise ValueError(f"M5 budget: {label} count outside [{minimum}, {maximum}]")
+    if int(row["largest"]) > _M5_BUDGET_ITEM_BYTES:
+        raise ValueError(f"M5 budget: {label} decoded payload exceeds per-item ceiling")
+    budget.payload_bytes += int(row["payload_bytes"])
+    if budget.payload_bytes > _M5_BUDGET_JSON_BYTES:
+        raise ValueError("M5 budget: cumulative decoded payload exceeds ceiling")
+    return count
+
+
+def _m5_budget_early_scope(
+    session: Session, *, field_id: int, generation_ids: Iterable[int] | None,
+    budget: _M5ExportBudget,
+    use_explicit_m4_source_heads: bool = False,
+) -> dict[int, int]:
+    """Bound the existing M5 generation and field-wide alias readers before their .all()."""
+    _m5_budget_probe(
+        session, budget, "FROM fields fld WHERE fld.field_id = :fid", {"fid": field_id},
+        label="field", minimum=1, maximum=1, text_columns=("fld.field_name",),
+    )
+    field_series_count = _m5_budget_probe(
+        session, budget, "FROM field_series fs WHERE fs.field_id = :fid", {"fid": field_id},
+        label="field series", maximum=18,
+    )
+    multiplicity: dict[int, int] = {}
+    if use_explicit_m4_source_heads:
+        # Aggregate to at most 18 series BEFORE _load_series_candidates materializes
+        # any alias/recipe JSON. This counts *all* SCIENCE alias rows, not just M4 IDs.
+        rows = session.execute(text("""
+            SELECT fs.series_id, COUNT(cpa.alias_id)::bigint AS n_alias,
+                   COUNT(DISTINCT cv.calibration_version_id)::bigint AS n_distinct_cv,
+                   COUNT(*) FILTER (WHERE cv.field_id IS DISTINCT FROM fs.field_id
+                       OR (fs.instrument_unit_id IS NOT NULL AND cv.instrument_unit_id IS NOT NULL
+                           AND fs.instrument_unit_id <> cv.instrument_unit_id))::bigint AS n_invalid,
+                   COALESCE(MAX(GREATEST(
+                       COALESCE(octet_length((cv.used_catalogs)::text), 0),
+                       COALESCE(octet_length((pr.recipe_json)::text), 0),
+                       octet_length(COALESCE(pr.catalog_name, '')))), 0)::bigint AS largest,
+                   COALESCE(SUM(COALESCE(octet_length((cv.used_catalogs)::text), 0)
+                       + COALESCE(octet_length((pr.recipe_json)::text), 0)
+                       + octet_length(COALESCE(pr.catalog_name, ''))), 0)::bigint AS payload_bytes
+            FROM field_series fs
+            JOIN calibration_versions cv ON cv.series_id = fs.series_id
+              AND cv.product_role = 'SCIENCE'
+            JOIN calibration_product_aliases cpa
+              ON cpa.head_calibration_version_id = cv.calibration_version_id
+            LEFT JOIN pipeline_runs pr ON pr.pipeline_run_id = cv.pipeline_run_id
+            WHERE fs.field_id = :fid
+            GROUP BY fs.series_id ORDER BY fs.series_id
+        """), {"fid": field_id}).mappings().all()
+        if len(rows) != field_series_count or not 1 <= len(rows) <= 18:
+            raise ValueError("M5 budget: explicit M4 aliases do not cover all field series")
+        for row in rows:
+            series_id = int(row["series_id"])
+            n_alias = int(row["n_alias"])
+            if (series_id in multiplicity or not 1 <= n_alias <= 2
+                    or int(row["n_distinct_cv"]) != n_alias or int(row["n_invalid"]) != 0):
+                raise ValueError(f"M5 budget: invalid SCIENCE alias multiplicity/scope: {series_id}")
+            if int(row["largest"]) > _M5_BUDGET_ITEM_BYTES:
+                raise ValueError("M5 budget: alias decoded payload exceeds per-item ceiling")
+            budget.payload_bytes += int(row["payload_bytes"])
+            if budget.payload_bytes > _M5_BUDGET_JSON_BYTES:
+                raise ValueError("M5 budget: cumulative decoded payload exceeds ceiling")
+            multiplicity[series_id] = n_alias
+        if sum(multiplicity.values()) > 36:
+            raise ValueError("M5 budget: field SCIENCE alias heads exceed opt-in ceiling")
+    else:
+        _m5_budget_probe(
+            session, budget,
+            """FROM field_series fs
+               JOIN calibration_versions cv ON cv.series_id = fs.series_id
+                 AND cv.product_role = 'SCIENCE'
+               JOIN calibration_product_aliases cpa
+                 ON cpa.head_calibration_version_id = cv.calibration_version_id
+               LEFT JOIN pipeline_runs pr ON pr.pipeline_run_id = cv.pipeline_run_id
+               WHERE fs.field_id = :fid""",
+            {"fid": field_id}, label="field SCIENCE alias heads", maximum=18,
+            json_columns=("cv.used_catalogs", "pr.recipe_json"),
+            text_columns=("pr.catalog_name",),
+        )
+    selected = sorted({int(value) for value in (generation_ids or ())})
+    if len(selected) > 18:
+        raise ValueError("M5 budget: generation selection exceeds ceiling")
+    clause = " AND g.interseries_generation_id = ANY(:ids)" if selected else ""
+    _m5_budget_probe(
+        session, budget,
+        """FROM interseries_calibration_generations g
+           LEFT JOIN interseries_calibration_series s
+             ON s.interseries_generation_id = g.interseries_generation_id
+           WHERE g.field_id = :fid AND g.lifecycle_status = 'COMPLETE_IMMUTABLE'
+             AND g.graph_status = 'OK'""" + clause,
+        {"fid": field_id, **({"ids": selected} if selected else {})},
+        label="M4 generation memberships", minimum=1, maximum=18,
+    )
+    return multiplicity
+
+
+def _m5_budget_preflight(
+    session: Session, *, object_id: int, generations: list[M5Generation],
+    budget: _M5ExportBudget,
+) -> None:
+    """Bound each SCIENCE/BASE load and each repeated normalized-stage term load.
+
+    Must be run in the SAME Session/snapshot as the export. A future live child
+    must independently enforce read-only snapshot, identity and timeouts.
+    """
+    sources = [int(cv) for gen in generations for _, cv in gen.series_sources]
+    if not sources or len(sources) > 18 or len(set(sources)) != len(sources):
+        raise ValueError("M5 budget: expected 1..18 distinct selected source CVs")
+    base_ids: list[int] = []
+    for cv_id in sources:
+        cv_chain: list[int] = []
+        seen: set[int] = set()
+        current: int | None = cv_id
+        while current is not None:
+            if current in seen or len(cv_chain) >= 7:
+                raise ValueError("M5 budget: cyclic or oversized calibration chain")
+            seen.add(current)
+            # Scalar metadata first: never materialize ORM JSON or unbounded text
+            # before its SQL-side decoded-size preflight.
+            meta = session.execute(text(
+                "SELECT calibration_version_id, source_calibration_version_id, product_kind, "
+                "product_role FROM calibration_versions WHERE calibration_version_id = :cv"
+            ), {"cv": current}).mappings().first()
+            if meta is None:
+                raise ValueError("M5 budget: missing calibration source metadata")
+            _m5_budget_probe(
+                session, budget,
+                "FROM calibration_versions cv WHERE cv.calibration_version_id = :cv",
+                {"cv": current}, label="calibration metadata", minimum=1, maximum=1,
+                json_columns=("cv.instrument_profile", "cv.used_catalogs", "cv.parameters"),
+                text_columns=("cv.notes",),
+            )
+            cv_chain.append(current)
+            kind = str(meta["product_kind"] or "").upper()
+            if current == cv_id and str(meta["product_role"] or "").upper() != "SCIENCE":
+                raise ValueError("M5 budget: selected calibration is not SCIENCE")
+            if kind == "BASE_PHOTOMETRY":
+                break
+            current = (int(meta["source_calibration_version_id"])
+                       if meta["source_calibration_version_id"] is not None else None)
+        if not cv_chain or kind != "BASE_PHOTOMETRY":
+            raise ValueError("M5 budget: calibration chain lacks BASE")
+        if len(cv_chain) - 1 > 6:
+            raise ValueError("M5 budget: more than six reconstruction stages per CV")
+        base_id = cv_chain[-1]
+        base_ids.append(base_id)
+        budget.science_rows += _m5_budget_probe(
+            session, budget,
+            "FROM science_photometry s WHERE s.calibration_version_id = :cv",
+            {"cv": cv_id}, label="SCIENCE per CV", minimum=1, maximum=600_000,
+        )
+        if budget.science_rows > 6_000_000:
+            raise ValueError("M5 budget: selected SCIENCE total exceeds ceiling")
+        points = _m5_budget_probe(
+            session, budget,
+            """FROM science_photometry s
+               JOIN measurements bm ON bm.measurement_id = s.base_measurement_id
+               WHERE s.calibration_version_id = :cv AND bm.object_id = :obj""",
+            {"cv": cv_id, "obj": object_id}, label="object SCIENCE points per CV",
+            minimum=1, maximum=3000,
+        )
+        budget.object_rows += points
+        if budget.object_rows > 3000:
+            raise ValueError("M5 budget: total object source points exceed ceiling")
+        mismatch = _m5_budget_probe(
+            session, budget,
+            """FROM science_photometry s
+               JOIN measurements bm ON bm.measurement_id = s.base_measurement_id
+               WHERE s.calibration_version_id = :cv AND bm.object_id = :obj
+                 AND bm.calibration_version_id <> :base""",
+            {"cv": cv_id, "obj": object_id, "base": base_id},
+            label="foreign BASE in object SCIENCE", maximum=0,
+        )
+        if mismatch:
+            raise ValueError("M5 budget: SCIENCE refers to another BASE")
+        base_count = _m5_budget_probe(
+            session, budget,
+            """FROM measurements bm WHERE bm.calibration_version_id = :base
+               AND bm.object_id = :obj""",
+            {"base": base_id, "obj": object_id}, label="object BASE rows per CV",
+            minimum=1, maximum=1000, json_columns=("bm.flags",),
+        )
+        budget.weighted_base_rows += base_count
+        if budget.weighted_base_rows > 6000:
+            raise ValueError("M5 budget: weighted BASE rows exceed ceiling")
+        # Guard a missing durable row before the reconstruction reader may
+        # build a full per-object state and then discover the missing scalar.
+        _m5_budget_probe(
+            session, budget,
+            """FROM measurements bm LEFT JOIN science_photometry s
+                 ON s.base_measurement_id = bm.measurement_id AND s.calibration_version_id = :cv
+               WHERE bm.calibration_version_id = :base AND bm.object_id = :obj
+                 AND s.base_measurement_id IS NULL""",
+            {"cv": cv_id, "base": base_id, "obj": object_id},
+            label="missing durable SCIENCE rows", maximum=0,
+        )
+        # Reuse the exact reconstruction lineage and latest-iteration rules,
+        # only AFTER all ORM metadata in this chain was size-checked above.
+        chain = _chain_from_base(session, session.get(CalibrationVersion, cv_id))
+        if [int(cv.calibration_version_id) for cv in reversed(chain)] != cv_chain:
+            raise ValueError("M5 budget: reconstruction chain changed")
+        for stage in chain[1:]:
+            stage_id = int(stage.calibration_version_id)
+            newest = session.execute(text(
+                "SELECT calibration_iteration_id, iteration_kind FROM calibration_iterations "
+                "WHERE calibration_version_id = :cv "
+                "ORDER BY iteration_no DESC, calibration_iteration_id DESC LIMIT 1"
+            ), {"cv": stage_id}).mappings().first()
+            if newest is None:
+                raise ValueError("M5 budget: missing normalized reconstruction iteration")
+            iteration_id = int(newest["calibration_iteration_id"])
+            kind = str(stage.product_kind or "").upper()
+            iteration_kind = str(newest["iteration_kind"] or "").upper()
+            if iteration_kind not in {"PHOTOMETRIC_FRAME_QC", "SPATIAL_ENSEMBLE"} and kind not in {
+                "APERTURE_CORRECTION", "APERTURE_ZP", "ENSEMBLE", "COLOR_CALIBRATION",
+            }:
+                raise ValueError("M5 budget: unsupported reconstruction stage")
+            _m5_budget_probe(
+                session, budget,
+                "FROM calibration_iterations it WHERE it.calibration_iteration_id = :it",
+                {"it": iteration_id}, label="iteration metadata", minimum=1, maximum=1,
+                json_columns=("it.parameters", "it.metrics"),
+                text_columns=("it.convergence_reason",),
+            )
+            actual = _latest_iteration(session, stage_id)
+            if actual is None or int(actual.calibration_iteration_id) != iteration_id:
+                raise ValueError("M5 budget: latest iteration changed")
+            budget.frame_terms += _m5_budget_probe(
+                session, budget,
+                "FROM calibration_frame_terms ft WHERE ft.calibration_iteration_id = :it",
+                {"it": iteration_id}, label="frame terms per stage", maximum=30_000,
+                json_columns=("ft.details",),
+            )
+            if budget.frame_terms > 30_000:
+                raise ValueError("M5 budget: cumulative frame terms exceed ceiling")
+            budget.object_terms += _m5_budget_probe(
+                session, budget,
+                "FROM calibration_iteration_objects ot WHERE ot.calibration_iteration_id = :it",
+                {"it": iteration_id}, label="object terms per stage", maximum=100_000,
+                json_columns=("ot.details",),
+            )
+            if budget.object_terms > 100_000:
+                raise ValueError("M5 budget: cumulative object terms exceed ceiling")
+
+    # The exact reader loads every series membership for every prepared frame,
+    # not just the requested series. Cover that fan-out and its frame/field flags.
+    _m5_budget_probe(
+        session, budget,
+        """FROM frames f JOIN field_series_frames fsf ON fsf.frame_id = f.frame_id
+           JOIN field_series fs ON fs.series_id = fsf.series_id
+           JOIN fields fld ON fld.field_id = fs.field_id
+           WHERE f.frame_id IN (
+               SELECT bm.frame_id FROM measurements bm
+               WHERE bm.object_id = :obj AND bm.calibration_version_id = ANY(:bases)
+           )""",
+        {"obj": object_id, "bases": sorted(set(base_ids))},
+        label="prepared frame memberships", maximum=30_000,
+        json_columns=("f.quality_flags",), text_columns=("fld.field_name",),
+    )
+    _m5_budget_probe(
+        session, budget,
+        """FROM object_qc qc WHERE qc.object_id = :obj
+           AND qc.calibration_version_id = ANY(:cvs) AND qc.algorithm = 'object_qc_v1'""",
+        {"obj": object_id, "cvs": sources}, label="object QC rows", maximum=3000,
+        json_columns=("qc.flags",),
+    )
+
+
+def _m5_budget_parent(root: Path) -> None:
+    if not root.is_absolute() or ".." in root.parts or not root.name:
+        raise ValueError("M5 budget requires an absolute, non-traversing output path")
+    parent = root.parent
+    for ancestor in (parent, *parent.parents):
+        info = ancestor.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or (getattr(info, "st_file_attributes", 0) & 0x400)):
+            raise ValueError("M5 budget requires an existing non-reparse output parent")
+    if os.path.lexists(root):
+        raise FileExistsError(f"M5 output bundle already exists: {root}")
+    # The old flat format could leave CSV, JSON or plots in this parent. Scan
+    # only a bounded number of entries; do not accept an uninspectable parent.
+    with os.scandir(parent) as entries:
+        for index, entry in enumerate(entries):
+            if index >= 1024:
+                raise ValueError("M5 budget: output parent has too many entries")
+            name = entry.name
+            if (name == root.name + ".csv" or name.startswith(root.name + "_")
+                    and name.endswith((".csv", ".json", ".png", ".pdf", ".svg"))):
+                raise FileExistsError(f"M5 legacy flat output already exists: {entry.path}")
+
+
+def _m5_budget_csv_bytes(row: dict[str, Any] | None) -> bytes:
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        buffer, fieldnames=list(GLOBAL_LIGHT_CURVE_COLUMNS), extrasaction="ignore",
+    )
+    if row is None:
+        writer.writeheader()
+    else:
+        writer.writerow(row)
+    return buffer.getvalue().encode("utf-8")
+
+
 def export_global_object_light_curve(
     session: Session,
     *,
@@ -486,7 +935,30 @@ def export_global_object_light_curve(
     plot_format: str = "png",
     plot_dpi: int = 160,
     plot_time_axis: str = "auto",
+    preserve_staging_on_failure: bool = False,
+    enforce_export_budget: bool = False,
+    use_explicit_m4_source_heads: bool = False,
 ) -> GlobalObjectLightCurveResult:
+    # Refuse incompatible opt-in BEFORE even a field/object database read or
+    # parent inspection. The default export retains its existing behavior.
+    if use_explicit_m4_source_heads and not enforce_export_budget:
+        raise ValueError("M5 explicit M4 source heads require enforce_export_budget=True")
+    if enforce_export_budget:
+        if not preserve_staging_on_failure:
+            raise ValueError("M5 budget requires preserve_staging_on_failure=True")
+        if plots or include_rejected_debug:
+            raise ValueError("M5 budget requires plots=False and include_rejected_debug=False")
+        if len(str(extra_reject_flags or "").encode("utf-8")) > 1024:
+            raise ValueError("M5 budget: extra reject flags exceed input ceiling")
+        generation_ids = tuple(islice(generation_ids or (), 19))
+        if len(generation_ids) > 18:
+            raise ValueError("M5 budget: generation selection exceeds ceiling")
+        if use_explicit_m4_source_heads:
+            if allow_partial:
+                raise ValueError("M5 explicit M4 source heads refuse allow_partial=True")
+            if (not generation_ids or any(int(value) <= 0 for value in generation_ids)
+                    or len({int(value) for value in generation_ids}) != len(generation_ids)):
+                raise ValueError("M5 explicit M4 source heads require distinct explicit generation_ids")
     object_id = int(object_id)
     field_id = int(field_id)
     plot_reduction = str(plot_reduction).lower()
@@ -504,6 +976,14 @@ def export_global_object_light_curve(
     if plot_format not in {"png", "pdf", "svg"}:
         raise ValueError("plot_format must be png, pdf or svg")
 
+    budget = _M5ExportBudget() if enforce_export_budget else None
+    alias_multiplicity: dict[int, int] = {}
+    if budget is not None:
+        _m5_budget_parent(Path(out_root))
+        alias_multiplicity = _m5_budget_early_scope(
+            session, field_id=field_id, generation_ids=generation_ids, budget=budget,
+            use_explicit_m4_source_heads=use_explicit_m4_source_heads,
+        )
     field_row = session.execute(
         text("SELECT field_id, field_name FROM fields WHERE field_id = :field_id"),
         {"field_id": field_id},
@@ -511,7 +991,10 @@ def export_global_object_light_curve(
     if field_row is None:
         raise ValueError(f"No field found with field_id={field_id}")
     object_row = session.execute(
-        text("SELECT object_id FROM objects WHERE object_id = :object_id"),
+        text(
+            "SELECT object_id, object_uid, ra_deg, dec_deg "
+            "FROM objects WHERE object_id = :object_id"
+        ),
         {"object_id": object_id},
     ).mappings().first()
     if object_row is None:
@@ -522,12 +1005,26 @@ def export_global_object_light_curve(
         field_id=field_id,
         generation_ids=generation_ids,
     )
+    explicit_cv_ids: list[int] | None = None
+    if use_explicit_m4_source_heads:
+        if {row.interseries_generation_id for row in generations} != set(generation_ids or ()):
+            raise ValueError("M5 explicit M4 generation selection changed")
+        explicit_cv_ids = _m5_explicit_m4_source_ids(
+            session, field_id=field_id, generations=generations,
+        )
     coverage = inspect_m5_series_coverage(
         session,
         field_id=field_id,
         object_id=object_id,
         generations=generations,
+        **({"science_calibration_version_ids": explicit_cv_ids}
+           if explicit_cv_ids is not None else {}),
     )
+    if use_explicit_m4_source_heads and (
+        {row.series_id for row in coverage} != set(alias_multiplicity)
+        or len(coverage) != len(alias_multiplicity)
+    ):
+        raise ValueError("M5 explicit M4 coverage differs from field alias inventory")
     blocking = [
         row for row in coverage
         if row.object_points_current_science > 0
@@ -548,6 +1045,10 @@ def export_global_object_light_curve(
             )
         warnings.append("Partial M5 export: " + detail)
 
+    if budget is not None:
+        _m5_budget_preflight(
+            session, object_id=object_id, generations=generations, budget=budget,
+        )
     generation_ids_resolved = [row.interseries_generation_id for row in generations]
     stats = _load_plot_source_stats(
         session,
@@ -566,6 +1067,11 @@ def export_global_object_light_curve(
         raise ValueError(
             f"No exact M4-linked SCIENCE rows found for object_id={object_id}, field_id={field_id}"
         )
+    if use_explicit_m4_source_heads and (
+        budget is None or sum(int(row["n_points"]) for row in stats) != budget.object_rows
+        or sum(row.object_points_current_science for row in coverage) != budget.object_rows
+    ):
+        raise ValueError("M5 explicit M4 source counts differ before output staging")
     plot_policy = _plot_policy_summary(
         plot_plan,
         reduction=plot_reduction,
@@ -575,10 +1081,35 @@ def export_global_object_light_curve(
     )
 
     root = Path(out_root)
-    root.parent.mkdir(parents=True, exist_ok=True)
-    csv_path = Path(f"{root}.csv")
-    summary_path = Path(f"{root}_summary.json")
-    rejection_debug_path = Path(f"{root}_rejections.csv") if include_rejected_debug else None
+    if budget is not None:
+        _m5_budget_parent(root)
+    else:
+        root.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(root):
+        raise FileExistsError(f"M5 output bundle already exists: {root}")
+
+    csv_path = root / f"{root.name}.csv"
+    summary_path = root / f"{root.name}_summary.json"
+    rejection_debug_path = (
+        root / f"{root.name}_rejections.csv" if include_rejected_debug else None
+    )
+    configured_plot_paths: dict[str, tuple[Path, Path]] = {}
+    if plots and plot_reduction != "none":
+        for filter_name in sorted(plot_plan):
+            safe_filter = _safe_filename_token(filter_name)
+            configured_plot_paths[filter_name] = (
+                root / f"{root.name}_{safe_filter}_plot.csv",
+                root / f"{root.name}_{safe_filter}.{plot_format}",
+            )
+    expected_final_paths = [csv_path, summary_path]
+    if rejection_debug_path is not None:
+        expected_final_paths.append(rejection_debug_path)
+    for plot_data_path, plot_path in configured_plot_paths.values():
+        expected_final_paths.extend((plot_data_path, plot_path))
+    for output_path in expected_final_paths:
+        legacy_path = root.parent / output_path.name
+        if os.path.lexists(legacy_path):
+            raise FileExistsError(f"M5 legacy flat output already exists: {legacy_path}")
 
     reject_flags = _m5_reject_flags(
         require_detection_support=require_detection_support,
@@ -604,6 +1135,20 @@ def export_global_object_light_curve(
         series_coverage=coverage,
         warnings=warnings,
         rejection_debug_path=str(rejection_debug_path) if rejection_debug_path is not None else None,
+        selection_provenance=({
+            "mode": "EXPLICIT_M4_SOURCE_CURRENT_ALIAS_HEADS",
+            "requested_generation_ids": list(generation_ids or ()),
+            "selected_sources": [
+                {"generation_id": generation.interseries_generation_id,
+                 "series_id": series_id, "science_calibration_version_id": cv_id,
+                 "current_alias_head_match": True,
+                 "field_science_alias_rows": alias_multiplicity[series_id]}
+                for generation in generations for series_id, cv_id in generation.series_sources
+            ],
+            "field_series_count": len(alias_multiplicity),
+            "field_science_alias_rows": sum(alias_multiplicity.values()),
+            "unselected_field_series": 0,
+        } if use_explicit_m4_source_heads else None),
     )
 
     raw_plot_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -613,111 +1158,283 @@ def export_global_object_light_curve(
 
     rejection_counts: dict[str, int] = defaultdict(int)
     rejection_counts_by_series: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    rejection_handle = None
-    rejection_writer = None
+    plot_identity_by_filter: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    staging_dir = Path(
+        tempfile.mkdtemp(prefix=f".{root.name}.m5-staging-", dir=root.parent)
+    )
+    staged_csv_path = staging_dir / csv_path.name
+    staged_summary_path = staging_dir / summary_path.name
+    staged_rejection_debug_path = (
+        staging_dir / rejection_debug_path.name if rejection_debug_path is not None else None
+    )
     try:
-        if rejection_debug_path is not None:
-            rejection_handle = rejection_debug_path.open("w", newline="", encoding="utf-8")
-            rejection_writer = csv.DictWriter(
-                rejection_handle,
-                fieldnames=list(REJECTION_DEBUG_COLUMNS),
-                extrasaction="ignore",
+        with ExitStack() as stack:
+            rejection_writer = None
+            if staged_rejection_debug_path is not None:
+                rejection_handle = stack.enter_context(
+                    staged_rejection_debug_path.open("w", newline="", encoding="utf-8")
+                )
+                rejection_writer = csv.DictWriter(
+                    rejection_handle,
+                    fieldnames=list(REJECTION_DEBUG_COLUMNS),
+                    extrasaction="ignore",
+                )
+                rejection_writer.writeheader()
+
+            csv_file = (
+                staged_csv_path.open("wb") if budget is not None
+                else staged_csv_path.open("w", newline="", encoding="utf-8")
             )
-            rejection_writer.writeheader()
-
-        with csv_path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(GLOBAL_LIGHT_CURVE_COLUMNS), extrasaction="ignore")
-            writer.writeheader()
-            for raw in _iter_exact_m4_rows(
-                session,
-                object_id=object_id,
-                field_id=field_id,
-                generation_ids=generation_ids_resolved,
-                generations=generations,
-            ):
-                result.rows_source_exact_m4 += 1
-                processed = _to_m5_row(raw, reject_flags=reject_flags, field_id=field_id)
-                filter_name = str(processed.get("filter_name") or "UNKNOWN")
-                if processed["is_rejected"]:
-                    result.rejected_rows += 1
-                    reasons = [part for part in str(processed.get("reject_reasons") or "").split(",") if part]
-                    if not reasons:
-                        reasons = ["UNSPECIFIED_REJECTION"]
-                    series_id = int(processed["series_id"])
-                    for reason in reasons:
-                        rejection_counts[reason] += 1
-                        rejection_counts_by_series[series_id][reason] += 1
-                    if rejection_writer is not None:
-                        rejection_writer.writerow(_csv_safe_row(processed, REJECTION_DEBUG_COLUMNS))
+            with csv_file as handle:
+                if budget is not None:
+                    csv_bytes = _m5_budget_csv_bytes(None)
+                    if len(csv_bytes) > _M5_BUDGET_CSV_BYTES:
+                        raise ValueError("M5 budget: main CSV header exceeds byte ceiling")
+                    handle.write(csv_bytes)
+                    written_bytes = len(csv_bytes)
                 else:
-                    result.accepted_rows += 1
-                    plot_input_counts[filter_name] += 1
-                    if plots and plot_plan.get(filter_name, {}).get("mode") == "raw":
-                        raw_plot_rows[filter_name].append(_plot_row_from_m5(processed))
-                    elif plots and plot_plan.get(filter_name, {}).get("mode") == "bin":
-                        _accumulate_plot_bin(bins, processed, plot_plan[filter_name])
-                if include_rejected or not processed["is_rejected"]:
-                    writer.writerow(_csv_safe_row(processed, GLOBAL_LIGHT_CURVE_COLUMNS))
-                    result.rows_written += 1
-                    filter_written_counts[filter_name] += 1
-    finally:
-        if rejection_handle is not None:
-            rejection_handle.close()
+                    writer = csv.DictWriter(
+                        handle,
+                        fieldnames=list(GLOBAL_LIGHT_CURVE_COLUMNS),
+                        extrasaction="ignore",
+                    )
+                    writer.writeheader()
+                for raw in _iter_exact_m4_rows(
+                    session,
+                    object_id=object_id,
+                    field_id=field_id,
+                    generation_ids=generation_ids_resolved,
+                    generations=generations,
+                ):
+                    result.rows_source_exact_m4 += 1
+                    if budget is not None and result.rows_source_exact_m4 > budget.object_rows:
+                        raise ValueError("M5 budget: source rows exceeded exact preflight")
+                    processed = _to_m5_row(raw, reject_flags=reject_flags, field_id=field_id)
+                    filter_name = str(processed.get("filter_name") or "UNKNOWN")
+                    catalog_name = processed.get("catalog_name")
+                    source_id = processed.get("source_id")
+                    if (
+                        plots
+                        and plot_reduction != "none"
+                        and catalog_name is not None
+                        and source_id is not None
+                    ):
+                        catalog_text = str(catalog_name).strip()
+                        source_text = str(source_id).strip()
+                        if catalog_text and source_text:
+                            plot_identity_by_filter[filter_name].add(
+                                (catalog_text, source_text)
+                            )
+                    if processed["is_rejected"]:
+                        result.rejected_rows += 1
+                        reasons = [
+                            part
+                            for part in str(processed.get("reject_reasons") or "").split(",")
+                            if part
+                        ]
+                        if not reasons:
+                            reasons = ["UNSPECIFIED_REJECTION"]
+                        series_id = int(processed["series_id"])
+                        for reason in reasons:
+                            rejection_counts[reason] += 1
+                            rejection_counts_by_series[series_id][reason] += 1
+                        if rejection_writer is not None:
+                            rejection_writer.writerow(_csv_safe_row(processed, REJECTION_DEBUG_COLUMNS))
+                    else:
+                        result.accepted_rows += 1
+                        plot_input_counts[filter_name] += 1
+                        if plots and plot_plan.get(filter_name, {}).get("mode") == "raw":
+                            raw_plot_rows[filter_name].append(_plot_row_from_m5(processed))
+                        elif plots and plot_plan.get(filter_name, {}).get("mode") == "bin":
+                            _accumulate_plot_bin(bins, processed, plot_plan[filter_name])
+                    if include_rejected or not processed["is_rejected"]:
+                        safe_row = _csv_safe_row(processed, GLOBAL_LIGHT_CURVE_COLUMNS)
+                        if budget is not None:
+                            csv_bytes = _m5_budget_csv_bytes(safe_row)
+                            if written_bytes + len(csv_bytes) > _M5_BUDGET_CSV_BYTES:
+                                raise ValueError("M5 budget: main CSV exceeds byte ceiling")
+                            handle.write(csv_bytes)
+                            written_bytes += len(csv_bytes)
+                        else:
+                            writer.writerow(safe_row)
+                        result.rows_written += 1
+                        filter_written_counts[filter_name] += 1
 
-    result.rejection_reasons = dict(sorted(rejection_counts.items()))
-    result.rejection_reasons_by_series = {
-        str(series_id): dict(sorted(counts.items()))
-        for series_id, counts in sorted(rejection_counts_by_series.items())
-    }
-    if result.rows_source_exact_m4 > 0 and result.accepted_rows == 0:
-        result.status = M5_STATUS_NO_ACCEPTED
-        result.warnings.append(
-            "All exact M4-linked SCIENCE rows were rejected by the active Stage-2/M5 QC policy; "
-            "no plots are produced because plots use accepted points only."
+        result.rejection_reasons = dict(sorted(rejection_counts.items()))
+        result.rejection_reasons_by_series = {
+            str(series_id): dict(sorted(counts.items()))
+            for series_id, counts in sorted(rejection_counts_by_series.items())
+        }
+        if result.rows_source_exact_m4 > 0 and result.accepted_rows == 0:
+            result.status = M5_STATUS_NO_ACCEPTED
+            result.warnings.append(
+                "All exact M4-linked SCIENCE rows were rejected by the active Stage-2/M5 QC policy; "
+                "no plots are produced because plots use accepted points only."
+            )
+
+        result.filters = dict(sorted(filter_written_counts.items()))
+        result.plot_input_points = dict(sorted(plot_input_counts.items()))
+
+        if use_explicit_m4_source_heads:
+            if (budget is None or result.rows_source_exact_m4 != budget.object_rows
+                    or result.rows_source_exact_m4 != result.accepted_rows + result.rejected_rows
+                    or result.rows_written != (result.accepted_rows
+                                               + (result.rejected_rows if include_rejected else 0))
+                    or sum(result.filters.values()) != result.rows_written):
+                raise ValueError("M5 explicit M4 source counts do not reconcile")
+            with staged_csv_path.open("r", newline="", encoding="utf-8") as csv_handle:
+                csv_reader = csv.DictReader(csv_handle)
+                if csv_reader.fieldnames != list(GLOBAL_LIGHT_CURVE_COLUMNS):
+                    raise ValueError("M5 explicit M4 CSV header differs from schema")
+                csv_records = 0
+                for _row in csv_reader:
+                    csv_records += 1
+                    if csv_records > result.rows_written:
+                        raise ValueError("M5 explicit M4 CSV exceeds recorded row count")
+            if csv_records != result.rows_written:
+                raise ValueError("M5 explicit M4 CSV record count does not reconcile")
+            if result.selection_provenance is not None:
+                result.selection_provenance["csv_records"] = csv_records
+
+        if plots and plot_reduction != "none":
+            binned_by_filter: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for accumulator in bins.values():
+                binned_by_filter[accumulator.filter_name].append(accumulator.finalize())
+            for rows in binned_by_filter.values():
+                rows.sort(key=lambda row: (float(row["mjd"]), int(row["series_id"])))
+
+            filter_names = sorted(set(raw_plot_rows) | set(binned_by_filter))
+            for filter_name in filter_names:
+                rows = raw_plot_rows.get(filter_name) or binned_by_filter.get(filter_name) or []
+                if not rows:
+                    continue
+                mode = plot_plan[filter_name]["mode"]
+                plot_data_path, plot_path = configured_plot_paths[filter_name]
+                staged_plot_data_path = staging_dir / plot_data_path.name
+                staged_plot_path = staging_dir / plot_path.name
+                _write_plot_data(rows, staged_plot_data_path)
+                reliabilities = sorted({str(row.get("interseries_reliability") or "UNKNOWN") for row in rows})
+                source_pairs = plot_identity_by_filter.get(filter_name, set())
+                catalog_name, source_id = _unique_m5_plot_source_pair(source_pairs)
+                plot_result = export_global_lightcurve_plot(
+                    rows,
+                    staged_plot_path,
+                    title=(
+                        f"Object {object_id} - {filter_name}; M4 "
+                        + ", ".join(reliabilities)
+                    ),
+                    subtitle=format_lightcurve_identity_subtitle(
+                        object_uid=object_row.get("object_uid"),
+                        ra_deg=object_row.get("ra_deg"),
+                        dec_deg=object_row.get("dec_deg"),
+                        catalog_name=catalog_name,
+                        source_id=source_id,
+                    ),
+                    dpi=plot_dpi,
+                    reduction_mode=mode,
+                    time_axis_mode=plot_time_axis,
+                )
+                result.plot_paths[filter_name] = str(plot_path)
+                result.plot_data_paths[filter_name] = str(plot_data_path)
+                result.plot_reduction[filter_name] = mode
+                result.plot_output_points[filter_name] = int(plot_result.n_points)
+                result.plot_time_axis[filter_name] = str(plot_result.time_axis_mode or "continuous")
+                result.plot_time_breaks[filter_name] = int(plot_result.n_time_breaks)
+                result.plot_style[filter_name] = str(plot_result.plot_style or "series_detailed")
+
+        summary = json.dumps(result.to_dict(), ensure_ascii=False, indent=2, default=str)
+        if budget is not None:
+            summary_bytes = summary.encode("utf-8")
+            if len(summary_bytes) > _M5_BUDGET_SUMMARY_BYTES:
+                raise ValueError("M5 budget: summary exceeds byte ceiling")
+            staged_summary_path.write_bytes(summary_bytes)
+        else:
+            staged_summary_path.write_text(summary, encoding="utf-8")
+        _rename_directory_noreplace(staging_dir, root)
+        return result
+    finally:
+        if not preserve_staging_on_failure:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def _unique_m5_plot_source_pair(
+    source_pairs: set[tuple[str, str]],
+) -> tuple[str | None, str | None]:
+    if len(source_pairs) != 1:
+        return None, None
+    return next(iter(source_pairs))
+
+
+def _rename_directory_noreplace(source: str | Path, destination: str | Path) -> None:
+    """Publish one staged directory without replacing an existing destination.
+
+    Only platform-native no-replace operations are accepted. Any missing primitive,
+    unsupported filesystem operation, or native error fails closed; this deliberately
+    has no check-then-rename or file-by-file fallback.
+    """
+    source_path = Path(source)
+    destination_path = Path(destination)
+    platform = sys.platform
+    if platform == "win32":
+        # Windows os.rename maps to the native no-replace move operation.
+        os.rename(source_path, destination_path)
+        return
+
+    if platform == "linux":
+        symbol = "renameat2"
+        argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        try:
+            native = getattr(ctypes.CDLL(None, use_errno=True), symbol)
+        except (AttributeError, OSError) as exc:
+            raise NotImplementedError(
+                "Linux M5 publication requires libc renameat2(RENAME_NOREPLACE)"
+            ) from exc
+        native.argtypes = argtypes
+        native.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        return_code = native(
+            _AT_FDCWD,
+            os.fsencode(source_path),
+            _AT_FDCWD,
+            os.fsencode(destination_path),
+            _RENAME_NOREPLACE,
+        )
+    elif platform == "darwin":
+        symbol = "renamex_np"
+        argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        try:
+            native = getattr(ctypes.CDLL(None, use_errno=True), symbol)
+        except (AttributeError, OSError) as exc:
+            raise NotImplementedError(
+                "macOS M5 publication requires libc renamex_np(RENAME_EXCL)"
+            ) from exc
+        native.argtypes = argtypes
+        native.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        return_code = native(
+            os.fsencode(source_path),
+            os.fsencode(destination_path),
+            _RENAME_EXCL,
+        )
+    else:
+        raise NotImplementedError(
+            f"M5 atomic bundle publication has no native no-replace rename for {platform!r}"
         )
 
-    result.filters = dict(sorted(filter_written_counts.items()))
-    result.plot_input_points = dict(sorted(plot_input_counts.items()))
-
-    if plots and plot_reduction != "none":
-        binned_by_filter: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for accumulator in bins.values():
-            binned_by_filter[accumulator.filter_name].append(accumulator.finalize())
-        for rows in binned_by_filter.values():
-            rows.sort(key=lambda row: (float(row["mjd"]), int(row["series_id"])))
-
-        filter_names = sorted(set(raw_plot_rows) | set(binned_by_filter))
-        for filter_name in filter_names:
-            rows = raw_plot_rows.get(filter_name) or binned_by_filter.get(filter_name) or []
-            if not rows:
-                continue
-            mode = plot_plan[filter_name]["mode"]
-            safe_filter = _safe_filename_token(filter_name)
-            plot_data_path = Path(f"{root}_{safe_filter}_plot.csv")
-            _write_plot_data(rows, plot_data_path)
-            plot_path = Path(f"{root}_{safe_filter}.{plot_format}")
-            reliabilities = sorted({str(row.get("interseries_reliability") or "UNKNOWN") for row in rows})
-            plot_result = export_global_lightcurve_plot(
-                rows,
-                plot_path,
-                title=(
-                    f"Object {object_id} - {filter_name}; M4 "
-                    + ", ".join(reliabilities)
-                ),
-                dpi=plot_dpi,
-                reduction_mode=mode,
-                time_axis_mode=plot_time_axis,
-            )
-            result.plot_paths[filter_name] = str(plot_path)
-            result.plot_data_paths[filter_name] = str(plot_data_path)
-            result.plot_reduction[filter_name] = mode
-            result.plot_output_points[filter_name] = int(plot_result.n_points)
-            result.plot_time_axis[filter_name] = str(plot_result.time_axis_mode or "continuous")
-            result.plot_time_breaks[filter_name] = int(plot_result.n_time_breaks)
-            result.plot_style[filter_name] = str(plot_result.plot_style or "series_detailed")
-
-    summary_path.write_text(json.dumps(result.to_dict(), ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    return result
+    if return_code != 0:
+        native_errno = ctypes.get_errno()
+        if native_errno:
+            raise OSError(native_errno, os.strerror(native_errno), str(destination_path))
+        raise OSError(
+            f"libc {symbol} returned {return_code} without setting errno; "
+            "M5 bundle publication failed closed"
+        )
 
 
 def _iter_exact_m4_rows(
@@ -757,6 +1474,8 @@ def _iter_exact_m4_rows_from_science(
                 ics.science_calibration_version_id,
                 ics.offset_mag,
                 ics.offset_err_mag,
+                ics.field_id AS membership_field_id,
+                g.field_id AS generation_field_id,
                 g.analysis_algorithm
             FROM interseries_calibration_series ics
             JOIN interseries_calibration_generations g
@@ -767,6 +1486,21 @@ def _iter_exact_m4_rows_from_science(
         ),
         {"generation_ids": sorted(generation_by_id)},
     ).mappings().all()
+    if any(
+        row["series_id"] is None or row["science_calibration_version_id"] is None
+        or (row.get("membership_field_id") is not None
+            and int(row["membership_field_id"]) != int(row["generation_field_id"]))
+        for row in source_rows
+    ):
+        raise RuntimeError("Persisted M4 membership was orphaned during durable SCIENCE M5 read")
+    source_counts: dict[int, int] = defaultdict(int)
+    for row in source_rows:
+        source_counts[int(row["interseries_generation_id"])] += 1
+    if any(
+        source_counts.get(generation_id) != len(generation.series_sources)
+        for generation_id, generation in generation_by_id.items()
+    ):
+        raise RuntimeError("Persisted M4 membership changed during durable SCIENCE M5 read")
     source_meta = {
         (int(row["interseries_generation_id"]), int(row["series_id"])): dict(row)
         for row in source_rows

@@ -49,6 +49,9 @@ def run_aperture_radius_sweep(
 ) -> ApertureSweepResult:
     """Run and compare forced-aperture light curves for several aperture radii."""
 
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("explicit frame_ids selection must not be empty")
+
     if source_id is None and object_id is None:
         raise ValueError("Provide source_id or object_id")
     if not radii:

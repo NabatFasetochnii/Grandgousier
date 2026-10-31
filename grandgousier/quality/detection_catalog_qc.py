@@ -127,6 +127,9 @@ def match_detections_to_catalog(
     historical QC.
     """
 
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("An explicit frame_ids selection must not be empty")
+
     if radius_arcsec <= 0:
         raise ValueError("radius_arcsec must be positive")
 
@@ -430,7 +433,7 @@ def _select_frames(
     limit: int | None,
 ) -> list[Frame]:
     stmt = select(Frame).options(joinedload(Frame.instrument_unit)).order_by(Frame.frame_id)
-    if frame_ids:
+    if frame_ids is not None:
         stmt = stmt.where(Frame.frame_id.in_(frame_ids))
     if instrument:
         stmt = stmt.where(Frame.instrument == instrument)

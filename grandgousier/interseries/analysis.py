@@ -300,6 +300,7 @@ def analyze_interseries_calibration(
     clip_sigma: float = 4.0,
     max_clip_iterations: int = 5,
     required_stage2_recipe: str | None = None,
+    science_calibration_version_ids: list[int] | None = None,
 ) -> InterseriesAnalysis:
     """Run read-only Stage-3 M1--M3 analysis on published Stage-2 SCIENCE products."""
 
@@ -320,6 +321,7 @@ def analyze_interseries_calibration(
         min_points_per_object=min_points_per_object,
         min_common_objects=min_common_objects,
         required_stage2_recipe=required_stage2_recipe,
+        science_calibration_version_ids=science_calibration_version_ids,
     )
     selected_ids, resolved_reference = _select_analysis_component(
         plan,

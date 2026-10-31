@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -242,6 +243,44 @@ def test_master_download_rejects_resume_with_wrong_range_start(tmp_path: Path) -
         _FakeResponse(206, [b"def"], {"Content-Range": "bytes 0-2/6", "Content-Length": "3"})
     )
     result = download_master_task(task, session=session)
+    assert result.status == "FAILED"
+    assert part.read_bytes() == b"abc"
+    assert not task.local_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("prior_validators", "response_validators"),
+    [
+        ({}, {}),
+        (
+            {"etag": '"stable"', "last_modified": "Wed, 21 Oct 2015 07:28:00 GMT"},
+            {"ETag": '"stable"', "Last-Modified": "Wed, 21 Oct 2015 07:28:00 GMT"},
+        ),
+    ],
+    ids=("validators-absent", "validators-match"),
+)
+def test_master_download_rejects_resumed_response_with_changed_total_size(
+    tmp_path: Path,
+    prior_validators: dict[str, str],
+    response_validators: dict[str, str],
+) -> None:
+    task = _download_task(tmp_path)
+    part = task.local_path.with_name("asset.fit.gz.part")
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"abc")
+    metadata_path = part.with_name(part.name + ".meta.json")
+    metadata_path.write_text(
+        json.dumps({"expected_bytes": 6, **prior_validators}) + "\n", encoding="utf-8"
+    )
+    headers = {
+        "Content-Range": "bytes 3-5/9",
+        "Content-Length": "3",
+        **response_validators,
+    }
+    session = _FakeSession(_FakeResponse(206, [b"def"], headers))
+
+    result = download_master_task(task, session=session)
+
     assert result.status == "FAILED"
     assert part.read_bytes() == b"abc"
     assert not task.local_path.exists()

@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 import json
+import warnings
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -163,14 +164,15 @@ def build_interseries_plan(
     min_points_per_object: int = 5,
     min_common_objects: int = 20,
     required_stage2_recipe: str | None = None,
+    science_calibration_version_ids: list[int] | None = None,
 ) -> InterseriesPlan:
     """Inspect whether one field is ready for Stage-3 inter-series calibration.
 
-    This is deliberately a read-only Stage-3 foundation.  It selects the newest
-    published SCIENCE generation by publication chronology for every field series,
+    This is deliberately a read-only Stage-3 foundation. It selects current
+    SCIENCE calibration-product alias heads (or validates an explicit head set),
     reports missing materialization explicitly, counts objects with enough epochs
-    inside each series, and constructs
-    a pairwise overlap graph.  No offset is estimated or persisted here.
+    inside each series, and constructs a pairwise overlap graph. No offset is
+    estimated or persisted here.
 
     Direct object-id overlap is safe when series resolve catalog sources through
     the same internal object identity.  Since 0.7.0.2 this identity is catalog-
@@ -191,6 +193,7 @@ def build_interseries_plan(
         instrument_unit_id=instrument_unit_id,
         filter_name=filter_name,
         catalog_name=catalog_name,
+        science_calibration_version_ids=science_calibration_version_ids,
     )
 
     calibration_ids = sorted(
@@ -221,7 +224,10 @@ def build_interseries_plan(
         recipe_mismatch_reasons: tuple[str, ...] = ()
         recipe_compatibility_notes: tuple[str, ...] = ()
         provenance_source: str | None = None
-        if cv_id is None:
+        selection_status = row.get("_selection_status")
+        if selection_status is not None:
+            status = str(selection_status)
+        elif cv_id is None:
             status = (
                 "NO_MATCHING_SCIENCE_CALIBRATION"
                 if catalog_name is not None
@@ -346,63 +352,371 @@ def _load_series_candidates(
     instrument_unit_id: int | None,
     filter_name: str | None,
     catalog_name: str | None,
+    science_calibration_version_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
+    explicit_ids = _normalize_science_calibration_version_ids(science_calibration_version_ids)
     clauses = ["fs.field_id = :field_id"]
-    science_clauses = [
-        "cv.series_id = fs.series_id",
-        "cv.product_role = 'SCIENCE'",
-    ]
     params: dict[str, Any] = {"field_id": int(field_id)}
-    if instrument_unit_id is not None:
-        clauses.append("COALESCE(fs.instrument_unit_id, science_cv.instrument_unit_id) = :instrument_unit_id")
-        params["instrument_unit_id"] = int(instrument_unit_id)
     if filter_name is not None:
         clauses.append("lower(COALESCE(fs.filter_name, '')) = lower(:filter_name)")
         params["filter_name"] = str(filter_name)
-    if catalog_name is not None:
-        science_clauses.append(
-            "lower(COALESCE(pr.catalog_name, cv.used_catalogs ->> 'catalog_name', '')) = lower(:catalog_name)"
+    if instrument_unit_id is not None:
+        params["instrument_unit_id"] = int(instrument_unit_id)
+        clauses.append(
+            """
+            (
+                fs.instrument_unit_id = :instrument_unit_id
+                OR (
+                    fs.instrument_unit_id IS NULL
+                    AND EXISTS (
+                        SELECT 1
+                        FROM calibration_product_aliases scoped_alias
+                        JOIN calibration_versions scoped_cv
+                          ON scoped_cv.calibration_version_id = scoped_alias.head_calibration_version_id
+                        WHERE scoped_cv.series_id = fs.series_id
+                          AND scoped_cv.product_role = 'SCIENCE'
+                          AND scoped_cv.instrument_unit_id = :instrument_unit_id
+                    )
+                )
+                OR (
+                    fs.instrument_unit_id IS NULL
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM calibration_product_aliases live_alias
+                        JOIN calibration_versions live_cv
+                          ON live_cv.calibration_version_id = live_alias.head_calibration_version_id
+                        WHERE live_cv.series_id = fs.series_id
+                          AND live_cv.product_role = 'SCIENCE'
+                    )
+                    AND EXISTS (
+                        SELECT 1
+                        FROM calibration_versions legacy_cv
+                        WHERE legacy_cv.series_id = fs.series_id
+                          AND legacy_cv.product_role = 'SCIENCE'
+                          AND legacy_cv.instrument_unit_id = :instrument_unit_id
+                    )
+                )
+            )
+            """
         )
-        params["catalog_name"] = str(catalog_name)
 
     sql = f"""
         SELECT
             fs.series_id,
-            COALESCE(fs.instrument_unit_id, science_cv.instrument_unit_id) AS instrument_unit_id,
+            fs.field_id AS series_field_id,
+            fs.instrument_unit_id AS series_instrument_unit_id,
             fs.filter_name,
             fs.n_frames,
             fs.time_start,
             fs.time_end,
-            science_cv.calibration_version_id,
-            science_cv.calibration_name,
-            science_cv.catalog_name,
-            science_cv.pipeline_run_id,
-            science_cv.pipeline_status,
-            science_cv.recipe_json
+            science_head.alias_id,
+            science_head.logical_name AS alias_logical_name,
+            science_head.calibration_version_id,
+            science_head.calibration_name,
+            science_head.calibration_field_id,
+            science_head.calibration_series_id,
+            science_head.calibration_product_role,
+            science_head.calibration_instrument_unit_id,
+            science_head.catalog_name,
+            science_head.pipeline_run_id,
+            science_head.pipeline_status,
+            science_head.recipe_json,
+            EXISTS (
+                SELECT 1
+                FROM calibration_product_aliases live_alias
+                JOIN calibration_versions live_cv
+                  ON live_cv.calibration_version_id = live_alias.head_calibration_version_id
+                WHERE live_cv.series_id = fs.series_id
+                  AND live_cv.product_role = 'SCIENCE'
+            ) AS has_science_alias_head,
+            (
+                NOT EXISTS (
+                    SELECT 1
+                    FROM calibration_product_aliases live_alias
+                    JOIN calibration_versions live_cv
+                      ON live_cv.calibration_version_id = live_alias.head_calibration_version_id
+                    WHERE live_cv.series_id = fs.series_id
+                      AND live_cv.product_role = 'SCIENCE'
+                )
+                AND EXISTS (
+                    SELECT 1
+                    FROM calibration_versions legacy_cv
+                    WHERE legacy_cv.series_id = fs.series_id
+                      AND legacy_cv.product_role = 'SCIENCE'
+                )
+            ) AS has_legacy_science_products
         FROM field_series fs
         LEFT JOIN LATERAL (
             SELECT
+                cpa.alias_id,
+                cpa.logical_name,
                 cv.calibration_version_id,
                 cv.name AS calibration_name,
-                cv.instrument_unit_id,
+                cv.field_id AS calibration_field_id,
+                cv.series_id AS calibration_series_id,
+                cv.product_role AS calibration_product_role,
+                cv.instrument_unit_id AS calibration_instrument_unit_id,
                 cv.pipeline_run_id,
                 pr.status AS pipeline_status,
                 pr.recipe_json,
                 COALESCE(pr.catalog_name, cv.used_catalogs ->> 'catalog_name') AS catalog_name
-            FROM calibration_versions cv
+            FROM calibration_product_aliases cpa
+            JOIN calibration_versions cv
+              ON cv.calibration_version_id = cpa.head_calibration_version_id
             LEFT JOIN pipeline_runs pr ON pr.pipeline_run_id = cv.pipeline_run_id
-            WHERE {' AND '.join(science_clauses)}
-            ORDER BY
-                cv.finalized_at DESC NULLS LAST,
-                cv.materialized_at DESC NULLS LAST,
-                cv.pipeline_run_id DESC NULLS LAST,
-                cv.calibration_version_id DESC
-            LIMIT 1
-        ) AS science_cv ON TRUE
+            WHERE cv.series_id = fs.series_id
+              AND cv.product_role = 'SCIENCE'
+        ) AS science_head ON TRUE
         WHERE {' AND '.join(clauses)}
-        ORDER BY fs.time_start NULLS LAST, fs.series_id
+        ORDER BY fs.time_start NULLS LAST, fs.series_id,
+                 science_head.logical_name, science_head.calibration_version_id
     """
-    return [dict(row) for row in session.execute(text(sql), params).mappings().all()]
+    raw_rows = [dict(row) for row in session.execute(text(sql), params).mappings().all()]
+    grouped: dict[int, dict[str, Any]] = {}
+    heads_by_series: dict[int, list[dict[str, Any]]] = {}
+    for raw in raw_rows:
+        series_id = int(raw["series_id"])
+        if series_id not in grouped:
+            grouped[series_id] = {
+                key: raw.get(key)
+                for key in (
+                    "series_id",
+                    "series_field_id",
+                    "series_instrument_unit_id",
+                    "filter_name",
+                    "n_frames",
+                    "time_start",
+                    "time_end",
+                    "has_science_alias_head",
+                    "has_legacy_science_products",
+                )
+            }
+            heads_by_series[series_id] = []
+        if raw.get("calibration_version_id") is not None:
+            heads_by_series[series_id].append(raw)
+
+    if explicit_ids is not None:
+        by_id: dict[int, list[dict[str, Any]]] = {}
+        for series_id, heads in heads_by_series.items():
+            for head in heads:
+                by_id.setdefault(int(head["calibration_version_id"]), []).append(
+                    {**grouped[series_id], **head}
+                )
+        selected: dict[int, dict[str, Any]] = {}
+        for calibration_version_id in explicit_ids:
+            matching_heads = by_id.get(calibration_version_id, [])
+            if not matching_heads:
+                raise ValueError(
+                    f"science_calibration_version_id={calibration_version_id} is not a current "
+                    "SCIENCE alias head in the requested field/instrument/filter/catalog scope"
+                )
+            head = matching_heads[0]
+            mismatches = _head_scope_mismatches(
+                head,
+                field_id=field_id,
+                instrument_unit_id=instrument_unit_id,
+                filter_name=filter_name,
+                catalog_name=catalog_name,
+            )
+            if mismatches:
+                raise ValueError(
+                    f"science_calibration_version_id={calibration_version_id} is not a valid "
+                    f"current SCIENCE alias head in the requested scope: {', '.join(mismatches)}"
+                )
+            series_id = int(head["series_id"])
+            if series_id in selected:
+                previous_id = int(selected[series_id]["calibration_version_id"])
+                raise ValueError(
+                    f"At most one explicit SCIENCE calibration version may be selected per series; "
+                    f"series {series_id} has IDs {previous_id} and {calibration_version_id}"
+                )
+            selected[series_id] = head
+
+        result: list[dict[str, Any]] = []
+        for series_id, base in grouped.items():
+            head = selected.get(series_id)
+            if head is None:
+                if (
+                    not bool(base.get("has_science_alias_head"))
+                    and bool(base.get("has_legacy_science_products"))
+                ):
+                    warnings.warn(
+                        f"Series {series_id} has legacy SCIENCE products but no current alias head; "
+                        "skipping it rather than selecting an unaliased calibration version.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    selection_status = "LEGACY_SCIENCE_SKIPPED"
+                else:
+                    selection_status = "UNSELECTED"
+                result.append(_unselected_candidate_row(base, selection_status=selection_status))
+            else:
+                result.append(_candidate_row(head))
+        return result
+
+    result = []
+    for series_id, base in grouped.items():
+        heads = heads_by_series[series_id]
+        for head in heads:
+            mismatches = _head_integrity_mismatches(head, field_id=field_id)
+            if mismatches:
+                raise ValueError(
+                    f"Current SCIENCE alias head {head['calibration_version_id']} for series "
+                    f"{series_id} violates field/series/instrument scope: {', '.join(mismatches)}"
+                )
+        scoped_heads = [
+            head
+            for head in heads
+            if not _head_scope_mismatches(
+                {**base, **head},
+                field_id=field_id,
+                instrument_unit_id=instrument_unit_id,
+                filter_name=filter_name,
+                catalog_name=catalog_name,
+            )
+        ]
+        if len(scoped_heads) > 1:
+            rendered = "; ".join(
+                f"{head['calibration_version_id']} (logical_name={head.get('alias_logical_name')!r})"
+                for head in sorted(
+                    scoped_heads,
+                    key=lambda item: (
+                        int(item["calibration_version_id"]),
+                        str(item.get("alias_logical_name") or ""),
+                    ),
+                )
+            )
+            raise ValueError(
+                f"Series {series_id} has multiple current SCIENCE alias heads in scope: {rendered}. "
+                "Supply --science-calibration-version-id explicitly."
+            )
+        if scoped_heads:
+            result.append(_candidate_row({**base, **scoped_heads[0]}))
+            continue
+
+        if heads or bool(base.get("has_science_alias_head")):
+            selection_status = "NO_MATCHING_SCIENCE_CALIBRATION"
+        elif bool(base.get("has_legacy_science_products")):
+            selection_status = "LEGACY_SCIENCE_SKIPPED"
+            warnings.warn(
+                f"Series {series_id} has legacy SCIENCE products but no current alias head; "
+                "skipping it rather than selecting an unaliased calibration version.",
+                UserWarning,
+                stacklevel=2,
+            )
+        elif catalog_name is not None:
+            selection_status = "NO_MATCHING_SCIENCE_CALIBRATION"
+        else:
+            selection_status = "NO_SCIENCE_CALIBRATION"
+        result.append(_unselected_candidate_row(base, selection_status=selection_status))
+    return result
+
+
+def _normalize_science_calibration_version_ids(
+    values: list[int] | None,
+) -> list[int] | None:
+    if values is None:
+        return None
+    try:
+        ids = [int(value) for value in values]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("science_calibration_version_ids must contain integer IDs") from exc
+    if not ids:
+        raise ValueError("science_calibration_version_ids must not be empty when explicitly provided")
+    if any(value <= 0 for value in ids):
+        raise ValueError("science_calibration_version_ids must contain positive IDs")
+    if len(set(ids)) != len(ids):
+        raise ValueError("science_calibration_version_ids must not contain duplicate IDs")
+    return ids
+
+
+def _head_integrity_mismatches(head: dict[str, Any], *, field_id: int) -> list[str]:
+    mismatches = []
+    if _int_or_none(head.get("calibration_field_id")) != int(field_id):
+        mismatches.append(f"field_id={head.get('calibration_field_id')!r}")
+    if _int_or_none(head.get("calibration_series_id")) != int(head["series_id"]):
+        mismatches.append(f"series_id={head.get('calibration_series_id')!r}")
+    if head.get("calibration_product_role") != "SCIENCE":
+        mismatches.append(f"product_role={head.get('calibration_product_role')!r}")
+    series_unit = _int_or_none(head.get("series_instrument_unit_id"))
+    calibration_unit = _int_or_none(head.get("calibration_instrument_unit_id"))
+    if series_unit is not None and calibration_unit is not None and series_unit != calibration_unit:
+        mismatches.append(
+            "instrument_unit_id differs between field_series "
+            f"({series_unit}) and calibration head ({calibration_unit})"
+        )
+    return mismatches
+
+
+def _head_scope_mismatches(
+    head: dict[str, Any],
+    *,
+    field_id: int,
+    instrument_unit_id: int | None,
+    filter_name: str | None,
+    catalog_name: str | None,
+) -> list[str]:
+    mismatches = _head_integrity_mismatches(head, field_id=field_id)
+    series_filter = _str_or_none(head.get("filter_name"))
+    if filter_name is not None and not _same_optional_text(series_filter, str(filter_name)):
+        mismatches.append(f"filter_name={series_filter!r}")
+    series_unit = _int_or_none(head.get("series_instrument_unit_id"))
+    head_unit = _int_or_none(head.get("calibration_instrument_unit_id"))
+    if instrument_unit_id is not None:
+        requested_unit = int(instrument_unit_id)
+        if series_unit is not None and series_unit != requested_unit:
+            mismatches.append(f"series_instrument_unit_id={series_unit!r}")
+        if head_unit is not None and head_unit != requested_unit:
+            mismatches.append(f"calibration_instrument_unit_id={head_unit!r}")
+        if series_unit is None and head_unit is None:
+            mismatches.append("instrument_unit_id=None")
+    actual_catalog = _str_or_none(head.get("catalog_name"))
+    if catalog_name is not None and not _same_optional_text(actual_catalog, str(catalog_name)):
+        mismatches.append(f"catalog_name={actual_catalog!r}")
+    return mismatches
+
+
+def _candidate_row(head: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "series_id": head["series_id"],
+        "instrument_unit_id": (
+            head.get("series_instrument_unit_id")
+            if head.get("series_instrument_unit_id") is not None
+            else head.get("calibration_instrument_unit_id")
+        ),
+        "filter_name": head.get("filter_name"),
+        "n_frames": head.get("n_frames"),
+        "time_start": head.get("time_start"),
+        "time_end": head.get("time_end"),
+        "calibration_version_id": head.get("calibration_version_id"),
+        "calibration_name": head.get("calibration_name"),
+        "catalog_name": head.get("catalog_name"),
+        "pipeline_run_id": head.get("pipeline_run_id"),
+        "pipeline_status": head.get("pipeline_status"),
+        "recipe_json": head.get("recipe_json"),
+    }
+
+
+def _unselected_candidate_row(
+    series: dict[str, Any],
+    *,
+    selection_status: str,
+) -> dict[str, Any]:
+    return {
+        "series_id": series["series_id"],
+        "instrument_unit_id": series.get("series_instrument_unit_id"),
+        "filter_name": series.get("filter_name"),
+        "n_frames": series.get("n_frames"),
+        "time_start": series.get("time_start"),
+        "time_end": series.get("time_end"),
+        "calibration_version_id": None,
+        "calibration_name": None,
+        "catalog_name": None,
+        "pipeline_run_id": None,
+        "pipeline_status": None,
+        "recipe_json": None,
+        "_selection_status": selection_status,
+    }
 
 
 def _load_science_stats(session: Session, calibration_ids: list[int]) -> dict[int, dict[str, int]]:

@@ -1385,6 +1385,12 @@ def _validate_master_response(response, *, requested_offset: int, prior_metadata
         start, end, total = (int(value) for value in match.groups())
         if start != requested_offset or end < start or total <= end:
             raise MasterTransportError(f"Unexpected Content-Range: {content_range}")
+        if requested_offset > 0:
+            prior_expected_total = _optional_positive_int(prior_metadata.get("expected_bytes"))
+            if prior_expected_total is not None and total != prior_expected_total:
+                raise MasterTransportError(
+                    "Resumed MASTER Content-Range total differs from previously expected size"
+                )
         segment_size = end - start + 1
         if content_length is not None and content_length != segment_size:
             raise MasterTransportError("Content-Length does not match Content-Range")

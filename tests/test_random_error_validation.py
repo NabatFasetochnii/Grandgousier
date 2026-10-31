@@ -1,5 +1,6 @@
 import pytest
 
+from grandgousier.quality import random_error_validation
 from grandgousier.quality.random_error_validation import summarize_random_error_rows
 
 
@@ -152,3 +153,94 @@ def test_frame_common_is_supported_only_when_floor_and_correlation_improve():
     )
     assert result["residual_floor_frame_common_floor_reduction_fraction"] >= 0.05
     assert result["residual_floor_frame_common_abs_correlation_reduction"] >= 0.01
+
+
+def _validation_snapshot():
+    return type(
+        "Snapshot",
+        (),
+        {
+            "calibration_version_id": 23,
+            "frame_ids": None,
+            "measurement_rows": (),
+            "frames_by_id": {},
+            "algorithm": "fake-validation-snapshot",
+            "timings_sec": {},
+        },
+    )()
+
+
+class _ValidationSession:
+    def __init__(self):
+        self.read_calls = 0
+
+    def scalar(self, _statement):
+        self.read_calls += 1
+        return type("Calibration", (), {"calibration_version_id": 23})()
+
+
+def test_suggested_residual_floor_can_skip_provenance_annotation(monkeypatch):
+    annotation_calls = []
+    monkeypatch.setattr(
+        random_error_validation,
+        "summarize_random_error_rows",
+        lambda *_args, **_kwargs: {
+            "n_reference_objects": 4,
+            "residual_floor_suggested_mag": 0.021,
+        },
+    )
+    monkeypatch.setattr(
+        random_error_validation,
+        "annotate_residual_floor_provenance",
+        lambda *_args, **_kwargs: annotation_calls.append(True),
+    )
+    session = _ValidationSession()
+
+    result = random_error_validation.validate_random_error_model(
+        session,
+        calibration_name="diagnostic-calibration",
+        diagnostic_calibration_names=["diagnostic-calibration"],
+        analysis_snapshot=_validation_snapshot(),
+        annotate_residual_floor=False,
+    )
+
+    assert session.read_calls == 1
+    assert annotation_calls == []
+    assert result.status == "OK"
+    assert result.residual_floor_suggested_mag == pytest.approx(0.021)
+    assert result.residual_floor_annotation_calibrations == 0
+    assert result.residual_floor_annotation_measurements == 0
+
+
+def test_residual_floor_annotation_remains_enabled_by_default(monkeypatch):
+    annotation_calls = []
+    monkeypatch.setattr(
+        random_error_validation,
+        "summarize_random_error_rows",
+        lambda *_args, **_kwargs: {
+            "n_reference_objects": 4,
+            "residual_floor_suggested_mag": 0.018,
+        },
+    )
+
+    def annotate(*_args, **_kwargs):
+        annotation_calls.append(True)
+        return {"calibrations": 2, "measurements": 7}
+
+    monkeypatch.setattr(
+        random_error_validation,
+        "annotate_residual_floor_provenance",
+        annotate,
+    )
+
+    result = random_error_validation.validate_random_error_model(
+        _ValidationSession(),
+        calibration_name="diagnostic-calibration",
+        diagnostic_calibration_names=["diagnostic-calibration"],
+        analysis_snapshot=_validation_snapshot(),
+    )
+
+    assert annotation_calls == [True]
+    assert result.residual_floor_suggested_mag == pytest.approx(0.018)
+    assert result.residual_floor_annotation_calibrations == 2
+    assert result.residual_floor_annotation_measurements == 7

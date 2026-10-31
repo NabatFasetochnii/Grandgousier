@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import date
 from enum import Enum
-from typing import Iterable
+from pathlib import PurePosixPath
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from grandgousier.db.models import FieldSeriesFrame, Frame, Observation
+from grandgousier.identity.observation import MASTER_IDENTITY_SCHEME
+from grandgousier.io.parsing import parse_datetime
 
 
 class ObservationScienceAction(str, Enum):
@@ -19,6 +25,15 @@ class ObservationScienceAction(str, Enum):
     ALREADY_REPRESENTED = "ALREADY_REPRESENTED"
     EXISTING_MULTIPLE_REPRESENTATIVES = "EXISTING_MULTIPLE_REPRESENTATIVES"
     AMBIGUOUS_MULTIPLE_PRODUCTS = "AMBIGUOUS_MULTIPLE_PRODUCTS"
+    PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM = (
+        "PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM"
+    )
+    AMBIGUOUS_PHYSICAL_IDENTITY_DATE_UNDER_LEGACY_UNIQNUM = (
+        "AMBIGUOUS_PHYSICAL_IDENTITY_DATE_UNDER_LEGACY_UNIQNUM"
+    )
+    AMBIGUOUS_PHYSICAL_IDENTITY_CONTEXT_UNDER_LEGACY_UNIQNUM = (
+        "AMBIGUOUS_PHYSICAL_IDENTITY_CONTEXT_UNDER_LEGACY_UNIQNUM"
+    )
     MISSING_OBSERVATION_ID = "MISSING_OBSERVATION_ID"
     IDENTITY_CONFLICT = "IDENTITY_CONFLICT"
 
@@ -33,12 +48,84 @@ class ScienceFileIdentityCandidate:
     observation_uid: str | None
     identity_scheme: str | None
     native_identity: str | None
+    date_obs: Any | None = None
     file_size_bytes: int | None = None
     naxis1: int | None = None
     naxis2: int | None = None
     object_name: str | None = None
     identity_status: str = "READY"
     identity_detail: str | None = None
+    camera: str | None = None
+    raw_relative_physical_key: str | None = None
+
+
+_MASTER_RAW_RELATIVE_KEY_RE = re.compile(
+    r"^rawdata/(?P<year>\d{4})/(?P<month>\d{2})/(?P<day>\d{2})/"
+    r"(?P<raw_id>\d+)\.(?:fit|fits|fts)(?:\.gz)?$"
+)
+
+
+def _validate_master_raw_relative_physical_key(value: object) -> str:
+    """Validate the canonical relative source key carried by physical MASTER provenance."""
+
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("MASTER raw physical key must be an exact canonical POSIX relative path")
+    match = _MASTER_RAW_RELATIVE_KEY_RE.fullmatch(value)
+    path = PurePosixPath(value)
+    if match is None or path.is_absolute() or path.as_posix() != value:
+        raise ValueError("invalid canonical MASTER raw-relative physical key")
+    try:
+        date(int(match.group("year")), int(match.group("month")), int(match.group("day")))
+    except ValueError as exc:
+        raise ValueError("MASTER raw physical key contains an invalid archive date") from exc
+    return value
+
+
+def _master_raw_relative_key_from_ggraw(value: object) -> str | None:
+    """Return a validated relative key only for the canonical MASTER GGRAW root."""
+
+    prefix = "/master/imdata/"
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return None
+    try:
+        return _validate_master_raw_relative_physical_key(value[len(prefix) :])
+    except ValueError:
+        return None
+
+
+def _existing_master_frame_source_key(frame: Frame) -> tuple[str | None, str | None]:
+    """Prefer structured MASTER provenance, checking it against any usable legacy GGRAW."""
+
+    header = frame.header_json or {}
+    structured_value = header.get("raw_relative_physical_key")
+    structured_present = structured_value not in (None, "")
+    structured_key = None
+    if structured_present:
+        try:
+            structured_key = _validate_master_raw_relative_physical_key(structured_value)
+        except ValueError:
+            return None, "INVALID_STRUCTURED_SOURCE_CONTEXT"
+
+    ggraw_key = _master_raw_relative_key_from_ggraw(header.get("GGRAW"))
+    if structured_key is not None:
+        if ggraw_key is not None and ggraw_key != structured_key:
+            return None, "STRUCTURED_SOURCE_VS_GGRAW_CONFLICT"
+        return structured_key, None
+    return ggraw_key, None
+
+
+def _camera_token(value: object) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _instrument_token(value: object) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    return text.casefold() or None
 
 
 @dataclass(slots=True)
@@ -174,6 +261,24 @@ def select_persisted_science_frames(
             product_id for product_id in product_ids if series_by_frame.get(product_id)
         )
 
+        date_action, date_reason = _persisted_master_uniqnum_date_issue(
+            observation.identity_scheme if observation is not None else None,
+            products,
+        )
+        if date_action is not None:
+            rows.append(
+                _persisted_row(
+                    frame=frame,
+                    action=date_action,
+                    reason=date_reason,
+                    product_frame_ids=product_ids,
+                    existing_series_ids=existing_series_ids,
+                    selected_frame_id=None,
+                    observation=observation,
+                )
+            )
+            continue
+
         if len(assigned_product_ids) > 1:
             action = ObservationScienceAction.EXISTING_MULTIPLE_REPRESENTATIVES
             reason = (
@@ -282,6 +387,16 @@ def plan_file_science_selection(
         groups.setdefault(key, []).append(item)
 
     for (observation_uid, identity_scheme, native_identity), group in sorted(groups.items()):
+        context_action, context_reason = _candidate_master_uniqnum_context_issue(
+            identity_scheme, group
+        )
+        if context_action is not None:
+            rows.extend(
+                _plan_row(item, action=context_action, reason=context_reason)
+                for item in group
+            )
+            continue
+
         by_uid = session.scalar(
             select(Observation).where(Observation.observation_uid == observation_uid)
         )
@@ -340,21 +455,65 @@ def plan_file_science_selection(
                     .order_by(Frame.frame_id)
                 )
             )
-            product_ids = [int(frame.frame_id) for frame in existing_products]
-            existing_frame_uids = {
-                str(frame.frame_uid) for frame in existing_products if frame.frame_uid not in (None, "")
-            }
-            if product_ids:
-                memberships = list(
-                    session.execute(
-                        select(FieldSeriesFrame.frame_id, FieldSeriesFrame.series_id)
-                        .where(FieldSeriesFrame.frame_id.in_(product_ids))
-                        .order_by(FieldSeriesFrame.frame_id, FieldSeriesFrame.series_id)
-                    ).all()
-                )
-                existing_series_ids = sorted({int(series_id) for _frame_id, series_id in memberships})
-                assigned_product_ids = sorted({int(frame_id) for frame_id, _series_id in memberships})
 
+        # Legacy Frames may predate Observation links but still carry the
+        # authoritative MASTER UNIQNUM in their FITS header JSON. Search only
+        # this exact physical identity and only for physical MASTER candidates.
+        if identity_scheme == MASTER_IDENTITY_SCHEME and any(
+            item.raw_relative_physical_key not in (None, "") for item in group
+        ):
+            unlinked_products = list(
+                session.scalars(
+                    select(Frame)
+                    .where(
+                        Frame.observation_id.is_(None),
+                        Frame.instrument == "MASTER",
+                        Frame.header_json["UNIQNUM"].as_string() == native_identity,
+                    )
+                    .order_by(Frame.frame_id)
+                )
+            )
+            known_product_ids = {int(frame.frame_id) for frame in existing_products}
+            existing_products.extend(
+                frame
+                for frame in unlinked_products
+                if int(frame.frame_id) not in known_product_ids
+            )
+
+        product_ids = [int(frame.frame_id) for frame in existing_products]
+        existing_frame_uids = {
+            str(frame.frame_uid) for frame in existing_products if frame.frame_uid not in (None, "")
+        }
+        if product_ids:
+            memberships = list(
+                session.execute(
+                    select(FieldSeriesFrame.frame_id, FieldSeriesFrame.series_id)
+                    .where(FieldSeriesFrame.frame_id.in_(product_ids))
+                    .order_by(FieldSeriesFrame.frame_id, FieldSeriesFrame.series_id)
+                ).all()
+            )
+            existing_series_ids = sorted({int(series_id) for _frame_id, series_id in memberships})
+            assigned_product_ids = sorted({int(frame_id) for frame_id, _series_id in memberships})
+
+        context_action, context_reason = _existing_master_uniqnum_context_issue(
+            identity_scheme, group, existing_products, observation=observation
+        )
+        if context_action is not None:
+            rows.extend(
+                _plan_row(
+                    item,
+                    action=context_action,
+                    reason=context_reason,
+                    observation_id=observation_id,
+                    product_frame_ids=[int(frame.frame_id) for frame in existing_products],
+                )
+                for item in group
+            )
+            continue
+
+        exact_physical_duplicate = _existing_master_physical_duplicate(
+            identity_scheme, group, existing_products, observation=observation
+        )
         copy_like_items = {
             id(item)
             for item in group
@@ -376,7 +535,15 @@ def plan_file_science_selection(
         )
         projected_products = len(existing_products) + len(new_frame_uids) + unknown_uid_products
 
-        if len(assigned_product_ids) > 1:
+        if exact_physical_duplicate:
+            action = ObservationScienceAction.ALREADY_REPRESENTED
+            reason = (
+                "this exact MASTER physical observation is already durably indexed; "
+                "the planner classifies it as already represented without selecting a new product"
+            )
+            selected_frame_id = int(existing_products[0].frame_id)
+            selected_uid = str(existing_products[0].frame_uid)
+        elif len(assigned_product_ids) > 1:
             action = ObservationScienceAction.EXISTING_MULTIPLE_REPRESENTATIVES
             reason = (
                 "physical Observation already has multiple Frame products in field_series_frames; "
@@ -422,7 +589,8 @@ def plan_file_science_selection(
             item_selected_frame_id = selected_frame_id
             item_selected_uid = selected_uid
             if (
-                action == ObservationScienceAction.ALREADY_REPRESENTED
+                not exact_physical_duplicate
+                and action == ObservationScienceAction.ALREADY_REPRESENTED
                 and allow_reassign_existing_frame
                 and assigned_frame_uid is not None
                 and item.frame_uid is not None
@@ -468,6 +636,270 @@ def _candidate_is_copy_like_of_frame(item: ScienceFileIdentityCandidate, frame: 
         if str(incoming).strip() != str(existing).strip():
             return False
     return compared
+
+
+def _existing_master_physical_duplicate(
+    identity_scheme: str,
+    group: list[ScienceFileIdentityCandidate],
+    existing_products: list[Frame],
+    *,
+    observation: Observation | None,
+) -> bool:
+    """Recognize exact durable MASTER physical context even without series membership."""
+
+    if identity_scheme != MASTER_IDENTITY_SCHEME or len(existing_products) != 1 or not group:
+        return False
+
+    candidate_contexts: set[tuple[object, str, str]] = set()
+    for item in group:
+        date_obs = parse_datetime(item.date_obs)
+        camera = _camera_token(item.camera)
+        try:
+            source_key = _validate_master_raw_relative_physical_key(
+                item.raw_relative_physical_key
+            )
+        except ValueError:
+            return False
+        if date_obs is None or camera is None:
+            return False
+        candidate_contexts.add((date_obs, camera, source_key))
+    if len(candidate_contexts) != 1:
+        return False
+
+    frame = existing_products[0]
+    existing_date = parse_datetime(frame.date_obs)
+    existing_camera = _camera_token(frame.camera)
+    if existing_camera is None and observation is not None:
+        existing_camera = _camera_token(observation.camera_identity)
+    existing_key, source_issue = _existing_master_frame_source_key(frame)
+    if source_issue is not None or existing_key is None:
+        return False
+    candidate_date, candidate_camera, candidate_key = next(iter(candidate_contexts))
+    return (
+        existing_date == candidate_date
+        and existing_camera == candidate_camera
+        and existing_key == candidate_key
+    )
+
+
+def _candidate_master_uniqnum_context_issue(
+    identity_scheme: str,
+    group: list[ScienceFileIdentityCandidate],
+) -> tuple[ObservationScienceAction | None, str | None]:
+    if identity_scheme != MASTER_IDENTITY_SCHEME:
+        return None, None
+    has_physical_source = any(
+        item.raw_relative_physical_key not in (None, "") for item in group
+    )
+    if has_physical_source:
+        candidate_instruments = {_instrument_token(item.instrument) for item in group}
+        if candidate_instruments != {"master"}:
+            return (
+                ObservationScienceAction.IDENTITY_CONFLICT,
+                "physical MASTER identity is associated with a non-MASTER or missing candidate instrument",
+            )
+    dates = [parse_datetime(item.date_obs) for item in group]
+    known_dates = sorted({value for value in dates if value is not None})
+    if len(known_dates) > 1:
+        rendered = ", ".join(value.isoformat() for value in known_dates)
+        return (
+            ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM,
+            "master_uniqnum_v1 candidates share UNIQNUM but have distinct known DATE-OBS values: "
+            + rendered,
+        )
+    if any(value is None for value in dates):
+        return (
+            ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_DATE_UNDER_LEGACY_UNIQNUM,
+            "master_uniqnum_v1 candidate DATE-OBS is missing or unparseable; a safe represented/no-op decision is unavailable",
+        )
+
+    cameras = [_camera_token(item.camera) for item in group]
+    known_cameras = sorted({value for value in cameras if value is not None})
+    if len(known_cameras) > 1:
+        return (
+            ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM,
+            "master_uniqnum_v1 candidates share UNIQNUM but have distinct known cameras: "
+            + ", ".join(known_cameras),
+        )
+
+    keys: list[str | None] = []
+    for item in group:
+        if item.raw_relative_physical_key in (None, ""):
+            keys.append(None)
+            continue
+        try:
+            keys.append(_validate_master_raw_relative_physical_key(item.raw_relative_physical_key))
+        except ValueError as exc:
+            return (
+                ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_CONTEXT_UNDER_LEGACY_UNIQNUM,
+                f"candidate MASTER raw physical key is invalid: {exc}",
+            )
+    known_keys = sorted({value for value in keys if value is not None})
+    if len(known_keys) > 1:
+        return (
+            ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM,
+            "master_uniqnum_v1 candidates share UNIQNUM but have distinct known raw physical keys",
+        )
+    if known_keys and (any(value is None for value in keys) or any(value is None for value in cameras)):
+        return (
+            ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_CONTEXT_UNDER_LEGACY_UNIQNUM,
+            "physical MASTER candidate group lacks a complete camera/raw-key context",
+        )
+    return None, None
+
+
+def _existing_master_uniqnum_context_issue(
+    identity_scheme: str,
+    group: list[ScienceFileIdentityCandidate],
+    existing_products: list[Frame],
+    *,
+    observation: Observation | None = None,
+) -> tuple[ObservationScienceAction | None, str | None]:
+    if identity_scheme != MASTER_IDENTITY_SCHEME:
+        return None, None
+    if not existing_products and observation is None:
+        return None, None
+    has_physical_source = any(
+        item.raw_relative_physical_key not in (None, "") for item in group
+    )
+    existing_keys: set[str] = set()
+    if has_physical_source:
+        candidate_instruments = {_instrument_token(item.instrument) for item in group}
+        persisted_instruments = [
+            *(
+                [_instrument_token(observation.instrument)]
+                if observation is not None
+                else []
+            ),
+            *(_instrument_token(frame.instrument) for frame in existing_products),
+        ]
+        if (
+            candidate_instruments != {"master"}
+            or not persisted_instruments
+            or any(value != "master" for value in persisted_instruments)
+        ):
+            return (
+                ObservationScienceAction.IDENTITY_CONFLICT,
+                "physical MASTER identity conflicts with persisted Observation/Frame instrument",
+            )
+        candidate_native_ids = {str(item.native_identity) for item in group}
+        if len(candidate_native_ids) == 1:
+            candidate_native_id = next(iter(candidate_native_ids))
+            for frame in existing_products:
+                header_uniqnum = (frame.header_json or {}).get("UNIQNUM")
+                if header_uniqnum not in (None, "") and str(header_uniqnum) != candidate_native_id:
+                    return (
+                        ObservationScienceAction.IDENTITY_CONFLICT,
+                        "linked MASTER Frame header UNIQNUM conflicts with the canonical Observation identity",
+                    )
+        for frame in existing_products:
+            existing_key, source_issue = _existing_master_frame_source_key(frame)
+            if source_issue == "STRUCTURED_SOURCE_VS_GGRAW_CONFLICT":
+                return (
+                    ObservationScienceAction.IDENTITY_CONFLICT,
+                    "STRUCTURED_SOURCE_VS_GGRAW_CONFLICT",
+                )
+            if source_issue is not None:
+                return (
+                    ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_CONTEXT_UNDER_LEGACY_UNIQNUM,
+                    "persisted Frame has an invalid raw_relative_physical_key",
+                )
+            if existing_key is not None:
+                existing_keys.add(existing_key)
+    candidate_date = parse_datetime(group[0].date_obs)
+    existing_dates = [parse_datetime(frame.date_obs) for frame in existing_products]
+    observation_date = parse_datetime(observation.observed_at) if observation is not None else None
+    known_dates = [value for value in existing_dates if value is not None]
+    if observation_date is not None:
+        known_dates.append(observation_date)
+    if any(value != candidate_date for value in known_dates):
+        rendered = ", ".join(
+            sorted({value.isoformat() for value in known_dates if value is not None})
+        )
+        return (
+            ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM,
+            "legacy UNIQNUM physical-source/date collision: candidate DATE-OBS conflicts with "
+            "existing Frame.date_obs for the same master_uniqnum_v1 identity: "
+            + rendered,
+        )
+    candidate_cameras = {_camera_token(item.camera) for item in group}
+    candidate_cameras.discard(None)
+    existing_cameras = {
+        value
+        for value in (
+            *(_camera_token(frame.camera) for frame in existing_products),
+            _camera_token(observation.camera_identity) if observation is not None else None,
+        )
+        if value is not None
+    }
+    if candidate_cameras and any(value not in candidate_cameras for value in existing_cameras):
+        return (
+            ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM,
+            "candidate camera conflicts with persisted MASTER observation/frame camera context",
+        )
+
+    candidate_keys: set[str] = set()
+    for item in group:
+        if item.raw_relative_physical_key in (None, ""):
+            continue
+        try:
+            candidate_keys.add(_validate_master_raw_relative_physical_key(item.raw_relative_physical_key))
+        except ValueError as exc:
+            return (
+                ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_CONTEXT_UNDER_LEGACY_UNIQNUM,
+                f"candidate MASTER raw physical key is invalid: {exc}",
+            )
+    if candidate_keys:
+        if existing_keys and not existing_keys.issubset(candidate_keys):
+            return (
+                ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM,
+                "legacy UNIQNUM physical-source/date collision: candidate raw physical source key "
+                "conflicts with persisted Frame source context",
+            )
+        if not existing_keys:
+            return (
+                ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_CONTEXT_UNDER_LEGACY_UNIQNUM,
+                "existing MASTER Frame/Observation has no durable raw physical source context; exact duplicate cannot be established",
+            )
+        if candidate_cameras and not existing_cameras:
+            return (
+                ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_CONTEXT_UNDER_LEGACY_UNIQNUM,
+                "existing MASTER Frame/Observation has no durable camera context; exact duplicate cannot be established",
+            )
+    elif candidate_cameras and any(value not in candidate_cameras for value in existing_cameras):
+        return (
+            ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM,
+            "candidate camera conflicts with persisted MASTER observation/frame camera context",
+        )
+    if any(value is None for value in existing_dates):
+        return (
+            ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_DATE_UNDER_LEGACY_UNIQNUM,
+            "an existing Frame with the same master_uniqnum_v1 identity has missing or unparseable date_obs",
+        )
+    return None, None
+
+
+def _persisted_master_uniqnum_date_issue(
+    identity_scheme: str | None,
+    products: list[Frame],
+) -> tuple[ObservationScienceAction | None, str | None]:
+    if identity_scheme != MASTER_IDENTITY_SCHEME or not products:
+        return None, None
+    dates = [parse_datetime(frame.date_obs) for frame in products]
+    known_dates = sorted({value for value in dates if value is not None})
+    if any(value is None for value in dates):
+        return (
+            ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_DATE_UNDER_LEGACY_UNIQNUM,
+            "a persisted Frame with this master_uniqnum_v1 identity has missing or unparseable date_obs",
+        )
+    if len(known_dates) > 1:
+        rendered = ", ".join(value.isoformat() for value in known_dates)
+        return (
+            ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM,
+            "persisted Frames with this master_uniqnum_v1 identity have distinct DATE-OBS values: "
+            + rendered,
+        )
+    return None, None
 
 
 def _persisted_row(
@@ -519,6 +951,13 @@ def _plan_row(
         "identity_scheme": item.identity_scheme,
         "native_identity": item.native_identity,
         "identity_status": item.identity_status,
+        "camera": item.camera,
+        "raw_relative_physical_key": item.raw_relative_physical_key,
+        "date_obs": (
+            item.date_obs.isoformat()
+            if hasattr(item.date_obs, "isoformat")
+            else item.date_obs
+        ),
         "action": action.value,
         "selected_frame_id": selected_frame_id,
         "selected_frame_uid": selected_frame_uid,
@@ -573,6 +1012,9 @@ def _summary(rows: list[dict], *, selected_frame_count: int) -> dict:
         ObservationScienceAction.ALREADY_REPRESENTED.value,
         ObservationScienceAction.EXISTING_MULTIPLE_REPRESENTATIVES.value,
         ObservationScienceAction.AMBIGUOUS_MULTIPLE_PRODUCTS.value,
+        ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM.value,
+        ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_DATE_UNDER_LEGACY_UNIQNUM.value,
+        ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_CONTEXT_UNDER_LEGACY_UNIQNUM.value,
         ObservationScienceAction.MISSING_OBSERVATION_ID.value,
         ObservationScienceAction.IDENTITY_CONFLICT.value,
     }

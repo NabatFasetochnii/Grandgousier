@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import median
-from typing import Any, Iterable
+from typing import Any
 
 from sqlalchemy import bindparam, select, text
 from sqlalchemy.orm import Session
@@ -22,6 +23,7 @@ from grandgousier.lightcurves.product import (
     _load_calibration_rows,
     export_science_light_curve_csv,
     load_science_light_curve_rows,
+    preflight_science_light_curve_selection,
 )
 from grandgousier.photometry.calibration_view import load_calibration_photometry_view
 
@@ -95,6 +97,8 @@ class TargetLightCurveProduct:
     mjd_max: float | None = None
     csv_path: str | None = None
     json_path: str | None = None
+    interseries_generation_ids: list[int] = field(default_factory=list)
+    interseries_generation_scopes: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -116,6 +120,8 @@ class TargetLightCurveProduct:
             "mjd_max": self.mjd_max,
             "csv_path": self.csv_path,
             "json_path": self.json_path,
+            "interseries_generation_ids": list(self.interseries_generation_ids),
+            "interseries_generation_scopes": list(self.interseries_generation_scopes),
             "warnings": list(self.warnings),
         }
 
@@ -617,6 +623,7 @@ def export_target_light_curve_product(
     catalog_name: str | None = None,
     series_id: int | None = None,
     frame_ids: list[int] | None = None,
+    interseries_generation_ids: list[int] | None = None,
     reject_flags: set[str] | None = None,
     out_csv: str | Path | None = None,
     out_json: str | Path | None = None,
@@ -629,23 +636,56 @@ def export_target_light_curve_product(
             _write_json(product.to_dict(), out_json)
         return product
 
+    scope_series_id = None if frame_ids else series_id
+    selection_scope = preflight_science_light_curve_selection(
+        session,
+        calibration_names=[calibration_name],
+        catalog_name=catalog_name,
+        series_id=scope_series_id,
+        frame_ids=frame_ids,
+        interseries_generation_ids=interseries_generation_ids,
+    )
+    product.interseries_generation_ids = list(
+        getattr(selection_scope, "interseries_generation_ids", []) or []
+    )
+    product.interseries_generation_scopes = list(
+        getattr(selection_scope, "interseries_generation_scopes", []) or []
+    )
+    product.warnings.extend(getattr(selection_scope, "warnings", []) or [])
+
     # ``process-archive-path`` passes both the series id and an explicit list of
     # frames that came from the requested filesystem path.  The light-curve scope
     # resolver intentionally rejects combining field-series selectors with
     # explicit frame_ids, because the combination is ambiguous for public CLI
     # calls.  For target export the explicit path frame selection is the stricter
     # and safer scope, so prefer it and do not also pass series_id downstream.
-    scope_series_id = None if frame_ids else series_id
-    _scope, rows = load_science_light_curve_rows(
+    scope, rows = load_science_light_curve_rows(
         session,
         calibration_names=[calibration_name],
         catalog_name=catalog_name,
         object_id=int(target.object_id),
         series_id=scope_series_id,
         frame_ids=frame_ids,
+        interseries_generation_ids=(
+            interseries_generation_ids
+            if interseries_generation_ids is not None
+            else (product.interseries_generation_ids or None)
+        ),
         reject_flags=reject_flags,
         exclude_rejected=False,
     )
+    if (
+        scope is not None
+        and (
+            list(getattr(scope, "interseries_generation_ids", []) or [])
+            != product.interseries_generation_ids
+            or list(getattr(scope, "interseries_generation_scopes", []) or [])
+            != product.interseries_generation_scopes
+        )
+    ):
+        raise LightCurveSelectionError(
+            "M4 generation selection changed after target-export preflight; refusing output"
+        )
     product.rows_total = len(rows)
     product.rows_accepted = sum(1 for r in rows if not r.get("is_rejected"))
     product.rows_rejected = sum(1 for r in rows if r.get("is_rejected"))

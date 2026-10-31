@@ -11,6 +11,14 @@ from grandgousier.lightcurves.target import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _stub_light_curve_selection_preflight(monkeypatch):
+    monkeypatch.setattr(
+        "grandgousier.lightcurves.target.preflight_science_light_curve_selection",
+        lambda *_args, **_kwargs: None,
+    )
+
+
 def test_target_export_prefers_explicit_frame_ids_over_series_selector(monkeypatch):
     calls = {}
 

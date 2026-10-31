@@ -107,6 +107,9 @@ def detect_sources_in_frames(
     pre_qc_detection_seeds: dict[int, dict] | None = None,
     pipeline_run_id: int | None = None,
 ) -> SourceDetectionResult:
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("An explicit frame_ids selection must not be empty")
+
     if threshold_sigma <= 0:
         raise ValueError("threshold_sigma must be positive")
     if max_sources_per_frame <= 0:

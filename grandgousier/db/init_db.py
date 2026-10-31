@@ -12,6 +12,17 @@ from grandgousier.db.schema_contract import (
 from grandgousier.db.session import make_engine
 
 
+def _assert_postgresql_15_or_newer(engine) -> None:
+    """Refuse ORM bootstrap/reset before any DDL on an unsupported server."""
+
+    if engine.dialect.name != "postgresql":
+        raise RuntimeError("Grandgousier 0.7 schema requires PostgreSQL 15 or newer")
+    with engine.connect() as conn:
+        version = int(conn.exec_driver_sql("SELECT current_setting('server_version_num')").scalar_one())
+    if version < 150000:
+        raise RuntimeError("Grandgousier 0.7 schema requires PostgreSQL 15 or newer")
+
+
 def init_db(database_url: str | None = None) -> None:
     """Create the complete current Grandgousier schema in a fresh database.
 
@@ -21,6 +32,7 @@ def init_db(database_url: str | None = None) -> None:
     """
 
     engine = make_engine(database_url)
+    _assert_postgresql_15_or_newer(engine)
     existing_before = set(inspect(engine).get_table_names())
     assert_clean_schema_epoch(existing_before)
     existing_current = existing_before.intersection(CURRENT_SCHEMA_TABLES)
@@ -46,6 +58,7 @@ def reset_db(database_url: str | None = None) -> None:
     """
 
     engine = make_engine(database_url)
+    _assert_postgresql_15_or_newer(engine)
     assert_clean_schema_epoch(inspect(engine).get_table_names())
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)

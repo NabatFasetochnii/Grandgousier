@@ -98,32 +98,119 @@ def _read_json(path: Path) -> Mapping[str, Any] | None:
     return payload if isinstance(payload, Mapping) else None
 
 
-def _checkpoint_product_is_durable(result: Mapping[str, Any]) -> bool:
+def _checkpoint_product_provenance(result: Mapping[str, Any]) -> Mapping[str, Any] | None:
     if str(result.get("status") or "") not in _SUCCESS_STATUSES:
-        return False
+        return None
     product_text = str(result.get("product_path") or "").strip()
     provenance_text = str(result.get("provenance_path") or "").strip()
     expected_checksum = str(result.get("product_checksum_sha256") or "").strip()
     fingerprint = str(result.get("fingerprint") or "").strip()
     if not product_text or not provenance_text or not expected_checksum or not fingerprint:
-        return False
+        return None
     product_path = Path(product_text)
     provenance_path = Path(provenance_text)
     if not product_path.is_file() or not provenance_path.is_file():
-        return False
+        return None
     try:
         actual_checksum = _sha256_file(product_path)
     except OSError:
-        return False
+        return None
     if actual_checksum.casefold() != expected_checksum.casefold():
-        return False
+        return None
     sidecar = _read_json(provenance_path)
     if sidecar is None or sidecar.get("schema") != STAGE1_PROVENANCE_SCHEMA:
-        return False
+        return None
     if str(sidecar.get("fingerprint") or "") != fingerprint:
-        return False
+        return None
     product = sidecar.get("product")
-    return isinstance(product, Mapping) and str(product.get("checksum_sha256") or "").casefold() == actual_checksum.casefold()
+    if not isinstance(product, Mapping):
+        return None
+    if str(product.get("checksum_sha256") or "").casefold() != actual_checksum.casefold():
+        return None
+    return sidecar
+
+
+def _checkpoint_product_is_durable(result: Mapping[str, Any]) -> bool:
+    return _checkpoint_product_provenance(result) is not None
+
+
+def _checkpoint_paths_match(
+    result: Mapping[str, Any],
+    *,
+    item: CalibrationPlanItem,
+    product_store: ProductStore,
+) -> tuple[Path, Path] | None:
+    if item.product is None:
+        return None
+    stored_product = str(result.get("product_path") or "").strip()
+    stored_provenance = str(result.get("provenance_path") or "").strip()
+    if not stored_product or not stored_provenance:
+        return None
+    try:
+        current_product = Path(product_store.resolve(item.product))
+        current_provenance = _provenance_path(current_product)
+        paths_match = (
+            Path(stored_product).resolve(strict=False)
+            == current_product.resolve(strict=False)
+            and Path(stored_provenance).resolve(strict=False)
+            == current_provenance.resolve(strict=False)
+        )
+        return (current_product, current_provenance) if paths_match else None
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _checkpoint_input_refs(item: CalibrationPlanItem) -> tuple[AssetRef, ...] | None:
+    if item.status != "READY" or item.product is None:
+        return None
+    if item.action == "IMPORT_PROCESSED":
+        processed = item.observation.asset("processed")
+        return (processed,) if processed is not None else None
+    if item.action == "REDUCE_RAW" and item.observation.instrument == "MASTER":
+        roles = ("science_raw", "processing_header", "dark", "flat")
+        refs = tuple(item.observation.asset(role) for role in roles)
+        if any(ref is None for ref in refs):
+            return None
+        return tuple(ref for ref in refs if ref is not None)
+    return None
+
+
+def _checkpoint_sidecar_inputs_match(
+    sidecar: Mapping[str, Any],
+    inputs: Sequence[MaterializedInput],
+) -> bool:
+    sidecar_inputs = sidecar.get("inputs")
+    if not isinstance(sidecar_inputs, list) or len(sidecar_inputs) != len(inputs):
+        return False
+    ordered = sorted(inputs, key=lambda value: (value.ref.role, value.ref.ref_uid))
+    for entry, materialized in zip(sidecar_inputs, ordered, strict=True):
+        if not isinstance(entry, Mapping):
+            return False
+        ref = entry.get("ref")
+        if not isinstance(ref, Mapping):
+            return False
+        if ref.get("role") != materialized.ref.role or ref.get("ref_uid") != materialized.ref.ref_uid:
+            return False
+        checksum = entry.get("checksum_sha256")
+        if not _is_sha256_checksum(checksum):
+            return False
+        if str(checksum).casefold() != materialized.checksum_sha256.casefold():
+            return False
+        declared_checksum = materialized.ref.checksum_sha256
+        if declared_checksum:
+            sidecar_declared_checksum = ref.get("checksum_sha256")
+            if not _is_sha256_checksum(sidecar_declared_checksum):
+                return False
+            if str(sidecar_declared_checksum).casefold() != declared_checksum.casefold():
+                return False
+        elif "checksum_sha256" in ref:
+            return False
+    return True
+
+
+def _is_sha256_checksum(value: Any) -> bool:
+    text = str(value or "").strip()
+    return len(text) == 64 and all(character in "0123456789abcdefABCDEF" for character in text)
 
 
 @dataclass(frozen=True, slots=True)
@@ -974,8 +1061,12 @@ def execute_stage1_stream(
 ) -> Stage1StreamingExecutionSummary:
     """Stream Stage-1 planning, execution, and reports in bounded batches."""
     from grandgousier.archive.stage1_contract import STAGE1_PLAN_SCHEMA
-    from grandgousier.archive.stage1_planner import iter_stage1_plan_batches
+    from grandgousier.archive.stage1_planner import (
+        iter_stage1_plan_batches,
+        normalize_stage1_batch_size,
+    )
 
+    batch_size = normalize_stage1_batch_size(batch_size)
     generated_at = _utc_now()
     plan_json = _StreamingJsonArtifact(
         plan_json_path,
@@ -1139,16 +1230,54 @@ def execute_stage1_stream(
                 if stop_requested.is_set():
                     raise Stage1StopRequested("Stage-1 stop requested at an item boundary")
                 item_key = None
+                checkpoint_paths = None
+                checkpoint_materialization_error = None
                 if checkpoint is not None and run_fingerprint is not None:
                     item_key = item_fingerprint(
                         run_fingerprint=run_fingerprint,
                         item=item.to_dict(),
                     )
                     stored = checkpoint.get_completed(item_key)
-                    if stored is not None and _checkpoint_product_is_durable(stored):
-                        write_result(stored)
-                        continue
-                if batch_blocked:
+                    if stored is not None:
+                        checkpoint_paths = _checkpoint_paths_match(
+                            stored,
+                            item=item,
+                            product_store=product_store,
+                        )
+                    if stored is not None and checkpoint_paths is not None:
+                        sidecar = _checkpoint_product_provenance(stored)
+                        if sidecar is not None:
+                            if context is None:
+                                context = _ExecutionContext(asset_provider)
+                            refs = _checkpoint_input_refs(item)
+                            if refs is not None:
+                                try:
+                                    materialized_inputs = [context.materialize(ref) for ref in refs]
+                                except Exception as exc:  # noqa: BLE001 - do not implicitly retry provider failures
+                                    materialized_inputs = None
+                                    checkpoint_materialization_error = exc
+                                if (
+                                    materialized_inputs is not None
+                                    and _checkpoint_sidecar_inputs_match(sidecar, materialized_inputs)
+                                ):
+                                    write_result(stored)
+                                    continue
+                if checkpoint_materialization_error is not None:
+                    if checkpoint is not None:
+                        checkpoint.mark_attempted()
+                    attempted_items += 1
+                    result = _result_for_item(
+                        item,
+                        status="FAILED",
+                        product=item.product,
+                        product_path=checkpoint_paths[0] if checkpoint_paths is not None else None,
+                        provenance_path=checkpoint_paths[1] if checkpoint_paths is not None else None,
+                        error=(
+                            f"{type(checkpoint_materialization_error).__name__}: "
+                            f"{checkpoint_materialization_error}"
+                        ),
+                    )
+                elif batch_blocked:
                     result = _result_for_item(
                         item,
                         status="BLOCKED",

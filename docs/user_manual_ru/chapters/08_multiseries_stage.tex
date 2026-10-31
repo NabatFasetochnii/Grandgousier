@@ -237,6 +237,23 @@ python -m grandgousier.cli analyze-interseries-calibration `
   \item[\texttt{interseries\_calibration\_edges}] pairwise M2 diagnostics, membership calibrator object IDs и M3 closure residuals.
 \end{description}
 
+В clean 0.7 M4 reference series должна относиться к тому же field, что и generation;
+удаление этой \texttt{field\_series} запрещено внешним ключом \texttt{RESTRICT}.
+При удалении другой series может сохраниться historical membership с
+\texttt{series\_id = NULL} и исходным \texttt{field\_id}. Такой M4 generation
+нельзя считать действительным для verification/M5/Parquet: операции отказывают
+до публикации неполного продукта. Другие ограничения (в частности, edges и
+calibration versions) могут сами запретить удаление. После применения managed
+migration 0.7.0.6 оба endpoint FK в \texttt{interseries\_calibration\_edges}
+используют \texttt{ON DELETE RESTRICT}:
+любое сохранённое ребро, независимо от статуса и generation (включая исторические),
+блокирует отдельное удаление series. Для series без связанных edges существующий
+membership FK всё ещё может установить \texttt{series\_id = NULL}, если другие FK
+это допускают. Полное удаление field допускается только как отдельный явно одобренный
+упорядоченный каскадный workflow; он не реализован здесь, и единственный
+\texttt{DELETE FROM fields} не гарантируется. Автоматического восстановления M4 из
+оставшихся series нет.
+
 Перед первым использованием необходимо применить managed migration:
 
 \begin{lstlisting}
@@ -315,15 +332,36 @@ python -m grandgousier.cli export-global-object-light-curve `
 
 \subsection{Выходные файлы}
 
-Для \texttt{--out-root reports\\object\_12345\_global} создаются:
+Путь \texttt{--out-root reports\\object\_12345\_global} --- это финальный каталог bundle.
+Внутри него создаются следующие файлы; их basenames сохраняют прежние стабильные имена:
 
 \begin{description}
   \item[\texttt{object\_12345\_global.csv}] точные accepted M5 points; без downsampling;
-  \item[\texttt{object\_12345\_global\_summary.json}] M4 provenance, coverage, uncertainty semantics и plot policy;
+  \item[\texttt{object\_12345\_global\_summary.json}] M4 provenance, coverage, uncertainty semantics и plot policy с финальными путями внутри bundle;
   \item[\texttt{object\_12345\_global\_V.png}] отдельный plot фильтра V;
   \item[\texttt{object\_12345\_global\_V\_plot.csv}] именно те raw/binned points, которые показаны на plot;
   \item[аналогичные R/g/r/i файлы] создаются независимо для каждого встреченного фильтра.
 \end{description}
+
+При \texttt{--include-rejected-debug} в тот же каталог добавляется
+\texttt{object\_12345\_global\_rejections.csv}. Существующий финальный каталог и
+оставшиеся рядом legacy flat-файлы с ожидаемыми basenames блокируют запуск; они не
+перезаписываются и не изменяются.
+
+Все файлы, включая summary с финальными путями, сначала записываются в отдельный скрытый
+staging-каталог рядом с bundle. После успешной записи весь каталог публикуется одной
+same-filesystem directory rename с native no-replace семантикой. Поэтому финальное имя
+появляется атомарно как namespace bundle; обычная ошибка до публикации очищает только
+staging-каталог этого запуска. Если процесс аварийно завершится до публикации, может
+остаться скрытый sibling вида \texttt{.object\_12345\_global.m5-staging-*}; он не является
+финальным экспортом, автоматически не очищается и не переиспользуется. Эта гарантия не
+означает fsync или power-loss durability.
+
+Используются только native primitives: Windows \texttt{os.rename}, Linux libc
+\texttt{renameat2(RENAME\_NOREPLACE)} и macOS libc \texttt{renamex\_np(RENAME\_EXCL)}.
+Если primitive/symbol отсутствует, платформа или файловая система не поддерживает такую
+операцию либо native вызов возвращает ошибку, экспорт прекращается без fallback; в
+частности, check-then-ordinary-rename не используется.
 
 По умолчанию main CSV содержит только science-accepted points. \texttt{--include-rejected} добавляет rejected rows с \texttt{quality\_flags} и \texttt{reject\_reasons}; plot всё равно строится только по accepted points.
 
@@ -335,7 +373,7 @@ python -m grandgousier.cli export-global-object-light-curve `
 --include-rejected-debug
 \end{lstlisting}
 
-Тогда создаётся отдельный \texttt{<out-root>\_rejections.csv} с \texttt{series\_id}, \texttt{frame\_id}, exact SCIENCE/M4 IDs, magnitude, merged \texttt{quality\_flags} и \texttt{reject\_reasons}. Этот файл диагностический и не меняет основной accepted CSV. Если accepted points нет, plots намеренно не создаются, поскольку plotting policy использует только science-accepted points.
+Тогда внутри bundle создаётся отдельный \texttt{<bundle-name>\_rejections.csv} с \texttt{series\_id}, \texttt{frame\_id}, exact SCIENCE/M4 IDs, magnitude, merged \texttt{quality\_flags} и \texttt{reject\_reasons}. Этот файл диагностический и не меняет основной accepted CSV. Если accepted points нет, plots намеренно не создаются, поскольку plotting policy использует только science-accepted points.
 
 \subsection{Насыщение в M5 начиная с 0.5.47.3}
 

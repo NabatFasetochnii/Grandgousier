@@ -137,6 +137,9 @@ def apply_photometric_frame_qc(
     untouched.
     """
 
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("explicit frame_ids selection must not be empty")
+
     if min_reference_stars_per_frame < 5:
         raise ValueError("min_reference_stars_per_frame must be >= 5")
     if suspect_sigma <= 0 or bad_sigma <= suspect_sigma:

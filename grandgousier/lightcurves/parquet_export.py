@@ -169,6 +169,19 @@ def _validate_stage3_generation(generation: Any) -> None:
         )
 
 
+def _validate_m4_memberships(generation: Any, rows: list[Any]) -> None:
+    """Refuse incomplete M4 provenance before filtering to an export's series scope."""
+
+    if len(rows) != int(generation.n_series) or any(
+        row.series_id is None or row.field_id != generation.field_id
+        for row in rows
+    ):
+        raise ValueError("Interseries generation has orphaned or incomplete membership")
+    references = [row for row in rows if row.is_reference_series]
+    if len(references) != 1 or references[0].series_id != generation.reference_series_id:
+        raise ValueError("Interseries generation has inconsistent reference membership")
+
+
 def _frame_qc_summary(flags: dict[str, Any] | None) -> tuple[str, dict[str, int]]:
     """Summarize persisted photometric frame-QC flags, not metric rows."""
     from grandgousier.calibration.photometric_frame_qc import PHOTOMETRIC_FRAME_QC_FLAG
@@ -350,9 +363,10 @@ def export_series(session, series_ids: list[int], out: str | Path, *, logical_db
         if generation is None or generation.lifecycle_status != "COMPLETE_IMMUTABLE":
             raise ValueError("Requested interseries generation is missing or not COMPLETE_IMMUTABLE")
         _validate_stage3_generation(generation)
-        rows = list(session.scalars(select(InterseriesCalibrationSeries).where(
-            InterseriesCalibrationSeries.interseries_generation_id == interseries_generation_id,
-            InterseriesCalibrationSeries.series_id.in_(series_ids))).all())
+        all_rows = list(session.scalars(select(InterseriesCalibrationSeries).where(
+            InterseriesCalibrationSeries.interseries_generation_id == interseries_generation_id)).all())
+        _validate_m4_memberships(generation, all_rows)
+        rows = [row for row in all_rows if row.series_id in series_ids]
         by_sid = {}
         for row in rows:
             if row.series_id in by_sid:

@@ -138,6 +138,7 @@ class ProcessArchiveResult:
     failed_files: int
     indexed_frame_ids: list[int] = field(default_factory=list)
     created_series_ids: list[int] = field(default_factory=list)
+    open_series_ids: list[int] = field(default_factory=list)
     processed_series_ids: list[int] = field(default_factory=list)
     groups: list[ArchiveGroupPlan] = field(default_factory=list)
     index_results: list[dict[str, Any]] = field(default_factory=list)
@@ -162,6 +163,7 @@ class ProcessArchiveResult:
             "failed_files": self.failed_files,
             "indexed_frame_ids": self.indexed_frame_ids,
             "created_series_ids": self.created_series_ids,
+            "open_series_ids": self.open_series_ids,
             "processed_series_ids": self.processed_series_ids,
             "groups": [g.to_dict() for g in self.groups],
             "index_results": self.index_results,
@@ -175,6 +177,14 @@ class ProcessArchiveResult:
             "warnings": self.warnings,
             "manifest_path": self.manifest_path,
         }
+
+
+@dataclass(frozen=True)
+class DetectedArchiveIndexResult:
+    index_results: tuple[dict[str, Any], ...]
+    indexed_paths: tuple[str, ...]
+    indexed_frame_ids: tuple[int, ...]
+    failed_files: int
 
 
 def default_profile_paths() -> dict[str, Path]:
@@ -192,6 +202,61 @@ def load_auto_profiles(
     if robophot_profile:
         paths["RoboPhot"] = Path(robophot_profile)
     return {name: InstrumentProfile.from_yaml(path) for name, path in paths.items()}
+
+
+def index_detected_archive_files(
+    session: Session,
+    detected: Iterable[DetectedArchiveFile],
+    *,
+    profiles: dict[str, InstrumentProfile] | None = None,
+    master_profile: str | Path | None = None,
+    robophot_profile: str | Path | None = None,
+) -> DetectedArchiveIndexResult:
+    """Persist exactly the supplied detected FITS files through the canonical indexer."""
+
+    active_profiles = profiles or load_auto_profiles(
+        master_profile=master_profile,
+        robophot_profile=robophot_profile,
+    )
+    detected_by_profile: dict[str, list[DetectedArchiveFile]] = {}
+    for item in detected:
+        detected_by_profile.setdefault(item.profile_name, []).append(item)
+
+    index_results: list[dict[str, Any]] = []
+    indexed_paths: list[str] = []
+    failed_files = 0
+    for profile_name, items in sorted(detected_by_profile.items()):
+        paths = [Path(item.path) for item in items]
+        result = index_archive_paths(
+            session=session,
+            paths=paths,
+            profile=active_profiles[profile_name],
+            dry_run=False,
+            progress_desc=f"Indexing {profile_name}",
+        )
+        indexed_paths.extend(str(path) for path in paths)
+        failed_files += int(result.failed)
+        index_results.append(
+            {
+                "profile_name": profile_name,
+                "discovered": result.discovered,
+                "inserted": result.inserted,
+                "skipped_existing": result.skipped_existing,
+                "failed": result.failed,
+            }
+        )
+        if result.failed:
+            break
+
+    indexed_frame_ids = (
+        _frame_ids_for_paths(session, indexed_paths) if failed_files == 0 else []
+    )
+    return DetectedArchiveIndexResult(
+        index_results=tuple(index_results),
+        indexed_paths=tuple(indexed_paths),
+        indexed_frame_ids=tuple(indexed_frame_ids),
+        failed_files=failed_files,
+    )
 
 
 def discover_fits_files(
@@ -291,6 +356,7 @@ def process_archive_path(
     limit: int | None = None,
     series_ids: Iterable[int] | None = None,
     min_frames_per_series: int = 10,
+    finalize_tail: bool = True,
     max_field_separation_arcmin: float = 30.0,
     max_series_gap_minutes: float = 60.0,
     include_assigned: bool = False,
@@ -607,33 +673,20 @@ def process_archive_path(
         _write_manifest_if_requested(result, manifest_out, session=session)
         return result
 
-    detected_by_profile: dict[str, list[DetectedArchiveFile]] = {}
-    for item in detected:
-        detected_by_profile.setdefault(item.profile_name, []).append(item)
-
-    indexed_paths: list[str] = []
-    for profile_name, items in sorted(detected_by_profile.items()):
-        profile = profiles[profile_name]
-        paths = [Path(item.path) for item in items]
-        idx = index_archive_paths(
-            session=session,
-            paths=paths,
-            profile=profile,
-            dry_run=False,
-            progress_desc=f"Indexing {profile_name}",
+    indexing = index_detected_archive_files(session, detected, profiles=profiles)
+    indexed_paths = list(indexing.indexed_paths)
+    result.index_results.extend(indexing.index_results)
+    result.failed_files += indexing.failed_files
+    if indexing.failed_files > 0:
+        result.status = "FAILED_INDEX_FILES"
+        result.warnings.append(
+            f"archive indexing failed for {indexing.failed_files} file(s)"
         )
-        indexed_paths.extend(str(p) for p in paths)
-        result.index_results.append(
-            {
-                "profile_name": profile_name,
-                "discovered": idx.discovered,
-                "inserted": idx.inserted,
-                "skipped_existing": idx.skipped_existing,
-                "failed": idx.failed,
-            }
-        )
+        if manifest_out is not None:
+            _write_manifest_if_requested(result, manifest_out, session=session)
+        return result
 
-    indexed_frame_ids = _frame_ids_for_paths(session, indexed_paths)
+    indexed_frame_ids = list(indexing.indexed_frame_ids)
     result.indexed_frame_ids = indexed_frame_ids
     requested_series_ids = sorted({int(v) for v in (series_ids or [])})
     existing_input_series_ids = _series_ids_for_paths(session, indexed_paths)
@@ -720,10 +773,22 @@ def process_archive_path(
                 only_unassigned=not include_assigned,
                 only_science=not include_non_science,
                 min_frames_per_series=min_frames_per_series,
+                finalize_tail=finalize_tail,
                 dry_run=False,
             )
             created = [int(row["series_id"]) for row in build_result.rows if row.get("series_id") is not None]
+            ready = [
+                int(row["series_id"])
+                for row in build_result.rows
+                if row.get("series_id") is not None and row.get("status") == "READY"
+            ]
+            open_ids = [
+                int(row["series_id"])
+                for row in build_result.rows
+                if row.get("series_id") is not None and row.get("status") == "OPEN"
+            ]
             result.created_series_ids.extend(created)
+            result.open_series_ids.extend(open_ids)
             result.series_results.append(
                 {
                     "instrument_unit_id": instrument_unit_id,
@@ -736,7 +801,7 @@ def process_archive_path(
                     "rows": [_json_safe(row) for row in build_result.rows],
                 }
             )
-            created_series_ids.extend(created)
+            created_series_ids.extend(ready)
 
     # Ordinary process-by-path mode must run only series created (or explicitly
     # rebuilt via --include-assigned) from Frames selected for this invocation.
@@ -761,7 +826,15 @@ def process_archive_path(
         pipeline_series_ids = sorted(set(created_series_ids))
     frame_ids_by_series_id = _frame_ids_by_series_for_paths(session, indexed_paths)
 
-    for series in _load_series_for_pipeline(session, pipeline_series_ids):
+    pipeline_series_rows = _load_series_for_pipeline(session, pipeline_series_ids)
+    finalized_series_rows, open_ids = _separate_open_series(pipeline_series_rows)
+    result.open_series_ids = sorted(set(result.open_series_ids).union(open_ids))
+    if open_ids:
+        result.warnings.append(
+            "OPEN field_series were not submitted to Stage 2; explicitly finalize eligible tails first: "
+            + ", ".join(str(series_id) for series_id in open_ids)
+        )
+    for series in finalized_series_rows:
         prefix = _format_calibration_prefix(calibration_prefix_template, series)
         series_out_dir = str(Path(out_root) / prefix) if out_root else None
         profile = profiles.get(str(series.get("instrument") or ""))
@@ -1070,6 +1143,15 @@ def process_archive_path(
             pipeline_result = run_field_pipeline(session, config)
             pipe_row = _pipeline_row(series, prefix, pipeline_result)
             result.processed_series_ids.append(int(series["series_id"]))
+            if pipeline_result.status == "DONE_WITH_WARNINGS":
+                warning_summary = pipeline_result.quality_policy.get(
+                    "pipeline_warning_summary"
+                )
+                result.warnings.append(
+                    _pipeline_warning_message(
+                        int(series["series_id"]), warning_summary
+                    )
+                )
             if reference_result is not None and reference_result.get("csv_path") and series_out_dir:
                 try:
                     _snapshot_post_pipeline_artifact(
@@ -1187,7 +1269,7 @@ def process_archive_path(
                     result.warnings.append(
                         f"series_id={series['series_id']} science_status={science_status} total_points={summary.total_points} accepted_points={summary.accepted_points}"
                     )
-            elif pipeline_result.status == "DONE":
+            elif pipeline_result.status in {"DONE", "DONE_WITH_WARNINGS"}:
                 pipe_row["science_status"] = "NO_LIGHT_CURVE_SUMMARY"
                 result.warnings.append(f"series_id={series['series_id']} science_status=NO_LIGHT_CURVE_SUMMARY")
             result.pipeline_results.append(pipe_row)
@@ -1213,10 +1295,17 @@ def process_archive_path(
 
     failed_rows = [
         row for row in result.pipeline_results
-        if row.get("status") not in ("DONE", "DONE_NO_SCIENCE_FRAMES")
+        if row.get("status") not in (
+            "DONE",
+            "DONE_WITH_WARNINGS",
+            "DONE_NO_SCIENCE_FRAMES",
+        )
     ]
     failed = len(failed_rows)
     science_warnings = sum(1 for row in result.pipeline_results if row.get("science_status") not in (None, "OK"))
+    pipeline_warnings = any(
+        row.get("status") == "DONE_WITH_WARNINGS" for row in result.pipeline_results
+    )
     if failed:
         if len(failed_rows) == len(result.pipeline_results) and all(
             row.get("status") == FAILED_PRECONDITION_ENSEMBLE_STATUS for row in failed_rows
@@ -1224,7 +1313,7 @@ def process_archive_path(
             result.status = FAILED_PRECONDITION_ENSEMBLE_STATUS
         else:
             result.status = "FAILED"
-    elif science_warnings or result.warnings:
+    elif pipeline_warnings or science_warnings or result.warnings:
         result.status = "DONE_WITH_WARNINGS"
     else:
         result.status = "DONE"
@@ -1242,6 +1331,7 @@ def process_archive_summary_rows(result: ProcessArchiveResult) -> list[dict[str,
         {"section": "frames", "metric": "indexed_frame_ids", "value": len(result.indexed_frame_ids)},
         {"section": "catalog", "metric": "catalog_name", "value": result.catalog_name},
         {"section": "groups", "metric": "n_groups", "value": len(result.groups)},
+        {"section": "series", "metric": "open_series_ids", "value": result.open_series_ids},
     ]
     for item in result.index_results:
         rows.extend(
@@ -1468,12 +1558,14 @@ def _science_identity_candidate(item: DetectedArchiveFile) -> ScienceFileIdentit
         observation_uid=item.observation_uid,
         identity_scheme=item.identity_scheme,
         native_identity=item.native_identity,
+        date_obs=item.date_obs,
         file_size_bytes=item.file_size_bytes,
         naxis1=item.naxis1,
         naxis2=item.naxis2,
         object_name=item.object_name,
         identity_status=item.observation_identity_status,
         identity_detail=item.observation_identity_detail,
+        camera=item.camera,
     )
 
 
@@ -2170,7 +2262,8 @@ def _load_series_for_pipeline(session: Session, series_ids: list[int]) -> list[d
             s.time_end,
             s.mjd_start,
             s.mjd_end,
-            s.n_frames
+            s.n_frames,
+            s.status
         FROM field_series s
         JOIN fields f ON f.field_id = s.field_id
         LEFT JOIN instrument_units iu ON iu.instrument_unit_id = s.instrument_unit_id
@@ -2179,6 +2272,22 @@ def _load_series_for_pipeline(session: Session, series_ids: list[int]) -> list[d
         """
     ).bindparams(bindparam("series_ids", expanding=True))
     return [_json_safe(dict(row)) for row in session.execute(stmt, {"series_ids": unique_ids}).mappings().all()]
+
+
+def _separate_open_series(
+    series_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[int]]:
+    """Keep OPEN tails out of the pipeline queue while reporting their IDs."""
+
+    finalized = []
+    open_ids = []
+    for series in series_rows:
+        series_id = int(series["series_id"])
+        if str(series.get("status", "")).upper() == "OPEN":
+            open_ids.append(series_id)
+        else:
+            finalized.append(series)
+    return finalized, sorted(set(open_ids))
 
 
 def _format_calibration_prefix(template: str | None, series: dict[str, Any]) -> str:
@@ -2207,6 +2316,50 @@ def _date_token(value: Any, mjd: Any = None) -> str:
         if m:
             return "".join(m.groups())
     return "nodate" if mjd is None else f"mjd{int(float(mjd))}"
+
+
+def _pipeline_warning_message(
+    series_id: int, summary: Any, *, sample_limit: int = 3
+) -> str:
+    if not isinstance(summary, dict):
+        return f"series_id={series_id} pipeline_status=DONE_WITH_WARNINGS"
+
+    def count(key: str) -> int:
+        try:
+            return max(0, int(summary.get(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    sample_descriptions: list[str] = []
+    samples = summary.get("failure_samples")
+    if isinstance(samples, list):
+        sample_limit = max(0, int(sample_limit))
+        for sample in samples:
+            if len(sample_descriptions) >= sample_limit:
+                break
+            if not isinstance(sample, dict):
+                continue
+            try:
+                frame_id = int(sample["frame_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            description = f"frame_id={frame_id}"
+            stage = sample.get("stage")
+            if isinstance(stage, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", stage):
+                description += f" stage={stage}"
+            sample_descriptions.append(description)
+
+    message = (
+        f"series_id={series_id} pipeline_status=DONE_WITH_WARNINGS "
+        f"failed_frames={count('failed_frames')} "
+        f"failed_measurements={count('failed_measurements')}"
+    )
+    if sample_descriptions:
+        message += " samples=[" + "; ".join(sample_descriptions) + "]"
+    samples_truncated = count("failure_samples_truncated")
+    if samples_truncated:
+        message += f" samples_truncated={samples_truncated}"
+    return message
 
 
 def _pipeline_row(series: dict[str, Any], prefix: str, result: PipelineRunResult) -> dict[str, Any]:

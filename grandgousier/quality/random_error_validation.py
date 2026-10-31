@@ -119,6 +119,7 @@ def validate_random_error_model(
     aperture_context_frames_csv: str | Path | None = None,
     diagnostic_calibration_names: list[str] | None = None,
     analysis_snapshot: CalibrationAnalysisSnapshot | None = None,
+    annotate_residual_floor: bool = True,
 ) -> RandomErrorValidationResult:
     """Validate random errors and estimate an additive residual floor.
 
@@ -263,7 +264,11 @@ def validate_random_error_model(
     annotation_names = list(dict.fromkeys(
         str(name) for name in (diagnostic_calibration_names or []) if name
     ))
-    if result.residual_floor_suggested_mag is not None and annotation_names:
+    if (
+        annotate_residual_floor
+        and result.residual_floor_suggested_mag is not None
+        and annotation_names
+    ):
         annotations = annotate_residual_floor_provenance(
             session,
             calibration_names=annotation_names,

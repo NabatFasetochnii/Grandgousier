@@ -6,8 +6,11 @@ to archive processing. Use `--photometry-estimator circular` to request the hist
 circular estimator explicitly. The adaptive equal-area radius has a 3-pixel base floor
 and a 2.5× base-radius cap; unavailable/invalid local PSF geometry uses the existing
 flagged circular fallback. The effective estimator is stored in Stage-2 recipe lineage.
-This source candidate is **IMPLEMENTED_NOT_REAL_VALIDATED**; this default alone does not
-make a generic run `stage3_scale_v1` compatible or establish photometric acceptance.
+As of 2026-09-28, version 0.7.0.10 has bounded live validation on the GPX rebuild
+database, including current Stage-2 readiness, M4/M5 products, and a two-series Parquet
+export smoke. This does not establish general scientific acceptance, full-archive
+performance, or release acceptance. The estimator default alone does not make a generic
+run `stage3_scale_v1` compatible.
 
 Grandgousier is a Python/PostgreSQL pipeline for calibrated astronomical time-series photometry.
 
@@ -46,6 +49,116 @@ from grandgousier.api import (
 `grandgousier.services` exposes typed field-archive job configuration, deployment readiness checks,
 and resumable execution over the same validated orchestration used by the CLI. It does not embed
 site credentials or private archive discovery logic.
+
+## Portable science export (Parquet)
+
+Install the optional exporter dependency from a published package release:
+
+```powershell
+python -m pip install "grandgousier[parquet]"
+```
+
+For a source checkout, run this from the repository root:
+
+```powershell
+python -m pip install -e ".[parquet]"
+```
+
+Use a database URL provided through private deployment configuration and an absolute
+output directory that does not exist. This PowerShell template exports series 1 using
+M4 generation 3; replace the series/generation IDs with the matching scope in your DB:
+
+```powershell
+$out = "C:\path\to\new\parquet-export"
+if (Test-Path -LiteralPath $out) { throw "Output directory already exists: $out" }
+
+python -m grandgousier.cli export-science-parquet `
+  --database-url $env:GRANDGOUSIER_DATABASE_URL `
+  --series-id 1 `
+  --out $out `
+  --interseries-generation-id 3
+```
+
+The command uses a PostgreSQL read-only transaction and refuses to overwrite an existing
+output directory. It writes `sources.parquet`, `frames.parquet`, `photometry.parquet`,
+`series.parquet`, and `manifest.json`. The manifest contains hashes, not database
+credentials; portable object/observation/frame UIDs are used instead of database
+surrogate IDs, and internal `catalog_source_id` is removed recursively from exported
+measurement flags.
+
+`--interseries-generation-id` takes one M4 generation. The selected immutable generation
+must have a matching SCIENCE calibration for every requested series; use separate
+exports for each M4 generation/filter scope. Without this option, the export is
+Stage-2-only and global values are marked `NOT_REQUESTED`.
+
+Live validation was limited to series 1/V (CV 127, M4 generation 3) and series 3/R
+(CV 134, M4 generation 4), with 50,000 photometry rows per series. Schema typing,
+manifest hashes, portable UIDs, the M4/global magnitude equation, and removal of
+internal catalog IDs from flags passed. This bounded two-series smoke is not a full
+18-series or production-scale test; the full export, archive-scale performance, full
+test suite, and release acceptance have not been validated.
+
+## M5 global-object light-curve export
+
+`export-global-object-light-curve` writes an M5 global light curve for one object in one
+field using persisted M4 inter-series calibrations. Provide the required object and field
+IDs, repeat `--generation-id` for each selected M4 generation, and choose an `--out-root`
+path naming the final bundle directory. Substitute IDs for the target object, field, and M4
+generations in your own target database. M4 generation IDs are database-specific and must
+be taken from the target database:
+
+```powershell
+# Replace the example object, field, and M4 generation IDs with IDs from your target database.
+python -m grandgousier.cli export-global-object-light-curve `
+  --object-id 123 `
+  --field-id 1 `
+  --generation-id 3 `
+  --generation-id 4 `
+  --out-root "exports\object-123-m5"
+```
+
+The command reads existing Stage-2 `SCIENCE` photometry and persisted M4 data; it does not
+write to the database. A row is globally calibrated only when both its `series_id` and
+Stage-2 `science_calibration_version_id` exactly match the source pair recorded in the
+selected M4 generation. A newer SCIENCE calibration never inherits an older M4 offset;
+when automatic selection is ambiguous, supply explicit repeatable `--generation-id`
+values. Unlinked or stale series with current object points block the export by default.
+`--allow-partial` permits omitting those unlinked/stale series while exporting exact-linked
+ones; it must not be used to apply stale M4 offsets.
+
+The `--out-root` path is the final bundle directory. For the example above it contains
+`object-123-m5.csv` and `object-123-m5_summary.json`, plus a plot-data CSV and plot image
+per filter by default; select `--plot-format png|pdf|svg` to choose the image format.
+`--include-rejected-debug` adds `object-123-m5_rejections.csv`. Member basenames remain
+stable inside the directory. Rejected rows are excluded from the main CSV by default, and
+plots always show accepted points only. `--include-rejected` adds rejected rows to the main
+CSV.
+
+The exporter refuses an existing bundle directory and legacy flat sibling outputs with
+those member names, without modifying them. It writes all members, including a summary
+containing the final bundle paths, in a private sibling staging directory and publishes
+the completed bundle with exactly one same-filesystem native no-replace directory rename.
+The final directory therefore appears as one atomic namespace publication; ordinary
+pre-publication errors clean up only this run's staging directory. A process crash may
+leave a hidden sibling named `.<bundle-name>.m5-staging-*`; such a directory is not a final
+output and is not automatically cleaned or reused. Publication does not promise fsync or
+power-loss durability.
+
+No-replace publication is platform-native only: Windows uses `os.rename`, Linux uses libc
+`renameat2(RENAME_NOREPLACE)`, and macOS uses libc `renamex_np(RENAME_EXCL)`. A missing
+native symbol, unsupported platform or filesystem, or native operation error fails closed;
+there is no check-then-rename fallback. Existing legacy flat outputs must be moved or
+renamed by the user before choosing a fresh bundle path.
+
+## Light-curve plot identity
+
+Generic diagnostic, M5/global-object, and candidate plots retain their titles and add an
+offline identifier subtitle with coordinates in degrees to six decimals, the full
+`object_uid` when available, and a catalog-qualified source ID when unambiguous. Positive
+declinations include an explicit `+`. The coordinate frame and epoch are deliberately not
+asserted; candidate coordinates are catalog coordinates. M5 selects a source pair per
+filter only when exactly one pair exists. Target light curves have no plot and remain
+CSV/JSON-only.
 
 
 ## Stage 1 archive-source contract (0.6.0 foundation)

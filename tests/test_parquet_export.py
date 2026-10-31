@@ -44,6 +44,19 @@ def test_utc_observing_night_uses_noon_boundary():
     assert export.observing_night(None) is None
 
 
+def test_parquet_rejects_orphaned_m4_before_filtering_to_requested_series():
+    generation = type("Generation", (), {"n_series": 2, "field_id": 33,
+                                         "reference_series_id": 76})()
+    reference = type("Member", (), {"series_id": 76, "field_id": 33,
+                                   "is_reference_series": True})()
+    orphan = type("Member", (), {"series_id": None, "field_id": 33,
+                                "is_reference_series": False})()
+    with pytest.raises(ValueError, match="orphaned or incomplete membership"):
+        export._validate_m4_memberships(generation, [reference, orphan])
+    with pytest.raises(ValueError, match="inconsistent reference membership"):
+        export._validate_m4_memberships(generation, [reference, reference])
+
+
 def test_measurement_flags_json_omits_internal_catalog_source_ids():
     flags = {
         "catalog_source_id": 17,

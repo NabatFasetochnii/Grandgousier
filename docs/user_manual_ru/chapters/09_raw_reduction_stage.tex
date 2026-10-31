@@ -65,7 +65,7 @@ archives:
   master-prepared:
     adapter: master-manifest
     instrument_profile: MASTER
-    # optional; bounded production execution window, default 128
+    # optional; plan/execute batch size 1..512 items, default 128
     stage1_batch_size: 128
     metadata:
       backend: prepared-inventory
@@ -97,7 +97,9 @@ Credential-bearing values в user-facing summary/plan редактируются
 
 В MASTER локальный cache не считается полной копией удалённого архива. Начиная с 0.6.1.1 \texttt{metadata.cache\_root} и \texttt{assets.cache\_root} независимы: первый может содержать только processing headers, необходимые для metadata/identity enrichment, а второй задаёт основной cache для materialized raw/calibration assets. \texttt{assets.search\_roots} позволяет добавить другие существующие cache-каталоги. При \cli{stage1-execute} provider сначала ищет ref во всех локальных roots; только отсутствующий ref при \texttt{fetch\_missing: true} загружается существующим repository-local transport. \cli{stage1-plan} этот transport не импортирует и ничего не скачивает.
 
-Production \cli{stage1-execute} читает discovery stream и обрабатывает его фиксированными bounded batches. Размер batch задаётся через \texttt{archives.<source>.stage1\_batch\_size} или одноимённый CLI override; default равен 128. Plan и execution report записываются инкрементально во временные artifacts и атомарно публикуются после нормального завершения. В памяти удерживается только текущая batch и небольшое состояние summary; exact RSS не фиксирован, но объём archive records не удерживается целиком. Явный \cli{stage1-plan} сохраняет прежний materialized preview/export режим.
+\cli{stage1-plan} и \cli{stage1-execute} используют streaming discovery с ограниченными batches: \texttt{stage1\_batch\_size} настраивается как целое от 1 до 512, default равен 128. \cli{stage1-execute --batch-size} переопределяет значение source config, которое переопределяет top-level config. Размер ограничивает число plan items в batch, но не гарантирует фиксированный предел байтов/RSS: размер metadata у одного item может различаться. Plan и execution report записываются инкрементально во временные artifacts и атомарно публикуются после нормального завершения. Public Python builder \texttt{build\_stage1\_plan()} остаётся full-memory API; cap этого CLI-пути не закрывает весь P2-08.
+
+Значения выше 512 отклоняются, не clamp'ятся. Checkpoint fingerprint включает batch size: незавершённый checkpoint, созданный с прежним размером >512, не возобновится после уменьшения размера под предел без отдельного явного restart решения. Не запускать restart автоматически.
 
 Перед каждым missing-asset download и каждой записью Stage~1 product выполняется disk preflight. Для каждого filesystem requirements агрегируются, а операция разрешается только если \texttt{free >= required + stage1\_disk\_reserve\_bytes}. Для download учитывается peak \texttt{.part}; для product учитываются временный product и небольшой provenance overhead. Если размер remote asset или output неизвестен, используется консервативная внутренняя оценка. При нехватке места операция останавливается до создания target directory или начала записи. Это safety guard, а не quota manager и не транзакционная reservation: внешний потребитель диска всё ещё может изменить free space после проверки.
 

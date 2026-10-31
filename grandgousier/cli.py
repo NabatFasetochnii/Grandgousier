@@ -6,15 +6,50 @@ import json
 import logging
 import re
 import sys
+import traceback
 from pathlib import Path
 
 from grandgousier import __version__
 from grandgousier.db.init_db import init_db, reset_db
 from grandgousier.db.session import make_session_factory
 from grandgousier.logging_config import configure_logging
+from grandgousier.logging_utils import sanitize_diagnostic_text
 from grandgousier.settings import get_settings
 
 logger = logging.getLogger(__name__)
+
+_P207_GUARDED_LEDGER_FLAG = "--guard-p207-test-readonly-ledger"
+_P207_GUARDED_LEDGER_CONFIG = r"C:\PycharmProjects\grandgousier_p207_test_ro.private.yaml"
+_P207_GUARDED_PROBE_FLAG = "--guard-p207-test-readonly-probe"
+_P207_GUARDED_PROBE_CONFIG = _P207_GUARDED_LEDGER_CONFIG
+_P207_GUARDED_INTEGRITY_FLAG = "--guard-p207-test-readonly-integrity"
+_P207_PROBE_FAILURE_CODES = frozenset(
+    {f"P{position:02d}" for position in range(15)} | {"ROW_SHAPE", "ROW_LIST_SLICING"}
+)
+
+
+class _SanitizingStderr:
+    """Sanitize CLI stderr writes while forwarding to the currently active stream."""
+
+    def __init__(self, original_stream):
+        self._original_stream = original_stream
+
+    def _target(self):
+        target = sys.stderr
+        return self._original_stream if target is self else target
+
+    def write(self, value):
+        return self._target().write(sanitize_diagnostic_text(value))
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        return self._target().flush()
+
+    def __getattr__(self, name):
+        return getattr(self._original_stream, name)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -112,6 +147,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_schema_status = sub.add_parser(
         "schema-status", help="Show schema migration ledger and checksum status"
+    )
+    p_schema_status.add_argument(
+        "--guard-p207-test-readonly-ledger", action="store_true",
+        help="Opt in to the fixed TEST-only guarded read-only ledger check",
+    )
+    p_schema_status.add_argument(
+        "--guard-p207-test-readonly-probe", action="store_true",
+        help="Opt in to the fixed TEST-only backend probe without querying the ledger",
+    )
+    p_schema_status.add_argument(
+        _P207_GUARDED_INTEGRITY_FLAG, action="store_true",
+        help="Opt in to the fixed TEST-only bounded read-only integrity preflight",
     )
     p_schema_status.set_defaults(func=cmd_schema_status)
 
@@ -225,6 +272,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_stage1_plan = sub.add_parser(
         "stage1-plan",
         help="Build a canonical metadata-only Stage-1 archive/product plan",
+        description=(
+            "Configure stage1_batch_size in archives.<source> (preferred) or at the top level; "
+            "the allowed range is 1..512 and the default is 128."
+        ),
     )
     p_stage1_plan.add_argument(
         "--config", dest="config_file", default=argparse.SUPPRESS,
@@ -314,7 +365,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_stage1_execute.add_argument(
         "--batch-size", dest="stage1_batch_size", type=int, default=None,
-        help="Bounded Stage-1 metadata/execution batch size; config default is 128",
+        help=(
+            "Stage-1 batch size 1..512; overrides archives.<source>.stage1_batch_size and "
+            "top-level stage1_batch_size (default 128)"
+        ),
     )
     p_stage1_execute.add_argument(
         "--stop-on-first-failure", action="store_true",
@@ -335,7 +389,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stage1_handoff = sub.add_parser(
         "stage1-handoff",
-        help="Handoff only products from one Stage-1 execution report to the existing Stage-2 pipeline",
+        help="Preflight or persist exact products from one Stage-1 execution report",
     )
     p_stage1_handoff.add_argument(
         "--config", dest="config_file", default=argparse.SUPPRESS,
@@ -345,9 +399,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--execution-report", required=True,
         help="Stage-1 execution JSON whose exact ProductStore FITS products are eligible for handoff",
     )
-    p_stage1_handoff.add_argument(
+    handoff_mode = p_stage1_handoff.add_mutually_exclusive_group()
+    handoff_mode.add_argument(
         "--execute", action="store_true",
         help="Index/select exact products and run existing Stage 2; default is read-only P4 preflight",
+    )
+    handoff_mode.add_argument(
+        "--persist-only", action="store_true",
+        help="Persist selected P4 identities and Stage-1 evidence only; do not invoke Stage 2",
     )
     p_stage1_handoff.add_argument(
         "--catalog-name", default=None,
@@ -377,7 +436,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_stage1_handoff.add_argument(
         "--report-out", default="reports/stage1_handoff.json",
-        help="Stage-1 -> Stage-2 handoff report JSON",
+        help="Stage-1 handoff result report JSON",
     )
     p_stage1_handoff.add_argument("--format", choices=("table", "json"), default="table")
     p_stage1_handoff.set_defaults(func=cmd_stage1_handoff)
@@ -428,6 +487,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--format", choices=("table", "json"), default="table", help="Console plan/result format"
     )
     p_master_reduce.set_defaults(func=cmd_master_archive_reduce)
+
+    p_master_physical_probe = sub.add_parser(
+        "probe-master-physical-archive",
+        help="Build a bounded, metadata-only, plan-only inventory of a local MASTER imdata tree",
+    )
+    p_master_physical_probe.add_argument(
+        "--imdata-root", required=True,
+        help="Local directory containing MASTER rawdata/ and procdata/ trees",
+    )
+    p_master_physical_probe.add_argument(
+        "--max-files", type=int, default=100,
+        help="Maximum number of raw FITS files whose headers may be inspected (default: 100; max: 10000)",
+    )
+    p_master_physical_probe.set_defaults(func=cmd_probe_master_physical_archive)
 
     p_master_prune = sub.add_parser(
         "master-archive-prune",
@@ -507,7 +580,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_build_series.add_argument("--instrument-unit-id", type=int, default=None, help="Restrict frames to one instrument unit")
     p_build_series.add_argument("--max-field-separation-arcmin", type=float, default=30.0, help="Maximum center separation for same field")
     p_build_series.add_argument("--max-series-gap-minutes", type=float, default=60.0, help="Start new series after this time gap")
-    p_build_series.add_argument("--min-frames-per-series", type=int, default=1, help="Drop groups smaller than this")
+    p_build_series.add_argument(
+        "--min-frames-per-series",
+        type=int,
+        default=1,
+        help="Minimum Frames for READY status; one-shot groups below this are dropped",
+    )
+    p_build_series.add_argument(
+        "--no-finalize-tail",
+        dest="finalize_tail",
+        action="store_false",
+        default=True,
+        help="Keep the final group OPEN for incremental additions",
+    )
     p_build_series.add_argument("--include-assigned", dest="only_unassigned", action="store_false", help="Reassign frames already present in field_series_frames")
     p_build_series.set_defaults(only_unassigned=True)
     p_build_series.add_argument("--include-non-science", dest="only_science", action="store_false", help="Include non-science frames")
@@ -515,6 +600,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_build_series.add_argument("--dry-run", action="store_true", help="Show proposed fields/series without writing")
     p_build_series.add_argument("--format", choices=("table", "csv", "json"), default="table", help="Output format")
     p_build_series.set_defaults(func=cmd_build_field_series)
+
+    p_finalize_series = sub.add_parser(
+        "finalize-field-series",
+        help="Finalize one eligible OPEN series; does not run Stage 2",
+    )
+    p_finalize_series.add_argument("--series-id", type=int, required=True)
+    p_finalize_series.set_defaults(func=cmd_finalize_field_series)
 
     p_show_fields = sub.add_parser("show-fields", help="Show persistent sky fields")
     p_show_fields.add_argument("--limit", type=int, default=50, help="Maximum rows")
@@ -1418,6 +1510,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_process_path.set_defaults(recursive=True)
     p_process_path.add_argument("--limit", type=int, default=None, help="Limit discovered FITS files")
     p_process_path.add_argument("--min-frames-per-series", type=int, default=10, help="Minimum frames per generated field_series")
+    p_process_path.add_argument(
+        "--no-finalize-tail",
+        dest="finalize_tail",
+        action="store_false",
+        default=True,
+        help="Leave the trailing series OPEN for incremental additions",
+    )
     p_process_path.add_argument("--max-field-separation-arcmin", type=float, default=30.0, help="Maximum center separation for same field")
     p_process_path.add_argument("--max-series-gap-minutes", type=float, default=60.0, help="Start new series after this time gap")
     p_process_path.add_argument("--include-assigned", action="store_true", help="Allow already assigned frames when building series")
@@ -1917,6 +2016,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--catalog-name", default=None, help="Optionally restrict selected SCIENCE generations to one catalog namespace"
     )
     p_interseries_plan.add_argument(
+        "--science-calibration-version-id",
+        type=int,
+        action="append",
+        default=None,
+        help="Explicit current SCIENCE alias head ID; repeat once per selected series",
+    )
+    p_interseries_plan.add_argument(
         "--min-points-per-object", type=int, default=5, help="Minimum science points in each series for an object to count toward overlap"
     )
     p_interseries_plan.add_argument(
@@ -1951,6 +2057,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--catalog-name", default=None, help="Restrict selected SCIENCE generations to one catalog namespace"
     )
     p_interseries_analyze.add_argument(
+        "--science-calibration-version-id",
+        type=int,
+        action="append",
+        default=None,
+        help="Explicit current SCIENCE alias head ID; repeat once per selected series",
+    )
+    p_interseries_analyze.add_argument(
         "--reference-series-id", type=int, default=None, help="Explicit graph gauge/reference series"
     )
     p_interseries_analyze.add_argument(
@@ -1964,6 +2077,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_interseries_analyze.add_argument(
         "--max-clip-iterations", type=int, default=5, help="Maximum robust clipping iterations per pair"
+    )
+    p_interseries_analyze.add_argument(
+        "--required-stage2-recipe",
+        choices=("stage3_scale_v1",),
+        default=None,
+        help="Optionally require persisted Stage-2 provenance compatible with this recipe contract",
     )
     p_interseries_analyze.add_argument(
         "--out-root", default="reports/interseries_analysis", help="Directory for Stage-3 diagnostic CSV/JSON files"
@@ -1983,11 +2102,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_interseries_persist.add_argument("--instrument-unit-id", type=int, default=None)
     p_interseries_persist.add_argument("--filter", dest="filter_name", default=None)
     p_interseries_persist.add_argument("--catalog-name", default=None)
+    p_interseries_persist.add_argument(
+        "--science-calibration-version-id",
+        type=int,
+        action="append",
+        default=None,
+        help="Explicit current SCIENCE alias head ID; repeat once per selected series",
+    )
     p_interseries_persist.add_argument("--reference-series-id", type=int, default=None)
     p_interseries_persist.add_argument("--min-points-per-object", type=int, default=5)
     p_interseries_persist.add_argument("--min-common-objects", type=int, default=20)
     p_interseries_persist.add_argument("--clip-sigma", type=float, default=4.0)
     p_interseries_persist.add_argument("--max-clip-iterations", type=int, default=5)
+    p_interseries_persist.add_argument(
+        "--required-stage2-recipe",
+        choices=("stage3_scale_v1",),
+        required=True,
+        help="Required Stage-2 recipe contract for safe M4 persistence",
+    )
     p_interseries_persist.add_argument(
         "--allow-sparse-graph", action="store_true",
         help="Explicitly allow persistence of a connected tree with graph_dof=0 and no closure test",
@@ -2031,7 +2163,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_global_object_lc.add_argument(
         "--out-root",
         required=True,
-        help="Output root without suffix; writes .csv, _summary.json, per-filter plot CSV and PNG/PDF/SVG",
+        help=(
+            "Final bundle directory (must not exist); members keep stable basenames "
+            "<name>.csv, <name>_summary.json, optional <name>_rejections.csv, and "
+            "per-filter <name>_<filter>_plot.csv plus image. Existing bundles and legacy "
+            "flat sibling outputs are refused. One same-filesystem native no-replace "
+            "directory rename publishes the bundle. A crash may leave a hidden "
+            ".<name>.m5-staging-* sibling, not a final output; it is not auto-cleaned. "
+            "Windows os.rename, Linux renameat2(RENAME_NOREPLACE), and macOS "
+            "renamex_np(RENAME_EXCL) are supported; unsupported platforms/filesystems "
+            "fail closed. No fsync/power-loss durability guarantee."
+        ),
     )
     p_global_object_lc.add_argument(
         "--include-rejected", action="store_true",
@@ -2039,7 +2181,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_global_object_lc.add_argument(
         "--include-rejected-debug", action="store_true",
-        help="Write a separate *_rejections.csv with rejected rows and their QC reasons",
+        help=(
+            "Write <name>_rejections.csv inside the output bundle with rejected rows and QC "
+            "reasons"
+        ),
     )
     p_global_object_lc.add_argument(
         "--allow-partial", action="store_true",
@@ -2058,7 +2203,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_global_object_lc.add_argument(
         "--no-plots", action="store_true",
-        help="Write only the main CSV and summary JSON",
+        help="Do not write per-filter plot CSVs or images",
     )
     p_global_object_lc.add_argument(
         "--plot-reduction",
@@ -2104,6 +2249,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_list_science_lc = sub.add_parser("list-light-curve-objects", help="List objects with science light-curve coverage")
     _add_science_lc_scope_arguments(p_list_science_lc)
+    p_list_science_lc.add_argument(
+        "--interseries-generation-id",
+        type=int,
+        action="append",
+        default=None,
+        help="Explicit M4 generation; repeat once per field/instrument/filter/catalog scope",
+    )
     p_list_science_lc.add_argument("--min-points", type=int, default=1, help="Minimum points per object")
     p_list_science_lc.add_argument("--exclude-rejected", action="store_true", help="Count only accepted science points")
     p_list_science_lc.add_argument("--limit", type=int, default=50, help="Maximum objects to show")
@@ -2112,12 +2264,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_science_lc_summary = sub.add_parser("light-curve-summary", help="Summarize science light-curve product coverage and QC")
     _add_science_lc_scope_arguments(p_science_lc_summary)
+    p_science_lc_summary.add_argument(
+        "--interseries-generation-id",
+        type=int,
+        action="append",
+        default=None,
+        help="Explicit M4 generation; repeat once per field/instrument/filter/catalog scope",
+    )
     p_science_lc_summary.add_argument("--out", default=None, help="Optional JSON report path")
     p_science_lc_summary.add_argument("--format", choices=("table", "json"), default="table", help="Console output format")
     p_science_lc_summary.set_defaults(func=cmd_light_curve_summary)
 
     p_export_science_lc = sub.add_parser("export-light-curve", help="Export science light-curve product CSV")
     _add_science_lc_scope_arguments(p_export_science_lc)
+    p_export_science_lc.add_argument(
+        "--interseries-generation-id",
+        type=int,
+        action="append",
+        default=None,
+        help="Explicit M4 generation; repeat once per field/instrument/filter/catalog scope",
+    )
     p_export_science_lc.add_argument("--out", required=True, help="Output science light-curve CSV path")
     p_export_science_lc.add_argument("--source-id", default=None, help="External source_id from measurement flags")
     p_export_science_lc.add_argument("--object-id", type=int, default=None, help="Internal object_id")
@@ -2661,9 +2827,9 @@ def cmd_stage1_plan(args: argparse.Namespace) -> int:
     )
     from grandgousier.archive.stage1_contract import ArchiveRequest
     from grandgousier.archive.stage1_planner import (
-        build_stage1_plan,
-        write_stage1_plan_csv,
-        write_stage1_plan_json,
+        iter_stage1_plan_batches,
+        normalize_stage1_batch_size,
+        write_stage1_plan_batches,
     )
     from grandgousier.config import read_config_file
     from grandgousier.exit_codes import OK, PRECONDITION, USAGE
@@ -2688,43 +2854,75 @@ def cmd_stage1_plan(args: argparse.Namespace) -> int:
             limit=args.limit,
             native_observation_ids=tuple(args.native_observation_id),
         )
-        plan = build_stage1_plan(
+
+        source_config = payload.get("archives", {}).get(args.source, {})
+        configured_batch_size = (
+            source_config.get("stage1_batch_size") if isinstance(source_config, dict) else None
+        )
+        if configured_batch_size is None:
+            configured_batch_size = payload.get("stage1_batch_size")
+        try:
+            batch_size = normalize_stage1_batch_size(configured_batch_size)
+        except ValueError as exc:
+            raise ValueError(
+                f"{exc}; configure archives.{args.source}.stage1_batch_size or "
+                "top-level stage1_batch_size"
+            ) from exc
+        batches = iter_stage1_plan_batches(
             request=request,
             source=runtime.descriptor,
             metadata_provider=runtime.metadata_provider,
-            asset_provider=runtime.asset_provider,
             product_store=product_store,
+            batch_size=batch_size,
         )
-        json_path = write_stage1_plan_json(plan, args.out)
-        csv_path = write_stage1_plan_csv(
-            plan,
-            args.csv_out or str(Path(args.out).with_suffix(".csv")),
+
+        json_target = Path(args.out)
+        csv_target = Path(args.csv_out or json_target.with_suffix(".csv"))
+
+        def emit_blocked_diagnostic(item) -> None:
+            if item.status == "READY":
+                return
+            observation = item.observation
+            label = (
+                observation.native_observation_id
+                or observation.metadata.get("raw_id")
+                or "?"
+            )
+            sys.stderr.write(f"  BLOCKED {label}: {'; '.join(item.issues)}\n")
+
+        summary, json_path, csv_path = write_stage1_plan_batches(
+            batches,
+            source=runtime.descriptor,
+            request=request,
+            product_store=product_store.public_descriptor,
+            json_path=json_target,
+            csv_path=csv_target,
+            on_item=emit_blocked_diagnostic if args.format != "json" else None,
         )
     except Exception as exc:
         print(f"Stage 1 planning failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return USAGE
 
     if args.format == "json":
-        print(plan.to_json(indent=2))
+        _stream_text_file_to_stdout(json_path)
     else:
-        summary = plan.to_dict()["summary"]
         print(
             "Stage 1 plan: "
-            f"status={plan.status}, source={args.source}, "
-            f"discovered={summary['discovered_records']}, science={summary['science_items']}, "
-            f"ready={summary['ready_items']}, blocked={summary['blocked_items']}"
+            f"status={summary.status}, source={args.source}, "
+            f"discovered={summary.discovered_records}, science={summary.science_items}, "
+            f"ready={summary.ready_items}, blocked={summary.blocked_items}"
         )
-        for item in plan.items:
-            if item.status == "READY":
-                continue
-            obs = item.observation
-            label = obs.native_observation_id or obs.metadata.get("raw_id") or "?"
-            print(f"  BLOCKED {label}: {'; '.join(item.issues)}", file=sys.stderr)
         print(f"Plan JSON: {json_path}")
         print(f"Plan CSV: {csv_path}")
         print("Plan-only: no source assets were materialized and no database writes were performed.")
 
-    return OK if plan.status in {"READY", "EMPTY"} else PRECONDITION
+    return OK if summary.status in {"READY", "EMPTY"} else PRECONDITION
+
+
+def _stream_text_file_to_stdout(path: str | Path, *, chunk_size: int = 64 * 1024) -> None:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        while chunk := handle.read(chunk_size):
+            sys.stdout.write(chunk)
 
 
 def cmd_stage1_execute(args: argparse.Namespace) -> int:
@@ -2860,6 +3058,10 @@ def cmd_stage1_handoff(args: argparse.Namespace) -> int:
     from grandgousier.config import field_archive_mapping, read_config_file
     from grandgousier.exit_codes import OK, PRECONDITION, PROCESSING, USAGE
 
+    if args.persist_only and args.stage2_manifest_out:
+        print("--stage2-manifest-out is unavailable with --persist-only", file=sys.stderr)
+        return USAGE
+
     field_config: dict = {}
     config_file = getattr(args, "config_file", None)
     try:
@@ -2874,6 +3076,7 @@ def cmd_stage1_handoff(args: argparse.Namespace) -> int:
                 session,
                 execution_report_path=args.execution_report,
                 execute=bool(args.execute),
+                persist_only=bool(args.persist_only),
                 catalog_name=catalog_name,
                 instrument_profile=instrument_profile,
                 master_profile=args.master_profile,
@@ -2897,8 +3100,10 @@ def cmd_stage1_handoff(args: argparse.Namespace) -> int:
         summary = report.to_dict()["summary"]
         print(
             "Stage 1 handoff: "
-            f"status={report.status}, execute={bool(args.execute)}, items={summary['items']}, "
+            f"status={report.status}, execute={bool(args.execute)}, "
+            f"persist_only={bool(args.persist_only)}, items={summary['items']}, "
             f"selected_for_stage2={summary['selected_for_stage2']}, "
+            f"persisted_identity_only={summary['persisted_identity_only']}, "
             f"already_represented={summary['already_represented']}, "
             f"blocked={summary['blocked']}, stage2_invoked={summary['stage2_invoked']}"
         )
@@ -2919,7 +3124,9 @@ def cmd_stage1_handoff(args: argparse.Namespace) -> int:
         for error in report.errors:
             print(f"  ERROR: {error}", file=sys.stderr)
         print(f"Handoff JSON: {report_path}")
-        if not args.execute:
+        if args.persist_only:
+            print("Persistence-only mode: Stage 2 was not invoked.")
+        elif not args.execute:
             print("Plan-only: no Stage-2 DB writes were performed.")
         elif summary["selected_for_stage2"] == 0:
             print("No new physical observations were selected; Stage 2 was not invoked and no DB writes were needed.")
@@ -2929,6 +3136,23 @@ def cmd_stage1_handoff(args: argparse.Namespace) -> int:
     if report.status == "BLOCKED":
         return PRECONDITION
     return PROCESSING
+
+
+def cmd_probe_master_physical_archive(args: argparse.Namespace) -> int:
+    from grandgousier.archive.master_physical_archive import probe_master_physical_archive
+    from grandgousier.exit_codes import OK, PRECONDITION, USAGE
+
+    try:
+        report = probe_master_physical_archive(
+            args.imdata_root,
+            max_files_scanned=args.max_files,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"MASTER physical archive probe failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return USAGE
+
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return OK if report["status"] == "PHYSICAL_INVENTORY_COMPLETE" else PRECONDITION
 
 
 def cmd_index_archive(args: argparse.Namespace) -> int:
@@ -3219,10 +3443,6 @@ def cmd_show_frames(args: argparse.Namespace) -> int:
             stmt = stmt.limit(args.limit)
 
         rows = []
-        if args.calibration_name:
-            stmt = stmt.where(CalibrationVersion.name == args.calibration_name)
-        if args.instrument_unit_id is not None:
-            stmt = stmt.where(InstrumentUnit.instrument_unit_id == int(args.instrument_unit_id))
 
         for row in session.execute(stmt).all():
             d = dict(row._mapping)
@@ -3288,11 +3508,6 @@ def cmd_frame_summary(args: argparse.Namespace) -> int:
             )
             .order_by(InstrumentUnit.instrument_unit_id)
         )
-        if args.calibration_name:
-            stmt = stmt.where(CalibrationVersion.name == args.calibration_name)
-        if args.instrument_unit_id is not None:
-            stmt = stmt.where(InstrumentUnit.instrument_unit_id == int(args.instrument_unit_id))
-
         for row in session.execute(stmt).all():
             d = dict(row._mapping)
             d["date_min"] = _format_dt(d.get("date_min"))
@@ -5151,6 +5366,9 @@ def cmd_build_field_series(args: argparse.Namespace) -> int:
             only_unassigned=args.only_unassigned,
             only_science=args.only_science,
             min_frames_per_series=args.min_frames_per_series,
+            finalize_tail=(
+                True if getattr(args, "finalize_tail", None) is None else args.finalize_tail
+            ),
             dry_run=args.dry_run,
         )
     if args.format == "json":
@@ -5169,7 +5387,8 @@ def cmd_build_field_series(args: argparse.Namespace) -> int:
         print(
             "Field/series build result: "
             f"selected_frames={result.selected_frames}, created_fields={result.created_fields}, "
-            f"created_series={result.created_series}, linked_frames={result.linked_frames}, "
+            f"created_series={result.created_series}, updated_series={result.updated_series}, "
+            f"open_series_ids={result.open_series_ids}, linked_frames={result.linked_frames}, "
             f"dry_run={result.dry_run}"
         )
         if result.observation_selection:
@@ -5993,6 +6212,9 @@ def cmd_process_archive_path(args: argparse.Namespace) -> int:
             series_ids=args.series_ids,
             native_observation_ids=args.native_observation_ids,
             min_frames_per_series=args.min_frames_per_series,
+            finalize_tail=(
+                True if getattr(args, "finalize_tail", None) is None else args.finalize_tail
+            ),
             max_field_separation_arcmin=args.max_field_separation_arcmin,
             max_series_gap_minutes=args.max_series_gap_minutes,
             include_assigned=args.include_assigned,
@@ -7033,6 +7255,7 @@ FIELD_SERIES_BUILD_COLUMNS = [
     "series_uid",
     "instrument_unit_id",
     "filter_name",
+    "status",
     "n_frames",
     "mjd_start",
     "mjd_end",
@@ -7933,6 +8156,7 @@ def cmd_plan_interseries_calibration(args: argparse.Namespace) -> int:
                 min_points_per_object=args.min_points_per_object,
                 min_common_objects=args.min_common_objects,
                 required_stage2_recipe=args.required_stage2_recipe,
+                science_calibration_version_ids=args.science_calibration_version_id,
             )
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
@@ -7996,6 +8220,8 @@ def cmd_analyze_interseries_calibration(args: argparse.Namespace) -> int:
                 min_common_objects=args.min_common_objects,
                 clip_sigma=args.clip_sigma,
                 max_clip_iterations=args.max_clip_iterations,
+                required_stage2_recipe=args.required_stage2_recipe,
+                science_calibration_version_ids=args.science_calibration_version_id,
             )
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
@@ -8044,6 +8270,8 @@ def cmd_persist_interseries_calibration(args: argparse.Namespace) -> int:
                 min_common_objects=args.min_common_objects,
                 clip_sigma=args.clip_sigma,
                 max_clip_iterations=args.max_clip_iterations,
+                required_stage2_recipe=args.required_stage2_recipe,
+                science_calibration_version_ids=args.science_calibration_version_id,
                 allow_sparse_graph=bool(args.allow_sparse_graph),
             )
     except ValueError as exc:
@@ -8224,7 +8452,7 @@ def cmd_list_light_curve_objects(args: argparse.Namespace) -> int:
     frame_ids = [int(v) for v in (args.frame_id or [])]
     Session = make_session_factory(args.database_url)
     with Session() as session:
-        _scope, rows = list_light_curve_objects(
+        scope, rows = list_light_curve_objects(
             session,
             calibration_names=args.calibration_name or [],
             calibration_prefixes=args.calibration_prefix or [],
@@ -8236,11 +8464,14 @@ def cmd_list_light_curve_objects(args: argparse.Namespace) -> int:
             frame_ids=frame_ids or None,
             object_qc_algorithm=args.object_qc_algorithm,
             offset_algorithm=args.offset_algorithm,
+            interseries_generation_ids=args.interseries_generation_id,
             reject_flags=reject_flags,
             min_points=args.min_points,
             exclude_rejected=args.exclude_rejected,
             limit=args.limit,
         )
+    for warning in scope.warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
     for row in rows:
         for key, nd in (
             ("mjd_min", 6),
@@ -8283,8 +8514,11 @@ def cmd_light_curve_summary(args: argparse.Namespace) -> int:
             frame_ids=frame_ids or None,
             object_qc_algorithm=args.object_qc_algorithm,
             offset_algorithm=args.offset_algorithm,
+            interseries_generation_ids=args.interseries_generation_id,
             reject_flags=reject_flags,
         )
+    for warning in summary.scope.warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
     if args.out:
         export_light_curve_summary_json(summary, args.out)
         print(f"Exported light-curve summary JSON: path={args.out}")
@@ -8327,10 +8561,13 @@ def cmd_export_science_light_curve(args: argparse.Namespace) -> int:
             frame_ids=frame_ids or None,
             object_qc_algorithm=args.object_qc_algorithm,
             offset_algorithm=args.offset_algorithm,
+            interseries_generation_ids=args.interseries_generation_id,
             reject_flags=reject_flags,
             exclude_rejected=args.exclude_rejected,
             limit=args.limit,
         )
+    for warning in scope.warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
     n = export_science_light_curve_csv(rows, args.out)
     if args.format == "json":
         print(
@@ -8352,14 +8589,18 @@ def cmd_export_science_light_curve(args: argparse.Namespace) -> int:
             f"accepted={sum(1 for row in rows if not row.get('is_rejected'))}, "
             f"rejected={sum(1 for row in rows if row.get('is_rejected'))}, "
             f"frame_selection_mode={scope.frame_selection_mode}, "
-            f"selected_frame_ids_count={scope.selected_frame_ids_count}"
+            f"selected_frame_ids_count={scope.selected_frame_ids_count}, "
+            f"interseries_generation_ids={scope.interseries_generation_ids}"
         )
     return 0
 
 
 def cmd_export_lightcurve_plot(args: argparse.Namespace) -> int:
     from grandgousier.calibration.preliminary import load_lightcurve_rows
-    from grandgousier.visualization.lightcurve_plot import export_lightcurve_plot
+    from grandgousier.visualization.lightcurve_plot import (
+        export_lightcurve_plot,
+        format_lightcurve_identity_subtitle,
+    )
 
     if args.source_id is None and args.object_id is None:
         raise SystemExit("Provide --source-id or --object-id")
@@ -8374,12 +8615,21 @@ def cmd_export_lightcurve_plot(args: argparse.Namespace) -> int:
             instrument_unit_id=args.instrument_unit_id,
             limit=args.limit,
         )
+    anchor_row = rows[0] if rows else None
+    subtitle = format_lightcurve_identity_subtitle(
+        object_uid=getattr(anchor_row, "object_uid", None),
+        ra_deg=getattr(anchor_row, "ra_deg", None),
+        dec_deg=getattr(anchor_row, "dec_deg", None),
+        catalog_name=getattr(anchor_row, "catalog_name", None),
+        source_id=getattr(anchor_row, "source_id", None),
+    )
     result = export_lightcurve_plot(
         rows,
         args.out,
         x_key=args.x,
         y_key=args.y,
         title=args.title,
+        subtitle=subtitle,
         dpi=args.dpi,
         invert_y=False if args.no_invert_y else None,
         show_errors=not args.no_errors,
@@ -9059,10 +9309,6 @@ def cmd_frame_qc_summary(args: argparse.Namespace) -> int:
         if args.instrument_unit_id is not None:
             stmt = stmt.where(Frame.instrument_unit_id == args.instrument_unit_id)
         rows = []
-        if args.calibration_name:
-            stmt = stmt.where(CalibrationVersion.name == args.calibration_name)
-        if args.instrument_unit_id is not None:
-            stmt = stmt.where(InstrumentUnit.instrument_unit_id == int(args.instrument_unit_id))
 
         for row in session.execute(stmt).all():
             d = dict(row._mapping)
@@ -9516,6 +9762,169 @@ def cmd_export_science_parquet(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Exact opt-ins dispatch before argparse, Settings(), .env, config,
+    # logging and the ordinary SQLAlchemy schema-status path. Never render argv.
+    integrity_result = _maybe_guarded_p207_integrity_schema_status(argv)
+    if integrity_result is not None:
+        return integrity_result
+    probe_result = _maybe_guarded_p207_probe_schema_status(argv)
+    if probe_result is not None:
+        return probe_result
+    guarded_result = _maybe_guarded_p207_schema_status(argv)
+    if guarded_result is not None:
+        return guarded_result
+    original_stderr = sys.stderr
+    sys.stderr = _SanitizingStderr(original_stderr)
+    try:
+        return _run_main(argv)
+    except SystemExit as exc:
+        if isinstance(exc.code, str):
+            raise SystemExit(sanitize_diagnostic_text(exc.code)) from exc
+        raise
+    except Exception as exc:
+        rendered_traceback = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        sys.stderr.write(sanitize_diagnostic_text(rendered_traceback))
+        return 1
+    finally:
+        sys.stderr = original_stderr
+
+
+def _maybe_guarded_p207_integrity_schema_status(argv: list[str] | None) -> int | None:
+    tokens = sys.argv[1:] if argv is None else argv
+    # Existing ledger/probe guards still own private-config-only and shared prefixes.
+    # An integrity-specific prefix or flag must never reach Settings/argparse.
+    if not any(
+        isinstance(token, str) and (
+            token.startswith(_P207_GUARDED_INTEGRITY_FLAG)
+            or (len(option := token.partition("=")[0]) > len("--guard-p207-test-readonly-")
+                and _P207_GUARDED_INTEGRITY_FLAG.startswith(option))
+        ) for token in tokens
+    ):
+        return None
+    exact = ["--config", _P207_GUARDED_LEDGER_CONFIG,
+             "schema-status", _P207_GUARDED_INTEGRITY_FLAG]
+    if tokens == exact:
+        try:
+            from grandgousier.db.migrations import guarded_p207_test_readonly_integrity
+
+            counts = guarded_p207_test_readonly_integrity()
+            if (type(counts) is not tuple or len(counts) != 5
+                    or any(type(n) is not int for n in counts)
+                    or counts[0] != 35 or not 0 < counts[1] <= 10000
+                    or counts[2:] != (18, 4, 36)):
+                raise ValueError("Unverified bounded integrity result")
+        except BaseException:  # noqa: BLE001 - never render source/driver/SQL exceptions
+            print("STOP P207_TEST_INTEGRITY_UNVERIFIED", file=sys.stderr)
+            return 2
+        print("PREFLIGHT_ONLY P207_TEST_INTEGRITY OLD35 NOT_WRITE_READY "
+              f"ledger=35 cv={counts[1]} series=18 generations=4 members=36 edges=144 "
+              "role_lifecycle=DIAGNOSTIC_ONLY")
+        return 0
+    print("STOP P207_TEST_INTEGRITY_INVALID_ARGS", file=sys.stderr)
+    return 2
+
+
+def _maybe_guarded_p207_probe_schema_status(argv: list[str] | None) -> int | None:
+    tokens = sys.argv[1:] if argv is None else argv
+    if not any(
+        isinstance(token, str)
+        and (
+            token.startswith(_P207_GUARDED_PROBE_FLAG)
+            or (
+                len(option := token.partition("=")[0]) > len("--guard-p207-test-readonly-")
+                and _P207_GUARDED_PROBE_FLAG.startswith(option)
+            )
+        )
+        for token in tokens
+    ):
+        return None
+    if tokens != [
+        "--config", _P207_GUARDED_PROBE_CONFIG,
+        "schema-status", _P207_GUARDED_PROBE_FLAG,
+    ]:
+        print("STOP P207_GUARDED_PROBE_INVALID_ARGS", file=sys.stderr)
+        return 2
+    try:
+        from grandgousier.db.migrations import guarded_p207_test_readonly_probe
+
+        failed = guarded_p207_test_readonly_probe()
+        if (type(failed) is not tuple
+                or any(type(code) is not str or code not in _P207_PROBE_FAILURE_CODES
+                       for code in failed)
+                or len(failed) != len(set(failed))
+                or ("ROW_SHAPE" in failed and failed != ("ROW_SHAPE",))):
+            raise ValueError("Unverified probe classification")
+    except BaseException:  # noqa: BLE001 - no driver/config/cleanup exception may escape
+        print("STOP P207_GUARDED_PROBE_UNVERIFIED", file=sys.stderr)
+        return 2
+    if failed:
+        print("STOP P207_TEST_BACKEND_PROBE_ONLY " + " ".join(failed), file=sys.stderr)
+        return 2
+    print("PROBE_ONLY P207_TEST_BACKEND_STRUCTURAL_CHECK")
+    return 0
+
+
+def cmd_finalize_field_series(args: argparse.Namespace) -> int:
+    from grandgousier.archive.fields_series import finalize_open_series
+
+    Session = make_session_factory(args.database_url)
+    with Session() as session:
+        result = finalize_open_series(session, args.series_id)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("status") == "READY" else 2
+
+
+def _maybe_guarded_p207_schema_status(argv: list[str] | None) -> int | None:
+    tokens = sys.argv[1:] if argv is None else argv
+    # Detect the fixed config path even when the flag is missing or --config is
+    # abbreviated/attached. argparse also accepts prefixes such as --g here;
+    # these must not reach the ordinary parser or Settings/.env on schema-status.
+    has_schema_status = "schema-status" in tokens
+    if not any(
+        isinstance(token, str)
+        and (
+            _P207_GUARDED_LEDGER_CONFIG in token
+            or token.startswith(_P207_GUARDED_LEDGER_FLAG)
+            or (
+                (has_schema_status or token.startswith("--guard"))
+                and len(option := token.partition("=")[0]) > 2
+                and _P207_GUARDED_LEDGER_FLAG.startswith(option)
+            )
+        )
+        for token in tokens
+    ):
+        return None
+    if tokens != [
+        "--config", _P207_GUARDED_LEDGER_CONFIG,
+        "schema-status", _P207_GUARDED_LEDGER_FLAG,
+    ]:
+        print("STOP P207_GUARDED_LEDGER_INVALID_ARGS", file=sys.stderr)
+        return 2
+    try:
+        from grandgousier.db.migrations import guarded_p207_test_readonly_ledger
+
+        state = guarded_p207_test_readonly_ledger()
+    except BaseException:  # noqa: BLE001 - never let driver/config errors reveal credentials
+        # Driver/config/SQL exceptions may contain a password or URL. No traceback,
+        # exception text, input path, environment value, or raw argument is emitted.
+        print("STOP P207_GUARDED_LEDGER_UNVERIFIED", file=sys.stderr)
+        return 2
+    if state == "NEW37":
+        print("PASS P207_TEST_LEDGER_ONLY ledger=37 baselined=32 applied=5 pending=0 drift=0")
+        return 0
+    if state == "OLD35":
+        print("STOP P207_TEST_LEDGER_PENDING ledger=35 baselined=32 applied=3 pending=2", file=sys.stderr)
+        return 2
+    if state == "PARTIAL36":
+        print("STOP P207_TEST_LEDGER_PENDING ledger=36 baselined=32 applied=4 pending=1", file=sys.stderr)
+        return 2
+    print("STOP P207_GUARDED_LEDGER_UNVERIFIED", file=sys.stderr)
+    return 2
+
+
+def _run_main(argv: list[str] | None = None) -> int:
     from grandgousier.config import application_settings_mapping, read_config_file
     from grandgousier.exit_codes import USAGE
 

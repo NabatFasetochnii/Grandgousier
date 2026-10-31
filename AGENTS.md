@@ -16,7 +16,7 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-- Set `GRANDGOUSIER_DATABASE_URL` explicitly when running database-backed commands; never put credentials in source or reports.
+- Set `GRANDGOUSIER_DATABASE_URL` explicitly for ordinary database-backed commands. The existing guarded, private-config P2-07 read-only CLI is a narrow exception only when separately authorized and after exact non-frozen DB identity checks; it is not permission to change secret handling. Never publish credentials, URLs, private config, or raw log/environment values.
 - Fast checks: `\.venv\Scripts\python.exe -m compileall grandgousier tests` and `\.venv\Scripts\python.exe -m pytest`.
 - Run one test with `\.venv\Scripts\python.exe -m pytest tests\test_name.py -q` or a focused node with `-k expression`.
 - Ruff is configured in `pyproject.toml` with 100-character lines and Python 3.11 target; run `\.venv\Scripts\python.exe -m ruff check grandgousier tests` when touching Python code.
@@ -42,9 +42,17 @@ py -3.11 -m venv .venv
 - Avoid nullable untyped PostgreSQL binds in `IS NULL OR` selectors; use separate scoped/global statements. Use `CAST(:value AS bigint)` rather than `:value::bigint`, and qualify columns in joins.
 - Exact row counts are required for baselines; PostgreSQL planner estimates such as `n_live_tup` may be stale. `rg` is not assumed available on Windows; use repository search tools or PowerShell alternatives.
 
+## Operating Preference (2026-10-16)
+
+Prioritize a working non-frozen TEST result with gate-advancing, bounded checks: do not proliferate standalone checkers/temp wrappers or repeat full hash/test loops without a purpose. After separate approval for a DB write, prefer existing migration under-lock preflights and one purposeful minimal postcheck. Current-session permission to inspect command output does not permit publishing credentials or URLs; the user may censor output locally. Documentation edits do not authorize migration/schema/DB writes, destructive filesystem or Git actions, release/deployment, or secret-handling changes: each requires separate explicit current-session user approval. Keep frozen/reference DBs read-only and STOP on material mismatches or uncertain gates.
+
 ## Canonical References
 
 - Current factual state: `CONTEXT.md`
 - Architecture and storage contract: `docs/CURRENT_ARCHITECTURE.md`
 - Ordered engineering gates: `docs/ROADMAP.md`
 - Historical record: `docs/PROJECT_HISTORY.md`
+
+Scientific meaning is a first-class review gate; Stage-2 science is not READY merely because a command exits 0.
+Within the task and existing access gates, pursue bounded read-only analysis of representative real FITS/CSV, guarded non-frozen SELECTs, statistics and tests without new approval gates for ordinary diagnostics.
+Retain current-session human approval for consequential actions under the existing gates, and STOP on material contract mismatches.

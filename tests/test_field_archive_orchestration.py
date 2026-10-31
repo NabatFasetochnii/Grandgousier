@@ -412,7 +412,7 @@ def test_execute_orchestration_runs_new_batch_then_stage3_and_m5(monkeypatch, tm
         failed_files = 0
         processed_series_ids = [88, 89]
         pipeline_results = [
-            {"series_id": 88, "filter_name": "V", "status": "DONE", "science_status": "OK", "quality_policy": {}},
+            {"series_id": 88, "filter_name": "V", "status": "DONE_WITH_WARNINGS", "science_status": "OK", "quality_policy": {}},
             {"series_id": 89, "filter_name": "R", "status": "DONE", "science_status": "OK", "quality_policy": {}},
         ]
         warnings = ["target provenance disabled"]
@@ -558,21 +558,36 @@ def test_execute_orchestration_runs_new_batch_then_stage3_and_m5(monkeypatch, tm
         science_materialization_parity_report=lambda *a, **k: {"status": "OK", "calibration_version_id": k["calibration_version_id"]},
     )
 
+    m5_export_calls = []
+
     class Control:
         object_id = 30112
         status = "READY"
         rows_source_exact_m4 = 1888
         accepted_rows = 1860
         rejected_rows = 28
+
+        def __init__(self, bundle_root):
+            self.bundle_root = Path(bundle_root)
+
         def to_dict(self):
             return {
                 "object_id": self.object_id, "status": self.status,
                 "rows_source_exact_m4": self.rows_source_exact_m4,
                 "accepted_rows": self.accepted_rows, "rejected_rows": self.rejected_rows,
                 "generation_ids": [15, 16], "rejection_reasons": {"NO_VALID_MAG": 28},
-                "csv_path": "object.csv", "summary_path": "object.json",
+                "csv_path": str(self.bundle_root / f"{self.bundle_root.name}.csv"),
+                "summary_path": str(self.bundle_root / f"{self.bundle_root.name}_summary.json"),
             }
-    module("grandgousier.lightcurves.global_object", export_global_object_light_curve=lambda *a, **k: Control())
+
+    def fake_export_m5(_session, **kwargs):
+        m5_export_calls.append(kwargs)
+        return Control(kwargs["out_root"])
+
+    module(
+        "grandgousier.lightcurves.global_object",
+        export_global_object_light_curve=fake_export_m5,
+    )
 
     from grandgousier.orchestration.field_archive import run_field_archive_workflow
     result = run_field_archive_workflow(
@@ -588,10 +603,17 @@ def test_execute_orchestration_runs_new_batch_then_stage3_and_m5(monkeypatch, tm
     )
     assert result.status == "READY"
     assert len(process_calls) == 1
+    assert result.stage2_runs[0]["pipeline_results"][0]["status"] == "DONE_WITH_WARNINGS"
     assert process_calls[0]["photometry_estimator"] == "adaptive_ellipse"
     assert process_calls[0]["enable_spatial_ensemble"] is False
     assert [row["generation"]["interseries_generation_id"] for row in result.stage3] == [15, 16]
     assert result.control_objects[0]["accepted_rows"] == 1860
+    expected_bundle = tmp_path / "report" / "m5" / "object_30112"
+    assert m5_export_calls[0]["out_root"] == expected_bundle
+    assert result.control_objects[0]["csv_path"] == str(expected_bundle / "object_30112.csv")
+    assert result.control_objects[0]["summary_path"] == str(
+        expected_bundle / "object_30112_summary.json"
+    )
     assert (tmp_path / "report" / "final_report.json").exists()
 
 

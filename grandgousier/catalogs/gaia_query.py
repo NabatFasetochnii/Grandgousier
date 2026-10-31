@@ -204,6 +204,9 @@ def query_gaia_for_frames(
     message if the optional dependency is absent.
     """
 
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("An explicit frame_ids selection must not be empty")
+
     providers = _build_gaia_tap_providers(gaia_timeout_sec)
 
     if margin_arcmin < 0:
@@ -933,7 +936,7 @@ def _select_frames(
     limit: int | None,
 ) -> list[Frame]:
     stmt = select(Frame).options(selectinload(Frame.instrument_unit)).order_by(Frame.frame_id)
-    if frame_ids:
+    if frame_ids is not None:
         stmt = stmt.where(Frame.frame_id.in_(frame_ids))
     if instrument:
         stmt = stmt.where(Frame.instrument == instrument)

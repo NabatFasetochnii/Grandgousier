@@ -11,10 +11,20 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from tqdm import tqdm
 
+from grandgousier.calibration.provenance import (
+    prepare_calibration_version_for_write,
+    set_source_calibration,
+)
 from grandgousier.db.bulk import DEFAULT_BULK_INSERT_BATCH_SIZE
 from grandgousier.db.measurement_io import upsert_measurement_rows
-from grandgousier.db.models import CalibrationVersion, Frame, FrameQc, InstrumentUnit, Measurement, Object
-from grandgousier.calibration.provenance import prepare_calibration_version_for_write, set_source_calibration
+from grandgousier.db.models import (
+    CalibrationVersion,
+    Frame,
+    FrameQc,
+    InstrumentUnit,
+    Measurement,
+    Object,
+)
 from grandgousier.photometry.calibration_view import load_calibration_photometry_view
 
 
@@ -56,6 +66,9 @@ class LightcurveRow:
     mag_err: float | None
     local_zp_correction: float | None
     flags: dict
+    object_uid: str | None = None
+    ra_deg: float | None = None
+    dec_deg: float | None = None
 
 
 def calibrate_measurements_from_frame_qc(
@@ -85,6 +98,9 @@ def calibrate_measurements_from_frame_qc(
     The target calibration is stored as a separate CalibrationVersion and the source
     measurements are copied rather than overwritten.
     """
+
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("explicit frame_ids selection must not be empty")
 
     result = PreliminaryCalibrationResult(dry_run=dry_run, target_calibration_name=target_calibration_name)
     if source_catalog_name is None:
@@ -399,6 +415,9 @@ def load_lightcurve_rows(
                     mag_err=meas.mag_err,
                     local_zp_correction=meas.local_zp_correction,
                     flags=flags,
+                    object_uid=str(obj.object_uid),
+                    ra_deg=obj.ra_deg,
+                    dec_deg=obj.dec_deg,
                 )
             )
             if limit is not None and len(rows) >= int(limit):
@@ -447,6 +466,9 @@ def load_lightcurve_rows(
                 mag_err=meas.mag_err,
                 local_zp_correction=meas.local_zp_correction,
                 flags=flags,
+                object_uid=str(obj.object_uid),
+                ra_deg=obj.ra_deg,
+                dec_deg=obj.dec_deg,
             )
         )
         if limit is not None and len(rows) >= limit:

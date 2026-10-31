@@ -122,6 +122,110 @@ def test_target_coordinate_pair_rejected_before_archive_scan(monkeypatch, tmp_pa
         process_archive_path(object(), root=tmp_path, target_ra_deg=20.0)
 
 
+def test_open_series_are_reported_but_never_queued_for_pipeline():
+    rows = [
+        {"series_id": 11, "status": "READY"},
+        {"series_id": 12, "status": "OPEN"},
+        {"series_id": 13, "status": "PROCESSED"},
+    ]
+
+    finalized, open_ids = auto_process_module._separate_open_series(rows)
+
+    assert [int(row["series_id"]) for row in finalized] == [11, 13]
+    assert open_ids == [12]
+
+
+def test_process_archive_path_forwards_streaming_and_skips_open_tail_pipeline(
+    monkeypatch, tmp_path
+):
+    detected = _detected_master("204_STREAMING")
+    source_path = Path(detected.path)
+    captured = {}
+    queued_ids = []
+    stage2_calls = []
+
+    monkeypatch.setattr(
+        auto_process_module,
+        "scan_archive_paths",
+        lambda *_args, **_kwargs: ([detected], [], []),
+    )
+    monkeypatch.setattr(auto_process_module, "load_auto_profiles", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        auto_process_module,
+        "index_detected_archive_files",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            indexed_paths=[str(source_path)],
+            indexed_frame_ids=[101],
+            index_results=[],
+            failed_files=0,
+        ),
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "select_persisted_science_frames",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            selected_frame_ids=[101], summary={}, rows=[]
+        ),
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "_series_ids_for_paths",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "_inspect_existing_catalog",
+        lambda *_args, **_kwargs: {"status": "READY"},
+    )
+    monkeypatch.setattr(auto_process_module, "_catalog_precondition_ok", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        auto_process_module,
+        "_frame_ids_by_instrument_unit",
+        lambda *_args, **_kwargs: {4: [101]},
+    )
+
+    def fake_build(_session, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            rows=[{"series_id": 7, "status": "OPEN"}],
+            summary=lambda: {"open_series_ids": [7]},
+            observation_selection_rows=[],
+        )
+
+    monkeypatch.setattr(auto_process_module, "build_field_series", fake_build)
+    monkeypatch.setattr(
+        auto_process_module,
+        "_frame_ids_by_series_for_paths",
+        lambda *_args, **_kwargs: {},
+    )
+
+    def pipeline_rows(_session, series_ids):
+        queued_ids.extend(series_ids)
+        return []
+
+    monkeypatch.setattr(auto_process_module, "_load_series_for_pipeline", pipeline_rows)
+    monkeypatch.setattr(
+        auto_process_module,
+        "run_field_pipeline",
+        lambda *_args, **_kwargs: stage2_calls.append("called"),
+    )
+
+    result = process_archive_path(
+        object(),
+        root=tmp_path,
+        exact_paths=[source_path],
+        catalog_name="existing-test-catalog",
+        execute=True,
+        min_frames_per_series=2,
+        finalize_tail=False,
+    )
+
+    assert captured["finalize_tail"] is False
+    assert result.open_series_ids == [7]
+    assert queued_ids == []
+    assert stage2_calls == []
+
+
 def test_process_archive_path_plan_accepts_degree_pair_without_processing(monkeypatch, tmp_path):
     monkeypatch.setattr(auto_process_module, "scan_archive_paths",
                         lambda *_a, **_kw: ([], [], []))
@@ -147,6 +251,7 @@ def test_process_archive_path_cli_passes_coordinate_pair_before_db_open(monkeypa
                         lambda *_a, **_kw: pytest.fail("invalid pair must not open DB"))
     assert cli.cmd_process_archive_path(args) == 2
     args.target_dec_deg = 67.25
+    args.finalize_tail = False
 
     class FakeSessionContext:
         def __enter__(self):
@@ -168,6 +273,7 @@ def test_process_archive_path_cli_passes_coordinate_pair_before_db_open(monkeypa
     assert observed["target_ra_deg"] == 22.5
     assert observed["target_dec_deg"] == 67.25
     assert observed["execute"] is False
+    assert observed["finalize_tail"] is False
 
 
 def test_discover_fits_files_is_suffix_based_and_sorted(tmp_path):
@@ -389,6 +495,148 @@ def test_prepare_auto_catalog_reuses_populated_exact_name_without_gaia(monkeypat
     assert row["queried_frames"] == 0
     assert row["queried_cones"] == 0
     assert _catalog_precondition_ok(row, allow_empty_catalog=False)
+
+
+def test_process_archive_path_forwards_indexed_frame_ids_to_gaia(monkeypatch, tmp_path):
+    indexed_frame_ids = [17, 9]
+    source_path = tmp_path / "indexed.fits"
+    detected = SimpleNamespace(path=str(source_path), profile_name="MASTER")
+    monkeypatch.setattr(
+        auto_process_module,
+        "scan_archive_paths",
+        lambda *_args, **_kwargs: ([detected], [], []),
+    )
+    monkeypatch.setattr(auto_process_module, "load_auto_profiles", lambda **_kwargs: {"MASTER": object()})
+    monkeypatch.setattr(
+        auto_process_module,
+        "index_archive_paths",
+        lambda **_kwargs: SimpleNamespace(discovered=1, inserted=1, skipped_existing=0, failed=0),
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "_frame_ids_for_paths",
+        lambda *_args: list(indexed_frame_ids),
+    )
+    monkeypatch.setattr(auto_process_module, "_series_ids_for_paths", lambda *_args: [])
+    monkeypatch.setattr(
+        auto_process_module,
+        "select_persisted_science_frames",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            selected_frame_ids=list(indexed_frame_ids), summary={}, rows=[]
+        ),
+    )
+    monkeypatch.setattr(auto_process_module, "_observation_selection_warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auto_process_module, "_default_auto_catalog_name", lambda *_args, **_kwargs: "auto-test")
+    monkeypatch.setattr(
+        auto_process_module,
+        "_inspect_existing_catalog",
+        lambda *_args, **_kwargs: {"n_sources": 0},
+    )
+    monkeypatch.setattr(auto_process_module, "_frame_ids_by_instrument_unit", lambda *_args: {})
+    monkeypatch.setattr(auto_process_module, "_frame_ids_by_series_for_paths", lambda *_args: {})
+    monkeypatch.setattr(auto_process_module, "_load_series_for_pipeline", lambda *_args: [])
+    monkeypatch.setattr(auto_process_module, "_write_manifest_if_requested", lambda *_args, **_kwargs: None)
+
+    import grandgousier.catalogs.gaia_query as gaia_query_module
+
+    observed_frame_ids: list[list[int] | None] = []
+
+    def fake_gaia_query(_session, **kwargs):
+        observed_frame_ids.append(kwargs["frame_ids"])
+        return SimpleNamespace(
+            selected_frames=len(indexed_frame_ids),
+            queried_frames=len(indexed_frame_ids),
+            queried_cones=1,
+            row_limit_reached_cones=0,
+            read_rows=2,
+            inserted_or_updated=2,
+            failed_frames=0,
+            skipped_missing_file=0,
+            skipped_oversized_cones=0,
+            failed_footprint_reasons={},
+            sample_failed_footprints=[],
+            query_provider="test-fake",
+            query_provider_failures={},
+            query_mode="frame_union",
+            effective_query_mode="frame_union",
+        )
+
+    monkeypatch.setattr(gaia_query_module, "query_gaia_for_frames", fake_gaia_query)
+
+    process_archive_path(
+        object(),
+        root=tmp_path,
+        exact_paths=[source_path],
+        execute=True,
+        auto_catalog_query=True,
+        auto_catalog_max_radius_deg=1.0,
+    )
+
+    assert observed_frame_ids == [indexed_frame_ids]
+
+
+@pytest.mark.parametrize("with_manifest", [False, True])
+def test_process_archive_path_stops_on_index_failure(monkeypatch, with_manifest):
+    source_path = Path("fake_failed_frame.fits")
+    detected = SimpleNamespace(path=str(source_path), profile_name="MASTER")
+    fake_session = object()
+    manifest_out = Path("fake_manifest.json") if with_manifest else None
+    manifest_calls = []
+
+    monkeypatch.setattr(
+        auto_process_module,
+        "scan_archive_paths",
+        lambda *_args, **_kwargs: ([detected], [], []),
+    )
+    monkeypatch.setattr(auto_process_module, "load_auto_profiles", lambda **_kwargs: {"MASTER": object()})
+    monkeypatch.setattr(auto_process_module, "_default_auto_catalog_name", lambda *_args, **_kwargs: "auto-test")
+
+    def fake_index(*, session, paths, profile, dry_run, progress_desc):
+        assert session is fake_session
+        assert paths == [source_path]
+        assert profile is not None
+        assert dry_run is False
+        assert progress_desc == "Indexing MASTER"
+        return SimpleNamespace(discovered=1, inserted=0, skipped_existing=0, failed=1)
+
+    monkeypatch.setattr(auto_process_module, "index_archive_paths", fake_index)
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("downstream must not run after index failure")
+
+    for name in (
+        "_frame_ids_for_paths", "_series_ids_for_paths", "select_persisted_science_frames",
+        "_prepare_auto_catalog", "_inspect_existing_catalog", "build_field_series",
+        "run_field_pipeline",
+    ):
+        monkeypatch.setattr(auto_process_module, name, unexpected)
+
+    import grandgousier.catalogs.gaia_query as gaia_query_module
+
+    monkeypatch.setattr(gaia_query_module, "query_gaia_for_frames", unexpected)
+    monkeypatch.setattr(
+        auto_process_module,
+        "_write_manifest_if_requested",
+        lambda result, path, *, session: manifest_calls.append((result, path, session)),
+    )
+
+    result = process_archive_path(
+        fake_session, root=Path("fake_archive"), exact_paths=[source_path],
+        execute=True, **({"manifest_out": manifest_out} if with_manifest else {}),
+    )
+
+    assert result.status == "FAILED_INDEX_FILES"
+    assert result.failed_files == 1
+    assert result.index_results == [
+        {"profile_name": "MASTER", "discovered": 1, "inserted": 0, "skipped_existing": 0, "failed": 1}
+    ]
+    assert result.warnings == ["archive indexing failed for 1 file(s)"]
+    assert str(source_path) not in str(result.warnings)
+    assert result.catalog_results == []
+    assert result.series_results == result.pipeline_results == []
+    assert result.indexed_frame_ids == result.created_series_ids == result.processed_series_ids == []
+    assert manifest_calls == ([(result, manifest_out, fake_session)] if with_manifest else [])
+    assert result.manifest_path is None
 
 
 def test_catalog_precondition_blocks_failed_or_empty_auto_catalogs():

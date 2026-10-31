@@ -154,6 +154,32 @@ def test_analyze_interseries_calibration_end_to_end_with_database_rows() -> None
 
     from grandgousier.interseries.analysis import analyze_interseries_calibration
 
+    def science_head(series_id: int) -> dict:
+        calibration_version_id = 100 + series_id
+        return {
+            "series_id": series_id,
+            "series_field_id": 9,
+            "series_instrument_unit_id": 5,
+            "filter_name": "R",
+            "n_frames": 20,
+            "time_start": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "time_end": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "alias_id": calibration_version_id + 1000,
+            "alias_logical_name": f"science_{series_id}",
+            "calibration_version_id": calibration_version_id,
+            "calibration_name": f"science_{series_id}",
+            "calibration_field_id": 9,
+            "calibration_series_id": series_id,
+            "calibration_product_role": "SCIENCE",
+            "calibration_instrument_unit_id": 5,
+            "catalog_name": "shared_catalog",
+            "pipeline_run_id": 200 + series_id,
+            "pipeline_status": "DONE",
+            "recipe_json": None,
+            "has_science_alias_head": True,
+            "has_legacy_science_products": False,
+        }
+
     class FakeMappings:
         def __init__(self, rows):
             self.rows = rows
@@ -181,21 +207,7 @@ def test_analyze_interseries_calibration_end_to_end_with_database_rows() -> None
             if "FROM fields" in sql:
                 return FakeResult([{"field_id": 9, "field_name": "GPX_TEST"}])
             if "FROM field_series fs" in sql:
-                now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-                return FakeResult([
-                    {
-                        "series_id": sid,
-                        "instrument_unit_id": 5,
-                        "filter_name": "R",
-                        "n_frames": 20,
-                        "time_start": now,
-                        "time_end": now,
-                        "calibration_version_id": 100 + sid,
-                        "calibration_name": f"science_{sid}",
-                        "catalog_name": "shared_catalog",
-                    }
-                    for sid in (1, 2, 3)
-                ])
+                return FakeResult([science_head(sid) for sid in (1, 2, 3)])
             if "COUNT(DISTINCT bm.frame_id)" in sql:
                 return FakeResult([
                     {
@@ -238,6 +250,7 @@ def test_analyze_interseries_calibration_end_to_end_with_database_rows() -> None
         filter_name="R",
         min_points_per_object=5,
         min_common_objects=20,
+        science_calibration_version_ids=[101, 102, 103],
     )
     assert result.status == "READY_M1_M3"
     assert result.selected_series_ids == (1, 2, 3)

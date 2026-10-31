@@ -6,6 +6,11 @@ import pytest
 from grandgousier.lightcurves import candidates as cand
 
 
+@pytest.fixture(autouse=True)
+def _stub_light_curve_selection_preflight(monkeypatch):
+    monkeypatch.setattr(cand, "preflight_science_light_curve_selection", lambda *_args, **_kwargs: None)
+
+
 def test_candidate_rank_orders_targets_then_combined_then_intrinsic():
     rows = [
         {"candidate_status": "ACCEPTED", "candidate_origin": "low_amplitude_intrinsic", "object_id": 3, "robust_peak_to_peak": 0.09, "rms_over_mag_err": 2.4},

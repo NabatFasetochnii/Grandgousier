@@ -221,8 +221,11 @@ def check_frames_wcs(
     update_center: bool = True,
     record_events: bool = False,
 ) -> WcsDbCheckResult:
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("An explicit frame_ids selection must not be empty")
+
     stmt = select(Frame).order_by(Frame.frame_id)
-    if frame_ids:
+    if frame_ids is not None:
         stmt = stmt.where(Frame.frame_id.in_(frame_ids))
     if instrument:
         stmt = stmt.where(Frame.instrument == instrument)

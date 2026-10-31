@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import csv
-from pathlib import Path
-from collections.abc import Iterator
+import json
+import os
+import tempfile
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, TextIO
 
 from grandgousier.archive.stage1_contract import (
+    STAGE1_PLAN_SCHEMA,
     ArchiveRequest,
     ArchiveSourceDescriptor,
     AssetProvider,
@@ -19,6 +25,7 @@ from grandgousier.archive.stage1_contract import (
 
 CALIBRATION_ROLES = ("bias", "dark", "flat", "processing_header")
 DEFAULT_STAGE1_BATCH_SIZE = 128
+MAX_STAGE1_BATCH_SIZE = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,10 +34,31 @@ class Stage1PlanBatch:
     discovered_records: int
 
 
+@dataclass(frozen=True, slots=True)
+class Stage1PlanStreamSummary:
+    discovered_records: int
+    science_items: int
+    ready_items: int
+    blocked_items: int
+
+    @property
+    def status(self) -> str:
+        if self.science_items == 0:
+            return "EMPTY"
+        return "BLOCKED" if self.blocked_items else "READY"
+
+
 def normalize_stage1_batch_size(value: int | str | None) -> int:
-    batch_size = DEFAULT_STAGE1_BATCH_SIZE if value is None else int(value)
-    if batch_size <= 0:
-        raise ValueError("stage1_batch_size must be a positive integer")
+    try:
+        batch_size = DEFAULT_STAGE1_BATCH_SIZE if value is None else int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"stage1_batch_size must be an integer from 1 through {MAX_STAGE1_BATCH_SIZE}"
+        ) from exc
+    if not 1 <= batch_size <= MAX_STAGE1_BATCH_SIZE:
+        raise ValueError(
+            f"stage1_batch_size must be from 1 through {MAX_STAGE1_BATCH_SIZE} inclusive"
+        )
     return batch_size
 
 
@@ -102,7 +130,7 @@ def iter_stage1_plan_batches(
         if discovered % size == 0:
             yield Stage1PlanBatch(items=tuple(batch), discovered_records=discovered)
             batch.clear()
-    if discovered % size and batch:
+    if discovered % size:
         yield Stage1PlanBatch(items=tuple(batch), discovered_records=discovered)
 
 
@@ -112,6 +140,15 @@ def _plan_science_record(
     product_store: ProductStore,
 ) -> CalibrationPlanItem:
     issues: list[str] = []
+    preflight_blockers = record.metadata.get("stage1_blockers", ())
+    if isinstance(preflight_blockers, (list, tuple)):
+        for blocker in preflight_blockers:
+            if isinstance(blocker, Mapping):
+                code = str(blocker.get("code") or "SOURCE_PREFLIGHT")
+                message = str(blocker.get("message") or code)
+                issues.append(f"Source preflight blocker [{code}]: {message}")
+            elif blocker not in (None, ""):
+                issues.append(f"Source preflight blocker: {blocker}")
     if record.identity_status != "READY":
         issues.append(
             "Stable source identity is unavailable; path/raw-id fallback is forbidden"
@@ -180,7 +217,180 @@ def write_stage1_plan_json(plan: CalibrationPlan, path: str | Path) -> Path:
 def write_stage1_plan_csv(plan: CalibrationPlan, path: str | Path) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    columns = [
+    columns = _stage1_plan_csv_columns()
+    with target.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for item in plan.items:
+            writer.writerow(_stage1_plan_csv_row(item))
+    return target
+
+
+def write_stage1_plan_batches(
+    batches: Iterator[Stage1PlanBatch],
+    *,
+    source: ArchiveSourceDescriptor,
+    request: ArchiveRequest,
+    product_store: Mapping[str, Any],
+    json_path: str | Path,
+    csv_path: str | Path,
+    on_item: Callable[[CalibrationPlanItem], None] | None = None,
+) -> tuple[Stage1PlanStreamSummary, Path, Path]:
+    """Write a complete plan from bounded batches without retaining plan items."""
+    json_target = Path(json_path)
+    csv_target = Path(csv_path)
+    json_destination = json_target.resolve(strict=False)
+    csv_destination = csv_target.resolve(strict=False)
+    if _stage1_output_paths_alias(json_destination, csv_destination):
+        raise ValueError(
+            "stage1-plan JSON and CSV output paths must be different; "
+            f"both paths refer to the same file: {json_target}"
+        )
+
+    json_destination.parent.mkdir(parents=True, exist_ok=True)
+    csv_destination.parent.mkdir(parents=True, exist_ok=True)
+
+    discovered_records = 0
+    science_items = 0
+    ready_items = 0
+    blocked_items = 0
+    csv_columns = _stage1_plan_csv_columns()
+    json_temp: Path | None = None
+    csv_temp: Path | None = None
+    json_handle: TextIO | None = None
+    csv_handle: TextIO | None = None
+    try:
+        json_temp, json_handle = _open_stage1_output(json_destination)
+        csv_temp, csv_handle = _open_stage1_output(csv_destination)
+        csv_writer = csv.DictWriter(csv_handle, fieldnames=csv_columns)
+        csv_writer.writeheader()
+
+        generated_at_utc = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        metadata_prefix = json.dumps(
+            {
+                "schema": STAGE1_PLAN_SCHEMA,
+                "generated_at_utc": generated_at_utc,
+                "source": source.to_dict(),
+                "request": request.to_dict(),
+                "product_store": dict(product_store),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=False,
+        )
+        json_handle.write(metadata_prefix[:-2])
+        json_handle.write(',\n  "items": [')
+
+        for batch in batches:
+            if len(batch.items) > MAX_STAGE1_BATCH_SIZE:
+                raise ValueError(
+                    "Stage1PlanBatch contains "
+                    f"{len(batch.items)} items; maximum is {MAX_STAGE1_BATCH_SIZE}"
+                )
+            discovered_records = batch.discovered_records
+            for item in batch.items:
+                science_items += 1
+                if item.status == "READY":
+                    ready_items += 1
+                else:
+                    blocked_items += 1
+
+                json_handle.write(",\n" if science_items > 1 else "\n")
+                serialized_item = json.dumps(
+                    item.to_dict(), ensure_ascii=False, indent=2, sort_keys=False
+                )
+                json_handle.write("    " + serialized_item.replace("\n", "\n    "))
+                csv_writer.writerow(_stage1_plan_csv_row(item))
+                if on_item is not None:
+                    on_item(item)
+
+        summary = Stage1PlanStreamSummary(
+            discovered_records=discovered_records,
+            science_items=science_items,
+            ready_items=ready_items,
+            blocked_items=blocked_items,
+        )
+        if science_items:
+            json_handle.write("\n  ]")
+        else:
+            json_handle.write("]")
+        json_handle.write(',\n  "status": ')
+        json.dump(summary.status, json_handle, ensure_ascii=False)
+        json_handle.write(',\n  "summary": ')
+        summary_json = json.dumps(
+            {
+                "discovered_records": summary.discovered_records,
+                "science_items": summary.science_items,
+                "ready_items": summary.ready_items,
+                "blocked_items": summary.blocked_items,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=False,
+        )
+        json_handle.write("  " + summary_json.replace("\n", "\n  "))
+        json_handle.write("\n}\n")
+
+        json_handle.close()
+        json_handle = None
+        csv_handle.close()
+        csv_handle = None
+
+        os.replace(json_temp, json_destination)
+        json_temp = None
+        os.replace(csv_temp, csv_destination)
+        csv_temp = None
+
+        return summary, json_target, csv_target
+    except BaseException as failure:
+        for handle in (json_handle, csv_handle):
+            if handle is not None and not handle.closed:
+                try:
+                    handle.close()
+                except OSError as cleanup_error:
+                    failure.add_note(f"could not close Stage-1 plan staging file: {cleanup_error}")
+        for temp_path in (json_temp, csv_temp):
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    failure.add_note(f"could not remove Stage-1 plan staging file: {cleanup_error}")
+        raise
+
+
+def _stage1_output_paths_alias(first: Path, second: Path) -> bool:
+    try:
+        if os.path.samefile(first, second):
+            return True
+    except OSError:
+        pass
+    first_identity = os.path.normcase(os.path.realpath(os.path.abspath(first)))
+    second_identity = os.path.normcase(os.path.realpath(os.path.abspath(second)))
+    return first_identity == second_identity
+
+
+def _open_stage1_output(target: Path) -> tuple[Path, TextIO]:
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    temp_path = Path(name)
+    try:
+        handle = os.fdopen(descriptor, "w", encoding="utf-8", newline="")
+    except BaseException as failure:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            failure.add_note(f"could not remove Stage-1 plan staging file: {cleanup_error}")
+        raise
+    return temp_path, handle
+
+
+def _stage1_plan_csv_columns() -> list[str]:
+    return [
         "source_id",
         "native_observation_id",
         "source_observation_uid",
@@ -198,40 +408,39 @@ def write_stage1_plan_csv(plan: CalibrationPlan, path: str | Path) -> Path:
         "missing_asset_roles",
         "issues",
     ]
-    with target.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=columns)
-        writer.writeheader()
-        for item in plan.items:
-            obs = item.observation
-            writer.writerow(
-                {
-                    "source_id": obs.source_id,
-                    "native_observation_id": obs.native_observation_id,
-                    "source_observation_uid": obs.source_observation_uid,
-                    "observation_uid": obs.observation_uid,
-                    "identity_status": obs.identity_status,
-                    "instrument": obs.instrument,
-                    "camera": obs.camera,
-                    "filter": obs.filter_name,
-                    "observed_at": obs.observed_at,
-                    "action": item.action,
-                    "status": item.status,
-                    "input_state": obs.input_state,
-                    "product_locator": item.product.locator if item.product else "",
-                    "asset_roles": ",".join(asset.role for asset in obs.assets),
-                    "missing_asset_roles": ",".join(item.missing_asset_roles),
-                    "issues": " | ".join(item.issues),
-                }
-            )
-    return target
+
+
+def _stage1_plan_csv_row(item: CalibrationPlanItem) -> dict[str, Any]:
+    obs = item.observation
+    return {
+        "source_id": obs.source_id,
+        "native_observation_id": obs.native_observation_id,
+        "source_observation_uid": obs.source_observation_uid,
+        "observation_uid": obs.observation_uid,
+        "identity_status": obs.identity_status,
+        "instrument": obs.instrument,
+        "camera": obs.camera,
+        "filter": obs.filter_name,
+        "observed_at": obs.observed_at,
+        "action": item.action,
+        "status": item.status,
+        "input_state": obs.input_state,
+        "product_locator": item.product.locator if item.product else "",
+        "asset_roles": ",".join(asset.role for asset in obs.assets),
+        "missing_asset_roles": ",".join(item.missing_asset_roles),
+        "issues": " | ".join(item.issues),
+    }
 
 
 __all__ = [
     "DEFAULT_STAGE1_BATCH_SIZE",
+    "MAX_STAGE1_BATCH_SIZE",
     "Stage1PlanBatch",
+    "Stage1PlanStreamSummary",
     "build_stage1_plan",
     "iter_stage1_plan_batches",
     "normalize_stage1_batch_size",
+    "write_stage1_plan_batches",
     "write_stage1_plan_csv",
     "write_stage1_plan_json",
 ]

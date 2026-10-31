@@ -161,6 +161,31 @@ def test_build_field_status_marks_stage3_stale_when_scope_differs(monkeypatch):
     assert not result.stage3[0]["source_scope_matches"]
 
 
+def test_build_field_status_marks_orphaned_m4_stale_without_int_null(monkeypatch):
+    plan = SimpleNamespace(
+        series=[_candidate(88, "V"), _candidate(92, "V")],
+        status="READY_FOR_GRAPH_VALIDATION", n_series=2, n_ready_series=2,
+        n_eligible_pairs=1, largest_component_size=2,
+        recommended_reference_series_id=88, connected_components=[[88, 92]],
+    )
+    monkeypatch.setattr(operations, "build_interseries_plan", lambda *a, **k: plan)
+    monkeypatch.setattr(operations, "verify_interseries_generation",
+                        lambda *a, **k: SimpleNamespace(status="FAILED"))
+    monkeypatch.setattr(operations, "load_interseries_generation_series",
+                        lambda *a, **k: [{"series_id": 88}, {"series_id": None}])
+    generation = {
+        "interseries_generation_id": 20, "filter_name": "V", "instrument_unit_id": 7,
+        "catalog_name": "shared", "reference_series_id": 88,
+        "reliability_status": "REDUNDANT_GRAPH_OK", "n_series": 2, "n_edges": 1,
+        "graph_dof": 0, "reduced_chi2": 0.0,
+    }
+    result = operations.build_field_status(
+        _Session({"field_id": 33, "field_name": "x"}, [generation]), field_id=33,
+    )
+    assert result.status == "STAGE3_STALE_OR_MISSING"
+    assert result.stage3[0]["source_scope_matches"] is False
+
+
 def test_build_field_status_keeps_same_filter_instrument_scopes_separate(monkeypatch):
     series = [
         SimpleNamespace(

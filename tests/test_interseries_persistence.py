@@ -14,6 +14,8 @@ from grandgousier.interseries.persistence import (
     generation_fingerprint,
 )
 
+STAGE2_RECIPE = "stage3_scale_v1"
+
 
 def _analysis_for_fingerprint(*, reference_series_id: int = 77, second_cv: int = 976):
     summaries = (
@@ -81,7 +83,30 @@ def test_persist_sparse_graph_requires_explicit_acknowledgement(monkeypatch) -> 
     monkeypatch.setattr(persistence, "analyze_interseries_calibration", lambda *args, **kwargs: analysis)
 
     with pytest.raises(ValueError, match="SPARSE_GRAPH_NO_CLOSURE"):
-        persistence.persist_interseries_calibration(object(), field_id=33, allow_sparse_graph=False)
+        persistence.persist_interseries_calibration(
+            object(),
+            field_id=33,
+            allow_sparse_graph=False,
+            required_stage2_recipe=STAGE2_RECIPE,
+        )
+
+
+def test_persist_without_required_recipe_refuses_before_analysis_or_database_calls(
+    monkeypatch,
+) -> None:
+    from grandgousier.interseries import persistence
+
+    def unexpected_analysis(*args, **kwargs):  # pragma: no cover
+        raise AssertionError("recipe guard must run before analysis")
+
+    monkeypatch.setattr(persistence, "analyze_interseries_calibration", unexpected_analysis)
+
+    class NoDatabaseOperations:
+        def execute(self, *args, **kwargs):  # pragma: no cover
+            raise AssertionError("recipe guard must run before database operations")
+
+    with pytest.raises(ValueError, match="required_stage2_recipe is required"):
+        persistence.persist_interseries_calibration(NoDatabaseOperations(), field_id=33)
 
 
 def test_stage3_m4_cli_contract() -> None:
@@ -95,6 +120,7 @@ def test_stage3_m4_cli_contract() -> None:
         "--filter", "V",
         "--reference-series-id", "76",
         "--min-common-objects", "15",
+        "--required-stage2-recipe", STAGE2_RECIPE,
         "--allow-sparse-graph",
     ])
     assert args.command == "persist-interseries-calibration"
@@ -102,6 +128,7 @@ def test_stage3_m4_cli_contract() -> None:
     assert args.filter_name == "V"
     assert args.reference_series_id == 76
     assert args.min_common_objects == 15
+    assert args.required_stage2_recipe == STAGE2_RECIPE
     assert args.allow_sparse_graph is True
 
     show = parser.parse_args(["show-interseries-calibration", "--generation-id", "4"])
@@ -234,20 +261,32 @@ def test_persist_redundant_generation_writes_exact_sources_and_edges(monkeypatch
     from grandgousier.interseries import persistence
 
     analysis = _minimal_redundant_analysis()
-    monkeypatch.setattr(persistence, "analyze_interseries_calibration", lambda *args, **kwargs: analysis)
+    captured_analysis_kwargs = {}
+
+    def fake_analyze(*args, **kwargs):
+        captured_analysis_kwargs.update(kwargs)
+        return analysis
+
+    monkeypatch.setattr(persistence, "analyze_interseries_calibration", fake_analyze)
 
     class FakeSession:
         def __init__(self):
             self.series_params = None
             self.edge_params = None
+            self.insert_order = []
         def execute(self, statement, params=None):
             sql = str(statement)
             if "INSERT INTO interseries_calibration_generations" in sql:
+                self.insert_order.append("generation")
+                assert params["reference_series_id"] == 77
                 return _MappingsResult([{"interseries_generation_id": 42}])
             if "INSERT INTO interseries_calibration_series" in sql:
+                self.insert_order.append("members")
+                assert "interseries_generation_id, field_id, series_id" in sql
                 self.series_params = params
                 return _MappingsResult([])
             if "INSERT INTO interseries_calibration_edges" in sql:
+                self.insert_order.append("edges")
                 self.edge_params = params
                 return _MappingsResult([])
             if "FROM interseries_calibration_generations g" in sql and "JOIN fields" in sql:
@@ -280,10 +319,20 @@ def test_persist_redundant_generation_writes_exact_sources_and_edges(monkeypatch
             raise AssertionError(sql)
 
     session = FakeSession()
-    result = persistence.persist_interseries_calibration(session, field_id=33)
+    result = persistence.persist_interseries_calibration(
+        session,
+        field_id=33,
+        required_stage2_recipe=STAGE2_RECIPE,
+        science_calibration_version_ids=[967, 976, 986],
+    )
     assert result.created is True
+    assert session.insert_order == ["generation", "members", "edges"]
+    assert [row["is_reference_series"] for row in session.series_params] == [True, False, False]
     assert result.reliability_status == RELIABILITY_REDUNDANT
+    assert captured_analysis_kwargs["required_stage2_recipe"] == STAGE2_RECIPE
+    assert captured_analysis_kwargs["science_calibration_version_ids"] == [967, 976, 986]
     assert [row["science_calibration_version_id"] for row in session.series_params] == [967, 976, 986]
+    assert {row["field_id"] for row in session.series_params} == {33}
     assert len(session.edge_params) == 3
     assert all(row["left_series_id"] < row["right_series_id"] for row in session.edge_params)
     canonical_80_81 = next(
@@ -347,7 +396,78 @@ def test_persist_is_idempotent_for_existing_fingerprint(monkeypatch) -> None:
             raise AssertionError(sql)
 
     session = FakeSession()
-    result = persistence.persist_interseries_calibration(session, field_id=33)
+    result = persistence.persist_interseries_calibration(
+        session, field_id=33, required_stage2_recipe=STAGE2_RECIPE
+    )
     assert result.created is False
     assert result.interseries_generation_id == 42
     assert session.child_inserts == 0
+
+
+def test_verify_orphaned_m4_membership_reports_failure_without_converting_null(monkeypatch) -> None:
+    from grandgousier.interseries import persistence
+
+    class FakeSession:
+        def execute(self, statement, _params):
+            assert "SELECT g.*, f.field_name" in str(statement)
+            return _MappingsResult([{
+                "generation_uid": "m4_orphan",
+                "input_snapshot": {},
+                "fingerprint_sha256": persistence.generation_fingerprint({}),
+                "reliability_status": RELIABILITY_REDUNDANT,
+            }])
+
+    monkeypatch.setattr(persistence, "load_interseries_generation_series", lambda *_args, **_kwargs: [
+        {"field_id": 33, "series_id": None, "science_calibration_version_id": 967}
+    ])
+    result = persistence.verify_interseries_generation(FakeSession(), generation_id=42)
+    assert result.status == "FAILED"
+    assert result.source_calibrations_ok is False and result.graph_ok is False
+    assert result.details == {
+        "failure_reason": "ORPHAN_M4_SERIES",
+        "orphan_memberships": [{"field_id": 33, "science_calibration_version_id": 967}],
+    }
+
+
+@pytest.mark.parametrize("cv_series_id", [77, 80])
+def test_verify_refuses_stale_cv_or_missing_edge_endpoint(monkeypatch, cv_series_id) -> None:
+    from grandgousier.interseries import persistence
+
+    snapshot = {"sources": [{"series_id": 77, "calibration_version_id": 967}]}
+    generation = {
+        "generation_uid": "m4_test", "input_snapshot": snapshot,
+        "fingerprint_sha256": persistence.generation_fingerprint(snapshot),
+        "field_id": 33, "reference_series_id": 77,
+        "n_series": 1, "n_edges": 1, "graph_dof": 0, "chi2": 0.0,
+        "max_abs_standardized_residual": None, "reduced_chi2": None,
+        "reliability_status": RELIABILITY_REDUNDANT,
+    }
+    member = {
+        "field_id": 33, "series_id": 77, "science_calibration_version_id": 967,
+        "is_reference_series": True, "offset_mag": 0.0, "n_science_points": 1,
+    }
+    edge = {"left_series_id": 77, "right_series_id": 80, "pair_status": "OK"}
+    monkeypatch.setattr(persistence, "load_interseries_generation_series",
+                        lambda *_args, **_kwargs: [member])
+    monkeypatch.setattr(persistence, "load_interseries_generation_edges",
+                        lambda *_args, **_kwargs: [edge])
+
+    class FakeSession:
+        def execute(self, statement, _params):
+            sql = str(statement)
+            if "SELECT g.*, f.field_name" in sql:
+                return _MappingsResult([generation])
+            if "FROM calibration_versions cv" in sql:
+                return _MappingsResult([{
+                    "series_id": cv_series_id, "field_id": 33, "product_role": "SCIENCE",
+                    "lifecycle_status": "COMPLETE_IMMUTABLE", "n_science_rows": 1,
+                }])
+            raise AssertionError(sql)
+
+    result = persistence.verify_interseries_generation(FakeSession(), generation_id=42)
+    assert result.status == "FAILED" and result.graph_ok is False
+    assert result.details["edge_checks"] == [
+        {"left_series_id": 77, "right_series_id": 80, "ok": False}
+    ]
+    if cv_series_id != 77:
+        assert result.source_calibrations_ok is False

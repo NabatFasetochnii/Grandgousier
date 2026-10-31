@@ -4,10 +4,12 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from types import SimpleNamespace
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -15,14 +17,20 @@ from sqlalchemy.orm import Session
 from grandgousier.archive.observation_selection import (
     ObservationScienceAction,
     ScienceFileIdentityCandidate,
+    _validate_master_raw_relative_physical_key,
     plan_file_science_selection,
 )
 from grandgousier.archive.stage1_execution import (
     STAGE1_EXECUTION_SCHEMA,
     STAGE1_PROVENANCE_SCHEMA,
+    _fingerprint,
+    _input_fingerprint_payload,
 )
-from grandgousier.io.frame_locations import add_or_touch_frame_location, find_frame_by_locator
+from grandgousier.archive.stage1_contract import AssetRef
 from grandgousier.db.models import FieldSeriesFrame, Frame, FrameLocation, make_frame_location_uid
+from grandgousier.identity.observation import MASTER_IDENTITY_SCHEME, make_observation_uid
+from grandgousier.io.frame_locations import add_or_touch_frame_location, find_frame_by_locator
+from grandgousier.io.parsing import parse_datetime
 
 STAGE1_HANDOFF_SCHEMA = "grandgousier.stage1.handoff.v1"
 _SUCCESS_EXECUTION_STATUSES = {
@@ -33,6 +41,9 @@ _SUCCESS_EXECUTION_STATUSES = {
 }
 _HARD_BLOCK_ACTIONS = {
     ObservationScienceAction.AMBIGUOUS_MULTIPLE_PRODUCTS.value,
+    ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM.value,
+    ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_DATE_UNDER_LEGACY_UNIQNUM.value,
+    ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_CONTEXT_UNDER_LEGACY_UNIQNUM.value,
     ObservationScienceAction.MISSING_OBSERVATION_ID.value,
     ObservationScienceAction.IDENTITY_CONFLICT.value,
 }
@@ -72,6 +83,186 @@ def _common_parent(paths: Sequence[Path]) -> Path:
         return paths[0].parent
 
 
+def _clean_text(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalized_instrument(value: Any) -> str | None:
+    text = _clean_text(value)
+    if text is None:
+        return None
+    return "MASTER" if text.casefold() == "master" else text
+
+
+def _recompute_stage1_fingerprint(
+    provenance: Mapping[str, Any], *, action: str, provenance_path: Path
+) -> str:
+    """Rebuild the v1 Stage-1 fingerprint using the canonical execution helpers."""
+
+    observation = provenance.get("observation")
+    recipe = provenance.get("recipe")
+    raw_inputs = provenance.get("inputs")
+    if not isinstance(observation, Mapping):
+        raise ValueError(f"Stage-1 provenance observation section is invalid: {provenance_path}")
+    if not isinstance(recipe, Mapping) or not isinstance(recipe.get("parameters"), Mapping):
+        raise ValueError(f"Stage-1 provenance recipe section is invalid: {provenance_path}")
+    if not isinstance(raw_inputs, list) or not raw_inputs:
+        raise ValueError(f"Stage-1 provenance inputs are missing or invalid: {provenance_path}")
+
+    observation_fields = (
+        "source_id",
+        "native_observation_id",
+        "source_observation_uid",
+        "observation_uid",
+        "identity_scheme",
+    )
+    fingerprint_observation = {
+        name: observation.get(name) for name in observation_fields
+    }
+    if any(_clean_text(fingerprint_observation[name]) is None for name in observation_fields):
+        raise ValueError(f"Stage-1 provenance fingerprint identity fields are incomplete: {provenance_path}")
+
+    fingerprint_inputs: list[SimpleNamespace] = []
+    for index, entry in enumerate(raw_inputs):
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"Stage-1 provenance input #{index} is invalid: {provenance_path}")
+        ref_data = entry.get("ref")
+        if not isinstance(ref_data, Mapping):
+            raise ValueError(f"Stage-1 provenance input ref #{index} is invalid: {provenance_path}")
+        metadata = ref_data.get("metadata", {})
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, Mapping):
+            raise ValueError(f"Stage-1 provenance input metadata #{index} is invalid: {provenance_path}")
+        try:
+            ref = AssetRef(
+                source_id=ref_data.get("source_id"),
+                role=ref_data.get("role"),
+                backend=ref_data.get("backend"),
+                locator=ref_data.get("locator"),
+                checksum_sha256=ref_data.get("checksum_sha256"),
+                metadata=metadata,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Stage-1 provenance input ref #{index} is invalid: {provenance_path}"
+            ) from exc
+        if ref.source_id != fingerprint_observation["source_id"]:
+            raise ValueError(
+                f"Stage-1 provenance input source_id mismatch: {provenance_path}"
+            )
+        if ref_data.get("ref_uid") != ref.ref_uid:
+            raise ValueError(
+                f"Stage-1 provenance input ref_uid does not match its source/backend/role/locator: "
+                f"{provenance_path}"
+            )
+        checksum = str(entry.get("checksum_sha256") or "").strip()
+        if not _SHA256.fullmatch(checksum):
+            raise ValueError(
+                f"Stage-1 provenance input checksum is invalid: {provenance_path}"
+            )
+        fingerprint_inputs.append(
+            SimpleNamespace(ref=ref, checksum_sha256=checksum)
+        )
+
+    recipe_name = _clean_text(recipe.get("name"))
+    if recipe_name is None:
+        raise ValueError(f"Stage-1 provenance recipe name is missing: {provenance_path}")
+    fingerprint_item = SimpleNamespace(
+        action=action,
+        observation=SimpleNamespace(**fingerprint_observation),
+    )
+    payload = _input_fingerprint_payload(
+        fingerprint_item,
+        fingerprint_inputs,
+        recipe=recipe_name,
+        parameters=recipe["parameters"],
+    )
+    return _fingerprint(payload)
+
+
+def _stage1_provenance_context(
+    provenance: Mapping[str, Any], *, provenance_path: Path
+) -> tuple[str | None, str | None, str | None, datetime | None, str | None]:
+    observation = provenance.get("observation")
+    if not isinstance(observation, Mapping):
+        raise TypeError(f"Stage-1 provenance observation section is missing: {provenance_path}")
+
+    identity_scheme = _clean_text(observation.get("identity_scheme"))
+    instrument = _normalized_instrument(observation.get("instrument"))
+    camera = _clean_text(observation.get("camera"))
+    observed_at = observation.get("observed_at")
+    date_obs = parse_datetime(observed_at)
+    if observed_at not in (None, "") and date_obs is None:
+        raise ValueError(f"Stage-1 provenance observed_at is invalid: {provenance_path}")
+
+    inputs = provenance.get("inputs")
+    raw_refs: list[Mapping[str, Any]] = []
+    all_refs: list[Mapping[str, Any]] = []
+    if isinstance(inputs, list):
+        for entry in inputs:
+            if not isinstance(entry, Mapping):
+                continue
+            ref = entry.get("ref")
+            if isinstance(ref, Mapping):
+                all_refs.append(ref)
+                if ref.get("role") == "science_raw":
+                    raw_refs.append(ref)
+
+    physical_source = any(
+        ref.get("backend") == "master-physical"
+        or (
+            isinstance(ref.get("metadata"), Mapping)
+            and "raw_relative_physical_key" in ref["metadata"]
+        )
+        for ref in all_refs
+    )
+    if not physical_source:
+        return instrument, camera, identity_scheme, date_obs, None
+
+    if len(raw_refs) != 1:
+        raise ValueError(
+            f"MASTER physical provenance must contain exactly one science_raw ref: {provenance_path}"
+        )
+    if instrument != "MASTER" or identity_scheme != MASTER_IDENTITY_SCHEME:
+        raise ValueError(f"MASTER physical provenance has incompatible observation identity: {provenance_path}")
+    raw_ref = raw_refs[0]
+    raw_metadata = raw_ref.get("metadata")
+    if not (
+        raw_ref.get("backend") == "master-physical"
+        or (
+            isinstance(raw_metadata, Mapping)
+            and "raw_relative_physical_key" in raw_metadata
+        )
+    ):
+        raise ValueError(
+            f"MASTER physical provenance marker is not bound to its science_raw ref: {provenance_path}"
+        )
+    native = _clean_text(observation.get("native_observation_id"))
+    p4_native = _clean_text(observation.get("p4_native_identity"))
+    observation_uid = _clean_text(observation.get("observation_uid"))
+    if not native or p4_native != native or observation_uid != make_observation_uid(identity_scheme, native):
+        raise ValueError(f"MASTER physical provenance identity fields are inconsistent: {provenance_path}")
+    if camera is None or date_obs is None:
+        raise ValueError(f"MASTER physical provenance requires camera and observed_at: {provenance_path}")
+
+    metadata = raw_refs[0].get("metadata")
+    key_value = metadata.get("raw_relative_physical_key") if isinstance(metadata, Mapping) else None
+    try:
+        raw_key = _validate_master_raw_relative_physical_key(key_value)
+    except ValueError as exc:
+        raise ValueError(f"MASTER physical provenance raw source key is invalid: {provenance_path}") from exc
+    expected_locator = f"/master/imdata/{raw_key}"
+    if raw_refs[0].get("locator") != expected_locator:
+        raise ValueError(
+            f"MASTER physical provenance raw key/locator mismatch: {provenance_path}"
+        )
+    return instrument, camera, identity_scheme, date_obs, raw_key
+
+
 @dataclass(frozen=True, slots=True)
 class ValidatedStage1Product:
     native_observation_id: str | None
@@ -82,6 +273,11 @@ class ValidatedStage1Product:
     product_checksum_sha256: str
     provenance_path: Path
     fingerprint: str
+    identity_scheme: str | None = None
+    instrument: str | None = None
+    camera: str | None = None
+    date_obs: datetime | None = None
+    raw_relative_physical_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -93,6 +289,11 @@ class ValidatedStage1Product:
             "product_checksum_sha256": self.product_checksum_sha256,
             "provenance_path": str(self.provenance_path),
             "fingerprint": self.fingerprint,
+            "identity_scheme": self.identity_scheme,
+            "instrument": self.instrument,
+            "camera": self.camera,
+            "date_obs": self.date_obs.isoformat() if self.date_obs is not None else None,
+            "raw_relative_physical_key": self.raw_relative_physical_key,
         }
 
 
@@ -125,6 +326,8 @@ class Stage1HandoffReport:
     stage2_result: Mapping[str, Any] | None = None
     errors: tuple[str, ...] = ()
     schema: str = STAGE1_HANDOFF_SCHEMA
+    persistence_only: bool = False
+    persistence_result: Mapping[str, Any] | None = None
 
     @property
     def blocked_items(self) -> int:
@@ -137,6 +340,10 @@ class Stage1HandoffReport:
     @property
     def retained_items(self) -> int:
         return sum(item.status == "ALREADY_REPRESENTED" for item in self.items)
+
+    @property
+    def persisted_identity_only_items(self) -> int:
+        return sum(item.status == "PERSISTED_IDENTITY_ONLY" for item in self.items)
 
     @property
     def status(self) -> str:
@@ -158,12 +365,22 @@ class Stage1HandoffReport:
             "summary": {
                 "items": len(self.items),
                 "selected_for_stage2": self.selected_items,
+                "persisted_identity_only": self.persisted_identity_only_items,
                 "already_represented": self.retained_items,
                 "blocked": self.blocked_items,
                 "stage2_invoked": self.stage2_result is not None,
+                "persistence_only": self.persistence_only,
             },
             "items": [item.to_dict() for item in self.items],
             "stage2_result": dict(self.stage2_result) if self.stage2_result is not None else None,
+            "persistence_result": (
+                dict(self.persistence_result) if self.persistence_result is not None else None
+            ),
+            "stage2_status": (
+                "NOT_INVOKED"
+                if self.persistence_only or self.stage2_result is None
+                else str(self.stage2_result.get("status") or "UNKNOWN")
+            ),
             "errors": list(self.errors),
         }
 
@@ -255,6 +472,9 @@ def load_validated_stage1_products(path: str | Path) -> tuple[ValidatedStage1Pro
         provenance_obs = provenance.get("observation")
         if not isinstance(provenance_obs, Mapping):
             raise ValueError(f"Stage-1 provenance observation section is missing: {provenance_path}")
+        report_source_id = _clean_text(payload.get("source_id"))
+        if report_source_id is None or provenance_obs.get("source_id") != report_source_id:
+            raise ValueError(f"Stage-1 provenance/report source_id mismatch: {product_path}")
         for key in ("source_observation_uid", "observation_uid", "native_observation_id"):
             report_value = row.get(key)
             provenance_value = provenance_obs.get(key)
@@ -262,6 +482,22 @@ def load_validated_stage1_products(path: str | Path) -> tuple[ValidatedStage1Pro
                 raise ValueError(
                     f"Stage-1 provenance/report {key} mismatch for product: {product_path}"
                 )
+        stage1_action = _clean_text(row.get("action"))
+        if stage1_action is None:
+            raise ValueError(f"Stage-1 execution result action is missing: {product_path}")
+        expected_fingerprint = _recompute_stage1_fingerprint(
+            provenance,
+            action=stage1_action,
+            provenance_path=provenance_path,
+        )
+        if provenance_fingerprint != expected_fingerprint:
+            raise ValueError(
+                f"Stage-1 provenance fingerprint does not recompute from its v1 inputs/recipe: "
+                f"{product_path}"
+            )
+        instrument, camera, identity_scheme, date_obs, physical_key = _stage1_provenance_context(
+            provenance, provenance_path=provenance_path
+        )
         if product_path.name != f"{row['source_observation_uid']}_processed.fits":
             raise ValueError(f"Stage-1 product filename/source identity mismatch: {product_path}")
 
@@ -275,6 +511,11 @@ def load_validated_stage1_products(path: str | Path) -> tuple[ValidatedStage1Pro
                 product_checksum_sha256=checksum,
                 provenance_path=provenance_path,
                 fingerprint=report_fingerprint,
+                identity_scheme=identity_scheme,
+                instrument=instrument,
+                camera=camera,
+                date_obs=date_obs,
+                raw_relative_physical_key=physical_key,
             )
         )
     return tuple(products)
@@ -285,6 +526,12 @@ def _check_frame_evidence(frame: Frame, product: ValidatedStage1Product) -> None
     if (observation is None or observation.observation_uid != product.observation_uid
             or observation.native_identity != product.native_observation_id):
         raise ValueError(f"Stage-1 product Frame observation mismatch: {product.product_path}")
+    if product.instrument is not None and _normalized_instrument(frame.instrument) != product.instrument:
+        raise ValueError(f"Stage-1 product Frame instrument mismatch: {product.product_path}")
+    if product.date_obs is not None and parse_datetime(frame.date_obs) != product.date_obs:
+        raise ValueError(f"Stage-1 product Frame DATE-OBS mismatch: {product.product_path}")
+    if product.camera is not None and _clean_text(frame.camera) != product.camera:
+        raise ValueError(f"Stage-1 product Frame camera mismatch: {product.product_path}")
     for metadata in (frame.header_json or {}, frame.quality_flags or {}):
         existing = metadata.get("stage1_fingerprint")
         if existing is not None and existing != product.fingerprint:
@@ -292,15 +539,29 @@ def _check_frame_evidence(frame: Frame, product: ValidatedStage1Product) -> None
         source_uid = metadata.get("source_observation_uid")
         if source_uid is not None and source_uid != product.source_observation_uid:
             raise ValueError(f"Stage-1 product Frame source identity conflict: {product.product_path}")
+        existing_key = metadata.get("raw_relative_physical_key")
+        if existing_key not in (None, ""):
+            try:
+                validated_key = _validate_master_raw_relative_physical_key(existing_key)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Stage-1 product Frame raw physical source key is invalid: {product.product_path}"
+                ) from exc
+            if product.raw_relative_physical_key is not None and validated_key != product.raw_relative_physical_key:
+                raise ValueError(f"Stage-1 product Frame source key conflict: {product.product_path}")
 
 
 def _persist_selected_evidence(
     session: Session, items: Sequence[Stage1HandoffItem], indexed_ids: Sequence[int],
-) -> None:
+) -> dict[str, int]:
     """Validate every selected exact locator before mutating any Frame metadata."""
-    selected = [item for item in items if item.status == "SELECTED_FOR_STAGE2"]
+    selected = [
+        item for item in items
+        if item.status in {"SELECTED_FOR_STAGE2", "SELECTED_FOR_PERSISTENCE"}
+    ]
     updates: list[tuple[Frame, ValidatedStage1Product]] = []
     used_ids: set[int] = set()
+    selected_frame_ids: dict[str, int] = {}
     with session.no_autoflush:
         for item in selected:
             product = item.product
@@ -324,6 +585,7 @@ def _persist_selected_evidence(
                 raise ValueError(f"Stage-1 product location checksum conflict: {product.product_path}")
             used_ids.add(int(frame.frame_id))
             updates.append((frame, product))
+            selected_frame_ids[str(product.product_path)] = int(frame.frame_id)
         if len(updates) != len(selected):
             raise ValueError("Stage-1 product mapping is incomplete")
         for frame, product in updates:
@@ -333,7 +595,10 @@ def _persist_selected_evidence(
             )
             frame.header_json = {**(frame.header_json or {}), "stage1_fingerprint": product.fingerprint,
                                  "source_observation_uid": product.source_observation_uid}
+            if product.raw_relative_physical_key is not None:
+                frame.header_json["raw_relative_physical_key"] = product.raw_relative_physical_key
     session.commit()
+    return selected_frame_ids
 
 
 def _validate_executed_stage2(
@@ -389,7 +654,9 @@ def _validate_executed_stage2(
         raise ValueError("Stage-2 completed series do not exactly cover selected Frames")
 
 
-def _candidate_from_detected(item: Any) -> ScienceFileIdentityCandidate:
+def _candidate_from_detected(
+    item: Any, product: ValidatedStage1Product | None = None
+) -> ScienceFileIdentityCandidate:
     return ScienceFileIdentityCandidate(
         path=item.path,
         instrument=item.instrument,
@@ -397,12 +664,25 @@ def _candidate_from_detected(item: Any) -> ScienceFileIdentityCandidate:
         observation_uid=item.observation_uid,
         identity_scheme=item.identity_scheme,
         native_identity=item.native_identity,
+        date_obs=(
+            product.date_obs
+            if product is not None and product.date_obs is not None
+            else getattr(item, "date_obs", None)
+        ),
         file_size_bytes=getattr(item, "file_size_bytes", None),
         naxis1=getattr(item, "naxis1", None),
         naxis2=getattr(item, "naxis2", None),
         object_name=getattr(item, "object_name", None),
         identity_status=item.observation_identity_status,
         identity_detail=item.observation_identity_detail,
+        camera=(
+            product.camera
+            if product is not None and product.camera is not None
+            else getattr(item, "camera", None)
+        ),
+        raw_relative_physical_key=(
+            product.raw_relative_physical_key if product is not None else None
+        ),
     )
 
 
@@ -411,6 +691,7 @@ def handoff_stage1_execution(
     *,
     execution_report_path: str | Path,
     execute: bool = False,
+    persist_only: bool = False,
     catalog_name: str | None = None,
     instrument_profile: str = "auto",
     master_profile: str | Path | None = None,
@@ -423,19 +704,30 @@ def handoff_stage1_execution(
     log_dir: str | Path = "logs",
     manifest_out: str | Path | None = None,
 ) -> Stage1HandoffReport:
-    """Handoff exact products from one Stage-1 execution report to Stage 2.
+    """Preflight or persist exact products from one Stage-1 execution report.
 
     Preflight is performed before any new Frame is indexed. Products for physical
     observations already represented in field_series_frames are retained as audit
     context and are not inserted as alternate Frame representatives. Ambiguous or
-    conflicting identities block the entire handoff before DB writes.
+    conflicting identities block the entire handoff before DB writes. ``persist_only``
+    uses the shared archive indexer and Stage-1 evidence validator without invoking
+    Stage 2.
     """
+
+    if persist_only and execute:
+        raise ValueError("persist_only and execute are mutually exclusive")
+    if persist_only and manifest_out is not None:
+        raise ValueError("Stage-2 manifest output is unavailable in persistence-only mode")
 
     products = load_validated_stage1_products(execution_report_path)
 
     # Import lazily: this path requires Astropy/FITS, while report validation above
     # remains usable in minimal release-tool environments.
-    from grandgousier.archive.auto_process import process_archive_path, scan_archive_paths
+    from grandgousier.archive.auto_process import (
+        index_detected_archive_files,
+        process_archive_path,
+        scan_archive_paths,
+    )
 
     paths = [item.product_path for item in products]
     detected, _groups, scan_warnings = scan_archive_paths(
@@ -454,6 +746,7 @@ def handoff_stage1_execution(
             execute=bool(execute),
             items=(),
             errors=errors,
+            persistence_only=persist_only,
         )
 
     expected_by_path = {str(item.product_path.resolve()).casefold(): item for item in products}
@@ -475,7 +768,30 @@ def handoff_stage1_execution(
                 f"native observation identity mismatch for {detected_item.path}: "
                 f"report={expected.native_observation_id}, FITS={detected_item.native_identity}"
             )
-        candidates.append(_candidate_from_detected(detected_item))
+        if expected.identity_scheme and detected_item.identity_scheme != expected.identity_scheme:
+            identity_errors.append(
+                f"P4 identity scheme mismatch for {detected_item.path}: "
+                f"provenance={expected.identity_scheme}, FITS={detected_item.identity_scheme}"
+            )
+        if (
+            expected.instrument is not None
+            and _normalized_instrument(detected_item.instrument) != expected.instrument
+        ):
+            identity_errors.append(
+                f"instrument mismatch for {detected_item.path}: "
+                f"provenance={expected.instrument}, FITS={detected_item.instrument}"
+            )
+        if expected.camera is not None and _clean_text(detected_item.camera) != expected.camera:
+            identity_errors.append(
+                f"camera mismatch for {detected_item.path}: "
+                f"provenance={expected.camera}, FITS={detected_item.camera}"
+            )
+        if expected.date_obs is not None and parse_datetime(detected_item.date_obs) != expected.date_obs:
+            identity_errors.append(
+                f"DATE-OBS mismatch for {detected_item.path}: "
+                f"provenance={expected.date_obs.isoformat()}, FITS={detected_item.date_obs}"
+            )
+        candidates.append(_candidate_from_detected(detected_item, expected))
 
     if identity_errors:
         return Stage1HandoffReport(
@@ -484,6 +800,7 @@ def handoff_stage1_execution(
             execute=bool(execute),
             items=(),
             errors=tuple(identity_errors),
+            persistence_only=persist_only,
         )
 
     if len(candidates) != len(products) or len({str(Path(c.path).resolve()).casefold() for c in candidates}) != len(products):
@@ -516,7 +833,7 @@ def handoff_stage1_execution(
             ObservationScienceAction.SELECTED.value,
             ObservationScienceAction.SELECTED_LEGACY_NO_OBSERVATION_ID.value,
         }:
-            status = "SELECTED_FOR_STAGE2"
+            status = "SELECTED_FOR_PERSISTENCE" if persist_only else "SELECTED_FOR_STAGE2"
             selected_paths.append(product.product_path)
         elif action in _HARD_BLOCK_ACTIONS:
             status = "BLOCKED"
@@ -542,12 +859,13 @@ def handoff_stage1_execution(
             generated_at_utc=_utc_now(),
             execute=bool(execute),
             items=tuple(items),
+            persistence_only=persist_only,
         )
 
     # Existing locators may refer to an already indexed selected product. Refuse
     # contradictory provenance before the nested Stage-2 workflow can commit work.
     for item in items:
-        if item.status != "SELECTED_FOR_STAGE2":
+        if item.status not in {"SELECTED_FOR_STAGE2", "SELECTED_FOR_PERSISTENCE"}:
             continue
         frame = find_frame_by_locator(session, str(item.product.product_path))
         if frame is not None:
@@ -591,7 +909,103 @@ def handoff_stage1_execution(
                 execute=bool(execute),
                 items=tuple(items),
                 errors=(f"Stage-2 handoff failed: {type(exc).__name__}: {exc}",),
+                persistence_only=persist_only,
             )
+
+    if persist_only:
+        if not selected_paths:
+            persistence_result = {
+                "status": "NOOP_ALREADY_REPRESENTED",
+                "index_results": [],
+                "indexed_frame_ids": [],
+                "inserted": 0,
+                "skipped_existing": 0,
+            }
+            return Stage1HandoffReport(
+                execution_report_path=str(execution_report_path),
+                generated_at_utc=_utc_now(),
+                execute=False,
+                items=tuple(items),
+                persistence_only=True,
+                persistence_result=persistence_result,
+            )
+
+        selected_path_keys = {str(path.resolve()).casefold() for path in selected_paths}
+        selected_detected = [
+            item for item in detected
+            if str(Path(item.path).resolve()).casefold() in selected_path_keys
+        ]
+        if len(selected_detected) != len(selected_paths):
+            raise ValueError("P4 persistence selection did not map to each exact detected product")
+
+        indexing = None
+        persistence_result: dict[str, Any] = {
+            "status": "NOT_STARTED",
+            "index_results": [],
+            "indexed_frame_ids": [],
+            "failed": None,
+        }
+        try:
+            indexing = index_detected_archive_files(
+                session,
+                selected_detected,
+                master_profile=master_profile,
+                robophot_profile=robophot_profile,
+            )
+            persistence_result = {
+                "status": "INDEXED",
+                "index_results": list(indexing.index_results),
+                "indexed_frame_ids": list(indexing.indexed_frame_ids),
+                "inserted": sum(row["inserted"] for row in indexing.index_results),
+                "skipped_existing": sum(
+                    row["skipped_existing"] for row in indexing.index_results
+                ),
+                "failed": indexing.failed_files,
+            }
+            if indexing.failed_files:
+                raise ValueError(f"archive indexing failed for {indexing.failed_files} selected product(s)")
+            if len(indexing.indexed_frame_ids) != len(selected_paths):
+                raise ValueError("identity-only indexing did not resolve every exact Frame")
+            selected_frame_ids = _persist_selected_evidence(
+                session, items, indexing.indexed_frame_ids
+            )
+        except Exception as exc:  # noqa: BLE001 - persistence failures are returned in the handoff report.
+            session.rollback()
+            failed_items = tuple(
+                replace(item, status="PERSISTENCE_FAILED")
+                if item.status == "SELECTED_FOR_PERSISTENCE" else item
+                for item in items
+            )
+            failed_result = {**persistence_result, "status": "FAILED"}
+            return Stage1HandoffReport(
+                execution_report_path=str(execution_report_path),
+                generated_at_utc=_utc_now(),
+                execute=False,
+                items=failed_items,
+                errors=(f"Identity-only Stage-1 persistence failed: {type(exc).__name__}: {exc}",),
+                persistence_only=True,
+                persistence_result=failed_result,
+            )
+
+        persisted_items = tuple(
+            replace(
+                item,
+                status="PERSISTED_IDENTITY_ONLY",
+                selected_frame_id=selected_frame_ids[str(item.product.product_path)],
+            )
+            if item.status == "SELECTED_FOR_PERSISTENCE" else item
+            for item in items
+        )
+        persistence_result["status"] = "PERSISTED_IDENTITY_ONLY"
+        return Stage1HandoffReport(
+            execution_report_path=str(execution_report_path),
+            generated_at_utc=_utc_now(),
+            execute=False,
+            items=persisted_items,
+            persistence_only=True,
+            persistence_result=persistence_result,
+        )
+    if execute and selected_paths:
         try:
             result_dict = result.to_dict()
             _validate_executed_stage2(session, items, result_dict)

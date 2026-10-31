@@ -376,6 +376,9 @@ def apply_aperture_correction(
     term; the scientifically relevant part here is the spatial dependence.
     """
 
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("explicit frame_ids selection must not be empty")
+
     _function_t0 = time.perf_counter() if diagnose_performance else 0.0
     timings: dict[str, float] = {}
 

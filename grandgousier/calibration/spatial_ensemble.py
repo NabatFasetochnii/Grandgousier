@@ -6,9 +6,14 @@ import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import median
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from grandgousier.db.models import CalibrationVersion, Measurement
 
 
 
@@ -130,6 +135,9 @@ def apply_spatial_ensemble_correction(
     zero point.  This stage fits only centered detector basis functions, so the
     applied correction has zero weighted mean over reference stars on every frame.
     """
+
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("explicit frame_ids selection must not be empty")
 
     from sqlalchemy import select
     from grandgousier.db.models import CalibrationVersion

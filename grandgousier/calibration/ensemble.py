@@ -146,6 +146,9 @@ def ensemble_calibrate_measurements(
     If the source calibration has mag_cal, that is used by default. Otherwise mag_inst is used.
     """
 
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("explicit frame_ids selection must not be empty")
+
     total_started = perf_counter()
     if min_ref_stars_per_frame < 1:
         raise ValueError("min_ref_stars_per_frame must be >= 1")

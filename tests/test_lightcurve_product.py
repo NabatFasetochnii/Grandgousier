@@ -24,6 +24,7 @@ def test_science_light_curve_columns_include_global_product_fields():
         "mag_err_effective_total",
         "mag_global",
         "interseries_offset_mag",
+        "interseries_generation_id",
         "quality_flags",
         "is_rejected",
         "reject_reasons",
@@ -96,7 +97,7 @@ def test_science_lightcurve_reader_has_no_legacy_storage_path() -> None:
     assert "science_photometry_cache" not in source
     assert "interseries_calibration_offsets" not in source
     assert "load_calibration_photometry_view" in source
-    assert "interseries_calibration_series" in source
+    assert "InterseriesCalibrationSeries" in source
 
 
 def test_raw_lightcurve_always_uses_storage_independent_view(monkeypatch):
@@ -128,7 +129,9 @@ def test_lightcurve_reader_avoids_raw_postgresql_array_and_nullable_predicate_bi
     assert "ANY(:calibration_names)" not in source
     assert "science_calibration_version_id = ANY(:cv_ids)" not in source
     assert "(:algorithm IS NULL OR" not in source
-    assert 'bindparam("cv_ids", expanding=True)' in source
+    assert "DISTINCT ON" not in source
+    assert "g.created_at DESC" not in source
+    assert "InterseriesCalibrationSeries.science_calibration_version_id" in source
 
 
 def test_resolve_lightcurve_scope_passes_calibration_object_to_chain_resolver(monkeypatch) -> None:

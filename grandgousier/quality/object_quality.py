@@ -233,6 +233,9 @@ def compute_object_qc(
 ) -> ObjectQcResult:
     """Compute object-level quality flags from catalog geometry and measurements."""
 
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("explicit frame_ids selection must not be empty")
+
     total_started = perf_counter()
     phase_started = perf_counter()
     cv = session.scalar(select(CalibrationVersion).where(CalibrationVersion.name == calibration_name))

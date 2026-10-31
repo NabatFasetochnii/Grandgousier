@@ -76,6 +76,14 @@ def materialize_science_photometry(
     )
     target_id = int(target_cv.calibration_version_id)
     _assert_durable_science_target(target_cv)
+    normalized_frame_ids = (
+        None if frame_ids is None else sorted({int(value) for value in frame_ids})
+    )
+    _validate_complete_frame_scope(
+        session,
+        target_cv=target_cv,
+        frame_ids=normalized_frame_ids,
+    )
     session.execute(
         text("DELETE FROM science_photometry WHERE calibration_version_id = :cv"),
         {"cv": target_id},
@@ -85,7 +93,7 @@ def materialize_science_photometry(
         plan = reconstruction_sql._build_server_reconstruction_plan(
             session,
             target_cv=target_cv,
-            frame_ids=frame_ids,
+            frame_ids=normalized_frame_ids,
         )
         if plan is not None:
             wide_sql, params = reconstruction_sql._build_postgres_server_reconstruction_sql(plan)
@@ -150,7 +158,7 @@ def materialize_science_photometry(
         session,
         calibration_name=calibration_name,
         calibration_version_id=calibration_version_id,
-        frame_ids=frame_ids,
+        frame_ids=normalized_frame_ids,
         apply_historical_flag_overrides=False,
     )
     rows = [
@@ -186,7 +194,7 @@ def materialize_science_photometry(
     reconstruction_sql._raise_if_empty_science_reconstruction(
         session,
         base_calibration_version_id=int(reconstructed.base_calibration_version_id),
-        frame_ids=frame_ids,
+        frame_ids=normalized_frame_ids,
         reconstructed_rows=science_rows,
         calibration_name=str(reconstructed.target_calibration_name),
     )
@@ -207,6 +215,46 @@ def materialize_science_photometry(
         write_strategy="PYTHON_RECONSTRUCTION_SCIENCE",
         status="OK",
     )
+
+
+def _validate_complete_frame_scope(
+    session: Session,
+    *,
+    target_cv: object,
+    frame_ids: list[int] | None,
+) -> None:
+    """Reject partial explicit scopes before durable SCIENCE rows are deleted."""
+
+    if frame_ids is None:
+        return
+    if not frame_ids:
+        raise ValueError("Explicit durable SCIENCE frame_ids must not be empty")
+
+    series_id = getattr(target_cv, "series_id", None)
+    if series_id is None:
+        raise ValueError(
+            "Cannot publish an explicit durable SCIENCE frame scope without a target series_id; "
+            "completeness cannot be established"
+        )
+
+    rows = session.execute(
+        text(
+            "SELECT frame_id FROM field_series_frames "
+            "WHERE series_id = :series_id ORDER BY frame_id"
+        ),
+        {"series_id": int(series_id)},
+    ).all()
+    expected_frame_ids = {int(row[0]) for row in rows}
+    selected_frame_ids = set(frame_ids)
+    if selected_frame_ids != expected_frame_ids:
+        missing = sorted(expected_frame_ids - selected_frame_ids)
+        extra = sorted(selected_frame_ids - expected_frame_ids)
+        raise ValueError(
+            "Explicit durable SCIENCE frame_ids must exactly match the target series' "
+            "full field_series_frames membership; refusing partial publication "
+            f"(series_id={int(series_id)}, missing={missing}, extra={extra}). "
+            "Excluded pre-QC frames must fail publication rather than mark partial SCIENCE complete."
+        )
 
 
 def _assert_durable_science_target(target_cv: object) -> None:

@@ -76,6 +76,9 @@ def match_catalog_to_frames(
     dry_run: bool = False,
     insert_batch_size: int = DEFAULT_BULK_INSERT_BATCH_SIZE,
 ) -> MatchCatalogResult:
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("An explicit frame_ids selection must not be empty")
+
     result = MatchCatalogResult(dry_run=dry_run, insert_batch_size=int(insert_batch_size))
     frames = _select_frames(
         session,
@@ -417,7 +420,7 @@ def _select_frames(
     limit: int | None,
 ) -> list[Frame]:
     stmt = select(Frame).order_by(Frame.frame_id)
-    if frame_ids:
+    if frame_ids is not None:
         stmt = stmt.where(Frame.frame_id.in_(frame_ids))
     if instrument:
         stmt = stmt.where(Frame.instrument == instrument)

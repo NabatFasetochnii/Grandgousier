@@ -293,6 +293,25 @@ python -m grandgousier.cli export-global-object-light-curve `
 --no-plots
 \end{lstlisting}
 
+\texttt{--out-root} задаёт имя финального каталога bundle, а не префикс файлов. Например,
+для \texttt{reports\\object\_12345\_global} основной CSV и summary имеют прежние стабильные
+basenames \texttt{object\_12345\_global.csv} и
+\texttt{object\_12345\_global\_summary.json} внутри этого каталога; там же находятся
+per-filter \texttt{<name>\_<filter>\_plot.csv} и выбранный plot image, а при
+\texttt{--include-rejected-debug} --- \texttt{<name>\_rejections.csv}. Summary содержит
+только финальные member paths внутри bundle.
+
+Уже существующий bundle directory и legacy flat sibling output с любым ожидаемым member
+basename блокируют экспорт без изменения этих outputs. Все файлы записываются в private
+hidden staging sibling, затем bundle публикуется одной same-filesystem native no-replace
+directory rename. При обычной ошибке до публикации очищается только staging-каталог этого
+запуска. После аварийного завершения может остаться
+\texttt{.<name>.m5-staging-*}; это не финальный bundle, такой каталог не очищается и не
+используется повторно. Публикация не обещает fsync/power-loss durability. Windows использует
+\texttt{os.rename}, Linux --- libc \texttt{renameat2(RENAME\_NOREPLACE)}, macOS --- libc
+\texttt{renamex\_np(RENAME\_EXCL)}. Missing symbol, неподдерживаемая платформа или
+файловая система и любая native-ошибка fail closed; ordinary-rename fallback отсутствует.
+
 \texttt{--allow-partial} не применяет offset к несовместимым series: он только разрешает исключить их из export с явным warning. \texttt{--include-rejected-debug} пишет отдельный diagnostic CSV. При exact-linked source rows, но нуле accepted rows, M5 0.5.47.1 возвращает status \texttt{NO\_ACCEPTED\_POINTS\_AFTER\_QC} и exit code 2. Начиная с 0.5.47.2 \texttt{--plot-max-points} является hard cap на filter, а \texttt{--plot-time-axis auto} по умолчанию визуально сокращает большие пустые gaps между series, не изменяя MJD в CSV. При числе series больше 12 включается archive-overview без per-series legend.
 
 Начиная с 0.5.47.3 default M5 saturation veto является epoch-level: \texttt{SATURATED\_OR\_NEAR\_SATURATED} отвергает конкретную measurement, а object-level \texttt{SATURATED\_LIKE} остаётся diagnostic-only для M5. Общий Stage~2/Object-QC policy не меняется. При необходимости strict series-level rejection можно вернуть явно: \texttt{--extra-reject-flags SATURATED\_LIKE}.

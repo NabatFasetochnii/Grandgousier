@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import bindparam, text
+from sqlalchemy import BigInteger, bindparam, text
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
@@ -25,6 +26,7 @@ class BuildFieldSeriesResult:
     linked_frames: int = 0
     updated_fields: int = 0
     updated_series: int = 0
+    open_series_ids: list[int] = field(default_factory=list)
     dry_run: bool = False
     frame_selection_diagnostics: dict[str, Any] = field(default_factory=dict)
     observation_selection: dict[str, Any] = field(default_factory=dict)
@@ -42,6 +44,7 @@ class BuildFieldSeriesResult:
             "linked_frames": self.linked_frames,
             "updated_fields": self.updated_fields,
             "updated_series": self.updated_series,
+            "open_series_ids": self.open_series_ids,
             "dry_run": self.dry_run,
             "frame_selection_diagnostics": self.frame_selection_diagnostics,
             "observation_selection": self.observation_selection,
@@ -59,6 +62,7 @@ def build_field_series(
     only_science: bool = True,
     min_frames_per_series: int = 1,
     grouping_method: str = "center_time_v1",
+    finalize_tail: bool = True,
     dry_run: bool = False,
 ) -> BuildFieldSeriesResult:
     """Assign frames to persistent sky fields and observing series.
@@ -68,6 +72,8 @@ def build_field_series(
     it uses WCS/image-center coordinates and time gaps, not object-name alone.
     """
 
+    if frame_ids is not None and not frame_ids:
+        raise ValueError("explicit frame_ids selection must not be empty")
     if max_field_separation_arcmin <= 0:
         raise ValueError("max_field_separation_arcmin must be positive")
     if max_series_gap_minutes <= 0:
@@ -144,33 +150,36 @@ def build_field_series(
             buckets.setdefault(key, []).append(frame)
         for (_iu, _filter_name), bucket in buckets.items():
             current: list[dict[str, Any]] = []
+            groups: list[list[dict[str, Any]]] = []
             prev = None
             for frame in bucket:
                 if prev is not None and _gap_minutes(prev, frame) > max_series_gap_minutes:
-                    _create_series_group(
-                        session,
-                        result=result,
-                        field_id=field_id,
-                        frames=current,
-                        grouping_method=grouping_method,
-                        min_frames=min_frames_per_series,
-                        dry_run=dry_run,
-                    )
+                    groups.append(current)
                     current = []
                 current.append(frame)
                 prev = frame
-            _create_series_group(
-                session,
-                result=result,
-                field_id=field_id,
-                frames=current,
-                grouping_method=grouping_method,
-                min_frames=min_frames_per_series,
-                dry_run=dry_run,
-            )
+            if current:
+                groups.append(current)
+            for group_index, group_frames in enumerate(groups):
+                is_tail = group_index == len(groups) - 1
+                _create_series_group(
+                    session,
+                    result=result,
+                    field_id=field_id,
+                    frames=group_frames,
+                    grouping_method=grouping_method,
+                    min_frames=min_frames_per_series,
+                    max_gap_minutes=max_series_gap_minutes,
+                    finalize_group=(not is_tail or finalize_tail),
+                    persist_subminimum_open=(is_tail and not finalize_tail),
+                    dry_run=dry_run,
+                )
 
     if not dry_run:
-        _refresh_field_summaries(session)
+        _refresh_field_summaries(
+            session,
+            field_ids={int(row["field_id"]) for row in result.rows if row["series_id"] is not None},
+        )
         session.commit()
     return result
 
@@ -210,6 +219,78 @@ def load_series_selection(session: Session, series_id: int) -> dict[str, Any]:
     out = dict(row)
     out["frame_ids"] = frame_ids
     return _json_safe(out)
+
+
+def finalize_open_series(session: Session, series_id: int) -> dict[str, Any]:
+    """Finalize one OPEN series without invoking Stage 2."""
+
+    row = session.execute(
+        text(
+            """
+            SELECT series_id, field_id, status, n_frames, metadata_json
+            FROM field_series
+            WHERE series_id = :series_id
+            FOR UPDATE
+            """
+        ),
+        {"series_id": int(series_id)},
+    ).mappings().first()
+    if row is None:
+        raise ValueError(f"field_series row not found: series_id={series_id}")
+    state = dict(row)
+    status = str(state["status"])
+    if status != "OPEN":
+        return {
+            "series_id": int(series_id),
+            "status": status,
+            "finalized": False,
+            "eligible": status == "READY",
+            "reason": "NOT_OPEN",
+        }
+
+    metadata = _series_metadata(state.get("metadata_json"))
+    minimum = metadata.get("min_frames_per_series")
+    if minimum is None or int(minimum) < 1:
+        raise ValueError(
+            f"OPEN series {series_id} has no valid persisted minimum-frame threshold"
+        )
+    member_count = int(
+        session.execute(
+            text(
+                "SELECT COUNT(*) FROM field_series_frames WHERE series_id = :series_id"
+            ),
+            {"series_id": int(series_id)},
+        ).scalar_one()
+    )
+    if member_count < int(minimum):
+        return {
+            "series_id": int(series_id),
+            "status": "OPEN",
+            "n_frames": member_count,
+            "min_frames_per_series": int(minimum),
+            "finalized": False,
+            "eligible": False,
+            "reason": "BELOW_MINIMUM",
+        }
+
+    session.execute(
+        text(
+            "UPDATE field_series SET status = 'READY', updated_at = now() "
+            "WHERE series_id = :series_id AND status = 'OPEN'"
+        ),
+        {"series_id": int(series_id)},
+    )
+    _refresh_field_processing_status(session, int(state["field_id"]))
+    session.commit()
+    return {
+        "series_id": int(series_id),
+        "status": "READY",
+        "n_frames": member_count,
+        "min_frames_per_series": int(minimum),
+        "finalized": True,
+        "eligible": True,
+        "reason": None,
+    }
 
 
 def list_fields(
@@ -627,9 +708,9 @@ def _load_frame_selection_diagnostics(
         f"""
         SELECT
             COALESCE(CAST(fr.image_type AS TEXT), '<NULL>') AS image_type,
-            COUNT(*)::int AS n_frames,
-            COUNT(*) FILTER (WHERE fr.ra_center_deg IS NOT NULL AND fr.dec_center_deg IS NOT NULL)::int AS n_with_center,
-            COUNT(*) FILTER (WHERE fr.ra_center_deg IS NULL OR fr.dec_center_deg IS NULL)::int AS n_without_center
+            CAST(COUNT(*) AS INTEGER) AS n_frames,
+            CAST(SUM(CASE WHEN fr.ra_center_deg IS NOT NULL AND fr.dec_center_deg IS NOT NULL THEN 1 ELSE 0 END) AS INTEGER) AS n_with_center,
+            CAST(SUM(CASE WHEN fr.ra_center_deg IS NULL OR fr.dec_center_deg IS NULL THEN 1 ELSE 0 END) AS INTEGER) AS n_without_center
         FROM frames fr
         LEFT JOIN field_series_frames sf ON sf.frame_id = fr.frame_id
         {where_sql}
@@ -753,101 +834,264 @@ def _create_series_group(
     frames: list[dict[str, Any]],
     grouping_method: str,
     min_frames: int,
+    max_gap_minutes: float,
+    finalize_group: bool,
+    persist_subminimum_open: bool,
     dry_run: bool,
 ) -> None:
-    if len(frames) < int(min_frames):
+    if not frames:
         return
     frames = sorted(frames, key=_frame_sort_key)
+    input_frame_ids = {int(frame["frame_id"]) for frame in frames}
+    existing_state: dict[str, Any] | None = None
+    existing_members: list[dict[str, Any]] = []
+
+    assigned_series_ids = _assigned_series_ids_for_frames(session, input_frame_ids)
+    if len(assigned_series_ids) > 1:
+        raise ValueError(
+            "candidate group spans multiple existing field_series memberships; refusing to merge"
+        )
+    if assigned_series_ids:
+        existing_state = _load_series_state(session, assigned_series_ids[0])
+        if existing_state is None:
+            raise RuntimeError("assigned field_series membership has no parent series")
+        existing_members = _load_series_members(session, int(existing_state["series_id"]))
+        existing_member_ids = {int(member["frame_id"]) for member in existing_members}
+        if str(existing_state["status"]) != "OPEN":
+            if existing_member_ids == input_frame_ids:
+                _append_series_result_row(
+                    result,
+                    series_state=existing_state,
+                    frames=existing_members,
+                    dry_run=dry_run,
+                )
+                return
+            raise ValueError(
+                "candidate group would extend a finalized field_series; refusing to mutate it"
+            )
+        new_members = [
+            frame for frame in frames if int(frame["frame_id"]) not in existing_member_ids
+        ]
+        if new_members:
+            existing_tail = max(existing_members, key=_frame_sort_key)
+            new_head = min(new_members, key=_frame_sort_key)
+            if _frame_sort_key(new_head) <= _frame_sort_key(existing_tail):
+                raise ValueError(
+                    "new Frames cannot be inserted before or inside an OPEN series tail"
+                )
+            if _gap_minutes(existing_tail, new_head) > max_gap_minutes:
+                raise ValueError(
+                    "new Frames exceed the configured gap from the OPEN series tail"
+                )
+        _validate_open_series_key(
+            existing_state,
+            field_id=field_id,
+            instrument_unit_id=frames[0].get("instrument_unit_id"),
+            filter_name=frames[0].get("filter_name"),
+            grouping_method=grouping_method,
+        )
+    else:
+        compatible_open = []
+        for state, members in _load_open_series_for_field(session, field_id, grouping_method):
+            if (
+                state.get("instrument_unit_id") != frames[0].get("instrument_unit_id")
+                or state.get("filter_name") != frames[0].get("filter_name")
+                or not members
+            ):
+                continue
+            _validate_open_series_metadata(
+                state,
+                min_frames=min_frames,
+                max_gap_minutes=max_gap_minutes,
+            )
+            compatible_open.append((state, members))
+
+        matching_open = []
+        for state, members in compatible_open:
+            if _series_groups_are_contiguous(members, frames, max_gap_minutes):
+                matching_open.append((state, members))
+        if len(matching_open) > 1:
+            raise ValueError(
+                "candidate group is contiguous with multiple OPEN series; refusing ambiguous merge"
+            )
+        if matching_open:
+            existing_state, existing_members = matching_open[0]
+        else:
+            # A later group proves the prior tail ended at the configured gap.
+            # A sub-minimum tail remains OPEN/ineligible rather than bypassing
+            # the existing minimum-frame acceptance rule.
+            for state, members in compatible_open:
+                if _gap_minutes(members[-1], frames[0]) <= max_gap_minutes:
+                    continue
+                if _frame_sort_key(frames[0]) <= _frame_sort_key(members[-1]):
+                    continue
+                _close_open_series_at_boundary(
+                    session,
+                    result=result,
+                    state=state,
+                    members=members,
+                    dry_run=dry_run,
+                )
+
+    if existing_state is not None:
+        metadata = _validate_open_series_metadata(
+            existing_state,
+            min_frames=min_frames,
+            max_gap_minutes=max_gap_minutes,
+        )
+        effective_minimum = int(metadata["min_frames_per_series"])
+        merged_by_id = {int(member["frame_id"]): member for member in existing_members}
+        merged_by_id.update({int(frame["frame_id"]): frame for frame in frames})
+        frames = sorted(merged_by_id.values(), key=_frame_sort_key)
+    else:
+        metadata = {}
+        effective_minimum = int(min_frames)
+
+    if len(frames) < effective_minimum:
+        if existing_state is None and not persist_subminimum_open:
+            return
+        target_status = "OPEN"
+    else:
+        target_status = "READY" if finalize_group else "OPEN"
+
     first = frames[0]
     last = frames[-1]
-    ra_vals = [float(f["ra_center_deg"]) for f in frames if f.get("ra_center_deg") is not None]
-    dec_vals = [float(f["dec_center_deg"]) for f in frames if f.get("dec_center_deg") is not None]
-    mjds = [float(f["mjd"]) for f in frames if f.get("mjd") is not None]
-    times = [f.get("date_obs") for f in frames if f.get("date_obs") is not None]
-    object_names = [_clean_name(f.get("object_name")) for f in frames if _clean_name(f.get("object_name"))]
+    ra_vals = [float(frame["ra_center_deg"]) for frame in frames if frame.get("ra_center_deg") is not None]
+    dec_vals = [float(frame["dec_center_deg"]) for frame in frames if frame.get("dec_center_deg") is not None]
+    mjds = [float(frame["mjd"]) for frame in frames if frame.get("mjd") is not None]
+    times = [
+        value
+        for frame in frames
+        if (value := _coerce_datetime(frame.get("date_obs"))) is not None
+    ]
+    object_names = [_clean_name(frame.get("object_name")) for frame in frames if _clean_name(frame.get("object_name"))]
     primary_object = object_names[0] if object_names else None
-    metadata = {
-        "primary_object_name": primary_object,
-        "first_frame_id": first.get("frame_id"),
-        "last_frame_id": last.get("frame_id"),
-        "frame_ids_sample": [int(f["frame_id"]) for f in frames[:10]],
-        "grouping_method": grouping_method,
-    }
-    series_uid = _make_series_uid(
-        field_id=field_id,
-        instrument_unit_id=first.get("instrument_unit_id"),
-        filter_name=first.get("filter_name"),
-        mjd_start=min(mjds) if mjds else None,
-        mjd_end=max(mjds) if mjds else None,
-        frame_ids=[int(f["frame_id"]) for f in frames],
-        grouping_method=grouping_method,
+    anchor_frame_id = metadata.get("uid_anchor_frame_id")
+    if anchor_frame_id is None:
+        anchor_frame_id = int(first["frame_id"])
+    metadata.update(
+        {
+            "primary_object_name": primary_object,
+            "first_frame_id": int(first["frame_id"]),
+            "last_frame_id": int(last["frame_id"]),
+            "frame_ids_sample": [int(frame["frame_id"]) for frame in frames[:10]],
+            "grouping_method": grouping_method,
+            "uid_anchor_frame_id": int(anchor_frame_id),
+            "min_frames_per_series": effective_minimum,
+            "max_series_gap_minutes": float(max_gap_minutes),
+        }
+    )
+    series_uid = (
+        str(existing_state["series_uid"])
+        if existing_state is not None
+        else _make_stable_series_uid(
+            field_id=field_id,
+            instrument_unit_id=first.get("instrument_unit_id"),
+            filter_name=first.get("filter_name"),
+            grouping_method=grouping_method,
+            first_frame_id=int(anchor_frame_id),
+        )
     )
     if dry_run:
-        result.created_series += 1
-        result.linked_frames += len(frames)
-        result.rows.append(
-            {
+        if existing_state is None:
+            result.created_series += 1
+            result.linked_frames += len(frames)
+        else:
+            result.updated_series += 1
+            result.linked_frames += max(0, len(input_frame_ids - {int(m["frame_id"]) for m in existing_members}))
+        _append_series_result_row(
+            result,
+            series_state={
+                "series_id": existing_state.get("series_id") if existing_state else None,
                 "field_id": field_id,
-                "series_id": None,
                 "series_uid": series_uid,
+                "status": target_status,
                 "instrument_unit_id": first.get("instrument_unit_id"),
                 "filter_name": first.get("filter_name"),
-                "n_frames": len(frames),
-                "mjd_start": min(mjds) if mjds else None,
-                "mjd_end": max(mjds) if mjds else None,
-                "frame_id_first": first.get("frame_id"),
-                "frame_id_last": last.get("frame_id"),
-                "dry_run": True,
-            }
+            },
+            frames=frames,
+            dry_run=True,
         )
         return
 
-    series_id = session.execute(
-        text(
-            """
-            INSERT INTO field_series
-                (field_id, series_uid, instrument_unit_id, filter_name, time_start, time_end,
-                 mjd_start, mjd_end, ra_center_deg, dec_center_deg, n_frames,
-                 grouping_method, status, metadata_json, created_at, updated_at)
-            VALUES
-                (:field_id, :series_uid, :instrument_unit_id, :filter_name, :time_start, :time_end,
-                 :mjd_start, :mjd_end, :ra_center_deg, :dec_center_deg, :n_frames,
-                 :grouping_method, 'READY', CAST(:metadata_json AS JSONB), now(), now())
-            ON CONFLICT (series_uid) DO UPDATE
-            SET n_frames = EXCLUDED.n_frames,
-                time_start = EXCLUDED.time_start,
-                time_end = EXCLUDED.time_end,
-                mjd_start = EXCLUDED.mjd_start,
-                mjd_end = EXCLUDED.mjd_end,
-                ra_center_deg = EXCLUDED.ra_center_deg,
-                dec_center_deg = EXCLUDED.dec_center_deg,
-                metadata_json = EXCLUDED.metadata_json,
-                updated_at = now()
-            RETURNING series_id
-            """
-        ),
-        {
-            "field_id": field_id,
-            "series_uid": series_uid,
-            "instrument_unit_id": first.get("instrument_unit_id"),
-            "filter_name": first.get("filter_name"),
-            "time_start": min(times) if times else None,
-            "time_end": max(times) if times else None,
-            "mjd_start": min(mjds) if mjds else None,
-            "mjd_end": max(mjds) if mjds else None,
-            "ra_center_deg": _mean_circular_ra(ra_vals) if ra_vals else None,
-            "dec_center_deg": sum(dec_vals) / len(dec_vals) if dec_vals else None,
-            "n_frames": len(frames),
-            "grouping_method": grouping_method,
-            "metadata_json": json.dumps(metadata, ensure_ascii=False),
-        },
-    ).scalar_one()
-    session.commit()
-    values = [
-        {"series_id": int(series_id), "frame_id": int(f["frame_id"]), "order_index": i + 1}
-        for i, f in enumerate(frames)
-    ]
-    for value in values:
+    if existing_state is None:
+        series_id = session.execute(
+            text(
+                """
+                INSERT INTO field_series
+                    (field_id, series_uid, instrument_unit_id, filter_name, time_start, time_end,
+                     mjd_start, mjd_end, ra_center_deg, dec_center_deg, n_frames,
+                     grouping_method, status, metadata_json, created_at, updated_at)
+                VALUES
+                    (:field_id, :series_uid, :instrument_unit_id, :filter_name, :time_start, :time_end,
+                     :mjd_start, :mjd_end, :ra_center_deg, :dec_center_deg, :n_frames,
+                     :grouping_method, :status, CAST(:metadata_json AS JSONB), now(), now())
+                RETURNING series_id
+                """
+            ),
+            _series_values(
+                field_id=field_id,
+                series_uid=series_uid,
+                instrument_unit_id=first.get("instrument_unit_id"),
+                filter_name=first.get("filter_name"),
+                time_start=min(times) if times else None,
+                time_end=max(times) if times else None,
+                mjd_start=min(mjds) if mjds else None,
+                mjd_end=max(mjds) if mjds else None,
+                ra_vals=ra_vals,
+                dec_vals=dec_vals,
+                n_frames=len(frames),
+                grouping_method=grouping_method,
+                status=target_status,
+                metadata=metadata,
+            ),
+        ).scalar_one()
+        series_id = int(series_id)
+        result.created_series += 1
+        new_frame_ids = input_frame_ids
+    else:
+        series_id = int(existing_state["series_id"])
+        session.execute(
+            text(
+                """
+                UPDATE field_series
+                SET time_start = :time_start,
+                    time_end = :time_end,
+                    mjd_start = :mjd_start,
+                    mjd_end = :mjd_end,
+                    ra_center_deg = :ra_center_deg,
+                    dec_center_deg = :dec_center_deg,
+                    n_frames = :n_frames,
+                    status = :status,
+                    metadata_json = CAST(:metadata_json AS JSONB),
+                    updated_at = now()
+                WHERE series_id = :series_id AND status = 'OPEN'
+                """
+            ),
+            {
+                **_series_values(
+                    field_id=field_id,
+                    series_uid=series_uid,
+                    instrument_unit_id=first.get("instrument_unit_id"),
+                    filter_name=first.get("filter_name"),
+                    time_start=min(times) if times else None,
+                    time_end=max(times) if times else None,
+                    mjd_start=min(mjds) if mjds else None,
+                    mjd_end=max(mjds) if mjds else None,
+                    ra_vals=ra_vals,
+                    dec_vals=dec_vals,
+                    n_frames=len(frames),
+                    grouping_method=grouping_method,
+                    status=target_status,
+                    metadata=metadata,
+                ),
+                "series_id": series_id,
+            },
+        )
+        result.updated_series += 1
+        new_frame_ids = input_frame_ids - {int(member["frame_id"]) for member in existing_members}
+
+    for order_index, frame in enumerate(frames, start=1):
         session.execute(
             text(
                 """
@@ -857,46 +1101,305 @@ def _create_series_group(
                 SET order_index = EXCLUDED.order_index
                 """
             ),
-            value,
+            {
+                "series_id": series_id,
+                "frame_id": int(frame["frame_id"]),
+                "order_index": order_index,
+            },
         )
-    session.execute(
-        text("UPDATE field_series SET n_frames = (SELECT COUNT(*) FROM field_series_frames WHERE series_id = :series_id), updated_at = now() WHERE series_id = :series_id"),
-        {"series_id": int(series_id)},
-    )
-    result.created_series += 1
-    result.linked_frames += len(frames)
+    result.linked_frames += len(new_frame_ids)
+    state = {
+        "series_id": series_id,
+        "field_id": field_id,
+        "series_uid": series_uid,
+        "status": target_status,
+        "instrument_unit_id": first.get("instrument_unit_id"),
+        "filter_name": first.get("filter_name"),
+    }
+    _append_series_result_row(result, series_state=state, frames=frames, dry_run=False)
+
+
+def _series_values(
+    *,
+    field_id: int,
+    series_uid: str,
+    instrument_unit_id: int | None,
+    filter_name: str | None,
+    time_start: datetime | None,
+    time_end: datetime | None,
+    mjd_start: float | None,
+    mjd_end: float | None,
+    ra_vals: list[float],
+    dec_vals: list[float],
+    n_frames: int,
+    grouping_method: str,
+    status: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "field_id": field_id,
+        "series_uid": series_uid,
+        "instrument_unit_id": instrument_unit_id,
+        "filter_name": filter_name,
+        "time_start": time_start,
+        "time_end": time_end,
+        "mjd_start": mjd_start,
+        "mjd_end": mjd_end,
+        "ra_center_deg": _mean_circular_ra(ra_vals) if ra_vals else None,
+        "dec_center_deg": sum(dec_vals) / len(dec_vals) if dec_vals else None,
+        "n_frames": n_frames,
+        "grouping_method": grouping_method,
+        "status": status,
+        "metadata_json": json.dumps(_json_safe(metadata), ensure_ascii=False),
+    }
+
+
+def _append_series_result_row(
+    result: BuildFieldSeriesResult,
+    *,
+    series_state: dict[str, Any],
+    frames: list[dict[str, Any]],
+    dry_run: bool,
+) -> None:
+    if not frames:
+        return
+    ordered = sorted(frames, key=_frame_sort_key)
+    first, last = ordered[0], ordered[-1]
+    mjds = [float(frame["mjd"]) for frame in ordered if frame.get("mjd") is not None]
+    times = [
+        value
+        for frame in ordered
+        if (value := _coerce_datetime(frame.get("date_obs"))) is not None
+    ]
+    status = str(series_state["status"])
+    series_id = series_state.get("series_id")
+    if (
+        series_id is not None
+        and status == "OPEN"
+        and int(series_id) not in result.open_series_ids
+    ):
+        result.open_series_ids.append(int(series_id))
     result.rows.append(
         {
-            "field_id": field_id,
-            "series_id": int(series_id),
-            "series_uid": series_uid,
-            "instrument_unit_id": first.get("instrument_unit_id"),
-            "filter_name": first.get("filter_name"),
-            "n_frames": len(frames),
+            "field_id": int(series_state["field_id"]),
+            "series_id": int(series_id) if series_id is not None else None,
+            "series_uid": series_state["series_uid"],
+            "instrument_unit_id": series_state.get("instrument_unit_id"),
+            "filter_name": series_state.get("filter_name"),
+            "status": status,
+            "n_frames": len(ordered),
             "mjd_start": min(mjds) if mjds else None,
             "mjd_end": max(mjds) if mjds else None,
             "time_start": min(times) if times else None,
             "time_end": max(times) if times else None,
-            "frame_id_first": first.get("frame_id"),
-            "frame_id_last": last.get("frame_id"),
-            "dry_run": False,
+            "frame_id_first": int(first["frame_id"]),
+            "frame_id_last": int(last["frame_id"]),
+            "dry_run": dry_run,
         }
     )
 
 
-def _refresh_field_summaries(session: Session) -> None:
+def _assigned_series_ids_for_frames(session: Session, frame_ids: set[int]) -> list[int]:
+    if not frame_ids:
+        return []
+    stmt = text(
+        """
+        SELECT DISTINCT series_id
+        FROM field_series_frames
+        WHERE frame_id IN :frame_ids
+        ORDER BY series_id
+        """
+    ).bindparams(bindparam("frame_ids", expanding=True))
+    return [
+        int(row[0])
+        for row in session.execute(stmt, {"frame_ids": sorted(frame_ids)}).all()
+    ]
+
+
+def _load_series_state(session: Session, series_id: int) -> dict[str, Any] | None:
+    row = session.execute(
+        text(
+            """
+            SELECT series_id, field_id, series_uid, instrument_unit_id, filter_name,
+                   grouping_method, status, n_frames, metadata_json
+            FROM field_series
+            WHERE series_id = :series_id
+            """
+        ),
+        {"series_id": int(series_id)},
+    ).mappings().first()
+    return dict(row) if row is not None else None
+
+
+def _load_series_members(session: Session, series_id: int) -> list[dict[str, Any]]:
     rows = session.execute(
         text(
             """
+            SELECT fr.frame_id, fr.instrument_unit_id, fr.filter_name, fr.object_name,
+                   fr.ra_center_deg, fr.dec_center_deg, fr.date_obs, fr.mjd
+            FROM field_series_frames sf
+            JOIN frames fr ON fr.frame_id = sf.frame_id
+            WHERE sf.series_id = :series_id
+            ORDER BY fr.mjd NULLS LAST, fr.date_obs NULLS LAST, fr.frame_id
+            """
+        ),
+        {"series_id": int(series_id)},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _load_open_series_for_field(
+    session: Session, field_id: int, grouping_method: str
+) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+    rows = session.execute(
+        text(
+            """
+            SELECT series_id
+            FROM field_series
+            WHERE field_id = :field_id AND grouping_method = :grouping_method
+              AND status = 'OPEN'
+            ORDER BY series_id
+            """
+        ),
+        {"field_id": int(field_id), "grouping_method": grouping_method},
+    ).all()
+    out = []
+    for row in rows:
+        state = _load_series_state(session, int(row[0]))
+        if state is None:
+            continue
+        members = _load_series_members(session, int(row[0]))
+        if members:
+            out.append((state, members))
+    return out
+
+
+def _series_groups_are_contiguous(
+    existing_members: list[dict[str, Any]],
+    new_frames: list[dict[str, Any]],
+    max_gap_minutes: float,
+) -> bool:
+    existing_ordered = sorted(existing_members, key=_frame_sort_key)
+    new_ordered = sorted(new_frames, key=_frame_sort_key)
+    if not existing_ordered or not new_ordered:
+        return False
+    if _frame_sort_key(new_ordered[0]) <= _frame_sort_key(existing_ordered[-1]):
+        return False
+    return _gap_minutes(existing_ordered[-1], new_ordered[0]) <= max_gap_minutes
+
+
+def _validate_open_series_key(
+    series_state: dict[str, Any],
+    *,
+    field_id: int,
+    instrument_unit_id: int | None,
+    filter_name: str | None,
+    grouping_method: str,
+) -> None:
+    if (
+        int(series_state["field_id"]) != int(field_id)
+        or series_state.get("instrument_unit_id") != instrument_unit_id
+        or series_state.get("filter_name") != filter_name
+        or str(series_state.get("grouping_method")) != grouping_method
+    ):
+        raise ValueError("candidate Frames do not match the existing OPEN series grouping key")
+
+
+def _series_metadata(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _validate_open_series_metadata(
+    series_state: dict[str, Any],
+    *,
+    min_frames: int,
+    max_gap_minutes: float,
+) -> dict[str, Any]:
+    metadata = _series_metadata(series_state.get("metadata_json"))
+    stored_minimum = metadata.get("min_frames_per_series")
+    if stored_minimum is None or int(stored_minimum) < 1:
+        raise ValueError(
+            f"OPEN series {series_state['series_id']} has no valid persisted minimum-frame threshold"
+        )
+    if int(stored_minimum) != int(min_frames):
+        raise ValueError(
+            "min_frames_per_series differs from the value persisted for the OPEN tail"
+        )
+    stored_gap = metadata.get("max_series_gap_minutes")
+    if stored_gap is None:
+        raise ValueError(
+            f"OPEN series {series_state['series_id']} has no persisted time-gap threshold"
+        )
+    if float(stored_gap) != float(max_gap_minutes):
+        raise ValueError(
+            "max_series_gap_minutes differs from the value persisted for the OPEN tail"
+        )
+    return metadata
+
+
+def _close_open_series_at_boundary(
+    session: Session,
+    *,
+    result: BuildFieldSeriesResult,
+    state: dict[str, Any],
+    members: list[dict[str, Any]],
+    dry_run: bool,
+) -> None:
+    metadata = _series_metadata(state.get("metadata_json"))
+    minimum_value = metadata.get("min_frames_per_series")
+    if minimum_value is None or int(minimum_value) < 1:
+        raise ValueError(
+            f"OPEN series {state['series_id']} has no valid persisted minimum-frame threshold"
+        )
+    minimum = int(minimum_value)
+    status = "READY" if len(members) >= minimum else "OPEN"
+    if status == "READY" and not dry_run:
+        session.execute(
+            text(
+                "UPDATE field_series SET status = 'READY', updated_at = now() "
+                "WHERE series_id = :series_id AND status = 'OPEN'"
+            ),
+            {"series_id": int(state["series_id"])},
+        )
+        result.updated_series += 1
+        state = {**state, "status": "READY"}
+    _append_series_result_row(
+        result,
+        series_state={**state, "status": status},
+        frames=members,
+        dry_run=dry_run,
+    )
+
+
+def _refresh_field_summaries(session: Session, field_ids: Iterable[int] | None = None) -> None:
+    scoped_ids = None if field_ids is None else sorted({int(field_id) for field_id in field_ids})
+    if scoped_ids == []:
+        return
+    scope_sql = "WHERE f.field_id IN :field_ids" if scoped_ids is not None else ""
+    stmt = text(
+        f"""
             SELECT f.field_id,
                    AVG(s.ra_center_deg) AS decoy_ra,
                    AVG(s.dec_center_deg) AS avg_dec,
                    COUNT(DISTINCT s.series_id)::int AS n_series
             FROM fields f
             JOIN field_series s ON s.field_id = f.field_id
+            {scope_sql}
             GROUP BY f.field_id
-            """
-        )
+        """
+    )
+    if scoped_ids is not None:
+        stmt = stmt.bindparams(bindparam("field_ids", expanding=True, type_=BigInteger()))
+    rows = session.execute(
+        stmt, {"field_ids": scoped_ids} if scoped_ids is not None else {}
     ).mappings().all()
     for row in rows:
         series_centers = session.execute(
@@ -935,11 +1438,22 @@ def _frame_sort_key(frame: dict[str, Any]) -> tuple[float, str, int]:
 def _gap_minutes(prev: dict[str, Any], cur: dict[str, Any]) -> float:
     if prev.get("mjd") is not None and cur.get("mjd") is not None:
         return abs(float(cur["mjd"]) - float(prev["mjd"])) * 1440.0
-    a = prev.get("date_obs")
-    b = cur.get("date_obs")
-    if isinstance(a, datetime) and isinstance(b, datetime):
+    a = _coerce_datetime(prev.get("date_obs"))
+    b = _coerce_datetime(cur.get("date_obs"))
+    if a is not None and b is not None:
         return abs((b - a).total_seconds()) / 60.0
     return 0.0
+
+
+def _coerce_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _clean_name(value: Any) -> str | None:
@@ -973,6 +1487,27 @@ def _make_series_uid(
             f"{mjd_start:.8f}" if mjd_start is not None else "-",
             f"{mjd_end:.8f}" if mjd_end is not None else "-",
             ",".join(map(str, frame_ids[:3] + frame_ids[-3:])),
+        ]
+    ).encode("utf-8")
+    return "series_" + hashlib.sha1(key).hexdigest()[:16]
+
+
+def _make_stable_series_uid(
+    *,
+    field_id: int,
+    instrument_unit_id: int | None,
+    filter_name: str | None,
+    grouping_method: str,
+    first_frame_id: int,
+) -> str:
+    key = "|".join(
+        [
+            "series_uid_first_frame_v2",
+            str(field_id),
+            str(instrument_unit_id),
+            str(filter_name),
+            str(grouping_method),
+            str(int(first_frame_id)),
         ]
     ).encode("utf-8")
     return "series_" + hashlib.sha1(key).hexdigest()[:16]

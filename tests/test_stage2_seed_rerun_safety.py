@@ -201,3 +201,408 @@ def test_failed_precondition_pipeline_status_maps_to_failed_series_state():
 
     assert _series_status_from_pipeline_status("FAILED_PRECONDITION_ENSEMBLE") == "FAILED"
     assert _series_status_from_pipeline_status("FAILED_PRECONDITION_SERIES_SELECTION") == "FAILED"
+
+
+def test_runner_rejects_empty_explicit_frame_scope_before_database_operations():
+    from grandgousier.pipeline.runner import FieldPipelineConfig, run_field_pipeline
+
+    class NoDatabaseOperations:
+        def __getattr__(self, name):
+            raise AssertionError(f"unexpected database operation: {name}")
+
+    config = FieldPipelineConfig(
+        catalog_name="catalog",
+        calibration_prefix="test",
+        series_id=7,
+        frame_ids=[],
+    )
+    with pytest.raises(ValueError, match="explicit frame_ids selection must not be empty"):
+        run_field_pipeline(NoDatabaseOperations(), config)
+
+
+def test_runner_rejects_open_series_before_pipeline_side_effects(monkeypatch):
+    from grandgousier.pipeline import runner
+
+    session = _FakeSession()
+    monkeypatch.setattr(
+        runner,
+        "load_series_selection",
+        lambda *_args: {
+            "status": "OPEN",
+            "frame_ids": [10],
+            "field_id": 1,
+            "instrument_unit_id": None,
+        },
+    )
+    before = session.pipeline_run_count
+    calls = _install_admission_spies(monkeypatch, session)
+
+    config = runner.FieldPipelineConfig(
+        catalog_name="catalog",
+        calibration_prefix="test",
+        series_id=7,
+    )
+    with pytest.raises(ValueError, match="field_series is OPEN.*series_id=7"):
+        runner.run_field_pipeline(session, config)
+    assert session.execute_calls == []
+    assert session.pipeline_run_count == before
+    assert calls == {
+        "capture": 0,
+        "insert": 0,
+        "series_started": 0,
+        "series_result": 0,
+        "logger": 0,
+        "stages": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("series_frame_ids", "explicit_frame_ids", "message"),
+    [
+        ([], None, "field_series has no selected frames"),
+        ([10], [99], "has no frames in series_id=7"),
+    ],
+)
+def test_runner_rejects_empty_resolved_series_scope_before_database_operations(
+    monkeypatch, series_frame_ids, explicit_frame_ids, message
+):
+    from grandgousier.pipeline import runner
+
+    monkeypatch.setattr(
+        runner,
+        "load_series_selection",
+        lambda *_args: {
+            "frame_ids": series_frame_ids,
+            "field_id": 1,
+            "instrument_unit_id": None,
+        },
+    )
+
+    class NoDatabaseOperations:
+        def __getattr__(self, name):
+            raise AssertionError(f"unexpected database operation: {name}")
+
+    config = runner.FieldPipelineConfig(
+        catalog_name="catalog",
+        calibration_prefix="test",
+        series_id=7,
+        frame_ids=explicit_frame_ids,
+    )
+    with pytest.raises(ValueError, match=message):
+        runner.run_field_pipeline(NoDatabaseOperations(), config)
+
+
+@pytest.fixture
+def runner_fake_session():
+    return _FakeSession()
+
+
+class _FakeResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar_one_or_none(self):
+        return self.value
+
+
+class _FakeNoAutoflush:
+    def __init__(self, session):
+        self.session = session
+
+    def __enter__(self):
+        self.session.no_autoflush_entries += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeSession:
+    def __init__(self):
+        self.series_memberships = {}
+        self.execute_calls = []
+        self.pipeline_run_count = 4
+        self.no_autoflush_entries = 0
+        self.new = set()
+        self.dirty = set()
+        self.deleted = set()
+        self.no_autoflush = _FakeNoAutoflush(self)
+
+    def execute(self, statement, parameters=None):
+        self.execute_calls.append((str(statement), parameters or {}))
+        frame_ids = (parameters or {}).get("frame_ids", ())
+        for frame_id in frame_ids:
+            for series_id, status in self.series_memberships.get(int(frame_id), ()):
+                if str(status).upper() == "OPEN":
+                    return _FakeResult(series_id)
+        return _FakeResult(None)
+
+
+class _UnexpectedAdmissionSideEffect(RuntimeError):
+    pass
+
+
+class _AdmissionPassed(RuntimeError):
+    pass
+
+
+def _pipeline_config(**scope):
+    from grandgousier.pipeline.runner import FieldPipelineConfig
+
+    return FieldPipelineConfig(
+        catalog_name="not-a-field-scope",
+        calibration_prefix="admission-test",
+        no_file_log=False,
+        **scope,
+    )
+
+
+def _seed_admission_series(
+    session,
+    *,
+    series_id,
+    status,
+    frame_ids=(),
+):
+    for frame_id in frame_ids:
+        session.series_memberships.setdefault(int(frame_id), []).append(
+            (int(series_id), str(status))
+        )
+
+
+def _install_admission_spies(monkeypatch, session, *, stop_at_artifact=False):
+    from grandgousier.pipeline import runner
+
+    calls = {
+        "capture": 0,
+        "insert": 0,
+        "series_started": 0,
+        "series_result": 0,
+        "logger": 0,
+        "stages": 0,
+    }
+
+    def capture(*_args, **_kwargs):
+        calls["capture"] += 1
+        if stop_at_artifact:
+            raise _AdmissionPassed
+        return {}
+
+    def insert(*_args, **_kwargs):
+        calls["insert"] += 1
+        session.pipeline_run_count += 1
+        raise _UnexpectedAdmissionSideEffect("pipeline run insertion reached")
+
+    def series_started(*_args, **_kwargs):
+        calls["series_started"] += 1
+        raise _UnexpectedAdmissionSideEffect("series start bookkeeping reached")
+
+    def series_result(*_args, **_kwargs):
+        calls["series_result"] += 1
+        raise _UnexpectedAdmissionSideEffect("series result bookkeeping reached")
+
+    def logger(*_args, **_kwargs):
+        calls["logger"] += 1
+        raise _UnexpectedAdmissionSideEffect("file logger creation reached")
+
+    def stage(*_args, **_kwargs):
+        calls["stages"] += 1
+        raise _UnexpectedAdmissionSideEffect("Stage-2 function reached")
+
+    monkeypatch.setattr(runner, "capture_tree_state", capture)
+    monkeypatch.setattr(runner, "_insert_pipeline_run", insert)
+    monkeypatch.setattr(runner, "mark_series_pipeline_started", series_started)
+    monkeypatch.setattr(runner, "mark_series_pipeline_result", series_result)
+    monkeypatch.setattr(runner.PipelineFileLogger, "create", logger)
+    for name in (
+        "check_frames_wcs",
+        "run_frame_pre_qc",
+        "match_catalog_to_frames",
+        "detect_sources_in_frames",
+        "run_forced_aperture_photometry",
+    ):
+        monkeypatch.setattr(runner, name, stage)
+    return calls
+
+
+def _assert_rejected_before_side_effects(
+    monkeypatch, session, config, expected_message
+):
+    from grandgousier.pipeline import runner
+
+    calls = _install_admission_spies(monkeypatch, session)
+    before = session.pipeline_run_count
+    with pytest.raises(ValueError, match=expected_message):
+        runner.run_field_pipeline(session, config)
+    assert session.pipeline_run_count == before
+    assert calls == {
+        "capture": 0,
+        "insert": 0,
+        "series_started": 0,
+        "series_result": 0,
+        "logger": 0,
+        "stages": 0,
+    }
+
+
+def _assert_admission_passes_to_artifact_boundary(monkeypatch, session, config):
+    from grandgousier.pipeline import runner
+
+    calls = _install_admission_spies(monkeypatch, session, stop_at_artifact=True)
+    with pytest.raises(_AdmissionPassed):
+        runner.run_field_pipeline(session, config)
+    assert calls == {
+        "capture": 1,
+        "insert": 0,
+        "series_started": 0,
+        "series_result": 0,
+        "logger": 0,
+        "stages": 0,
+    }
+
+
+def test_runner_rejects_explicit_frame_ids_in_open_series_before_side_effects(
+    monkeypatch, runner_fake_session
+):
+    session = runner_fake_session
+    _seed_admission_series(
+        session,
+        series_id=10,
+        status="OPEN",
+        frame_ids=[100, 101],
+    )
+    before_count = session.pipeline_run_count
+    calls = _install_admission_spies(monkeypatch, session)
+
+    with pytest.raises(ValueError, match="requested frame_ids.*OPEN.*series_id=10"):
+        from grandgousier.pipeline import runner
+
+        runner.run_field_pipeline(session, _pipeline_config(frame_ids=[101, 100]))
+
+    assert session.no_autoflush_entries == 1
+    assert session.pipeline_run_count == before_count
+    query, parameters = session.execute_calls[0]
+    assert query.lstrip().upper().startswith("SELECT")
+    assert parameters["frame_ids"] == [100, 101]
+    assert calls == {
+        "capture": 0,
+        "insert": 0,
+        "series_started": 0,
+        "series_result": 0,
+        "logger": 0,
+        "stages": 0,
+    }
+
+
+def test_runner_rejects_mixed_open_and_finalized_frame_memberships_atomically(
+    monkeypatch, runner_fake_session
+):
+    session = runner_fake_session
+    _seed_admission_series(
+        session,
+        series_id=10,
+        status="OPEN",
+        frame_ids=[100],
+    )
+    _seed_admission_series(
+        session,
+        series_id=11,
+        status="READY",
+        frame_ids=[101],
+    )
+
+    _assert_rejected_before_side_effects(
+        monkeypatch,
+        session,
+        _pipeline_config(frame_ids=[101, 100]),
+        "requested frame_ids.*OPEN.*series_id=10",
+    )
+    assert session.execute_calls[0][1]["frame_ids"] == [100, 101]
+
+
+def test_runner_allows_finalized_and_unassigned_explicit_frames(
+    monkeypatch, runner_fake_session
+):
+    session = runner_fake_session
+    _seed_admission_series(
+        session,
+        series_id=11,
+        status="READY",
+        frame_ids=[101],
+    )
+
+    _assert_admission_passes_to_artifact_boundary(
+        monkeypatch, session, _pipeline_config(frame_ids=[101, 102])
+    )
+
+
+def test_runner_allows_explicit_frames_without_series_membership(
+    monkeypatch, runner_fake_session
+):
+    session = runner_fake_session
+    _assert_admission_passes_to_artifact_boundary(
+        monkeypatch, session, _pipeline_config(frame_ids=[102])
+    )
+    assert session.execute_calls[0][1]["frame_ids"] == [102]
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {},
+        {"field_id": 1},
+        {"instrument_unit_id": 7},
+        {"field_id": 1, "instrument_unit_id": 7},
+    ],
+)
+def test_runner_rejects_unscoped_broad_invocation_with_any_field_unit_filters(
+    monkeypatch, runner_fake_session, scope
+):
+    session = runner_fake_session
+    _assert_rejected_before_side_effects(
+        monkeypatch,
+        session,
+        _pipeline_config(**scope),
+        "requires either series_id or explicit frame_ids",
+    )
+    assert session.execute_calls == []
+
+
+def test_cli_without_series_cannot_bypass_runner_admission_guard(monkeypatch, capsys):
+    from grandgousier import cli
+
+    class SessionContext:
+        def __enter__(self):
+            return session
+
+        def __exit__(self, *_args):
+            return False
+
+    session = _FakeSession()
+    calls = _install_admission_spies(monkeypatch, session)
+    monkeypatch.setattr(cli, "make_session_factory", lambda *_args: lambda: SessionContext())
+    monkeypatch.setattr(cli, "_build_pipeline_command_snapshot", dict)
+    monkeypatch.setattr(cli, "_build_pipeline_environment_snapshot", lambda *_args: {})
+    args = cli.build_parser().parse_args(
+        [
+            "run-field-pipeline",
+            "--catalog-name",
+            "catalog",
+            "--calibration-prefix",
+            "test",
+            "--instrument-unit-id",
+            "7",
+        ]
+    )
+
+    assert args.series_id is None
+    assert cli.cmd_run_field_pipeline(args) == 1
+    assert "requires either series_id or explicit frame_ids" in capsys.readouterr().err
+    assert calls == {
+        "capture": 0,
+        "insert": 0,
+        "series_started": 0,
+        "series_result": 0,
+        "logger": 0,
+        "stages": 0,
+    }
