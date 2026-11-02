@@ -24,7 +24,7 @@ snapshot = _load("gg_snapshot_environment", ROOT / "tools" / "snapshot_environme
 
 def test_release_version_consistency_matches_project():
     pyproject_version, init_version = release_check.read_versions()
-    assert pyproject_version == "0.7.0.10"
+    assert pyproject_version == "0.7.0.11"
     assert init_version == pyproject_version
 
 
@@ -90,6 +90,7 @@ def test_sdist_inspection_requires_release_tools_and_rejects_internal(tmp_path):
         "grandgousier-0.5.58.1/release/README.md": b"x",
         "grandgousier-0.5.58.1/requirements-release.txt": b"x",
         "grandgousier-0.5.58.1/internal_tools/private.py": b"secret",
+        "grandgousier-0.5.58.1/tools/check_m5_test_source_fields.py": b"run-specific",
     }
     with tarfile.open(sdist, "w:gz") as tf:
         for name, data in files.items():
@@ -99,6 +100,62 @@ def test_sdist_inspection_requires_release_tools_and_rejects_internal(tmp_path):
     checks = {row.name: row for row in release_check.inspect_sdist(sdist)}
     assert checks["sdist_private_paths"].status == "FAIL"
     assert checks["sdist_release_tools"].status == "OK"
+    assert checks["sdist_run_specific_tools"].status == "FAIL"
+
+
+def test_manifest_and_sdist_check_exclude_run_specific_checker(tmp_path):
+    import io
+    import tarfile
+
+    manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
+    assert "exclude tools/check_m5_test_source_fields.py" in manifest
+
+    sdist = tmp_path / "grandgousier-0.7.0.11.tar.gz"
+    required = [
+        "tools/release_check.py",
+        "tools/snapshot_environment.py",
+        "tools/acceptance_check.py",
+        "release/README.md",
+        "requirements-release.txt",
+    ]
+    with tarfile.open(sdist, "w:gz") as archive:
+        for member in required:
+            payload = b"x"
+            info = tarfile.TarInfo(f"grandgousier-0.7.0.11/{member}")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+    checks = {
+        row.name: row
+        for row in release_check.inspect_sdist(sdist)
+    }
+    assert checks["sdist_run_specific_tools"].status == "OK"
+
+
+def test_canonical_docs_do_not_require_omitted_private_context_files():
+    canonical_docs = [
+        ROOT / "AGENTS.md",
+        ROOT / "README.md",
+        ROOT / "README_PUBLIC.md",
+        ROOT / "docs" / "README.md",
+        ROOT / "docs" / "CURRENT_ARCHITECTURE.md",
+        ROOT / "docs" / "ROADMAP.md",
+    ]
+    for path in canonical_docs:
+        content = path.read_text(encoding="utf-8")
+        assert "CONTEXT.md" not in content
+        assert "context/project_state.yaml" not in content
+
+
+def test_release_install_docs_use_github_release_wheel():
+    wheel_url = (
+        "https://github.com/NabatFasetochnii/Grandgousier/releases/download/v0.7.0.11/"
+        "grandgousier-0.7.0.11-py3-none-any.whl"
+    )
+    assert wheel_url in (ROOT / "README_PUBLIC.md").read_text(encoding="utf-8")
+    assert wheel_url in (ROOT / "release" / "README.md").read_text(encoding="utf-8")
+    assert "python -m pip install grandgousier\n" not in (
+        ROOT / "README_PUBLIC.md"
+    ).read_text(encoding="utf-8")
 
 
 def test_install_smoke_forces_target_isolation(monkeypatch, tmp_path):

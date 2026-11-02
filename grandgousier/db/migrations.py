@@ -723,7 +723,7 @@ def summarize_status(items: Iterable[MigrationStatus]) -> dict[str, int]:
 
 # This opt-in verifier deliberately does NOT use status(), ensure_ledger_table(),
 # Settings, SQLAlchemy engines, the migration runner, or a user-supplied root.
-_P207_PRIVATE_SOURCE = Path(r"C:\PycharmProjects\grandgousier_p207_test_ro.private.yaml")
+_P207_PRIVATE_CONFIG_ENV = "GRANDGOUSIER_P207_PRIVATE_CONFIG"
 _P207_MAX_SOURCE_BYTES = 2 * 1024 * 1024
 _P207_URL_RE = re.compile(
     r"postgresql\+psycopg://grandgousier:(?P<password>(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+)"
@@ -762,10 +762,20 @@ def _p207_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
+def _p207_private_source_path() -> Path:
+    raw_path = os.environ.get(_P207_PRIVATE_CONFIG_ENV)
+    if (not isinstance(raw_path, str) or not raw_path or raw_path != raw_path.strip()):
+        raise ValueError("Guarded private source path is not explicitly configured")
+    path = Path(raw_path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("Guarded private source path is invalid")
+    return path
+
+
 def _p207_path_snapshot(path: Path) -> tuple[os.stat_result, ...]:
     """Refuse any ancestor/final reparse point, non-regular source or unknown identity."""
-    if path != _P207_PRIVATE_SOURCE or not path.is_absolute():
-        raise ValueError("Guarded private source is not the fixed path")
+    if path != _p207_private_source_path():
+        raise ValueError("Guarded private source does not match the explicit path")
     chain = (*reversed(path.parents), path)
     result = []
     for entry in chain:
@@ -831,7 +841,7 @@ def _p207_open_readonly(path: Path) -> int:
 
 
 def _p207_read_private_source() -> bytes:
-    path = _P207_PRIVATE_SOURCE
+    path = _p207_private_source_path()
     before = _p207_path_snapshot(path)
     fd = _p207_open_readonly(path)
     try:

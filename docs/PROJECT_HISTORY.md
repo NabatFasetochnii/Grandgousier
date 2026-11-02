@@ -261,7 +261,7 @@ Git commit: `1e44390`. Working tree: clean.
 7. [`docs/releases/`](docs/releases/) — изменения по версиям.
 8. [`docs/decisions/`](docs/decisions/) — принятые архитектурные решения.
 
-Машиночитаемое резюме: [`context/project_state.yaml`](context/project_state.yaml).
+Машиночитаемое резюме в этом историческом снимке: `context/project_state.yaml`.
 
 ## Создание переносного файла для нового чата
 
@@ -878,7 +878,7 @@ Git commit: `1e44390`. Working tree: dirty.
 7. [`docs/releases/`](docs/releases/) — изменения по версиям.
 8. [`docs/decisions/`](docs/decisions/) — принятые архитектурные решения.
 
-Машиночитаемое резюме: [`context/project_state.yaml`](context/project_state.yaml).
+Машиночитаемое резюме в этом историческом снимке: `context/project_state.yaml`.
 
 ## Создание переносного файла для нового чата
 
@@ -23791,7 +23791,7 @@ The first golden dataset is `grandgousier/resources/acceptance/gpx_tf17_2.json`.
 
 ## Для продолжения разработки
 
-- [`../CONTEXT.md`](../CONTEXT.md) — входная точка для нового чата.
+- `../CONTEXT.md` — входная точка для нового чата в этом архивном снимке; файл не входит в текущий source.
 - [`context/CURRENT_STATE.md`](context/CURRENT_STATE.md) — текущее подтверждённое состояние.
 - [`context/NEXT_TASKS.md`](context/NEXT_TASKS.md) — ближайшие задачи.
 - [`context/KNOWN_ISSUES.md`](context/KNOWN_ISSUES.md) — известные проблемы.

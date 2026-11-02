@@ -1,4 +1,4 @@
-"""Offline synthetic-only checks; never inspect the fixed private file or contact PostgreSQL."""
+"""Offline synthetic-only checks; never inspect a private config or contact PostgreSQL."""
 
 from __future__ import annotations
 
@@ -20,11 +20,12 @@ from grandgousier.db.models import (
 # only after _fake_probe has replaced its source and driver with synthetic fakes.
 _FAKE_ONLY_LEDGER_HELPER = migrations.guarded_p207_test_readonly_ledger
 _FAKE_ONLY_INTEGRITY_HELPER = migrations.guarded_p207_test_readonly_integrity
+_REAL_PRIVATE_SOURCE_READER = migrations._p207_read_private_source
 
 FLAG = "--guard-p207-test-readonly-ledger"
 PROBE_FLAG = "--guard-p207-test-readonly-probe"
 INTEGRITY_FLAG = "--guard-p207-test-readonly-integrity"
-PRIVATE_CONFIG = r"C:\PycharmProjects\grandgousier_p207_test_ro.private.yaml"
+PRIVATE_CONFIG = r"C:\synthetic\p207-private-config.yaml"
 GUARDED_ARGS = ["--config", PRIVATE_CONFIG, "schema-status", FLAG]
 PROBE_ARGS = ["--config", PRIVATE_CONFIG, "schema-status", PROBE_FLAG]
 INTEGRITY_ARGS = ["--config", PRIVATE_CONFIG, "schema-status", INTEGRITY_FLAG]
@@ -62,23 +63,66 @@ def _no_settings_or_parser(monkeypatch):
     return calls
 
 
-def test_guarded_tokens_match_fixed_module_constants_without_path_access():
+def test_guarded_tokens_use_explicit_environment_path_without_path_access(monkeypatch):
     assert FLAG == cli._P207_GUARDED_LEDGER_FLAG
-    assert PRIVATE_CONFIG == cli._P207_GUARDED_LEDGER_CONFIG
-    assert PRIVATE_CONFIG == str(migrations._P207_PRIVATE_SOURCE)
     assert PROBE_FLAG == cli._P207_GUARDED_PROBE_FLAG
-    assert PRIVATE_CONFIG == cli._P207_GUARDED_PROBE_CONFIG
     assert INTEGRITY_FLAG == cli._P207_GUARDED_INTEGRITY_FLAG
+    assert cli._P207_PRIVATE_CONFIG_ENV == migrations._P207_PRIVATE_CONFIG_ENV
+    monkeypatch.setenv(cli._P207_PRIVATE_CONFIG_ENV, PRIVATE_CONFIG)
+    assert str(migrations._p207_private_source_path()) == PRIVATE_CONFIG
 
 
 @pytest.fixture(autouse=True)
 def no_real_private_source_or_helper(monkeypatch):
+    monkeypatch.setenv(cli._P207_PRIVATE_CONFIG_ENV, PRIVATE_CONFIG)
+
     def forbidden():
         pytest.fail("The real private source or guarded helper must not run in offline tests")
 
     monkeypatch.setattr(migrations, "_p207_read_private_source", forbidden)
     monkeypatch.setattr(migrations, "guarded_p207_test_readonly_ledger", forbidden)
     monkeypatch.setattr(migrations, "guarded_p207_test_readonly_integrity", forbidden)
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [None, "", "relative/private.yaml", r"C:\synthetic\..\private.yaml"],
+)
+def test_private_config_path_is_required_and_invalid_paths_stop_before_filesystem(
+    monkeypatch, config_path,
+):
+    if config_path is None:
+        monkeypatch.delenv(cli._P207_PRIVATE_CONFIG_ENV, raising=False)
+    else:
+        monkeypatch.setenv(cli._P207_PRIVATE_CONFIG_ENV, config_path)
+    snapshot_calls = []
+    monkeypatch.setattr(
+        migrations, "_p207_path_snapshot", lambda path: snapshot_calls.append(path)
+    )
+    with pytest.raises(ValueError):
+        _REAL_PRIVATE_SOURCE_READER()
+    assert snapshot_calls == []
+
+
+@pytest.mark.parametrize(
+    ("args", "marker"),
+    [
+        (GUARDED_ARGS, "STOP P207_GUARDED_LEDGER_INVALID_ARGS"),
+        (PROBE_ARGS, "STOP P207_GUARDED_PROBE_INVALID_ARGS"),
+        (INTEGRITY_ARGS, "STOP P207_TEST_INTEGRITY_INVALID_ARGS"),
+    ],
+)
+def test_cli_guard_requires_explicit_private_config_before_helper(
+    monkeypatch, capsys, args, marker,
+):
+    monkeypatch.delenv(cli._P207_PRIVATE_CONFIG_ENV, raising=False)
+    ordinary_calls = _no_settings_or_parser(monkeypatch)
+    assert cli.main(args) == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err.strip() == marker
+    assert PRIVATE_CONFIG not in output.err
+    assert ordinary_calls == []
 
 
 @pytest.mark.parametrize("count,expected_exit,marker", [
@@ -169,10 +213,39 @@ def test_implicit_sys_argv_disguised_opt_in_stops_before_ordinary_path(
     ["migrate-db", "--dry-run"],
 ])
 def test_unopted_dispatch_preserves_ordinary_path(monkeypatch, args):
+    monkeypatch.delenv(cli._P207_PRIVATE_CONFIG_ENV, raising=False)
     calls = []
     monkeypatch.setattr(cli, "_run_main", lambda args: calls.append(args) or 17)
     assert cli.main(args) == 17
     assert calls == [args]
+
+
+@pytest.mark.parametrize(
+    ("config_style", "command"),
+    [
+        pytest.param("separate", "schema-status", id="separate-config-schema-status"),
+        pytest.param("attached", "schema-status", id="attached-config-schema-status"),
+        pytest.param("separate", "migrate-db", id="separate-config-migrate-db"),
+    ],
+)
+def test_unset_private_config_stops_legacy_profile_before_ordinary_path(
+    monkeypatch, capsys, config_style, command,
+):
+    monkeypatch.delenv(cli._P207_PRIVATE_CONFIG_ENV, raising=False)
+    legacy_path = rf"C:\synthetic\{cli._P207_LEGACY_PRIVATE_CONFIG_BASENAME}"
+    ordinary_calls = _no_settings_or_parser(monkeypatch)
+    if config_style == "separate":
+        args = ["--config", legacy_path, command]
+    else:
+        args = [f"--config={legacy_path}", command]
+
+    assert cli.main(args) == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err.strip() == "STOP P207_CONFIG_REQUIRED"
+    assert cli._P207_LEGACY_PRIVATE_CONFIG_BASENAME not in output.err
+    assert legacy_path not in output.err
+    assert ordinary_calls == []
 
 
 @pytest.mark.parametrize("source", [

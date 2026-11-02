@@ -136,6 +136,15 @@ def inspect_sdist(sdist: Path) -> list[Check]:
             "all release tools present" if not missing else "missing=" + ",".join(missing),
         )
     )
+    run_specific_tool = "tools/check_m5_test_source_fields.py"
+    tool_included = run_specific_tool in normalized
+    checks.append(
+        Check(
+            "sdist_run_specific_tools",
+            "FAIL" if tool_included else "OK",
+            "run-specific checker excluded" if not tool_included else run_specific_tool,
+        )
+    )
     return checks
 
 def install_smoke(wheel: Path, version: str) -> Check:

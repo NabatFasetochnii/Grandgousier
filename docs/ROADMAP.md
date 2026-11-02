@@ -318,7 +318,8 @@ MASTER `UNIQNUM` и RoboPhot `SERNUM+DATE-OBS(UTC)` остаются authoritati
 Перед первой правкой следующего чата:
 
 1. подтвердить актуальный source tree `0.6.4.5.1`;
-2. прочитать `CONTEXT.md`, `CURRENT_ARCHITECTURE.md`, `ROADMAP.md`, `project_state.yaml`;
+2. прочитать `CURRENT_ARCHITECTURE.md` и `ROADMAP.md`, затем открыть релевантные исходники
+   и tests;
 3. прочитать actual models/schema/bootstrap и relevant readers/writers;
 4. проверить tests, которые зафиксируют 0.6.4.5.1 behavior;
 5. не выполнять никаких DB commands;

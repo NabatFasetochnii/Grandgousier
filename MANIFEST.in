@@ -10,4 +10,5 @@ exclude README.md
 
 include requirements-release.txt
 recursive-include tools *.py
+exclude tools/check_m5_test_source_fields.py
 recursive-include release *.md

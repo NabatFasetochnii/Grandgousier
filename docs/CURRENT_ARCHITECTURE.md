@@ -139,9 +139,9 @@ At unchanged HEAD `8a370d65cad383337d2a55d8ec72aecf0ddb18e3` / version `0.7.0.10
 
 The single user approval is consumed; the external pause was attested through Reviewer postcheck and can be released after report delivery, not server-proven. Frozen reference was never contacted. No verified backup/PITR, physical-byte equality, science parity or proven physical socket closure; rollback can create WAL/locks/physical growth. Manual coordinated member-plus-edge deletion, A2/B and ordered whole-field deletion remain untested/open. Full pytest/release not run, P2-07 OPEN/PARTIAL; `READY_FOR_EXECUTE=NO`, `READY_FOR_DB_WRITE=NO`, `READY_FOR_SCHEMA_CHANGE=NO`, `READY_FOR_MIGRATION_APPLICATION=NO`. This docs-only update uses the reports above, not a fresh DB query.
 
-## Current status — 2026-09-28
+## Historical bounded-status snapshot — 2026-09-28 (version 0.7.0.10)
 
-Package/source version is **0.7.0.10**. The live clean-rebuild target is `grandgousier_070_gpx_full` (OID `23069087`); frozen `grandgousier` remains untouched and read-only. All 18 current Stage-2 heads are `READY_STAGE3_RECIPE`. Current M4 was independently verified as V generation 3 (reference series 15, 9 series, 35 OK edges, dof 27, reduced chi-square 1.4035944978863608) and R generation 4 (reference series 16, 9 series, 36 OK edges, dof 28, reduced chi-square 3.474181644470778). M5 exported 134 unique candidate IDs (234 per-series occurrences); candidate IDs are not scientifically confirmed variables.
+This dated report describes the then-current `grandgousier_070_gpx_full` snapshot (OID `23069087`); it is not a current checkout result or Stage-2/Stage-3 scientific acceptance. The report recorded 18 Stage-2 heads as `READY_STAGE3_RECIPE`, M4 V generation 3 (reference series 15, 9 series, 35 OK edges, dof 27, reduced chi-square 1.4035944978863608) and R generation 4 (reference series 16, 9 series, 36 OK edges, dof 28, reduced chi-square 3.474181644470778), and 134 unique M5 candidate IDs (234 per-series occurrences). Candidate IDs are not scientifically confirmed variables.
 
 Selecting `adaptive_ellipse` does not by itself make a generic Stage-2 run compatible with `stage3_scale_v1`; verify recipe readiness from the persisted provenance. This qualification does not alter the 18 current heads reported above as `READY_STAGE3_RECIPE`.
 
@@ -152,7 +152,7 @@ FKs are **source-only, not DB-applied**, at unchanged HEAD / version 0.7.0.10.
 Manifest is 36 total / 20 managed; last documented TEST state remains .6 APPLIED,
 ledger 35 and three edge FKs, not a new DB query. The frozen reference stays read-only.
 Offline focused tests passed (120); live .7 PostgreSQL migration/parser validation,
-full science/release acceptance and DB-write approval remain absent. See `CONTEXT.md`
+full science/release acceptance and DB-write approval remain absent. See `ROADMAP.md`
 for the current safety gate; the 2026-09-28 results above remain dated evidence.
 
 The architecture details below are retained; older dated status statements are historical snapshots and are superseded by this current scope.
@@ -423,18 +423,17 @@ Fresh 0.7 DB создаётся только после реализации cle
 ## 9. Source of truth docs
 
 ```text
-CONTEXT.md                    current factual state
 this file                     architecture contract
 ROADMAP.md                    next engineering sequence
 PROJECT_HISTORY.md            historical archive
-context/project_state.yaml    machine-readable state
 ```
 
 Legacy `NEXT_CHAT_PROMPT.md` deprecated и не должен заменять canonical context.
 
 ## Portable science product: Parquet export
 
-Install the optional dependency with `python -m pip install "grandgousier[parquet]"`.
+For the released wheel, install the optional dependency with:
+`python -m pip install "grandgousier[parquet] @ https://github.com/NabatFasetochnii/Grandgousier/releases/download/v0.7.0.11/grandgousier-0.7.0.11-py3-none-any.whl"`.
 From PowerShell, set the database URL through the deployment's private configuration
 and choose an absolute output directory that does not already exist:
 

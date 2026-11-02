@@ -6,11 +6,11 @@ to archive processing. Use `--photometry-estimator circular` to request the hist
 circular estimator explicitly. The adaptive equal-area radius has a 3-pixel base floor
 and a 2.5× base-radius cap; unavailable/invalid local PSF geometry uses the existing
 flagged circular fallback. The effective estimator is stored in Stage-2 recipe lineage.
-As of 2026-09-28, version 0.7.0.10 has bounded live validation on the GPX rebuild
-database, including current Stage-2 readiness, M4/M5 products, and a two-series Parquet
-export smoke. This does not establish general scientific acceptance, full-archive
-performance, or release acceptance. The estimator default alone does not make a generic
-run `stage3_scale_v1` compatible.
+The 2026-09-28 status note is a historical bounded snapshot for version 0.7.0.10, not
+validation of this source release or a Stage-2/Stage-3 scientific-acceptance result. It
+does not establish general scientific acceptance, full-archive performance, or release
+acceptance. This packaging/config-path/test-harness patch makes no new science-acceptance
+claim. The estimator default alone does not make a generic run `stage3_scale_v1` compatible.
 
 Grandgousier is a Python/PostgreSQL pipeline for calibrated astronomical time-series photometry.
 
@@ -23,7 +23,7 @@ be supplied by the deployment environment.
 ## Install
 
 ```bash
-python -m pip install grandgousier
+python -m pip install "grandgousier @ https://github.com/NabatFasetochnii/Grandgousier/releases/download/v0.7.0.11/grandgousier-0.7.0.11-py3-none-any.whl"
 ```
 
 For a source checkout:
@@ -55,7 +55,7 @@ site credentials or private archive discovery logic.
 Install the optional exporter dependency from a published package release:
 
 ```powershell
-python -m pip install "grandgousier[parquet]"
+python -m pip install "grandgousier[parquet] @ https://github.com/NabatFasetochnii/Grandgousier/releases/download/v0.7.0.11/grandgousier-0.7.0.11-py3-none-any.whl"
 ```
 
 For a source checkout, run this from the repository root:

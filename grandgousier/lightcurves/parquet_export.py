@@ -52,7 +52,10 @@ def _schemas():
     try:
         import pyarrow as pa
     except ImportError as exc:
-        raise RuntimeError("Parquet export requires `pip install grandgousier[parquet]` (pyarrow>=15)") from exc
+        raise RuntimeError(
+            "Parquet export requires pyarrow>=15; see README_PUBLIC.md for the GitHub Release "
+            "wheel installation command with the [parquet] extra"
+        ) from exc
     string, f64, i64, timestamp = pa.string(), pa.float64(), pa.int64(), pa.timestamp("us", tz="UTC")
     return {
         "sources.parquet": pa.schema([

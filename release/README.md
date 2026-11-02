@@ -47,7 +47,7 @@ py -3.11 -m venv .venv-clean
 python -m pip install --upgrade pip
 python -m pip install `
   --constraint "release\validated_windows_py311\constraints.txt" `
-  ".[photometry,gaia]"
+  "grandgousier[photometry,gaia] @ https://github.com/NabatFasetochnii/Grandgousier/releases/download/v0.7.0.11/grandgousier-0.7.0.11-py3-none-any.whl"
 python -m grandgousier.cli doctor --config grandgousier.yaml
 ```
 

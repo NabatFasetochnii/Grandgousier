@@ -5,7 +5,8 @@
 - This is a Python 3.11+ package backed by PostgreSQL; the supported development environment is Windows/PowerShell.
 - `pyproject.toml` is authoritative for package metadata and dependencies. `Pipfile.lock` is legacy and is not a production lockfile.
 - Public API entrypoints are under `grandgousier.api`; the CLI entrypoint is `python -m grandgousier.cli` (also installed as `grandgousier`).
-- Read `CONTEXT.md`, `docs/CURRENT_ARCHITECTURE.md`, and `docs/ROADMAP.md` before changing database, pipeline, or scientific behavior. `context/project_state.yaml` is the machine-readable state summary.
+- Read `docs/CURRENT_ARCHITECTURE.md` and `docs/ROADMAP.md` before changing database, pipeline,
+  or scientific behavior. `docs/ROADMAP.md` records current status and ordered engineering gates.
 - Keep project history in the existing canonical docs; do not add per-patch README, release-note, or handoff Markdown files.
 
 ## Setup And Verification
@@ -48,7 +49,7 @@ Prioritize a working non-frozen TEST result with gate-advancing, bounded checks:
 
 ## Canonical References
 
-- Current factual state: `CONTEXT.md`
+- Current status and ordered gates: `docs/ROADMAP.md`
 - Architecture and storage contract: `docs/CURRENT_ARCHITECTURE.md`
 - Ordered engineering gates: `docs/ROADMAP.md`
 - Historical record: `docs/PROJECT_HISTORY.md`

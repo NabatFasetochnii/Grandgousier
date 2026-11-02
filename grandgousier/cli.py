@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import logging
+import os
 import re
 import sys
 import traceback
@@ -19,9 +20,9 @@ from grandgousier.settings import get_settings
 logger = logging.getLogger(__name__)
 
 _P207_GUARDED_LEDGER_FLAG = "--guard-p207-test-readonly-ledger"
-_P207_GUARDED_LEDGER_CONFIG = r"C:\PycharmProjects\grandgousier_p207_test_ro.private.yaml"
+_P207_PRIVATE_CONFIG_ENV = "GRANDGOUSIER_P207_PRIVATE_CONFIG"
+_P207_LEGACY_PRIVATE_CONFIG_BASENAME = "grandgousier_p207_test_ro.private.yaml"
 _P207_GUARDED_PROBE_FLAG = "--guard-p207-test-readonly-probe"
-_P207_GUARDED_PROBE_CONFIG = _P207_GUARDED_LEDGER_CONFIG
 _P207_GUARDED_INTEGRITY_FLAG = "--guard-p207-test-readonly-integrity"
 _P207_PROBE_FAILURE_CODES = frozenset(
     {f"P{position:02d}" for position in range(15)} | {"ROW_SHAPE", "ROW_LIST_SLICING"}
@@ -9803,9 +9804,10 @@ def _maybe_guarded_p207_integrity_schema_status(argv: list[str] | None) -> int |
         ) for token in tokens
     ):
         return None
-    exact = ["--config", _P207_GUARDED_LEDGER_CONFIG,
+    private_config = os.environ.get(_P207_PRIVATE_CONFIG_ENV)
+    exact = ["--config", private_config,
              "schema-status", _P207_GUARDED_INTEGRITY_FLAG]
-    if tokens == exact:
+    if private_config and tokens == exact:
         try:
             from grandgousier.db.migrations import guarded_p207_test_readonly_integrity
 
@@ -9840,10 +9842,11 @@ def _maybe_guarded_p207_probe_schema_status(argv: list[str] | None) -> int | Non
         for token in tokens
     ):
         return None
+    private_config = os.environ.get(_P207_PRIVATE_CONFIG_ENV)
     if tokens != [
-        "--config", _P207_GUARDED_PROBE_CONFIG,
+        "--config", private_config,
         "schema-status", _P207_GUARDED_PROBE_FLAG,
-    ]:
+    ] or not private_config:
         print("STOP P207_GUARDED_PROBE_INVALID_ARGS", file=sys.stderr)
         return 2
     try:
@@ -9878,14 +9881,21 @@ def cmd_finalize_field_series(args: argparse.Namespace) -> int:
 
 def _maybe_guarded_p207_schema_status(argv: list[str] | None) -> int | None:
     tokens = sys.argv[1:] if argv is None else argv
-    # Detect the fixed config path even when the flag is missing or --config is
-    # abbreviated/attached. argparse also accepts prefixes such as --g here;
+    private_config = os.environ.get(_P207_PRIVATE_CONFIG_ENV)
+    # Detect the explicit config path even when the flag is missing or --config
+    # is abbreviated/attached. argparse also accepts prefixes such as --g here;
     # these must not reach the ordinary parser or Settings/.env on schema-status.
     has_schema_status = "schema-status" in tokens
+    if (
+        private_config is None
+        and _p207_legacy_private_config_named(tokens)
+    ):
+        print("STOP P207_CONFIG_REQUIRED", file=sys.stderr)
+        return 2
     if not any(
         isinstance(token, str)
         and (
-            _P207_GUARDED_LEDGER_CONFIG in token
+            (private_config is not None and private_config in token)
             or token.startswith(_P207_GUARDED_LEDGER_FLAG)
             or (
                 (has_schema_status or token.startswith("--guard"))
@@ -9897,9 +9907,9 @@ def _maybe_guarded_p207_schema_status(argv: list[str] | None) -> int | None:
     ):
         return None
     if tokens != [
-        "--config", _P207_GUARDED_LEDGER_CONFIG,
+        "--config", private_config,
         "schema-status", _P207_GUARDED_LEDGER_FLAG,
-    ]:
+    ] or not private_config:
         print("STOP P207_GUARDED_LEDGER_INVALID_ARGS", file=sys.stderr)
         return 2
     try:
@@ -9922,6 +9932,26 @@ def _maybe_guarded_p207_schema_status(argv: list[str] | None) -> int | None:
         return 2
     print("STOP P207_GUARDED_LEDGER_UNVERIFIED", file=sys.stderr)
     return 2
+
+
+def _p207_legacy_private_config_named(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens):
+        if not isinstance(token, str):
+            continue
+        option, separator, value = token.partition("=")
+        if option != "--config" and not (
+            len(option) > 2 and "--config".startswith(option)
+        ):
+            continue
+        config_path = value if separator else (
+            tokens[index + 1] if index + 1 < len(tokens) else None
+        )
+        if not isinstance(config_path, str):
+            continue
+        basename = config_path.replace("\\", "/").rsplit("/", 1)[-1]
+        if basename.casefold() == _P207_LEGACY_PRIVATE_CONFIG_BASENAME.casefold():
+            return True
+    return False
 
 
 def _run_main(argv: list[str] | None = None) -> int:

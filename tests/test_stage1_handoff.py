@@ -4111,8 +4111,9 @@ class _DurablePersistOnlyPostgresHarness:
 def durable_persist_only_postgres_harness(pytestconfig, tmp_path: Path):
     config_path = pytestconfig.getoption("--grandgousier-test-config")
     if not config_path:
-        raise AssertionError(
-            "Durable PostgreSQL tests require the explicit --grandgousier-test-config option"
+        pytest.skip(
+            "Durable PostgreSQL tests require --grandgousier-test-config; "
+            "no database access attempted"
         )
     raw_url = _postgres_integration_raw_url(pytestconfig)
     if raw_url is None:
@@ -4154,6 +4155,56 @@ def durable_persist_only_postgres_harness(pytestconfig, tmp_path: Path):
             harness.cleanup()
         finally:
             engine.dispose()
+
+
+def test_durable_postgres_harness_skips_before_config_path_or_engine_access(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    pytestconfig = _FakePytestConfig()
+    calls = []
+
+    def forbidden(*_args, **_kwargs):
+        calls.append("access")
+        raise AssertionError(
+            "durable PostgreSQL setup must be skipped before config or engine access"
+        )
+
+    monkeypatch.setattr(app_config, "read_config_file", forbidden)
+    monkeypatch.setattr(app_settings, "get_settings", forbidden)
+    monkeypatch.setattr(sys.modules[__name__], "create_engine", forbidden)
+    monkeypatch.setattr(sys.modules[__name__], "_postgres_integration_raw_url", forbidden)
+    harness_fixture = durable_persist_only_postgres_harness.__wrapped__
+    with pytest.raises(pytest.skip.Exception, match="--grandgousier-test-config"):
+        next(harness_fixture(pytestconfig, tmp_path))
+    assert pytestconfig.option_names == ["--grandgousier-test-config"]
+    assert calls == []
+
+
+def test_durable_postgres_harness_rejects_wrong_target_before_engine(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    wrong_url = (
+        f"postgresql://{_POSTGRES_IT_ROLE}:fake-target-secret@{_POSTGRES_IT_HOST}:"
+        f"{_POSTGRES_IT_PORT}/wrong_test_database"
+    )
+    config_path = _write_postgres_test_config(tmp_path, wrong_url)
+    pytestconfig = _FakePytestConfig(config_path)
+    engine_calls = []
+
+    def forbidden_engine(*_args, **_kwargs):
+        engine_calls.append(True)
+        raise AssertionError("durable target pre-pin must precede engine creation")
+
+    monkeypatch.setattr(sys.modules[__name__], "create_engine", forbidden_engine)
+    harness_fixture = durable_persist_only_postgres_harness.__wrapped__
+    with pytest.raises(AssertionError, match="explicit target pre-pin") as exc:
+        next(harness_fixture(pytestconfig, tmp_path))
+    assert exc.value.__cause__ is None
+    assert engine_calls == []
+    assert pytestconfig.option_names == [
+        "--grandgousier-test-config",
+        "--grandgousier-test-config",
+    ]
 
 
 def _make_durable_synthetic_stage1_product(

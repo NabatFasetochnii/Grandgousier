@@ -1,10 +1,10 @@
 # Grandgousier
 
-Версия пакета: **0.7.0.10**
+Версия пакета: **0.7.0.11**
 
 Grandgousier - Python-пакет для индексирования FITS-архивов, forced-aperture фотометрии, локальной и ensemble-калибровки, reference/color calibration, QC объектов, проверки event coverage и отбора кандидатов в переменные объекты.
 
-Актуальное ограниченное live-состояние на 2026-09-28: в `grandgousier_070_gpx_full` все 18 текущих Stage-2 heads имеют статус `READY_STAGE3_RECIPE`; M4 V generation 3 и R generation 4 независимо проверены; M5 экспортировал 134 уникальных candidate ID. Parquet exporter проверен на двух сериях, но full 18-series export, archive-scale performance, полный test suite и release acceptance не проходили. Candidate IDs не означают научно подтверждённые переменные звёзды. Stage 1 reprocess за 2018-09-16 остаётся частичным: 544 raw скачано, 186/544 новых reduced products готовы, 358 осталось; эта работа не меняла БД или aliases. Подробности и точные пределы — в `CONTEXT.md` и `docs/ROADMAP.md`. 0.7 — fresh-baseline schema epoch; frozen 0.6 database не мигрируется in-place.
+Историческая ограниченная live-запись от 2026-09-28 относится к версии 0.7.0.10 и не подтверждает состояние этого source-релиза. На том снимке сообщалось о 18 Stage-2 heads со статусом `READY_STAGE3_RECIPE`, проверках M4 V/R и 134 M5 candidate ID; Parquet smoke охватывал две серии. Эта запись не является научной приёмкой Stage-2/Stage-3 и не устанавливает полный 18-series export, archive-scale performance, полный test suite или release acceptance. Candidate IDs не означают научно подтверждённые переменные звёзды. Stage 1 reprocess за 2018-09-16 в том снимке оставался частичным: 544 raw скачано, 186/544 новых reduced products готовы, 358 осталось; работа не меняла БД или aliases. Этот patch меняет только packaging/docs/config-path/test-harness behavior и не заявляет новой научной валидации. Подтверждённые ограничения и gates описаны в `docs/ROADMAP.md`; 0.7 — fresh-baseline schema epoch, frozen 0.6 database не мигрируется in-place.
 
 Версионные заметки 0.5.x/0.6.x ниже сохранены как историческая документация. Они не заменяют текущие инструкции 0.7 и могут описывать уже superseded workflow или storage.
 
@@ -59,13 +59,10 @@ from grandgousier.api import compute_aperture_error_budget
 
 Для продолжения разработки и переноса работы в новый чат используйте:
 
-- `CONTEXT.md` — короткая входная точка;
 - `docs/CURRENT_ARCHITECTURE.md` — действующая архитектура и storage boundaries;
 - `docs/ROADMAP.md` — ближайшие задачи, ограничения и validation gates;
-- `docs/CURRENT_ARCHITECTURE.md` — действующая архитектура;
 - `docs/PROJECT_HISTORY.md` — единый исторический архив;
-- `context/project_state.yaml` — машиночитаемое резюме;
-- `python scripts/build_context_bundle.py` — сборка переносного context bundle.
+- `docs/user_manual_ru/README.md` — пользовательский LaTeX-мануал;
 
 Старые patch/release/handoff документы объединены в `docs/PROJECT_HISTORY.md`; отдельные файлы больше не являются частью рабочего дерева.
 
@@ -483,7 +480,7 @@ NO_MATCH
 
 ## История проекта
 
-Исторические README/release notes/patch notes/ADR/handoff документы объединены в `docs/PROJECT_HISTORY.md`. Актуальный инженерный план хранится только в `docs/ROADMAP.md`; текущее подтверждённое состояние — в `CONTEXT.md`. Новые Markdown-файлы на каждый patch/version создавать не следует.
+Исторические README/release notes/patch notes/ADR/handoff документы объединены в `docs/PROJECT_HISTORY.md`. Текущие ограничения и инженерные gates хранятся в `docs/ROADMAP.md`, архитектурный контракт — в `docs/CURRENT_ARCHITECTURE.md`. Новые Markdown-файлы на каждый patch/version создавать не следует.
 
 
 ### 0.6.4.5.1 global materialized SCIENCE scope
