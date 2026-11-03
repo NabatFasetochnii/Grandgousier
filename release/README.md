@@ -28,11 +28,30 @@ python tools\release_check.py `
   --snapshot "release\validated_windows_py311\environment_snapshot.json"
 ```
 
+`requirements-release.txt` is the canonical release-environment bootstrap and includes the PEP 517
+frontend, the configured backend requirement (`setuptools>=68`), and checker dependencies. For an
+offline environment, prepare a wheelhouse in advance and install it without contacting an index:
+
+```powershell
+python -m pip install --no-index --find-links "release\wheelhouse" -r requirements-release.txt
+```
+
+Before cleaning or creating build artifacts, the checker validates every applicable requirement in
+`[build-system].requires` against distributions visible to the same Python interpreter. It then runs
+the standard PEP 517 frontend with isolation disabled:
+
+```powershell
+python -m build --sdist --wheel --no-isolation --outdir dist
+```
+
+The frontend honors `[build-system].build-backend`; all declared build requirements must already be
+provisioned. The checker does not download build requirements or fall back to a hard-coded backend.
+
 The checker:
 
 1. verifies `pyproject.toml` and `grandgousier.__version__` agree;
 2. verifies the validated constraints contain all core dependencies;
-3. builds wheel + sdist with `the configured `setuptools.build_meta` PEP-517 backend without build isolation`;
+3. builds wheel + sdist through `python -m build --sdist --wheel --no-isolation --outdir dist`, honoring the configured PEP 517 backend;
 4. checks wheel resources and excludes private/internal paths;
 5. installs the wheel into a temporary target without dependencies and imports it from there;
    starting with 0.5.58.1 this smoke uses `--ignore-installed` plus `python -I -S` and verifies the actual import/resource origin is inside that target;

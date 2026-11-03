@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import email.policy
 import hashlib
+import importlib.metadata
 import json
 import re
 import shutil
@@ -753,19 +754,157 @@ def clean_build_staging() -> list[Path]:
     return removed
 
 
+def _valid_build_backend(value: object) -> bool:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    module, separator, target = value.partition(":")
+
+    def dotted_identifier(candidate: str) -> bool:
+        return bool(candidate) and all(part.isidentifier() for part in candidate.split("."))
+
+    return dotted_identifier(module) and (not separator or dotted_identifier(target))
+
+
+def _installed_distribution_version(name: str) -> Version:
+    return Version(importlib.metadata.version(name))
+
+
+def _display_build_requirement(requirement: Requirement) -> str:
+    name = canonicalize_name(requirement.name)
+    extras = (
+        f"[{','.join(sorted(canonicalize_name(extra) for extra in requirement.extras))}]"
+        if requirement.extras
+        else ""
+    )
+    if requirement.url is not None:
+        return f"{name}{extras} @ <direct reference>"
+    return str(requirement)
+
+
+def check_build_backend_requirements() -> Check:
+    """Verify configured PEP 517 requirements in this interpreter, without installing anything."""
+
+    check_name = "BUILD_BACKEND_REQUIREMENTS_SATISFIED"
+    backend = "<unavailable>"
+    installed: list[str] = []
+    declared: list[str] = []
+    errors: list[str] = []
+    try:
+        project = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    except Exception:
+        return Check(
+            check_name,
+            "FAIL",
+            f"{check_name}=NO; backend={backend}; declared_requires=<unavailable>; "
+            "installed=<none>; errors=pyproject could not be parsed",
+        )
+
+    build_system = project.get("build-system")
+    if not isinstance(build_system, dict):
+        errors.append("[build-system] is missing or is not a table")
+    else:
+        backend_value = build_system.get("build-backend")
+        if _valid_build_backend(backend_value):
+            backend = str(backend_value)
+        else:
+            backend = repr(backend_value) if backend_value is not None else "<missing>"
+            errors.append("invalid or missing build-backend declaration")
+
+        raw_requirements = build_system.get("requires")
+        if not isinstance(raw_requirements, list):
+            declared.append("<unavailable>")
+            errors.append("build-system.requires is missing or is not an array")
+        else:
+            parsed: list[tuple[int, Requirement]] = []
+            for index, raw in enumerate(raw_requirements):
+                if not isinstance(raw, str):
+                    declared.append(f"requires[{index}]=<non-string>")
+                    errors.append(f"requires[{index}] is not a string")
+                    continue
+                try:
+                    requirement = Requirement(raw)
+                except Exception:
+                    declared.append(f"requires[{index}]=<malformed requirement>")
+                    errors.append(f"requires[{index}] is malformed")
+                    continue
+                declared.append(
+                    f"requires[{index}]={_display_build_requirement(requirement)}"
+                )
+                parsed.append((index, requirement))
+
+            for index, requirement in parsed:
+                try:
+                    applicable = (
+                        requirement.marker.evaluate() if requirement.marker is not None else True
+                    )
+                except Exception:
+                    errors.append(f"requires[{index}] marker is unverifiable")
+                    continue
+                name = canonicalize_name(requirement.name)
+                if not applicable:
+                    installed.append(f"{name}=<skipped: marker false>")
+                    continue
+                if requirement.url is not None:
+                    installed.append(f"{name}=<unverifiable direct reference>")
+                    errors.append(
+                        f"requires[{index}] uses an unsupported direct reference"
+                    )
+                    continue
+                if requirement.extras:
+                    installed.append(f"{name}=<unverifiable extras>")
+                    errors.append(
+                        f"requires[{index}] requests extras whose installation cannot be verified"
+                    )
+                    continue
+                try:
+                    version = _installed_distribution_version(requirement.name)
+                except importlib.metadata.PackageNotFoundError:
+                    installed.append(f"{name}=<missing>")
+                    errors.append(f"requires[{index}] distribution {name} is not installed")
+                    continue
+                except Exception:
+                    installed.append(f"{name}=<unverifiable>")
+                    errors.append(f"requires[{index}] installed version for {name} is unverifiable")
+                    continue
+
+                installed.append(f"{name}={version}")
+                if not requirement.specifier.contains(version):
+                    errors.append(
+                        f"requires[{index}] {requirement} is incompatible with installed {version}"
+                    )
+
+    detail = (
+        f"{check_name}={'NO' if errors else 'YES'}; backend={backend}; "
+        f"declared_requires={json.dumps(declared, separators=(',', ':'))}; "
+        f"installed={','.join(installed) if installed else '<none>'}"
+    )
+    if errors:
+        detail += "; errors=" + "; ".join(errors)
+    return Check(check_name, "FAIL" if errors else "OK", detail)
+
+
 def build_release(*, clean: bool = True) -> tuple[list[Check], list[Path]]:
-    checks: list[Check] = []
+    requirements_check = check_build_backend_requirements()
+    checks = [requirements_check]
+    if requirements_check.status != "OK":
+        return checks, []
+
     if clean:
         if DIST.exists():
             shutil.rmtree(DIST)
         clean_build_staging()
     DIST.mkdir(exist_ok=True)
-    code = (
-        "from setuptools import build_meta; "
-        f"print(build_meta.build_sdist({str(DIST)!r})); "
-        f"print(build_meta.build_wheel({str(DIST)!r}))"
-    )
-    proc = run([sys.executable, "-c", code])
+    command = [
+        sys.executable,
+        "-m",
+        "build",
+        "--sdist",
+        "--wheel",
+        "--no-isolation",
+        "--outdir",
+        str(DIST),
+    ]
+    proc = run(command)
     if proc.returncode != 0:
         checks.append(Check("build", "FAIL", (proc.stderr or proc.stdout).strip()[-2000:]))
         return checks, []

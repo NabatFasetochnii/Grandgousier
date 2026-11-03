@@ -237,11 +237,17 @@ def test_build_release_cleans_stale_staging_before_backend(monkeypatch, tmp_path
     monkeypatch.setattr(release_check, "ROOT", tmp_path)
     monkeypatch.setattr(release_check, "DIST", dist)
     monkeypatch.setattr(release_check, "BUILD", build)
+    monkeypatch.setattr(
+        release_check,
+        "_installed_distribution_version",
+        lambda name: release_check.Version("82.0.1" if name == "setuptools" else "0.44"),
+    )
     monkeypatch.setattr(release_check, "run", fake_run)
 
     checks, artifacts = release_check.build_release(clean=True)
 
     assert seen == {"build_exists": False, "egg_exists": False}
+    assert checks[0].name == "BUILD_BACKEND_REQUIREMENTS_SATISFIED"
     assert checks[0].status == "OK"
     assert len(artifacts) == 2
 
@@ -269,6 +275,312 @@ def _write_project(
         + "\n",
         encoding="utf-8",
     )
+
+
+def _write_build_system(
+    path: Path,
+    *,
+    requires: tuple[str, ...] = ("setuptools>=68",),
+    backend: str | None = "custom_backend.api:Builder",
+) -> None:
+    rendered_requires = ", ".join(json.dumps(value) for value in requires)
+    backend_line = (
+        f"build-backend = {json.dumps(backend)}\n" if backend is not None else ""
+    )
+    path.write_text(
+        "[build-system]\n"
+        f"requires = [{rendered_requires}]\n"
+        + backend_line,
+        encoding="utf-8",
+    )
+
+
+def test_build_requirements_fail_before_frontend_or_artifact_creation(monkeypatch, tmp_path):
+    project = tmp_path / "pyproject.toml"
+    _write_build_system(project)
+    dist = tmp_path / "dist"
+    build = tmp_path / "build"
+    monkeypatch.setattr(release_check, "ROOT", tmp_path)
+    monkeypatch.setattr(release_check, "PYPROJECT", project)
+    monkeypatch.setattr(release_check, "DIST", dist)
+    monkeypatch.setattr(release_check, "BUILD", build)
+    monkeypatch.setattr(
+        release_check,
+        "_installed_distribution_version",
+        lambda name: release_check.Version("65.5") if name == "setuptools" else None,
+    )
+    calls = []
+    monkeypatch.setattr(release_check, "run", lambda command, **kwargs: calls.append(command))
+
+    checks, artifacts = release_check.build_release(clean=True)
+
+    assert len(checks) == 1
+    assert checks[0].name == "BUILD_BACKEND_REQUIREMENTS_SATISFIED"
+    assert checks[0].status == "FAIL"
+    assert "BUILD_BACKEND_REQUIREMENTS_SATISFIED=NO" in checks[0].detail
+    assert "backend=custom_backend.api:Builder" in checks[0].detail
+    assert 'declared_requires=["requires[0]=setuptools>=68"]' in checks[0].detail
+    assert "setuptools=65.5" in checks[0].detail
+    assert calls == []
+    assert artifacts == []
+    assert not dist.exists()
+    assert not build.exists()
+
+
+def test_compatible_build_requirements_invoke_configured_pep517_frontend(
+    monkeypatch, tmp_path
+):
+    import subprocess
+
+    project = tmp_path / "pyproject.toml"
+    _write_build_system(project, requires=("setuptools>=68",))
+    dist = tmp_path / "dist"
+    monkeypatch.setattr(release_check, "ROOT", tmp_path)
+    monkeypatch.setattr(release_check, "PYPROJECT", project)
+    monkeypatch.setattr(release_check, "DIST", dist)
+    monkeypatch.setattr(release_check, "BUILD", tmp_path / "build")
+    monkeypatch.setattr(
+        release_check,
+        "_installed_distribution_version",
+        lambda name: release_check.Version("82.0.1"),
+    )
+    calls = []
+
+    def fake_run(command, *, cwd=release_check.ROOT, env=None):
+        calls.append(list(command))
+        (dist / "grandgousier-1.0.0.tar.gz").write_bytes(b"sdist")
+        (dist / "grandgousier-1.0.0-py3-none-any.whl").write_bytes(b"wheel")
+        return subprocess.CompletedProcess(command, 0, stdout="built", stderr="")
+
+    monkeypatch.setattr(release_check, "run", fake_run)
+
+    checks, artifacts = release_check.build_release(clean=False)
+
+    assert checks[0].status == "OK"
+    assert "backend=custom_backend.api:Builder" in checks[0].detail
+    assert 'declared_requires=["requires[0]=setuptools>=68"]' in checks[0].detail
+    assert "setuptools=82.0.1" in checks[0].detail
+    assert calls == [[
+        sys.executable,
+        "-m",
+        "build",
+        "--sdist",
+        "--wheel",
+        "--no-isolation",
+        "--outdir",
+        str(dist),
+    ]]
+    assert len(artifacts) == 2
+
+
+def test_build_requirement_exact_and_lower_bound_versions_use_pep440_semantics(
+    monkeypatch, tmp_path
+):
+    project = tmp_path / "pyproject.toml"
+    _write_build_system(
+        project,
+        requires=("exact-package==1.2.3", "lower-package>=1.2.3"),
+    )
+    versions = {"exact-package": "1.2.3", "lower-package": "1.2.4"}
+    monkeypatch.setattr(release_check, "PYPROJECT", project)
+    monkeypatch.setattr(
+        release_check,
+        "_installed_distribution_version",
+        lambda name: release_check.Version(versions[name]),
+    )
+
+    assert release_check.check_build_backend_requirements().status == "OK"
+
+    versions["exact-package"] = "1.2.4"
+    versions["lower-package"] = "1.2.2"
+    result = release_check.check_build_backend_requirements()
+    assert result.status == "FAIL"
+    assert "exact-package==1.2.3 is incompatible with installed 1.2.4" in result.detail
+    assert "lower-package>=1.2.3 is incompatible with installed 1.2.2" in result.detail
+
+
+def test_missing_build_distribution_fails_closed(monkeypatch, tmp_path):
+    project = tmp_path / "pyproject.toml"
+    _write_build_system(project, requires=("missing-builder>=1",))
+    monkeypatch.setattr(release_check, "PYPROJECT", project)
+
+    def missing_distribution(_name):
+        raise release_check.importlib.metadata.PackageNotFoundError("missing-builder")
+
+    monkeypatch.setattr(release_check, "_installed_distribution_version", missing_distribution)
+    result = release_check.check_build_backend_requirements()
+    assert result.status == "FAIL"
+    assert "BUILD_BACKEND_REQUIREMENTS_SATISFIED=NO" in result.detail
+    assert "missing-builder=<missing>" in result.detail
+
+
+def test_malformed_build_requirement_fails_closed(monkeypatch, tmp_path):
+    project = tmp_path / "pyproject.toml"
+    raw_requirement = "not a valid requirement with secret-token ???"
+    _write_build_system(project, requires=(raw_requirement,))
+    monkeypatch.setattr(release_check, "PYPROJECT", project)
+    monkeypatch.setattr(
+        release_check,
+        "_installed_distribution_version",
+        lambda _name: (_ for _ in ()).throw(AssertionError("must not inspect malformed requirement")),
+    )
+    real_requirement = release_check.Requirement
+
+    def reject_with_echo(value):
+        if value == raw_requirement:
+            raise ValueError(f"parser details echo {value}")
+        return real_requirement(value)
+
+    monkeypatch.setattr(release_check, "Requirement", reject_with_echo)
+
+    result = release_check.check_build_backend_requirements()
+    assert result.status == "FAIL"
+    assert "BUILD_BACKEND_REQUIREMENTS_SATISFIED=NO" in result.detail
+    assert "is malformed" in result.detail
+    assert "<malformed requirement>" in result.detail
+    assert raw_requirement not in result.detail
+    assert "secret-token" not in result.detail
+    assert "parser details echo" not in result.detail
+
+
+def test_build_requirement_markers_are_evaluated(monkeypatch, tmp_path):
+    project = tmp_path / "pyproject.toml"
+    _write_build_system(
+        project,
+        requires=(
+            'active-builder>=1; python_version >= "3.0"',
+            'inactive-builder>=1; sys_platform == "no-such-platform"',
+        ),
+    )
+    seen = []
+
+    def installed_version(name):
+        seen.append(name)
+        return release_check.Version("1.0")
+
+    monkeypatch.setattr(release_check, "PYPROJECT", project)
+    monkeypatch.setattr(release_check, "_installed_distribution_version", installed_version)
+
+    result = release_check.check_build_backend_requirements()
+
+    assert result.status == "OK"
+    assert seen == ["active-builder"]
+    assert "inactive-builder=<skipped: marker false>" in result.detail
+
+
+def test_invalid_or_missing_build_backend_fails_before_frontend(monkeypatch, tmp_path):
+    project = tmp_path / "pyproject.toml"
+    monkeypatch.setattr(release_check, "PYPROJECT", project)
+    monkeypatch.setattr(
+        release_check,
+        "_installed_distribution_version",
+        lambda _name: release_check.Version("1.0"),
+    )
+    calls = []
+    monkeypatch.setattr(release_check, "run", lambda command, **kwargs: calls.append(command))
+
+    for backend in (None, "not a backend"):
+        _write_build_system(project, backend=backend)
+        result, artifacts = release_check.build_release(clean=True)
+        assert result[0].status == "FAIL"
+        assert "invalid or missing build-backend" in result[0].detail
+        expected_backend = "backend=<missing>" if backend is None else "backend='not a backend'"
+        assert expected_backend in result[0].detail
+        assert artifacts == []
+
+    assert calls == []
+    assert not (tmp_path / "dist").exists()
+
+
+def test_frontend_failure_for_unsupported_backend_has_no_fallback(monkeypatch, tmp_path):
+    import subprocess
+
+    project = tmp_path / "pyproject.toml"
+    _write_build_system(project, backend="unsupported_backend:build")
+    dist = tmp_path / "dist"
+    monkeypatch.setattr(release_check, "ROOT", tmp_path)
+    monkeypatch.setattr(release_check, "PYPROJECT", project)
+    monkeypatch.setattr(release_check, "DIST", dist)
+    monkeypatch.setattr(release_check, "BUILD", tmp_path / "build")
+    monkeypatch.setattr(
+        release_check,
+        "_installed_distribution_version",
+        lambda _name: release_check.Version("82.0.1"),
+    )
+    calls = []
+
+    def frontend_failure(command, **kwargs):
+        calls.append(list(command))
+        return subprocess.CompletedProcess(
+            command, 1, stdout="", stderr="unsupported backend"
+        )
+
+    monkeypatch.setattr(release_check, "run", frontend_failure)
+
+    checks, artifacts = release_check.build_release(clean=False)
+
+    assert checks[0].status == "OK"
+    assert checks[1].name == "build"
+    assert checks[1].status == "FAIL"
+    assert "unsupported backend" in checks[1].detail
+    assert len(calls) == 1
+    assert calls[0][1:3] == ["-m", "build"]
+    assert "-c" not in calls[0]
+    assert artifacts == []
+
+
+def test_main_reports_incompatible_build_requirements_as_failed_without_artifacts(
+    monkeypatch, tmp_path
+):
+    project = tmp_path / "pyproject.toml"
+    _write_build_system(project, requires=("setuptools>=68",))
+    dist = tmp_path / "dist"
+    monkeypatch.setattr(release_check, "ROOT", tmp_path)
+    monkeypatch.setattr(release_check, "PYPROJECT", project)
+    monkeypatch.setattr(release_check, "DIST", dist)
+    monkeypatch.setattr(release_check, "BUILD", tmp_path / "build")
+    monkeypatch.setattr(release_check, "read_versions", lambda: ("1.0.0", "1.0.0"))
+    monkeypatch.setattr(
+        release_check,
+        "_installed_distribution_version",
+        lambda _name: release_check.Version("65.5"),
+    )
+    calls = []
+    monkeypatch.setattr(release_check, "run", lambda command, **kwargs: calls.append(command))
+
+    assert release_check.main(["--report", "release-report.json"]) == 1
+
+    report = json.loads((tmp_path / "release-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "FAILED"
+    requirement_check = next(
+        row
+        for row in report["checks"]
+        if row["name"] == "BUILD_BACKEND_REQUIREMENTS_SATISFIED"
+    )
+    assert requirement_check["status"] == "FAIL"
+    assert "BUILD_BACKEND_REQUIREMENTS_SATISFIED=NO" in requirement_check["detail"]
+    assert calls == []
+    assert report["artifacts"] == []
+    assert not list(dist.glob("*.whl"))
+    assert not list(dist.glob("*.tar.gz"))
+
+
+def test_direct_url_build_requirement_is_unverifiable_and_rejected(monkeypatch, tmp_path):
+    project = tmp_path / "pyproject.toml"
+    _write_build_system(
+        project,
+        requires=("builder @ https://username:secret-token@example.invalid/builder.whl",),
+    )
+    monkeypatch.setattr(release_check, "PYPROJECT", project)
+
+    result = release_check.check_build_backend_requirements()
+
+    assert result.status == "FAIL"
+    assert "unsupported direct reference" in result.detail
+    assert "builder=<unverifiable direct reference>" in result.detail
+    assert 'declared_requires=["requires[0]=builder @ <direct reference>"]' in result.detail
+    assert "username" not in result.detail
+    assert "secret-token" not in result.detail
 
 
 def _metadata_text(
