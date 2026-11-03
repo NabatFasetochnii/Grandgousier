@@ -3,9 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 
+ALLOWED_PUBLIC_MASTER_PHYSICAL_LOCATORS = ("/master/imdata/",)
+
 FORBIDDEN_PUBLIC_STRINGS = (
     "master.kourovka.ru",
-    "/master/imdata/",
     "master2/processing.php",
     "master2/index.php",
     "MASTER Collaboration Private Area",
@@ -25,6 +26,17 @@ def test_public_package_has_no_private_master_transport_details() -> None:
     lowered = corpus.lower()
     for token in FORBIDDEN_PUBLIC_STRINGS:
         assert token.lower() not in lowered, token
+
+
+def test_public_package_allows_canonical_master_physical_locator() -> None:
+    root = Path(__file__).resolve().parents[1]
+    public_files = [root / "pyproject.toml", root / "README_PUBLIC.md"]
+    public_files.extend((root / "grandgousier").rglob("*.py"))
+    public_files.extend((root / "grandgousier").rglob("*.yaml"))
+    public_files.extend((root / "grandgousier").rglob("*.sql"))
+    corpus = "\n".join(path.read_text(encoding="utf-8", errors="ignore") for path in public_files)
+    for locator in ALLOWED_PUBLIC_MASTER_PHYSICAL_LOCATORS:
+        assert locator in corpus, locator
 
 
 def test_private_remote_adapter_is_outside_public_package() -> None:
