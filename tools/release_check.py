@@ -5,6 +5,7 @@ import email.policy
 import hashlib
 import importlib.metadata
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -13,12 +14,13 @@ import tarfile
 import tempfile
 import tomllib
 import zipfile
+from collections import deque
 from dataclasses import dataclass, asdict
 from email.parser import BytesParser
 from pathlib import Path
 from pathlib import PurePosixPath
 
-from packaging.markers import Marker
+from packaging.markers import Marker, default_environment
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
@@ -941,6 +943,93 @@ def check_constraints(path: Path | None) -> Check:
 
 
 
+SNAPSHOT_CLOSURE_FORMAT = "grandgousier_dependency_closure_v1"
+
+
+def _snapshot_requirement_record(record: object) -> tuple[str, tuple[str, ...], Marker | None]:
+    if not isinstance(record, dict):
+        raise ValueError("requirement record is not an object")
+    name = record.get("name")
+    extras = record.get("extras")
+    specifier = record.get("specifier")
+    marker_value = record.get("marker")
+    if not isinstance(name, str) or _canonical_name(name) != name:
+        raise ValueError("requirement name is invalid or not canonical")
+    if (
+        not isinstance(extras, list)
+        or any(not isinstance(extra, str) for extra in extras)
+        or extras != sorted(set(extras))
+        or any(_canonical_name(extra) != extra for extra in extras)
+    ):
+        raise ValueError("requirement extras are invalid or not canonical")
+    if not isinstance(specifier, str) or not isinstance(record.get("url_present"), bool):
+        raise ValueError("requirement specifier/reference fields are invalid")
+    SpecifierSet(specifier)
+    if marker_value is None:
+        marker = None
+    elif isinstance(marker_value, str):
+        marker = Marker(marker_value)
+    else:
+        raise ValueError("requirement marker is invalid")
+    return name, tuple(extras), marker
+
+
+def _snapshot_marker_applies(marker: Marker | None, *, extra: str) -> bool:
+    if marker is None:
+        return True
+    environment = default_environment()
+    environment["extra"] = extra
+    return bool(marker.evaluate(environment))
+
+
+def _snapshot_marker_applies_for_extras(
+    marker: Marker | None, extras: tuple[str, ...]
+) -> bool:
+    contexts = extras or ("",)
+    return any(
+        _snapshot_marker_applies(marker, extra=extra)
+        for extra in contexts
+    )
+
+
+def _snapshot_root_requirements(
+    project: dict, selected_extras: list[str]
+) -> list[tuple[Requirement, str]]:
+    project_metadata = project["project"]
+    optional = project_metadata.get("optional-dependencies", {})
+    if not isinstance(optional, dict):
+        raise ValueError("project.optional-dependencies is not a table")
+    groups: dict[str, list[str]] = {}
+    for group, values in optional.items():
+        if not isinstance(group, str) or not isinstance(values, list):
+            raise ValueError("optional dependency group is malformed")
+        canonical = _canonical_name(group)
+        if canonical in groups:
+            raise ValueError("duplicate normalized optional dependency group")
+        if any(not isinstance(value, str) for value in values):
+            raise ValueError(f"optional dependency group {canonical} is malformed")
+        groups[canonical] = values
+
+    selected: list[str] = []
+    for extra in selected_extras:
+        canonical = _canonical_name(extra)
+        if canonical not in groups:
+            raise ValueError(f"unknown selected optional dependency group {canonical}")
+        selected.append(canonical)
+    if len(selected) != len(set(selected)):
+        raise ValueError("selected optional dependency groups contain duplicates")
+
+    requirements = []
+    core = project_metadata.get("dependencies", [])
+    if not isinstance(core, list) or any(not isinstance(value, str) for value in core):
+        raise ValueError("project.dependencies is malformed")
+    requirements.extend((Requirement(value), "") for value in core)
+    for canonical in sorted(selected):
+        values = groups[canonical]
+        requirements.extend((Requirement(value), canonical) for value in values)
+    return requirements
+
+
 def check_snapshot(path: Path | None, *, version: str) -> Check:
     if path is None:
         return Check("validated_snapshot", "WARN", "not supplied")
@@ -950,27 +1039,263 @@ def check_snapshot(path: Path | None, *, version: str) -> Check:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         return Check("validated_snapshot", "FAIL", f"invalid JSON: {exc}")
+    if not isinstance(payload, dict):
+        return Check("validated_snapshot", "FAIL", "snapshot root is not an object")
     problems = []
-    if payload.get("format") != "grandgousier_environment_snapshot_v1":
+    if payload.get("format") != "grandgousier_environment_snapshot_v2":
         problems.append("format")
     if str(payload.get("grandgousier_version")) != version:
         problems.append(f"version={payload.get('grandgousier_version')}")
     if payload.get("pyproject_sha256") != sha256_file(PYPROJECT):
         problems.append("pyproject_sha256")
-    if payload.get("missing_required_packages"):
-        problems.append("missing_required_packages")
+    missing = payload.get("missing_required_packages")
+    if not isinstance(missing, list) or any(not isinstance(name, str) for name in missing):
+        problems.append("missing_required_packages_invalid")
+    elif missing:
+        problems.append("missing_required_packages=" + ",".join(sorted(set(missing))))
+
+    closure = payload.get("dependency_closure")
+    if not isinstance(closure, dict):
+        problems.append("dependency_closure_missing")
+    else:
+        if closure.get("format") != SNAPSHOT_CLOSURE_FORMAT:
+            problems.append("dependency_closure_format")
+        if closure.get("complete") is not True:
+            problems.append("dependency_closure_incomplete")
+        unresolved = closure.get("unresolved_requirements")
+        if not isinstance(unresolved, list) or any(not isinstance(item, str) for item in unresolved):
+            problems.append("unresolved_requirements_invalid")
+        elif unresolved:
+            problems.append("unresolved_requirements=" + ",".join(sorted(set(unresolved))))
+
+    packages_value = payload.get("packages")
+    package_rows: dict[str, dict] = {}
+    package_requirements: dict[str, list[tuple[str, tuple[str, ...], Marker | None]]] = {}
+    if not isinstance(packages_value, list):
+        problems.append("packages_invalid")
+    else:
+        for index, row in enumerate(packages_value):
+            if not isinstance(row, dict):
+                problems.append(f"package_record_invalid={index}")
+                continue
+            name = row.get("canonical_name")
+            display_name = row.get("name")
+            try:
+                canonical = _canonical_name(name) if isinstance(name, str) else ""
+            except ValueError:
+                canonical = ""
+            if not canonical or canonical != name:
+                problems.append(f"package_name_invalid={index}")
+                continue
+            if canonical in package_rows:
+                problems.append(f"package_duplicate={canonical}")
+                continue
+            try:
+                if not isinstance(display_name, str) or _canonical_name(display_name) != canonical:
+                    raise ValueError("display name does not match canonical name")
+                raw_requirements = row.get("requires")
+                if not isinstance(raw_requirements, list):
+                    raise ValueError("requires is missing or not a list")
+                package_requirements[canonical] = [
+                    _snapshot_requirement_record(item) for item in raw_requirements
+                ]
+            except Exception:
+                problems.append(f"package_requirements_invalid={canonical}")
+                package_requirements[canonical] = []
+            package_rows[canonical] = row
+
+    package_count = payload.get("package_count")
+    if (
+        not isinstance(package_count, int)
+        or isinstance(package_count, bool)
+        or not isinstance(packages_value, list)
+        or package_count != len(packages_value)
+    ):
+        problems.append("package_count_mismatch")
+
+    selected_extras = payload.get("selected_extras")
+    if not isinstance(selected_extras, list) or any(
+        not isinstance(extra, str) for extra in selected_extras
+    ):
+        problems.append("selected_extras_invalid")
+        selected_extras = []
+
+    recorded_states: set[tuple[str, tuple[str, ...]]] = set()
+    if isinstance(closure, dict):
+        raw_states = closure.get("states")
+        if not isinstance(raw_states, list):
+            problems.append("closure_states_invalid")
+        else:
+            for index, state in enumerate(raw_states):
+                if not isinstance(state, dict):
+                    problems.append(f"closure_state_invalid={index}")
+                    continue
+                name = state.get("canonical_name")
+                extras = state.get("extras")
+                try:
+                    if not isinstance(name, str) or _canonical_name(name) != name:
+                        raise ValueError
+                    if (
+                        not isinstance(extras, list)
+                        or any(not isinstance(extra, str) for extra in extras)
+                        or extras != sorted(set(extras))
+                        or any(_canonical_name(extra) != extra for extra in extras)
+                    ):
+                        raise ValueError
+                except ValueError:
+                    problems.append(f"closure_state_invalid={index}")
+                    continue
+                state_key = (name, tuple(extras))
+                if state_key in recorded_states:
+                    problems.append(f"closure_state_duplicate={name}")
+                recorded_states.add(state_key)
+
+    try:
+        project = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+        root_requirements = _snapshot_root_requirements(project, selected_extras)
+        expected_states: set[tuple[str, tuple[str, ...]]] = set()
+        queue: deque[tuple[str, tuple[str, ...]]] = deque()
+        for requirement, active_extra in root_requirements:
+            if requirement.marker is None or _snapshot_marker_applies(
+                requirement.marker, extra=active_extra
+            ):
+                queue.append(
+                    (
+                        canonicalize_name(requirement.name),
+                        tuple(sorted(canonicalize_name(extra) for extra in requirement.extras)),
+                    )
+                )
+        while queue:
+            name, extras = queue.popleft()
+            state = (name, extras)
+            if state in expected_states:
+                continue
+            expected_states.add(state)
+            if name not in package_rows:
+                continue
+            for dependency_name, dependency_extras, marker in package_requirements.get(name, []):
+                if _snapshot_marker_applies_for_extras(marker, extras):
+                    queue.append((dependency_name, dependency_extras))
+
+        missing_packages = sorted({name for name, _ in expected_states} - set(package_rows))
+        extra_packages = sorted(set(package_rows) - {name for name, _ in expected_states})
+        if missing_packages:
+            problems.append("closure_packages_missing=" + ",".join(missing_packages))
+        if extra_packages:
+            problems.append("closure_packages_unexpected=" + ",".join(extra_packages))
+        missing_states = sorted(expected_states - recorded_states)
+        unexpected_states = sorted(recorded_states - expected_states)
+        if missing_states:
+            problems.append(
+                "closure_states_missing="
+                + ",".join(name + (f"[{','.join(extras)}]" if extras else "") for name, extras in missing_states)
+            )
+        if unexpected_states:
+            problems.append(
+                "closure_states_unexpected="
+                + ",".join(name + (f"[{','.join(extras)}]" if extras else "") for name, extras in unexpected_states)
+            )
+    except Exception as exc:
+        problems.append(f"closure_unverifiable={type(exc).__name__}")
+
     if problems:
-        return Check("validated_snapshot", "FAIL", "mismatch=" + ",".join(problems))
-    py = payload.get("python", {}).get("version", "unknown")
-    platform_name = payload.get("platform", {}).get("system", "unknown")
-    return Check("validated_snapshot", "OK", f"python={py}, platform={platform_name}, packages={payload.get('package_count')}")
+        return Check("validated_snapshot", "FAIL", "mismatch=" + ";".join(problems))
+    python_info = payload.get("python")
+    platform_info = payload.get("platform")
+    py = python_info.get("version", "unknown") if isinstance(python_info, dict) else "unknown"
+    platform_name = (
+        platform_info.get("system", "unknown")
+        if isinstance(platform_info, dict)
+        else "unknown"
+    )
+    return Check(
+        "validated_snapshot",
+        "OK",
+        f"python={py}, platform={platform_name}, packages={package_count}",
+    )
+
+def validate_artifacts(artifacts: list[Path], version: str) -> list[Check]:
+    """Run the shared wheel/sdist validation gates without changing artifacts."""
+
+    checks: list[Check] = []
+    wheels = [path for path in artifacts if path.suffix == ".whl"]
+    sdists = [path for path in artifacts if path.name.endswith(".tar.gz")]
+    if len(wheels) == 1:
+        checks.extend(inspect_wheel(wheels[0], version))
+        checks.append(install_smoke(wheels[0], version))
+    else:
+        checks.append(Check("wheel", "FAIL", f"wheel artifacts={len(wheels)}"))
+        checks.extend(
+            Check(name, "FAIL", "wheel artifact unavailable")
+            for name in (
+                "wheel_metadata",
+                "wheel_dependencies_match_source",
+                "wheel_extras_match_source",
+            )
+        )
+    if len(sdists) == 1:
+        checks.extend(inspect_sdist(sdists[0], version=version))
+    else:
+        checks.append(Check("sdist", "FAIL", f"sdist artifacts={len(sdists)}"))
+        checks.extend(
+            Check(name, "FAIL", "sdist artifact unavailable")
+            for name in (
+                "sdist_dependencies_match_source",
+                "sdist_extras_match_source",
+                "sdist_metadata_copies_consistent",
+                "sdist_metadata_version",
+            )
+        )
+    if len(wheels) == 1 and len(sdists) == 1:
+        checks.extend(compare_wheel_sdist_metadata(wheels[0], sdists[0]))
+    else:
+        checks.extend(
+            Check(name, "FAIL", "wheel or sdist artifact unavailable")
+            for name in (
+                "wheel_sdist_dependencies_match",
+                "wheel_sdist_extras_match",
+            )
+        )
+    return checks
+
+
+def _rooted_path(value: str | Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else ROOT / path
+
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Build and validate Grandgousier wheel/sdist release artifacts.")
     p.add_argument("--constraints", help="Validated constraints snapshot to require/check")
     p.add_argument("--snapshot", help="environment_snapshot.json paired with the validated constraints")
     p.add_argument("--report", default="dist/release_check.json")
+    p.add_argument(
+        "--verify-existing",
+        action="store_true",
+        help="Validate exact existing wheel and sdist paths without building or modifying them",
+    )
+    p.add_argument("--wheel", help="Exact wheel path required with --verify-existing")
+    p.add_argument("--sdist", help="Exact sdist path required with --verify-existing")
     args = p.parse_args(argv)
+
+    if args.verify_existing:
+        if not args.wheel or not args.sdist:
+            p.error("--verify-existing requires both --wheel and --sdist")
+        wheel_path = _rooted_path(args.wheel)
+        sdist_path = _rooted_path(args.sdist)
+        report_path = _rooted_path(args.report)
+        same_report = report_path.resolve() in {wheel_path.resolve(), sdist_path.resolve()}
+        if report_path.exists():
+            same_report = same_report or any(
+                artifact.exists() and os.path.samefile(report_path, artifact)
+                for artifact in (wheel_path, sdist_path)
+            )
+        if same_report:
+            p.error("--report must not point to either artifact")
+        if report_path.exists() or report_path.is_symlink():
+            p.error("--verify-existing refuses to overwrite an existing --report path")
+    elif args.wheel or args.sdist:
+        p.error("--wheel and --sdist are only accepted with --verify-existing")
 
     checks: list[Check] = []
     try:
@@ -993,63 +1318,50 @@ def main(argv: list[str] | None = None) -> int:
         else:
             checks.append(Check("pipfile_lock", "OK", f"legacy/non-authoritative; python_version={lock_py or 'unknown'}"))
 
-    build_checks, artifacts = build_release()
-    checks.extend(build_checks)
-    if artifacts:
-        wheels = [p for p in artifacts if p.suffix == ".whl"]
-        sdists = [p for p in artifacts if p.name.endswith(".tar.gz")]
-        if len(wheels) == 1:
-            checks.extend(inspect_wheel(wheels[0], pyproject_version))
-            checks.append(install_smoke(wheels[0], pyproject_version))
+    artifacts: list[Path] = []
+    if args.verify_existing:
+        exact_artifacts = [wheel_path, sdist_path]
+        missing = [str(path) for path in exact_artifacts if not path.is_file()]
+        if missing:
+            checks.append(
+                Check("existing_artifacts", "FAIL", "not found=" + ",".join(missing))
+            )
         else:
-            checks.append(Check("wheel", "FAIL", f"wheel artifacts={len(wheels)}"))
-            checks.extend(
-                Check(name, "FAIL", "wheel artifact unavailable")
-                for name in (
-                    "wheel_metadata",
-                    "wheel_dependencies_match_source",
-                    "wheel_extras_match_source",
+            checks.append(
+                Check(
+                    "existing_artifacts",
+                    "OK",
+                    f"wheel={wheel_path.name},sdist={sdist_path.name}",
                 )
             )
-        if len(sdists) == 1:
-            checks.extend(inspect_sdist(sdists[0], version=pyproject_version))
-        else:
-            checks.append(Check("sdist", "FAIL", f"sdist artifacts={len(sdists)}"))
-            checks.extend(
-                Check(name, "FAIL", "sdist artifact unavailable")
-                for name in (
-                    "sdist_dependencies_match_source",
-                    "sdist_extras_match_source",
-                    "sdist_metadata_copies_consistent",
-                    "sdist_metadata_version",
-                )
-            )
-        if len(wheels) == 1 and len(sdists) == 1:
-            checks.extend(compare_wheel_sdist_metadata(wheels[0], sdists[0]))
-        else:
-            checks.extend(
-                Check(name, "FAIL", "wheel or sdist artifact unavailable")
-                for name in (
-                    "wheel_sdist_dependencies_match",
-                    "wheel_sdist_extras_match",
-                )
-            )
-        sums = write_checksums(artifacts)
-        checks.append(Check("checksums", "OK", str(sums.relative_to(ROOT))))
+            artifacts = exact_artifacts
+            checks.extend(validate_artifacts(artifacts, pyproject_version))
+    else:
+        build_checks, artifacts = build_release()
+        checks.extend(build_checks)
+        if artifacts:
+            checks.extend(validate_artifacts(artifacts, pyproject_version))
+            sums = write_checksums(artifacts)
+            checks.append(Check("checksums", "OK", str(sums.relative_to(ROOT))))
 
     overall = "FAILED" if any(c.status == "FAIL" for c in checks) else ("READY_WITH_WARNINGS" if any(c.status == "WARN" for c in checks) else "READY")
     report = {
         "format": "grandgousier_release_check_v1",
+        "mode": "verify-existing" if args.verify_existing else "build-and-check",
         "status": overall,
         "version": pyproject_version,
         "python": sys.version,
         "checks": [asdict(c) for c in checks],
         "artifacts": [
-            {"path": str(p.relative_to(ROOT)), "sha256": sha256_file(p), "size": p.stat().st_size}
+            {
+                "path": str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(p),
+                "sha256": sha256_file(p),
+                "size": p.stat().st_size,
+            }
             for p in artifacts
         ],
     }
-    report_path = ROOT / args.report
+    report_path = _rooted_path(args.report)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 

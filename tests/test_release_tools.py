@@ -9,6 +9,7 @@ import tomllib
 import zipfile
 from pathlib import Path
 
+import pytest
 from packaging.markers import Marker
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
@@ -54,21 +55,39 @@ def test_check_constraints_requires_core_dependency_names(tmp_path):
     assert result.status == "OK"
 
 
-def test_check_snapshot_binds_version_and_pyproject(tmp_path):
+def test_check_snapshot_binds_version_pyproject_and_complete_closure(monkeypatch, tmp_path):
     version, _ = release_check.read_versions()
+    project = tmp_path / "pyproject.toml"
+    _write_project(project, dependencies=(), version=version)
+    monkeypatch.setattr(release_check, "PYPROJECT", project)
     path = tmp_path / "environment_snapshot.json"
-    path.write_text(json.dumps({
-        "format": "grandgousier_environment_snapshot_v1",
+    payload = {
+        "format": "grandgousier_environment_snapshot_v2",
         "grandgousier_version": version,
-        "pyproject_sha256": release_check.sha256_file(release_check.PYPROJECT),
+        "pyproject_sha256": release_check.sha256_file(project),
         "missing_required_packages": [],
-        "package_count": 12,
+        "selected_extras": [],
+        "package_count": 0,
+        "packages": [],
+        "dependency_closure": {
+            "format": release_check.SNAPSHOT_CLOSURE_FORMAT,
+            "complete": True,
+            "states": [],
+            "unresolved_requirements": [],
+        },
         "python": {"version": "3.11.0"},
         "platform": {"system": "Windows"},
-    }), encoding="utf-8")
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
     result = release_check.check_snapshot(path, version=version)
     assert result.status == "OK"
     assert "Windows" in result.detail
+
+    payload["format"] = "grandgousier_environment_snapshot_v1"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    legacy = release_check.check_snapshot(path, version=version)
+    assert legacy.status == "FAIL"
+    assert "mismatch=format" in legacy.detail
 
 
 def test_wheel_inspection_rejects_private_paths_and_accepts_resources(tmp_path):
@@ -293,6 +312,305 @@ def _write_build_system(
         + backend_line,
         encoding="utf-8",
     )
+
+
+class _FakeDistribution:
+    def __init__(self, name: str, requires: tuple[str, ...] = ()):
+        self.metadata = {"Name": name}
+        self.version = "1.0"
+        self.requires = list(requires)
+
+    def read_text(self, _name: str) -> None:
+        return None
+
+
+def _fake_distributions(monkeypatch, *distributions: _FakeDistribution) -> None:
+    installed = {
+        canonicalize_name(distribution.metadata["Name"]): distribution
+        for distribution in distributions
+    }
+    monkeypatch.setattr(snapshot, "_installed_distributions", lambda: installed)
+
+
+def _closure_names(closure) -> list[str]:
+    return [row["canonical_name"] for row in closure.packages]
+
+
+def test_dependency_closure_and_checker_use_only_selected_extra_context(
+    monkeypatch, tmp_path
+):
+    cases = (
+        (
+            "root-extra",
+            "foo[bar]",
+            ('helper; extra == "bar"',),
+            ["foo", "helper"],
+        ),
+        (
+            "no-extra",
+            "foo",
+            ('helper; extra == "bar"',),
+            ["foo"],
+        ),
+        (
+            "negative-extra",
+            "foo[binary]",
+            (
+                'helper; extra != "binary"',
+                'ordinary; python_version >= "3.0"',
+            ),
+            ["foo", "ordinary"],
+        ),
+    )
+
+    for name, root_requirement, requires, expected_names in cases:
+        project_path = tmp_path / name / "pyproject.toml"
+        project_path.parent.mkdir()
+        _write_project(
+            project_path,
+            dependencies=(root_requirement,),
+            version="1.2.3",
+        )
+        project = tomllib.loads(project_path.read_text(encoding="utf-8"))
+        _fake_distributions(
+            monkeypatch,
+            _FakeDistribution("foo", requires),
+            _FakeDistribution("helper"),
+            _FakeDistribution("ordinary"),
+        )
+
+        closure = snapshot.dependency_closure(project, ())
+        assert _closure_names(closure) == expected_names
+        assert closure.complete
+
+        monkeypatch.setattr(release_check, "PYPROJECT", project_path)
+        snapshot_path = project_path.parent / "environment_snapshot.json"
+        snapshot_path.write_text(
+            json.dumps(
+                {
+                    "format": "grandgousier_environment_snapshot_v2",
+                    "grandgousier_version": "1.2.3",
+                    "pyproject_sha256": release_check.sha256_file(project_path),
+                    "selected_extras": [],
+                    "missing_required_packages": closure.missing,
+                    "package_count": len(closure.packages),
+                    "packages": closure.packages,
+                    "dependency_closure": {
+                        "format": snapshot.DEPENDENCY_CLOSURE_FORMAT,
+                        "complete": closure.complete,
+                        "states": closure.states,
+                        "unresolved_requirements": closure.unresolved_requirements,
+                    },
+                    "python": {"version": "3.11.0"},
+                    "platform": {"system": "Windows"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        checked = release_check.check_snapshot(snapshot_path, version="1.2.3")
+        assert checked.status == "OK", checked.detail
+
+
+def test_dependency_closure_selects_root_optional_extra_only_when_requested(monkeypatch):
+    _fake_distributions(
+        monkeypatch,
+        _FakeDistribution("alpha"),
+        _FakeDistribution("beta"),
+    )
+    project = {
+        "project": {
+            "dependencies": ["alpha"],
+            "optional-dependencies": {
+                "fast": ['beta; extra == "fast"'],
+            },
+        }
+    }
+
+    core = snapshot.dependency_closure(project, ())
+    with_extra = snapshot.dependency_closure(project, ("fast",))
+
+    assert _closure_names(core) == ["alpha"]
+    assert _closure_names(with_extra) == ["alpha", "beta"]
+    assert with_extra.states == [
+        {"canonical_name": "alpha", "extras": []},
+        {"canonical_name": "beta", "extras": []},
+    ]
+
+
+def test_dependency_closure_evaluates_multiple_active_extras(monkeypatch):
+    _fake_distributions(
+        monkeypatch,
+        _FakeDistribution(
+            "alpha",
+            (
+                'first-dependency; extra == "first"',
+                'second-dependency; extra == "second"',
+            ),
+        ),
+        _FakeDistribution("first-dependency"),
+        _FakeDistribution("second-dependency"),
+    )
+    project = {"project": {"dependencies": ["alpha[first,second]"]}}
+
+    closure = snapshot.dependency_closure(project, ())
+
+    assert _closure_names(closure) == ["alpha", "first-dependency", "second-dependency"]
+    assert {tuple(state["extras"]) for state in closure.states if state["canonical_name"] == "alpha"} == {
+        ("first", "second")
+    }
+
+
+def test_dependency_closure_propagates_dependency_extras(monkeypatch):
+    _fake_distributions(
+        monkeypatch,
+        _FakeDistribution("root", ('middle[speed]>=2; python_version >= "3.0"',)),
+        _FakeDistribution("middle", ('leaf; extra == "speed"',)),
+        _FakeDistribution("leaf"),
+    )
+    project = {"project": {"dependencies": ["root"]}}
+
+    closure = snapshot.dependency_closure(project, ())
+
+    assert _closure_names(closure) == ["leaf", "middle", "root"]
+    assert {tuple(state["extras"]) for state in closure.states if state["canonical_name"] == "middle"} == {
+        ("speed",)
+    }
+    middle_edge = next(
+        row for row in closure.packages if row["canonical_name"] == "root"
+    )["requires"][0]
+    assert middle_edge["extras"] == ["speed"]
+
+
+def test_dependency_closure_evaluates_environment_and_extra_markers(monkeypatch):
+    _fake_distributions(
+        monkeypatch,
+        _FakeDistribution(
+            "alpha",
+            (
+                'active; python_version >= "3.0" and extra == "enabled"',
+                'inactive; sys_platform == "no-such-platform" and extra == "enabled"',
+            ),
+        ),
+        _FakeDistribution("active"),
+        _FakeDistribution("inactive"),
+    )
+    project = {"project": {"dependencies": ["alpha[enabled]"]}}
+
+    closure = snapshot.dependency_closure(project, ())
+
+    assert _closure_names(closure) == ["active", "alpha"]
+
+
+def test_dependency_closure_cycles_terminate_by_name_and_extras(monkeypatch):
+    _fake_distributions(
+        monkeypatch,
+        _FakeDistribution("alpha", ("beta[feature]",)),
+        _FakeDistribution("beta", ('alpha[feature]; extra == "feature"',)),
+    )
+    project = {"project": {"dependencies": ["alpha"]}}
+
+    closure = snapshot.dependency_closure(project, ())
+
+    assert _closure_names(closure) == ["alpha", "beta"]
+    assert closure.states == [
+        {"canonical_name": "alpha", "extras": []},
+        {"canonical_name": "alpha", "extras": ["feature"]},
+        {"canonical_name": "beta", "extras": ["feature"]},
+    ]
+
+
+def test_dependency_closure_reports_missing_distribution_and_incomplete_state(monkeypatch):
+    _fake_distributions(monkeypatch, _FakeDistribution("present"))
+    project = {"project": {"dependencies": ["present", "missing"]}}
+
+    closure = snapshot.dependency_closure(project, ())
+
+    assert closure.missing == ["missing"]
+    assert not closure.complete
+    assert closure.states == [
+        {"canonical_name": "missing", "extras": []},
+        {"canonical_name": "present", "extras": []},
+    ]
+
+
+def test_dependency_closure_output_is_deterministic_across_distribution_order(monkeypatch):
+    alpha = _FakeDistribution("alpha", ("charlie>=1", "bravo>=1"))
+    bravo = _FakeDistribution("bravo")
+    charlie = _FakeDistribution("charlie")
+    project = {"project": {"dependencies": ["alpha"]}}
+
+    _fake_distributions(monkeypatch, alpha, bravo, charlie)
+    first = snapshot.dependency_closure(project, ())
+    _fake_distributions(monkeypatch, charlie, bravo, alpha)
+    second = snapshot.dependency_closure(project, ())
+
+    assert first == second
+
+
+def test_dependency_closure_includes_psycopg_binary_extra_dependency(monkeypatch):
+    _fake_distributions(
+        monkeypatch,
+        _FakeDistribution("psycopg", ('psycopg-binary>=3.1; extra == "binary"',)),
+        _FakeDistribution("psycopg-binary"),
+    )
+    project = {"project": {"dependencies": ["psycopg[binary]>=3.1"]}}
+
+    closure = snapshot.dependency_closure(project, ())
+
+    assert _closure_names(closure) == ["psycopg", "psycopg-binary"]
+    assert closure.complete
+    psycopg = next(row for row in closure.packages if row["canonical_name"] == "psycopg")
+    assert psycopg["requires"][0]["extras"] == []
+    assert psycopg["requires"][0]["name"] == "psycopg-binary"
+
+
+def test_check_snapshot_rejects_psycopg_snapshot_missing_binary_extra_dependency(
+    monkeypatch, tmp_path
+):
+    project = tmp_path / "pyproject.toml"
+    _write_project(
+        project,
+        dependencies=("psycopg[binary]>=3.1",),
+        version="1.2.3",
+    )
+    monkeypatch.setattr(release_check, "PYPROJECT", project)
+    snapshot_path = tmp_path / "environment_snapshot.json"
+    payload = {
+        "format": "grandgousier_environment_snapshot_v2",
+        "grandgousier_version": "1.2.3",
+        "pyproject_sha256": release_check.sha256_file(project),
+        "selected_extras": [],
+        "missing_required_packages": [],
+        "package_count": 1,
+        "packages": [
+            {
+                "name": "psycopg",
+                "canonical_name": "psycopg",
+                "version": "3.2.5",
+                "requires": [
+                    {
+                        "name": "psycopg-binary",
+                        "extras": [],
+                        "specifier": ">=3.1",
+                        "marker": 'extra == "binary"',
+                        "url_present": False,
+                    }
+                ],
+            }
+        ],
+        "dependency_closure": {
+            "format": release_check.SNAPSHOT_CLOSURE_FORMAT,
+            "complete": True,
+            "states": [{"canonical_name": "psycopg", "extras": ["binary"]}],
+            "unresolved_requirements": [],
+        },
+    }
+    snapshot_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = release_check.check_snapshot(snapshot_path, version="1.2.3")
+
+    assert result.status == "FAIL"
+    assert "psycopg-binary" in result.detail
 
 
 def test_build_requirements_fail_before_frontend_or_artifact_creation(monkeypatch, tmp_path):
@@ -1015,3 +1333,106 @@ def test_metadata_distribution_version_mismatch_fails_wheel_and_sdist_checks(
     sdist_checks = _checks(release_check.inspect_sdist(sdist))
     assert wheel_checks["wheel_metadata"].status == "FAIL"
     assert sdist_checks["sdist_metadata_version"].status == "FAIL"
+
+
+def test_verify_existing_checks_exact_artifacts_without_touching_artifacts_or_staging(
+    monkeypatch, tmp_path
+):
+    project = tmp_path / "pyproject.toml"
+    _write_project(project, dependencies=("alpha>=1",))
+    root = tmp_path
+    dist_dir = root / "dist"
+    dist_dir.mkdir()
+    wheel = _write_wheel(
+        dist_dir / "grandgousier-1.2.3-py3-none-any.whl",
+        _metadata_for_project(project),
+    )
+    metadata = _metadata_for_project(project).encode()
+    sdist = _write_sdist(
+        dist_dir / "grandgousier-1.2.3.tar.gz",
+        (metadata,),
+        extra_members=(
+            "grandgousier-1.2.3/tools/release_check.py",
+            "grandgousier-1.2.3/tools/snapshot_environment.py",
+            "grandgousier-1.2.3/tools/acceptance_check.py",
+            "grandgousier-1.2.3/release/README.md",
+            "grandgousier-1.2.3/requirements-release.txt",
+        ),
+    )
+    staging = root / "build" / "lib" / "grandgousier"
+    staging.mkdir(parents=True)
+    staged_file = staging / "stale.py"
+    staged_file.write_bytes(b"staging must remain untouched")
+    preserved = [wheel, sdist, staged_file]
+    before = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in preserved
+    }
+
+    monkeypatch.setattr(release_check, "ROOT", root)
+    monkeypatch.setattr(release_check, "PYPROJECT", project)
+    monkeypatch.setattr(release_check, "DIST", dist_dir)
+    monkeypatch.setattr(release_check, "BUILD", root / "build")
+    monkeypatch.setattr(release_check, "read_versions", lambda: ("1.2.3", "1.2.3"))
+    monkeypatch.setattr(
+        release_check,
+        "install_smoke",
+        lambda _wheel, _version: release_check.Check("wheel_install_smoke", "OK", "stubbed"),
+    )
+
+    def unexpected_action(*_args, **_kwargs):
+        raise AssertionError("verify-existing must not build, clean, or write checksums")
+
+    monkeypatch.setattr(release_check, "build_release", unexpected_action)
+    monkeypatch.setattr(release_check, "clean_build_staging", unexpected_action)
+    monkeypatch.setattr(release_check, "write_checksums", unexpected_action)
+    report = root / "verify-existing.json"
+
+    result = release_check.main(
+        [
+            "--verify-existing",
+            "--wheel",
+            str(wheel),
+            "--sdist",
+            str(sdist),
+            "--report",
+            str(report),
+        ]
+    )
+
+    assert result == 0
+    report_data = json.loads(report.read_text(encoding="utf-8"))
+    assert report_data["mode"] == "verify-existing"
+    assert report_data["status"] == "READY_WITH_WARNINGS"
+    hashes = {Path(row["path"]).name: row["sha256"] for row in report_data["artifacts"]}
+    assert hashes[wheel.name] == release_check.sha256_file(wheel)
+    assert hashes[sdist.name] == release_check.sha256_file(sdist)
+    assert all(
+        (path.read_bytes(), path.stat().st_mtime_ns) == before[path]
+        for path in preserved
+    )
+
+
+def test_verify_existing_refuses_existing_report_without_overwriting_it(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(release_check, "ROOT", tmp_path)
+    report = tmp_path / "existing-report.json"
+    report.write_bytes(b"review evidence must stay unchanged\n")
+    before = (report.read_bytes(), report.stat().st_mtime_ns)
+
+    with pytest.raises(SystemExit) as error:
+        release_check.main(
+            [
+                "--verify-existing",
+                "--wheel",
+                str(tmp_path / "artifact.whl"),
+                "--sdist",
+                str(tmp_path / "artifact.tar.gz"),
+                "--report",
+                str(report),
+            ]
+        )
+
+    assert error.value.code == 2
+    assert (report.read_bytes(), report.stat().st_mtime_ns) == before

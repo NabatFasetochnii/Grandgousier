@@ -18,8 +18,13 @@ The command writes:
 - `constraints.txt` — exact versions in the installed Grandgousier dependency closure.
 
 The snapshot is read-only and does not modify the Python environment.
+It records the requested-extra states and dependency edges used to build the closure. The release
+checker rejects snapshots with missing distributions or unresolved dependency metadata, and
+recomputes the closure from the recorded edges before accepting it.
+Snapshots with this closure schema use `grandgousier_environment_snapshot_v2`; older v1 snapshots
+are unsupported by the current checker and must be regenerated before release validation.
 
-Release artifacts are checked with:
+Build and check release artifacts with:
 
 ```powershell
 python -m pip install -r requirements-release.txt
@@ -47,7 +52,7 @@ python -m build --sdist --wheel --no-isolation --outdir dist
 The frontend honors `[build-system].build-backend`; all declared build requirements must already be
 provisioned. The checker does not download build requirements or fall back to a hard-coded backend.
 
-The checker:
+Build-and-check mode:
 
 1. verifies `pyproject.toml` and `grandgousier.__version__` agree;
 2. verifies the validated constraints contain all core dependencies;
@@ -56,6 +61,23 @@ The checker:
 5. installs the wheel into a temporary target without dependencies and imports it from there;
    starting with 0.5.58.1 this smoke uses `--ignore-installed` plus `python -I -S` and verifies the actual import/resource origin is inside that target;
 6. writes `dist/SHA256SUMS.txt` and `dist/release_check.json`.
+
+To audit exact artifacts that already exist without rebuilding or changing them, provide both paths:
+
+```powershell
+python tools\release_check.py `
+  --verify-existing `
+  --wheel "dist\grandgousier-0.7.0.11-py3-none-any.whl" `
+  --sdist "dist\grandgousier-0.7.0.11.tar.gz" `
+  --constraints "release\validated_windows_py311\constraints.txt" `
+  --snapshot "release\validated_windows_py311\environment_snapshot.json" `
+  --report "dist\verify_existing.json"
+```
+
+Verify-existing mode runs the same version, metadata, resource, private-path, install-smoke, and
+supplied evidence checks, then records hashes in its report. It does not invoke the build backend,
+clean staging, write `SHA256SUMS.txt`, or alter either artifact. Both artifact paths must name
+existing files; the report path must not be either artifact.
 
 For a clean-machine acceptance test, create a new Python 3.11 venv and install using the validated
 constraints file:
