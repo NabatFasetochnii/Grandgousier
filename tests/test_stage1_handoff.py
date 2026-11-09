@@ -1942,6 +1942,179 @@ def test_physical_provenance_context_must_match_detected_product(
     assert db_session.scalar(select(func.count(Frame.frame_id))) == 0
 
 
+@pytest.mark.parametrize(
+    ("provenance_date", "detected_date"),
+    [
+        pytest.param(
+            datetime(2018, 9, 7, 17, 4, 22, tzinfo=UTC),
+            datetime(2018, 9, 7, 17, 4, 22, 902000, tzinfo=UTC),
+            id="master-whole-second",
+        ),
+        pytest.param(
+            datetime(2018, 9, 7, 17, 4, 22, 902000, tzinfo=UTC),
+            datetime(2018, 9, 7, 17, 4, 22, 902000, tzinfo=UTC),
+            id="exact-timestamp",
+        ),
+    ],
+)
+def test_master_date_obs_precision_passes_p4_preflight(
+    db_session: Session,
+    tmp_path: Path,
+    monkeypatch,
+    provenance_date: datetime,
+    detected_date: datetime,
+) -> None:
+    native = "204_MASTER_DATE_PRECISION"
+    report, product = _write_physical_master_execution_report(
+        tmp_path, native=native, date_obs=provenance_date
+    )
+    process_calls = []
+
+    def forbidden_process(*_args, **_kwargs):
+        process_calls.append(True)
+        raise AssertionError("P4 preflight must not invoke Stage 2")
+
+    _install_fake_auto_process(
+        monkeypatch,
+        product,
+        native=native,
+        frame_uid="master-date-precision-frame",
+        process_call=forbidden_process,
+        date_obs=detected_date,
+    )
+
+    result = handoff_stage1_execution(
+        db_session, execution_report_path=report, execute=False
+    )
+
+    assert result.status == "READY"
+    assert result.errors == ()
+    assert result.selected_items == 1
+    assert result.items[0].p4_action == ObservationScienceAction.SELECTED.value
+    assert result.items[0].status == "SELECTED_FOR_STAGE2"
+    assert process_calls == []
+
+
+def test_master_date_obs_adjacent_seconds_do_not_match_with_subsecond_delta(
+    db_session: Session, tmp_path: Path, monkeypatch
+) -> None:
+    native = "204_MASTER_DATE_ADJACENT_SECONDS"
+    provenance_date = datetime(2018, 9, 7, 17, 4, 22, 999000, tzinfo=UTC)
+    detected_date = datetime(2018, 9, 7, 17, 4, 23, 1000, tzinfo=UTC)
+    report, product = _write_physical_master_execution_report(
+        tmp_path, native=native, date_obs=provenance_date
+    )
+    process_calls = []
+
+    def forbidden_process(*_args, **_kwargs):
+        process_calls.append(True)
+        raise AssertionError("DATE-OBS mismatch must stop before Stage 2")
+
+    _install_fake_auto_process(
+        monkeypatch,
+        product,
+        native=native,
+        frame_uid="master-adjacent-seconds-frame",
+        process_call=forbidden_process,
+        date_obs=detected_date,
+    )
+
+    result = handoff_stage1_execution(
+        db_session, execution_report_path=report, execute=True
+    )
+
+    assert result.status == "FAILED"
+    assert len(result.errors) == 1
+    assert "DATE-OBS mismatch" in result.errors[0]
+    assert f"provenance={provenance_date.isoformat()}" in result.errors[0]
+    assert f"FITS={detected_date}" in result.errors[0]
+    assert process_calls == []
+    assert db_session.scalar(select(func.count(Observation.observation_id))) == 0
+    assert db_session.scalar(select(func.count(Frame.frame_id))) == 0
+
+
+def test_non_master_date_obs_still_requires_exact_timestamp(
+    db_session: Session, tmp_path: Path, monkeypatch
+) -> None:
+    native = "204_NON_MASTER_DATE_PRECISION"
+    provenance_date = datetime(2018, 9, 7, 17, 4, 22, tzinfo=UTC)
+    detected_date = datetime(2018, 9, 7, 17, 4, 22, 902000, tzinfo=UTC)
+    report, product = _write_execution_report(tmp_path, native=native)
+    sidecar = product.with_name(product.name + ".provenance.json")
+    provenance = json.loads(sidecar.read_text(encoding="utf-8"))
+    provenance["observation"].update(
+        {
+            "instrument": "RoboPhot",
+            "camera": "204",
+            "observed_at": provenance_date.isoformat(),
+        }
+    )
+    sidecar.write_text(json.dumps(provenance), encoding="utf-8")
+    process_calls = []
+
+    def forbidden_process(*_args, **_kwargs):
+        process_calls.append(True)
+        raise AssertionError("DATE-OBS mismatch must stop before Stage 2")
+
+    _install_fake_auto_process(
+        monkeypatch,
+        product,
+        native=native,
+        frame_uid="non-master-date-precision-frame",
+        process_call=forbidden_process,
+        date_obs=detected_date,
+        instrument="RoboPhot",
+    )
+
+    result = handoff_stage1_execution(
+        db_session, execution_report_path=report, execute=True
+    )
+
+    assert result.status == "FAILED"
+    assert len(result.errors) == 1
+    assert "DATE-OBS mismatch" in result.errors[0]
+    assert f"provenance={provenance_date.isoformat()}" in result.errors[0]
+    assert f"FITS={detected_date}" in result.errors[0]
+    assert process_calls == []
+    assert db_session.scalar(select(func.count(Observation.observation_id))) == 0
+    assert db_session.scalar(select(func.count(Frame.frame_id))) == 0
+
+
+def test_master_date_obs_missing_on_both_sides_does_not_create_date_mismatch(
+    db_session: Session, tmp_path: Path, monkeypatch
+) -> None:
+    native = "204_MASTER_DATE_MISSING"
+    report, product = _write_execution_report(tmp_path, native=native)
+    sidecar = product.with_name(product.name + ".provenance.json")
+    provenance = json.loads(sidecar.read_text(encoding="utf-8"))
+    provenance["observation"].update({"instrument": "MASTER", "camera": "204"})
+    sidecar.write_text(json.dumps(provenance), encoding="utf-8")
+    process_calls = []
+
+    def forbidden_process(*_args, **_kwargs):
+        process_calls.append(True)
+        raise AssertionError("P4 preflight must not invoke Stage 2")
+
+    _install_fake_auto_process(
+        monkeypatch,
+        product,
+        native=native,
+        frame_uid="master-date-missing-frame",
+        process_call=forbidden_process,
+        date_obs=None,
+    )
+
+    result = handoff_stage1_execution(
+        db_session, execution_report_path=report, execute=False
+    )
+
+    assert result.status == "BLOCKED"
+    assert result.errors == ()
+    assert len(result.items) == 1
+    assert result.items[0].status == "BLOCKED"
+    assert process_calls == []
+
+
 @pytest.mark.parametrize("raw_key", ["C:/rawdata/2018/09/07/375506.fit.gz", "rawdata/2018/02/30/375506.fit.gz"])
 def test_physical_master_provenance_rejects_noncanonical_source_key(
     tmp_path: Path, raw_key: str

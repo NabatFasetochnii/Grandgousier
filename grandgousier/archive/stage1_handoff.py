@@ -786,7 +786,20 @@ def handoff_stage1_execution(
                 f"camera mismatch for {detected_item.path}: "
                 f"provenance={expected.camera}, FITS={detected_item.camera}"
             )
-        if expected.date_obs is not None and parse_datetime(detected_item.date_obs) != expected.date_obs:
+        provenance_date_obs = parse_datetime(expected.date_obs)
+        detected_date_obs = parse_datetime(detected_item.date_obs)
+        if (
+            _normalized_instrument(expected.instrument) == "MASTER"
+            and provenance_date_obs is not None
+            and detected_date_obs is not None
+        ):
+            dates_match = (
+                provenance_date_obs.replace(microsecond=0)
+                == detected_date_obs.replace(microsecond=0)
+            )
+        else:
+            dates_match = provenance_date_obs == detected_date_obs
+        if expected.date_obs is not None and not dates_match:
             identity_errors.append(
                 f"DATE-OBS mismatch for {detected_item.path}: "
                 f"provenance={expected.date_obs.isoformat()}, FITS={detected_item.date_obs}"
