@@ -62,6 +62,8 @@ from grandgousier.archive.stage1_execution import (
 )
 from grandgousier.archive.stage1_handoff import (
     Stage1HandoffItem,
+    ValidatedStage1Product,
+    _check_frame_evidence,
     _persist_selected_evidence,
     handoff_stage1_execution,
     load_validated_stage1_products,
@@ -85,7 +87,7 @@ from grandgousier.db.models import (
     make_frame_location_uid,
     make_instrument_unit_uid,
 )
-from grandgousier.identity.observation import make_observation_uid
+from grandgousier.identity.observation import MASTER_IDENTITY_SCHEME, make_observation_uid
 from grandgousier.instruments.base import InstrumentProfile
 from grandgousier.io.frame_uid import make_frame_uid
 from grandgousier.resources import instrument_profile_path
@@ -1996,6 +1998,70 @@ def test_master_date_obs_precision_passes_p4_preflight(
     assert result.items[0].p4_action == ObservationScienceAction.SELECTED.value
     assert result.items[0].status == "SELECTED_FOR_STAGE2"
     assert process_calls == []
+
+
+@pytest.mark.parametrize(
+    ("identity_scheme", "instrument", "frame_date", "matches"),
+    [
+        pytest.param(
+            MASTER_IDENTITY_SCHEME,
+            "MASTER",
+            datetime(2018, 9, 7, 17, 4, 22, 1000, tzinfo=UTC),
+            True,
+            id="master-same-calendar-second",
+        ),
+        pytest.param(
+            MASTER_IDENTITY_SCHEME,
+            "MASTER",
+            datetime(2018, 9, 7, 17, 4, 23, 1000, tzinfo=UTC),
+            False,
+            id="master-next-calendar-second",
+        ),
+        pytest.param(
+            "robophot_sernum_dateobs_v1",
+            "RoboPhot",
+            datetime(2018, 9, 7, 17, 4, 22, 1000, tzinfo=UTC),
+            False,
+            id="non-master-subsecond-difference-is-exact",
+        ),
+    ],
+)
+def test_check_frame_evidence_date_precision(
+    identity_scheme: str, instrument: str, frame_date: datetime, matches: bool
+) -> None:
+    provenance_date = datetime(2018, 9, 7, 17, 4, 22, 999000, tzinfo=UTC)
+    product = ValidatedStage1Product(
+        native_observation_id="native-id",
+        source_observation_uid="source-uid",
+        observation_uid="observation-uid",
+        execution_status="REDUCED",
+        product_path=Path("product.fits"),
+        product_checksum_sha256="0" * 64,
+        provenance_path=Path("product.provenance.json"),
+        fingerprint="f" * 64,
+        identity_scheme=identity_scheme,
+        instrument=instrument,
+        camera="204",
+        date_obs=provenance_date,
+    )
+    frame = SimpleNamespace(
+        observation=SimpleNamespace(
+            observation_uid="observation-uid", native_identity="native-id"
+        ),
+        instrument=instrument,
+        date_obs=frame_date,
+        camera="204",
+        header_json={},
+        quality_flags={},
+    )
+
+    if matches:
+        _check_frame_evidence(frame, product)
+    else:
+        with pytest.raises(ValueError, match="DATE-OBS mismatch") as exc_info:
+            _check_frame_evidence(frame, product)
+        assert f"provenance={provenance_date.isoformat()}" in str(exc_info.value)
+        assert f"Frame={frame_date.isoformat()}" in str(exc_info.value)
 
 
 def test_master_date_obs_adjacent_seconds_do_not_match_with_subsecond_delta(

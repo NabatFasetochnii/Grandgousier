@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from enum import Enum
 from pathlib import PurePosixPath
 from typing import Any
@@ -63,6 +63,18 @@ _MASTER_RAW_RELATIVE_KEY_RE = re.compile(
     r"^rawdata/(?P<year>\d{4})/(?P<month>\d{2})/(?P<day>\d{2})/"
     r"(?P<raw_id>\d+)\.(?:fit|fits|fts)(?:\.gz)?$"
 )
+
+
+def _master_date_obs_equal_by_calendar_second(
+    first: datetime | None, second: datetime | None
+) -> bool:
+    """Compare MASTER DATE-OBS timestamps at whole-second precision."""
+
+    return (
+        first is not None
+        and second is not None
+        and first.replace(microsecond=0) == second.replace(microsecond=0)
+    )
 
 
 def _validate_master_raw_relative_physical_key(value: object) -> str:
@@ -650,7 +662,7 @@ def _existing_master_physical_duplicate(
     if identity_scheme != MASTER_IDENTITY_SCHEME or len(existing_products) != 1 or not group:
         return False
 
-    candidate_contexts: set[tuple[object, str, str]] = set()
+    candidate_contexts: set[tuple[datetime, str, str]] = set()
     for item in group:
         date_obs = parse_datetime(item.date_obs)
         camera = _camera_token(item.camera)
@@ -662,7 +674,7 @@ def _existing_master_physical_duplicate(
             return False
         if date_obs is None or camera is None:
             return False
-        candidate_contexts.add((date_obs, camera, source_key))
+        candidate_contexts.add((date_obs.replace(microsecond=0), camera, source_key))
     if len(candidate_contexts) != 1:
         return False
 
@@ -676,7 +688,7 @@ def _existing_master_physical_duplicate(
         return False
     candidate_date, candidate_camera, candidate_key = next(iter(candidate_contexts))
     return (
-        existing_date == candidate_date
+        _master_date_obs_equal_by_calendar_second(existing_date, candidate_date)
         and existing_camera == candidate_camera
         and existing_key == candidate_key
     )
@@ -700,7 +712,11 @@ def _candidate_master_uniqnum_context_issue(
             )
     dates = [parse_datetime(item.date_obs) for item in group]
     known_dates = sorted({value for value in dates if value is not None})
-    if len(known_dates) > 1:
+    if any(
+        not _master_date_obs_equal_by_calendar_second(first, second)
+        for index, first in enumerate(known_dates)
+        for second in known_dates[index + 1 :]
+    ):
         rendered = ", ".join(value.isoformat() for value in known_dates)
         return (
             ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM,
@@ -812,7 +828,10 @@ def _existing_master_uniqnum_context_issue(
     known_dates = [value for value in existing_dates if value is not None]
     if observation_date is not None:
         known_dates.append(observation_date)
-    if any(value != candidate_date for value in known_dates):
+    if any(
+        not _master_date_obs_equal_by_calendar_second(value, candidate_date)
+        for value in known_dates
+    ):
         rendered = ", ".join(
             sorted({value.isoformat() for value in known_dates if value is not None})
         )
@@ -892,7 +911,11 @@ def _persisted_master_uniqnum_date_issue(
             ObservationScienceAction.AMBIGUOUS_PHYSICAL_IDENTITY_DATE_UNDER_LEGACY_UNIQNUM,
             "a persisted Frame with this master_uniqnum_v1 identity has missing or unparseable date_obs",
         )
-    if len(known_dates) > 1:
+    if any(
+        not _master_date_obs_equal_by_calendar_second(first, second)
+        for index, first in enumerate(known_dates)
+        for second in known_dates[index + 1 :]
+    ):
         rendered = ", ".join(value.isoformat() for value in known_dates)
         return (
             ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM,

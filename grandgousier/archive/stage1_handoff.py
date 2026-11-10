@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from grandgousier.archive.observation_selection import (
     ObservationScienceAction,
     ScienceFileIdentityCandidate,
+    _master_date_obs_equal_by_calendar_second,
     _validate_master_raw_relative_physical_key,
     plan_file_science_selection,
 )
@@ -534,8 +535,25 @@ def _check_frame_evidence(frame: Frame, product: ValidatedStage1Product) -> None
         raise ValueError(f"Stage-1 product Frame observation mismatch: {product.product_path}")
     if product.instrument is not None and _normalized_instrument(frame.instrument) != product.instrument:
         raise ValueError(f"Stage-1 product Frame instrument mismatch: {product.product_path}")
-    if product.date_obs is not None and parse_datetime(frame.date_obs) != product.date_obs:
-        raise ValueError(f"Stage-1 product Frame DATE-OBS mismatch: {product.product_path}")
+    if product.date_obs is not None:
+        frame_date_obs = parse_datetime(frame.date_obs)
+        if product.identity_scheme == MASTER_IDENTITY_SCHEME:
+            dates_match = _master_date_obs_equal_by_calendar_second(
+                frame_date_obs, product.date_obs
+            )
+        else:
+            dates_match = frame_date_obs == product.date_obs
+        if not dates_match:
+            frame_date_text = (
+                frame_date_obs.isoformat()
+                if frame_date_obs is not None
+                else str(frame.date_obs)
+            )
+            raise ValueError(
+                f"Stage-1 product Frame DATE-OBS mismatch: "
+                f"provenance={product.date_obs.isoformat()}, Frame={frame_date_text}: "
+                f"{product.product_path}"
+            )
     if product.camera is not None and _clean_text(frame.camera) != product.camera:
         raise ValueError(f"Stage-1 product Frame camera mismatch: {product.product_path}")
     for metadata in (frame.header_json or {}, frame.quality_flags or {}):
@@ -804,9 +822,8 @@ def handoff_stage1_execution(
             and provenance_date_obs is not None
             and detected_date_obs is not None
         ):
-            dates_match = (
-                provenance_date_obs.replace(microsecond=0)
-                == detected_date_obs.replace(microsecond=0)
+            dates_match = _master_date_obs_equal_by_calendar_second(
+                provenance_date_obs, detected_date_obs
             )
         else:
             dates_match = provenance_date_obs == detected_date_obs

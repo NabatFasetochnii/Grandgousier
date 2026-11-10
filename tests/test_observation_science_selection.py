@@ -277,6 +277,50 @@ def test_plan_blocks_distinct_master_dates_before_database_lookup() -> None:
     assert all("DATE-OBS" in row["reason"] for row in result.rows)
 
 
+@pytest.mark.parametrize(
+    ("candidate_date", "expected_action"),
+    [
+        pytest.param(
+            datetime(2018, 9, 7, 17, 4, 22, 1000, tzinfo=timezone.utc),
+            ObservationScienceAction.AMBIGUOUS_MULTIPLE_PRODUCTS.value,
+            id="same-calendar-second",
+        ),
+        pytest.param(
+            datetime(2018, 9, 7, 17, 4, 23, 1000, tzinfo=timezone.utc),
+            ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM.value,
+            id="next-calendar-second",
+        ),
+    ],
+)
+def test_candidate_master_dates_compare_by_calendar_second(
+    db_session: Session, candidate_date: datetime, expected_action: str
+) -> None:
+    first_date = datetime(2018, 9, 7, 17, 4, 22, 999000, tzinfo=timezone.utc)
+
+    result = plan_file_science_selection(
+        db_session,
+        [
+            _candidate(
+                "204_CANDIDATE_DATE_PRECISION",
+                frame_uid="candidate-date-a",
+                path="C:/candidate-date-a.fits",
+                date_obs=first_date,
+            ),
+            _candidate(
+                "204_CANDIDATE_DATE_PRECISION",
+                frame_uid="candidate-date-b",
+                path="C:/candidate-date-b.fits",
+                date_obs=candidate_date,
+            ),
+        ],
+    )
+
+    assert {row["action"] for row in result.rows} == {expected_action}
+    if expected_action == ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM.value:
+        assert first_date.isoformat() in result.rows[0]["reason"]
+        assert candidate_date.isoformat() in result.rows[0]["reason"]
+
+
 def test_plan_blocks_missing_master_date_instead_of_safe_noop() -> None:
     class NoQuerySession:
         def scalar(self, *_args, **_kwargs):
@@ -423,6 +467,105 @@ def test_exact_master_physical_context_is_represented_without_series_membership(
     assert result.rows[0]["action"] == ObservationScienceAction.ALREADY_REPRESENTED.value
     assert result.rows[0]["selected_frame_id"] == frame.frame_id
     assert result.summary["selected_frames"] == 0
+
+
+@pytest.mark.parametrize(
+    ("candidate_date", "expected_action"),
+    [
+        pytest.param(
+            datetime(2018, 9, 7, 17, 4, 22, 1000, tzinfo=timezone.utc),
+            ObservationScienceAction.ALREADY_REPRESENTED.value,
+            id="same-calendar-second",
+        ),
+        pytest.param(
+            datetime(2018, 9, 7, 17, 4, 23, 1000, tzinfo=timezone.utc),
+            ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM.value,
+            id="next-calendar-second",
+        ),
+    ],
+)
+def test_existing_master_physical_duplicate_compares_dates_by_calendar_second(
+    db_session: Session, candidate_date: datetime, expected_action: str
+) -> None:
+    native = "204_EXISTING_DATE_PRECISION"
+    existing_date = datetime(2018, 9, 7, 17, 4, 22, 999000, tzinfo=timezone.utc)
+    raw_key = "rawdata/2018/09/07/375506.fit.gz"
+    observation = _observation(db_session, native)
+    observation.observed_at = existing_date
+    _frame(
+        db_session,
+        uid="existing-date-precision",
+        path="C:/existing-date-precision.fits",
+        observation=observation,
+        date_obs=existing_date,
+        camera="204",
+        raw_relative_physical_key=raw_key,
+    )
+
+    result = plan_file_science_selection(
+        db_session,
+        [
+            _candidate(
+                native,
+                frame_uid="incoming-date-precision",
+                path="D:/incoming-date-precision.fits",
+                date_obs=candidate_date,
+                camera="204",
+                raw_relative_physical_key=raw_key,
+            )
+        ],
+    )
+
+    assert result.rows[0]["action"] == expected_action
+    if expected_action == ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM.value:
+        assert existing_date.isoformat() in result.rows[0]["reason"]
+
+
+def test_existing_master_duplicate_groups_candidate_dates_by_calendar_second(
+    db_session: Session,
+) -> None:
+    native = "204_EXISTING_CANDIDATE_CONTEXT_PRECISION"
+    existing_date = datetime(2018, 9, 7, 17, 4, 22, 999000, tzinfo=timezone.utc)
+    raw_key = "rawdata/2018/09/07/375506.fit.gz"
+    observation = _observation(db_session, native)
+    observation.observed_at = existing_date
+    frame = _frame(
+        db_session,
+        uid="existing-candidate-context-precision",
+        path="C:/existing-candidate-context-precision.fits",
+        observation=observation,
+        date_obs=existing_date,
+        camera="204",
+        raw_relative_physical_key=raw_key,
+    )
+
+    result = plan_file_science_selection(
+        db_session,
+        [
+            _candidate(
+                native,
+                frame_uid="incoming-candidate-context-a",
+                path="D:/incoming-candidate-context-a.fits",
+                date_obs=existing_date,
+                camera="204",
+                raw_relative_physical_key=raw_key,
+            ),
+            _candidate(
+                native,
+                frame_uid="incoming-candidate-context-b",
+                path="D:/incoming-candidate-context-b.fits",
+                date_obs=existing_date.replace(microsecond=1000),
+                camera="204",
+                raw_relative_physical_key=raw_key,
+            ),
+        ],
+    )
+
+    assert len(result.rows) == 2
+    assert {row["action"] for row in result.rows} == {
+        ObservationScienceAction.ALREADY_REPRESENTED.value
+    }
+    assert {row["selected_frame_id"] for row in result.rows} == {frame.frame_id}
 
 
 def test_exact_unlinked_master_physical_frame_is_safe_duplicate_noop(
@@ -639,6 +782,79 @@ def test_persisted_selector_blocks_master_products_with_distinct_dates(db_sessio
         ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM.value
     }
     assert result.summary["blocked_frames"] == 2
+
+
+@pytest.mark.parametrize(
+    ("second_date", "expected_action"),
+    [
+        pytest.param(
+            datetime(2018, 9, 7, 17, 4, 22, 1000, tzinfo=timezone.utc),
+            ObservationScienceAction.AMBIGUOUS_MULTIPLE_PRODUCTS.value,
+            id="same-calendar-second",
+        ),
+        pytest.param(
+            datetime(2018, 9, 7, 17, 4, 23, 1000, tzinfo=timezone.utc),
+            ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM.value,
+            id="next-calendar-second",
+        ),
+    ],
+)
+def test_persisted_master_dates_compare_by_calendar_second(
+    db_session: Session, second_date: datetime, expected_action: str
+) -> None:
+    observation = _observation(db_session, "204_PERSISTED_DATE_PRECISION")
+    first_date = datetime(2018, 9, 7, 17, 4, 22, 999000, tzinfo=timezone.utc)
+    first = _frame(
+        db_session,
+        uid="persisted-date-precision-a",
+        path="C:/persisted-date-precision-a.fits",
+        observation=observation,
+        date_obs=first_date,
+    )
+    second = _frame(
+        db_session,
+        uid="persisted-date-precision-b",
+        path="C:/persisted-date-precision-b.fits",
+        observation=observation,
+        date_obs=second_date,
+    )
+
+    result = select_persisted_science_frames(db_session, [first.frame_id, second.frame_id])
+
+    assert {row["action"] for row in result.rows} == {expected_action}
+    if expected_action == ObservationScienceAction.PHYSICAL_IDENTITY_COLLISION_UNDER_LEGACY_UNIQNUM.value:
+        assert first_date.isoformat() in result.rows[0]["reason"]
+        assert second_date.isoformat() in result.rows[0]["reason"]
+
+
+def test_persisted_non_master_dates_are_not_compared_with_master_precision(
+    db_session: Session,
+) -> None:
+    observation = _observation(db_session, "204_NON_MASTER_DATE_PRECISION")
+    observation.identity_scheme = "robophot_sernum_dateobs_v1"
+    observation.observation_uid = make_observation_uid(
+        observation.identity_scheme, observation.native_identity
+    )
+    first = _frame(
+        db_session,
+        uid="persisted-non-master-date-a",
+        path="C:/persisted-non-master-date-a.fits",
+        observation=observation,
+        date_obs=datetime(2018, 9, 7, 17, 4, 22, 999000, tzinfo=timezone.utc),
+    )
+    second = _frame(
+        db_session,
+        uid="persisted-non-master-date-b",
+        path="C:/persisted-non-master-date-b.fits",
+        observation=observation,
+        date_obs=datetime(2018, 9, 7, 17, 4, 22, 1000, tzinfo=timezone.utc),
+    )
+
+    result = select_persisted_science_frames(db_session, [first.frame_id, second.frame_id])
+
+    assert {row["action"] for row in result.rows} == {
+        ObservationScienceAction.AMBIGUOUS_MULTIPLE_PRODUCTS.value
+    }
 
 
 def test_persisted_selector_blocks_missing_master_date_even_when_represented(
