@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -410,12 +412,26 @@ def test_quality_policy_records_noop_candidate_exclusion_guard():
 def test_run_field_pipeline_without_target_keeps_artifacts_and_skips_target_export(
     monkeypatch, tmp_path
 ):
-    calls = {"ensemble": 0, "object_qc": 0, "field_report": 0}
-    observed = {"ensemble_exclusions": [], "qc_target_ids": [], "field_target_ids": []}
+    calls = {"ensemble": 0, "object_qc": 0, "field_report": 0, "error_validation": 0}
+    validation_out_dirs = []
+    validation_legacy_comparison = []
+    observed = {
+        "ensemble_exclusions": [],
+        "qc_target_ids": [],
+        "field_target_ids": [],
+        "field_report_diagnostics": [],
+    }
 
     class FakeSession:
+        @property
+        def no_autoflush(self):
+            return nullcontext()
+
         def rollback(self):
             return None
+
+        def execute(self, *_args, **_kwargs):
+            return SimpleNamespace(scalar_one_or_none=lambda: None)
 
     def fake_ensemble(*args, **kwargs):
         calls["ensemble"] += 1
@@ -438,6 +454,7 @@ def test_run_field_pipeline_without_target_keeps_artifacts_and_skips_target_expo
     def fake_field_report(*args, **kwargs):
         calls["field_report"] += 1
         observed["field_target_ids"].append(kwargs["target_object_ids"])
+        observed["field_report_diagnostics"].append(kwargs["include_diagnostics"])
         return SimpleNamespace(
             summary_rows=[],
             rms_bins=[],
@@ -479,21 +496,34 @@ def test_run_field_pipeline_without_target_keeps_artifacts_and_skips_target_expo
         "load_calibration_analysis_snapshot",
         lambda *args, **kwargs: SimpleNamespace(timings_sec={}),
     )
-    monkeypatch.setattr(
-        runner_module,
-        "validate_random_error_model",
-        lambda *args, **kwargs: SimpleNamespace(
-            summary_json=None,
+    def fake_random_error_validation(*args, **kwargs):
+        calls["error_validation"] += 1
+        validation_legacy_comparison.append(kwargs["include_legacy_comparison"])
+        out_dir = kwargs["out_dir"]
+        validation_out_dirs.append(out_dir)
+        summary_json = None
+        if out_dir is not None:
+            out_path = Path(out_dir)
+            out_path.mkdir(parents=True, exist_ok=True)
+            summary_file = out_path / "random_error_validation_summary.json"
+            summary_file.write_text("{}", encoding="utf-8")
+            summary_json = str(summary_file)
+        return SimpleNamespace(
+            summary_json=summary_json,
             objects_csv=None,
             residual_floor_summary_json=None,
             residual_floor_objects_csv=None,
             residual_floor_frames_csv=None,
-        ),
+        )
+
+    monkeypatch.setattr(
+        runner_module, "validate_random_error_model", fake_random_error_validation
     )
 
     config = FieldPipelineConfig(
         catalog_name="cat",
         calibration_prefix="p",
+        stage2_profile="bulk",
         frame_ids=[1],
         run_pre_photometry_qc=False,
         skip_wcs=True,
@@ -537,7 +567,33 @@ def test_run_field_pipeline_without_target_keeps_artifacts_and_skips_target_expo
     )
 
     assert candidate_result.status == "DONE"
-    assert calls == {"ensemble": 1, "object_qc": 1, "field_report": 1}
+    assert calls == {
+        "ensemble": 1,
+        "object_qc": 1,
+        "field_report": 1,
+        "error_validation": 1,
+    }
+    assert candidate_result.quality_policy["random_error_model"] == (
+        runner_module.PHYSICAL_APERTURE_ERROR_MODEL
+    )
+    assert candidate_result.quality_policy["effective_stage2_settings"][
+        "random_error_validation_and_legacy_comparison"
+    ] is False
+    assert candidate_result.quality_policy["effective_stage2_settings"][
+        "random_error_validation"
+    ] is True
+    assert candidate_result.quality_policy["effective_stage2_settings"][
+        "random_error_legacy_comparison"
+    ] is False
+    assert candidate_result.quality_policy["effective_stage2_settings"][
+        "random_error_diagnostic_exports"
+    ] is False
+    assert candidate_result.quality_policy["effective_stage2_settings"][
+        "random_error_residual_floor_diagnostics"
+    ] is True
+    assert validation_out_dirs == [None]
+    assert validation_legacy_comparison == [False]
+    assert not (tmp_path / "random_error_model").exists()
     assert "ensemble_calibrate_candidate_excluded" not in step_names
     assert "compute_object_qc_candidate_excluded" not in step_names
     assert "field_qc_report_candidate_excluded" not in step_names
@@ -550,6 +606,7 @@ def test_run_field_pipeline_without_target_keeps_artifacts_and_skips_target_expo
         "ensemble_exclusions": [[]],
         "qc_target_ids": [[]],
         "field_target_ids": [[]],
+        "field_report_diagnostics": [False],
     }
     assert "export_target_light_curve" not in step_names
     assert all(
@@ -560,15 +617,25 @@ def test_run_field_pipeline_without_target_keeps_artifacts_and_skips_target_expo
     # With candidate exclusion disabled, target export would otherwise be eligible;
     # unresolved/not-requested target identity must still skip it without touching files.
     config.exclude_candidates_from_ensemble = False
+    config.stage2_profile = "diagnostic"
     field_result = runner_module.run_field_pipeline(FakeSession(), config)
     assert field_result.status == "DONE"
     assert "export_target_light_curve" not in [step.step_name for step in field_result.steps]
-    assert calls == {"ensemble": 2, "object_qc": 2, "field_report": 2}
+    assert calls == {
+        "ensemble": 2,
+        "object_qc": 2,
+        "field_report": 2,
+        "error_validation": 2,
+    }
     assert observed == {
         "ensemble_exclusions": [[], []],
         "qc_target_ids": [[], []],
         "field_target_ids": [[], []],
+        "field_report_diagnostics": [False, True],
     }
+    assert validation_out_dirs == [None, tmp_path / "random_error_model"]
+    assert validation_legacy_comparison == [False, True]
+    assert (tmp_path / "random_error_model" / "random_error_validation_summary.json").is_file()
     assert all(
         (tmp_path / f"p_target_light_curve.{suffix}").read_bytes() == content
         for suffix, content in artifact_bytes.items()

@@ -188,7 +188,7 @@ def query_gaia_for_frames(
     only_wcs_ok: bool = True,
     margin_arcmin: float = 1.0,
     mag_limit: float | None = None,
-    max_rows_per_frame: int = 50000,
+    max_rows_per_frame: int = 20000,
     query_mode: str = "per_frame",
     max_radius_deg: float | None = None,
     gaia_timeout_sec: float | None = 120.0,

@@ -118,6 +118,92 @@ def test_residual_floor_lower_envelope_and_frame_common_diagnostics():
     )
 
 
+def test_bulk_summary_omits_only_legacy_comparison_metrics():
+    import numpy as np
+
+    rng = np.random.default_rng(12345)
+    rows = []
+    for frame_index in range(40):
+        frame_common = 0.010 * np.sin(2.0 * np.pi * frame_index / 13.0)
+        for object_index in range(12):
+            center = 12.2 + (object_index // 4) * 2.0 + (object_index % 4) * 0.08
+            independent_sigma = 0.018 if object_index % 4 < 3 else 0.050
+            row = {
+                "object_id": object_index + 1,
+                "frame_id": frame_index + 1,
+                "mag": center + frame_common + rng.normal(0.0, independent_sigma),
+                "physical_err": 0.010,
+                "total_err": 0.012,
+                "x": 100.0 + object_index * 100.0,
+                "y": 200.0 + object_index * 50.0,
+            }
+            if (frame_index, object_index) != (0, 0):
+                row["legacy_err"] = 0.008
+            rows.append(row)
+
+    options = {
+        "min_measurements_per_object": 20,
+        "residual_floor_bin_width": 1.0,
+        "residual_floor_lower_quantile": 0.25,
+        "residual_floor_min_objects_per_bin": 3,
+    }
+    diagnostic = summarize_random_error_rows(rows, **options)
+    explicit_diagnostic = summarize_random_error_rows(
+        rows, include_legacy_comparison=True, **options
+    )
+    bulk = summarize_random_error_rows(
+        rows, include_legacy_comparison=False, **options
+    )
+
+    assert diagnostic == explicit_diagnostic
+    assert diagnostic["n_reference_objects"] == bulk["n_reference_objects"] == 12
+    assert diagnostic["n_measurements"] == bulk["n_measurements"] == 479
+    assert diagnostic["residual_floor_status"] == bulk["residual_floor_status"] == "OK"
+
+    legacy_summary_metrics = {
+        "legacy_normalized_robust_sigma",
+        "legacy_normalized_rms",
+        "legacy_reduced_chi2",
+        "legacy_error_scale_recommendation",
+        "legacy_log_distance_to_unity",
+        "physical_closer_to_unity",
+    }
+    legacy_object_metrics = {
+        "legacy_mag_err_median",
+        "legacy_normalized_robust_sigma",
+        "legacy_normalized_rms",
+        "legacy_reduced_chi2",
+    }
+    legacy_bin_metrics = {
+        "legacy_normalized_robust_sigma_median",
+        "legacy_mag_err_median",
+    }
+    assert set(diagnostic) - set(bulk) == legacy_summary_metrics
+    for diagnostic_row, bulk_row in zip(
+        diagnostic["object_rows"], bulk["object_rows"]
+    ):
+        assert set(diagnostic_row) - set(bulk_row) == legacy_object_metrics
+    for diagnostic_bin, bulk_bin in zip(
+        diagnostic["magnitude_bins"], bulk["magnitude_bins"]
+    ):
+        assert set(diagnostic_bin) - set(bulk_bin) == legacy_bin_metrics
+
+    bulk_comparable = dict(bulk)
+    diagnostic_comparable = dict(diagnostic)
+    for key in legacy_summary_metrics:
+        diagnostic_comparable.pop(key)
+    for key, metric_keys in (
+        ("object_rows", legacy_object_metrics),
+        ("magnitude_bins", legacy_bin_metrics),
+    ):
+        diagnostic_comparable[key] = [
+            {name: value for name, value in row.items() if name not in metric_keys}
+            for row in diagnostic[key]
+        ]
+    assert bulk_comparable == diagnostic_comparable
+    assert diagnostic["residual_floor_suggested_mag"] is not None
+
+
 def test_frame_common_is_supported_only_when_floor_and_correlation_improve():
     import numpy as np
 
@@ -153,6 +239,153 @@ def test_frame_common_is_supported_only_when_floor_and_correlation_improve():
     )
     assert result["residual_floor_frame_common_floor_reduction_fraction"] >= 0.05
     assert result["residual_floor_frame_common_abs_correlation_reduction"] >= 0.01
+
+
+def test_skipping_pairwise_correlations_preserves_core_metrics_and_marks_support_unevaluated(
+    monkeypatch,
+):
+    import numpy as np
+
+    rng = np.random.default_rng(12345)
+    rows = []
+    for frame_index in range(40):
+        frame_common = 0.010 * np.sin(2.0 * np.pi * frame_index / 13.0)
+        for object_index in range(12):
+            center = 12.2 + (object_index // 4) * 2.0 + (object_index % 4) * 0.08
+            independent_sigma = 0.018 if object_index % 4 < 3 else 0.050
+            rows.append(
+                {
+                    "object_id": object_index + 1,
+                    "frame_id": frame_index + 1,
+                    "mag": center + frame_common + rng.normal(0.0, independent_sigma),
+                    "physical_err": 0.010,
+                    "legacy_err": 0.008,
+                    "total_err": 0.012,
+                    "x": 100.0 + object_index * 100.0,
+                    "y": 200.0 + object_index * 50.0,
+                }
+            )
+
+    options = {
+        "min_measurements_per_object": 20,
+        "residual_floor_bin_width": 1.0,
+        "residual_floor_lower_quantile": 0.25,
+        "residual_floor_min_objects_per_bin": 3,
+        "include_legacy_comparison": False,
+    }
+    pairwise_calls = []
+    original_pairwise = random_error_validation._pairwise_residual_correlations
+
+    def track_pairwise(*args, **kwargs):
+        pairwise_calls.append(kwargs["after_common"])
+        return original_pairwise(*args, **kwargs)
+
+    monkeypatch.setattr(
+        random_error_validation,
+        "_pairwise_residual_correlations",
+        track_pairwise,
+    )
+    diagnostic = summarize_random_error_rows(rows, **options)
+    assert pairwise_calls == [False, True]
+
+    pairwise_calls.clear()
+    bulk = summarize_random_error_rows(
+        rows,
+        include_pairwise_residual_correlations=False,
+        **options,
+    )
+    assert pairwise_calls == []
+
+    pairwise_support_fields = {
+        "residual_floor_pairwise_correlation_median",
+        "residual_floor_pairwise_abs_correlation_median",
+        "residual_floor_pairwise_abs_correlation_p90",
+        "residual_floor_pairwise_correlation_after_common_median",
+        "residual_floor_pairwise_abs_correlation_after_common_median",
+        "residual_floor_pairwise_pairs",
+        "residual_floor_pairwise_correlations_evaluated",
+        "residual_floor_frame_common_supported",
+        "residual_floor_frame_common_support_status",
+        "residual_floor_frame_common_support_reason",
+        "residual_floor_frame_common_abs_correlation_reduction",
+        "residual_floor_independent_mag",
+    }
+    assert set(diagnostic) == set(bulk)
+    assert all(
+        diagnostic[key] == bulk[key]
+        for key in set(diagnostic) - pairwise_support_fields
+    )
+    assert diagnostic["n_reference_objects"] == bulk["n_reference_objects"] == 12
+    assert diagnostic["n_measurements"] == bulk["n_measurements"] == 480
+    assert diagnostic["residual_floor_status"] == bulk["residual_floor_status"] == "OK"
+    assert diagnostic["residual_floor_suggested_mag"] == pytest.approx(
+        bulk["residual_floor_suggested_mag"]
+    )
+    assert diagnostic["residual_floor_after_frame_common_mag"] == pytest.approx(
+        bulk["residual_floor_after_frame_common_mag"]
+    )
+    assert diagnostic["residual_floor_frame_common_floor_reduction_mag"] == pytest.approx(
+        bulk["residual_floor_frame_common_floor_reduction_mag"]
+    )
+    assert diagnostic[
+        "residual_floor_frame_common_floor_reduction_fraction"
+    ] == pytest.approx(
+        bulk["residual_floor_frame_common_floor_reduction_fraction"]
+    )
+    assert [row["mag_err_random_median"] for row in diagnostic["object_rows"]] == [
+        row["mag_err_random_median"] for row in bulk["object_rows"]
+    ]
+    assert bulk["residual_floor_pairwise_correlations_evaluated"] is False
+    assert bulk["residual_floor_pairwise_pairs"] is None
+    assert bulk["residual_floor_pairwise_abs_correlation_median"] is None
+    assert bulk["residual_floor_pairwise_abs_correlation_after_common_median"] is None
+    assert bulk["residual_floor_frame_common_supported"] is None
+    assert bulk["residual_floor_frame_common_support_status"] == "INSUFFICIENT_DATA"
+    assert bulk["residual_floor_frame_common_abs_correlation_reduction"] is None
+    assert bulk["residual_floor_independent_mag"] is None
+    assert diagnostic["residual_floor_frame_common_support_status"] in {
+        "SUPPORTED",
+        "NOT_SUPPORTED",
+    }
+
+
+def test_validation_forwards_pairwise_switch_and_keeps_status_warnings_and_annotation(
+    monkeypatch,
+):
+    captured = {}
+    annotation = {}
+
+    def summarize(_rows, **kwargs):
+        captured.update(kwargs)
+        return {
+            "n_reference_objects": 3,
+            "residual_floor_suggested_mag": 0.02,
+            "residual_floor_frame_common_supported": None,
+            "residual_floor_frame_common_support_status": "INSUFFICIENT_DATA",
+        }
+
+    def annotate(_session, **kwargs):
+        annotation.update(kwargs)
+        return {"calibrations": 1, "measurements": 3}
+
+    monkeypatch.setattr(random_error_validation, "summarize_random_error_rows", summarize)
+    monkeypatch.setattr(random_error_validation, "annotate_residual_floor_provenance", annotate)
+
+    result = random_error_validation.validate_random_error_model(
+        _ValidationSession(),
+        calibration_name="bulk-calibration",
+        diagnostic_calibration_names=["bulk-calibration"],
+        analysis_snapshot=_validation_snapshot(),
+        include_pairwise_residual_correlations=False,
+    )
+
+    assert captured["include_pairwise_residual_correlations"] is False
+    assert result.status == "OK"
+    assert result.warnings == []
+    assert result.residual_floor_annotation_calibrations == 1
+    assert result.residual_floor_annotation_measurements == 3
+    assert annotation["frame_common_supported"] is None
+    assert annotation["frame_common_support_status"] == "INSUFFICIENT_DATA"
 
 
 def _validation_snapshot():
@@ -210,6 +443,31 @@ def test_suggested_residual_floor_can_skip_provenance_annotation(monkeypatch):
     assert result.residual_floor_suggested_mag == pytest.approx(0.021)
     assert result.residual_floor_annotation_calibrations == 0
     assert result.residual_floor_annotation_measurements == 0
+
+
+def test_validation_forwards_legacy_comparison_switch_to_summary(monkeypatch):
+    captured = {}
+
+    def summarize(_rows, **kwargs):
+        captured.update(kwargs)
+        return {"n_reference_objects": 3}
+
+    monkeypatch.setattr(
+        random_error_validation,
+        "summarize_random_error_rows",
+        summarize,
+    )
+
+    result = random_error_validation.validate_random_error_model(
+        _ValidationSession(),
+        calibration_name="diagnostic-calibration",
+        analysis_snapshot=_validation_snapshot(),
+        annotate_residual_floor=False,
+        include_legacy_comparison=False,
+    )
+
+    assert captured["include_legacy_comparison"] is False
+    assert result.status == "OK"
 
 
 def test_residual_floor_annotation_remains_enabled_by_default(monkeypatch):

@@ -89,8 +89,13 @@ def build_field_qc_report(
     borderline_threshold_ratio: float = 0.9,
     diagnostic_max_failed_criteria: int = 2,
     analysis_snapshot: CalibrationAnalysisSnapshot | None = None,
+    include_diagnostics: bool = True,
 ) -> FieldQcReport:
-    """Build a compact field/series QC report from existing database products."""
+    """Build field QC and candidate rows from existing database products.
+
+    ``include_diagnostics=False`` retains the same candidate triage and warning
+    inputs while omitting diagnostic-only RMS bins, blend rows, and report tables.
+    """
 
     cv = session.scalar(select(CalibrationVersion).where(CalibrationVersion.name == calibration_name))
     if cv is None:
@@ -159,10 +164,14 @@ def build_field_qc_report(
             frame_ids=selected_frame_ids,
             min_measurements=min_measurements,
         )
-    rms_bins = build_rms_mag_summary(
-        object_rows,
-        bin_width=bin_width,
-        min_objects_per_bin=min_objects_per_bin,
+    rms_bins = (
+        build_rms_mag_summary(
+            object_rows,
+            bin_width=bin_width,
+            min_objects_per_bin=min_objects_per_bin,
+        )
+        if include_diagnostics
+        else []
     )
 
     object_qc = _object_qc_summary(
@@ -216,18 +225,22 @@ def build_field_qc_report(
     )
     candidate_rows = triage.rows
 
-    blend_rows = build_blend_diagnostic_rows(
-        session,
-        calibration_name=calibration_name,
-        catalog_name=catalog_name,
-        instrument_unit_id=instrument_unit_id,
-        frame_ids=selected_frame_ids,
-        algorithm=object_qc_algorithm,
-        only_flagged=False,
-        sort="risk",
-        limit=None,
-    )
-    blend_summary = summarize_blend_diagnostics(blend_rows)
+    if include_diagnostics:
+        blend_rows = build_blend_diagnostic_rows(
+            session,
+            calibration_name=calibration_name,
+            catalog_name=catalog_name,
+            instrument_unit_id=instrument_unit_id,
+            frame_ids=selected_frame_ids,
+            algorithm=object_qc_algorithm,
+            only_flagged=False,
+            sort="risk",
+            limit=None,
+        )
+        blend_summary = summarize_blend_diagnostics(blend_rows)
+    else:
+        blend_rows = []
+        blend_summary = {}
 
     warnings = _build_warnings(
         frames=frames,
@@ -294,16 +307,17 @@ def build_field_qc_report(
         "object_qc": object_qc,
         "candidate_triage": triage.summary,
         "blend_diagnostics": blend_summary,
-        "top_candidates": {
+        "warnings": warnings,
+    }
+    if include_diagnostics:
+        report["top_candidates"] = {
             "accepted": [r for r in candidate_rows if r.get("candidate_status") == "ACCEPTED"][:top_limit],
             "borderline": [r for r in candidate_rows if r.get("candidate_status") == "BORDERLINE"][:top_limit],
             "diagnostic": [r for r in candidate_rows if r.get("candidate_status") == "DIAGNOSTIC"][:top_limit],
             "rejected": [r for r in candidate_rows if r.get("candidate_status") == "REJECTED"][:top_limit],
-        },
-        "top_blend_risk": blend_rows[:top_limit],
-        "warnings": warnings,
-    }
-    summary_rows = _summary_rows(report)
+        }
+        report["top_blend_risk"] = blend_rows[:top_limit]
+    summary_rows = _summary_rows(report) if include_diagnostics else []
     return FieldQcReport(
         report=report,
         summary_rows=summary_rows,

@@ -89,6 +89,236 @@ def test_light_curve_reject_flags_can_make_detection_support_diagnostic_only():
     assert "HIGH_RMS" in relaxed
 
 
+def test_compact_count_summary_matches_full_summary_with_merged_rejection_flags(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from grandgousier.db.models import CalibrationVersion
+    from grandgousier.lightcurves import product
+
+    cv = SimpleNamespace(
+        calibration_version_id=101,
+        name="science_v",
+        model_name="ensemble_test",
+        series_id=55,
+    )
+
+    def measurement(
+        measurement_id, object_id, frame_id, mag_cal, flags, *, mag_err_random=0.02
+    ):
+        return SimpleNamespace(
+            measurement_id=measurement_id,
+            base_measurement_id=measurement_id,
+            object_id=object_id,
+            frame_id=frame_id,
+            x=1.0,
+            y=2.0,
+            flux=100.0,
+            flux_err=1.0,
+            mag_inst=mag_cal,
+            mag_cal=mag_cal,
+            mag_err=0.03,
+            mag_err_random=mag_err_random,
+            mag_err_systematic=None,
+            aperture_radius_pix=3.0,
+            local_background=10.0,
+            local_zp_correction=None,
+            centroid_dx_pix=0.0,
+            centroid_dy_pix=0.0,
+            flags=flags,
+        )
+
+    measurements = [
+        measurement(1, 1, 1, 14.0, {"catalog_name": "gaia", "source_id": "s1"}),
+        measurement(
+            2,
+            1,
+            2,
+            14.1,
+            {"catalog_name": "gaia", "source_id": "s1", "NO_DETECTION_SUPPORT": True},
+            mag_err_random=None,
+        ),
+        measurement(3, 2, 3, 15.0, {"catalog_name": "gaia", "source_id": "s2"}),
+        measurement(4, 3, 4, 15.1, {"catalog_name": "gaia", "source_id": "s3"}),
+        measurement(
+            5,
+            4,
+            5,
+            15.2,
+            {"catalog_name": "gaia", "source_id": "s4", "EDGE": False},
+        ),
+        measurement(6, 5, 6, None, {"catalog_name": "gaia", "source_id": "s5"}),
+        measurement(7, 6, 1, 16.0, {"catalog_name": "other", "source_id": "s6"}),
+        measurement(8, 7, 7, 16.1, {"catalog_name": "gaia", "source_id": "s7"}),
+        measurement(9, 8, 8, 16.2, {"catalog_name": "gaia", "source_id": "s8"}),
+    ]
+    frames = [
+        SimpleNamespace(
+            frame_id=frame_id,
+            instrument_unit_id=9 if frame_id == 7 else 8,
+            quality_flags={"EDGE": True} if frame_id in {4, 5} else {},
+            date_obs=None,
+            mjd=float(frame_id),
+            jd=None,
+            instrument="MASTER",
+            site="test",
+            tube="east",
+            camera="204",
+            filter_name="V",
+        )
+        for frame_id in range(1, 8)
+    ]
+    object_qc = SimpleNamespace(
+        object_id=2,
+        calibration_version_id=101,
+        catalog_name="gaia",
+        instrument_unit_id=8,
+        flags={"HIGH_RMS": True},
+    )
+    scope_context_row = {
+        "calibration_version_id": 101,
+        "product_role": "SCIENCE",
+        "calibration_field_id": 33,
+        "calibration_series_id": 55,
+        "calibration_instrument_unit_id": 8,
+        "used_catalogs": {"catalog_name": "gaia"},
+        "series_field_id": 33,
+        "series_instrument_unit_id": 8,
+        "series_filter_name": "V",
+        "pipeline_catalog_name": "gaia",
+    }
+    generation_row = {
+        "interseries_generation_id": 900,
+        "field_id": 33,
+        "instrument_unit_id": 8,
+        "filter_name": "V",
+        "catalog_name": "gaia",
+        "analysis_algorithm": "interseries_graph_median_v1",
+        "lifecycle_status": "COMPLETE_IMMUTABLE",
+        "reliability_status": "REDUNDANT_GRAPH_OK",
+        "n_series": 1,
+        "membership_field_id": 33,
+        "series_id": 55,
+        "science_calibration_version_id": 101,
+        "offset_mag": 0.1,
+        "offset_err": 0.01,
+    }
+
+    class Result:
+        def __init__(self, rows):
+            self._rows = list(rows)
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return list(self._rows)
+
+    class FakeSession:
+        def __init__(self):
+            self.scalar_responses = iter(([cv], frames, [object_qc]))
+            self.execute_responses = iter(
+                ([scope_context_row], [generation_row], [(55, "field", 33)])
+            )
+
+        def get(self, model, key):
+            assert model is CalibrationVersion
+            assert key == 101
+            return cv
+
+        def scalars(self, _statement):
+            return Result(next(self.scalar_responses))
+
+        def execute(self, _statement, *_args, **_kwargs):
+            return Result(next(self.execute_responses))
+
+    monkeypatch.setattr(
+        product,
+        "_load_calibration_rows",
+        lambda *_args, **_kwargs: [
+            {
+                "calibration_version_id": 101,
+                "name": "science_v",
+                "model_name": "ensemble_test",
+                "instrument_unit_id": 8,
+                "series_id": 55,
+                "field_id": 33,
+                "product_role": "SCIENCE",
+                "is_current_alias_head": True,
+            }
+        ],
+    )
+    monkeypatch.setattr(product, "_calibration_chain_names", lambda *_args: ["science_v"])
+    monkeypatch.setattr(
+        product,
+        "_resolve_field_series_filter",
+        lambda *_args, **_kwargs: {
+            "frame_ids": list(range(1, 9)),
+            "series_id": 55,
+            "field_name": "field",
+        },
+    )
+
+    def fake_view(_session, *, frame_ids, **_kwargs):
+        selected = set(frame_ids or ())
+        return SimpleNamespace(
+            rows=[row for row in measurements if not selected or row.frame_id in selected]
+        )
+
+    monkeypatch.setattr(product, "load_calibration_photometry_view", fake_view)
+    selected_generations = []
+    apply_selection = product._apply_interseries_selection_to_scope
+
+    def record_selection(scope, selection):
+        apply_selection(scope, selection)
+        selected_generations.append(list(scope.interseries_generation_ids))
+
+    monkeypatch.setattr(product, "_apply_interseries_selection_to_scope", record_selection)
+    converted_rows = []
+    science_row_from_db = product._science_row_from_db
+
+    def record_science_row(*args, **kwargs):
+        converted_rows.append(True)
+        return science_row_from_db(*args, **kwargs)
+
+    monkeypatch.setattr(product, "_science_row_from_db", record_science_row)
+    reject_flags = product.light_curve_reject_flags(require_detection_support=False)
+
+    compact = product.build_light_curve_count_summary(
+        FakeSession(),
+        calibration_names=["science_v"],
+        catalog_name="gaia",
+        series_id=55,
+        reject_flags=reject_flags,
+    )
+    assert converted_rows == []
+
+    full = product.build_light_curve_summary(
+        FakeSession(),
+        calibration_names=["science_v"],
+        catalog_name="gaia",
+        series_id=55,
+        reject_flags=reject_flags,
+    )
+
+    assert (
+        compact.total_points,
+        compact.accepted_points,
+        compact.rejected_points,
+        compact.n_objects,
+    ) == (
+        full.total_points,
+        full.accepted_points,
+        full.rejected_points,
+        full.n_objects,
+    ) == (7, 4, 3, 6)
+    assert full.scope.interseries_generation_ids == [900]
+    assert selected_generations == [[900], [900]]
+    assert len(converted_rows) == 7
+    assert full.n_reject_reasons == {"EDGE": 1, "HIGH_RMS": 1, "NO_VALID_MAG": 1}
+
+
 def test_science_lightcurve_reader_has_no_legacy_storage_path() -> None:
     from pathlib import Path
 

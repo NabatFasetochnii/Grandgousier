@@ -15,9 +15,7 @@ from grandgousier.db.models import (
     CalibrationProductAlias,
     Field,
     FieldSeries,
-    FieldSeriesFrame,
     Frame,
-    Measurement,
     InterseriesCalibrationGeneration,
     InterseriesCalibrationSeries,
     ObjectQc,
@@ -206,6 +204,14 @@ class LightCurveSummary:
             "n_reject_reasons": self.n_reject_reasons,
             "n_filters": self.n_filters,
         }
+
+
+@dataclass(frozen=True)
+class LightCurveCountSummary:
+    total_points: int
+    accepted_points: int
+    rejected_points: int
+    n_objects: int
 
 
 def parse_reject_flags(value: str | None, *, use_defaults: bool = True) -> set[str]:
@@ -467,6 +473,88 @@ def build_light_curve_summary(
         n_without_interseries_offset=sum(1 for row in rows if row.get("interseries_offset_mag") is None),
         n_reject_reasons=dict(sorted(reject_counts.items())),
         n_filters=dict(sorted(filter_counts.items())),
+    )
+
+
+def build_light_curve_count_summary(
+    session: Session,
+    *,
+    calibration_names: list[str] | None = None,
+    calibration_prefixes: list[str] | None = None,
+    model_name: str | None = None,
+    catalog_name: str | None = None,
+    instrument_unit_id: int | None = None,
+    series_id: int | None = None,
+    field_series_name: str | None = None,
+    frame_ids: list[int] | None = None,
+    object_qc_algorithm: str = "object_qc_v1",
+    offset_algorithm: str = "interseries_graph_median_v1",
+    interseries_generation_ids: list[int] | None = None,
+    reject_flags: set[str] | None = None,
+) -> LightCurveCountSummary:
+    """Count science points without building detailed light-curve row dictionaries.
+
+    Calibration scope, normalized photometry loading, M4 generation selection,
+    and the row inclusion checks are shared with the full summary path. Rejection
+    uses the same merged flags and magnitude/error rules as
+    :func:`_science_row_from_db`.
+    """
+
+    scope = resolve_light_curve_scope(
+        session,
+        calibration_names=calibration_names,
+        calibration_prefixes=calibration_prefixes,
+        model_name=model_name,
+        catalog_name=catalog_name,
+        instrument_unit_id=instrument_unit_id,
+        series_id=series_id,
+        field_series_name=field_series_name,
+        frame_ids=frame_ids,
+    )
+    effective_reject_flags = (
+        reject_flags if reject_flags is not None else set(DEFAULT_REJECT_FLAGS)
+    )
+    object_ids: set[int] = set()
+    total_points = accepted_points = rejected_points = 0
+    for row in _iter_raw_light_curve_rows_virtual(
+        session,
+        scope=scope,
+        source_id=None,
+        object_id=None,
+        object_qc_algorithm=object_qc_algorithm,
+        offset_algorithm=offset_algorithm,
+        interseries_generation_ids=interseries_generation_ids,
+        count_only=True,
+    ):
+        (
+            _measurement_flags,
+            _object_flags,
+            _frame_flags,
+            _quality_flags,
+            _random_err,
+            is_rejected,
+            _reject_reasons,
+        ) = _science_rejection_state(
+            measurement_flags=row.get("measurement_flags"),
+            object_qc_flags=row.get("object_qc_flags"),
+            frame_quality_flags=row.get("frame_quality_flags"),
+            mag_cal=row.get("mag_cal"),
+            mag_err=row.get("mag_err"),
+            mag_err_random=row.get("mag_err_random"),
+            reject_flags=effective_reject_flags,
+        )
+        total_points += 1
+        if is_rejected:
+            rejected_points += 1
+        else:
+            accepted_points += 1
+        object_ids.add(int(row["object_id"]))
+
+    return LightCurveCountSummary(
+        total_points=total_points,
+        accepted_points=accepted_points,
+        rejected_points=rejected_points,
+        n_objects=len(object_ids),
     )
 
 
@@ -807,7 +895,41 @@ def _load_raw_light_curve_rows_virtual(
     offset_algorithm: str,
     interseries_generation_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build the public light-curve row shape from normalized calibration state."""
+    rows = list(
+        _iter_raw_light_curve_rows_virtual(
+            session,
+            scope=scope,
+            source_id=source_id,
+            object_id=object_id,
+            object_qc_algorithm=object_qc_algorithm,
+            offset_algorithm=offset_algorithm,
+            interseries_generation_ids=interseries_generation_ids,
+        )
+    )
+    rows.sort(
+        key=lambda row: (
+            int(row["object_id"]),
+            float(row["mjd"]) if row.get("mjd") is not None else float("inf"),
+            str(row.get("date_obs") or ""),
+            int(row["frame_id"]),
+            int(row.get("measurement_id") or 0),
+        )
+    )
+    return rows
+
+
+def _iter_raw_light_curve_rows_virtual(
+    session: Session,
+    *,
+    scope: LightCurveScope,
+    source_id: str | None,
+    object_id: int | None,
+    object_qc_algorithm: str,
+    offset_algorithm: str,
+    interseries_generation_ids: list[int] | None = None,
+    count_only: bool = False,
+) -> Iterable[dict[str, Any]]:
+    """Stream full rows or the minimal fields needed for point counts."""
 
     cv_ids = sorted({int(value) for value in scope.calibration_version_ids})
     cvs = {
@@ -861,7 +983,7 @@ def _load_raw_light_curve_rows_virtual(
     )
     _apply_interseries_selection_to_scope(scope, offset_selection)
     if not virtual_rows:
-        return []
+        return
 
     frame_ids = sorted({int(row.frame_id) for _cv, row in virtual_rows})
     frames = {
@@ -876,7 +998,7 @@ def _load_raw_light_curve_rows_virtual(
             and frames[int(row.frame_id)].instrument_unit_id == int(scope.instrument_unit_id)
         ]
     if not virtual_rows:
-        return []
+        return
 
     # A frame may belong to several reproducible grouping definitions in 0.7.
     # CalibrationVersion.series_id is the authoritative series scope for a
@@ -887,7 +1009,7 @@ def _load_raw_light_curve_rows_virtual(
         if cv.series_id is not None
     })
     series_info: dict[int, tuple[str | None, int]] = {}
-    if scoped_series_ids:
+    if scoped_series_ids and not count_only:
         for series_id_value, field_name, field_id_value in session.execute(
             select(FieldSeries.series_id, Field.field_name, Field.field_id)
             .join(Field, Field.field_id == FieldSeries.field_id)
@@ -913,18 +1035,11 @@ def _load_raw_light_curve_rows_virtual(
         )
         qc_by_key[key] = qc
 
-    result: list[dict[str, Any]] = []
     for cv, measurement in virtual_rows:
         frame = frames.get(int(measurement.frame_id))
         if frame is None:
             continue
         flags = dict(measurement.flags or {})
-        series_id_value = (
-            int(cv.series_id)
-            if cv.series_id is not None
-            else (int(scope.series_id) if scope.series_id is not None else None)
-        )
-        field_name = series_info.get(series_id_value, (None, -1))[0] if series_id_value is not None else None
         qc = qc_by_key.get(
             (
                 int(measurement.object_id),
@@ -932,6 +1047,28 @@ def _load_raw_light_curve_rows_virtual(
                 flags.get("catalog_name"),
                 int(frame.instrument_unit_id) if frame.instrument_unit_id is not None else None,
             )
+        )
+        if count_only:
+            yield {
+                "object_id": int(measurement.object_id),
+                "mag_cal": measurement.mag_cal,
+                "mag_err": measurement.mag_err,
+                "mag_err_random": measurement.mag_err_random,
+                "measurement_flags": flags,
+                "frame_quality_flags": dict(frame.quality_flags or {}),
+                "object_qc_flags": dict(qc.flags or {}) if qc is not None else {},
+            }
+            continue
+
+        series_id_value = (
+            int(cv.series_id)
+            if cv.series_id is not None
+            else (int(scope.series_id) if scope.series_id is not None else None)
+        )
+        field_name = (
+            series_info.get(series_id_value, (None, -1))[0]
+            if series_id_value is not None
+            else None
         )
         offset = (
             offset_selection["source_offsets"].get(
@@ -955,59 +1092,47 @@ def _load_raw_light_curve_rows_virtual(
                 "NO_M4_SOURCE_MATCH",
             )
         )
-        result.append(
-            {
-                "measurement_id": measurement.measurement_id or measurement.base_measurement_id,
-                "object_id": int(measurement.object_id),
-                "frame_id": int(measurement.frame_id),
-                "series_id": series_id_value,
-                "field_name": field_name,
-                "calibration_name": str(cv.name),
-                "calibration_version_id": int(cv.calibration_version_id),
-                "model_name": cv.model_name,
-                "date_obs": frame.date_obs,
-                "mjd": frame.mjd,
-                "jd": frame.jd,
-                "instrument_unit_id": frame.instrument_unit_id,
-                "instrument": frame.instrument,
-                "site": frame.site,
-                "tube": frame.tube,
-                "camera": frame.camera,
-                "filter_name": frame.filter_name,
-                "x": measurement.x,
-                "y": measurement.y,
-                "flux": measurement.flux,
-                "flux_err": measurement.flux_err,
-                "mag_inst": measurement.mag_inst,
-                "mag_cal": measurement.mag_cal,
-                "mag_err": measurement.mag_err,
-                "mag_err_random": measurement.mag_err_random,
-                "mag_err_systematic": measurement.mag_err_systematic,
-                "aperture_radius_pix": measurement.aperture_radius_pix,
-                "local_background": measurement.local_background,
-                "local_zp_correction": measurement.local_zp_correction,
-                "centroid_dx_pix": measurement.centroid_dx_pix,
-                "centroid_dy_pix": measurement.centroid_dy_pix,
-                "measurement_flags": flags,
-                "frame_quality_flags": dict(frame.quality_flags or {}),
-                "object_qc_flags": dict(qc.flags or {}) if qc is not None else {},
-                "interseries_offset_mag": offset["offset_mag"] if offset is not None else None,
-                "interseries_offset_err": offset["offset_err"] if offset is not None else None,
-                "interseries_offset_status": offset_status,
-                "interseries_algorithm": offset["algorithm"] if offset is not None else None,
-                "interseries_generation_id": offset["interseries_generation_id"] if offset is not None else None,
-            }
-        )
-    result.sort(
-        key=lambda row: (
-            int(row["object_id"]),
-            float(row["mjd"]) if row.get("mjd") is not None else float("inf"),
-            str(row.get("date_obs") or ""),
-            int(row["frame_id"]),
-            int(row.get("measurement_id") or 0),
-        )
-    )
-    return result
+        yield {
+            "measurement_id": measurement.measurement_id or measurement.base_measurement_id,
+            "object_id": int(measurement.object_id),
+            "frame_id": int(measurement.frame_id),
+            "series_id": series_id_value,
+            "field_name": field_name,
+            "calibration_name": str(cv.name),
+            "calibration_version_id": int(cv.calibration_version_id),
+            "model_name": cv.model_name,
+            "date_obs": frame.date_obs,
+            "mjd": frame.mjd,
+            "jd": frame.jd,
+            "instrument_unit_id": frame.instrument_unit_id,
+            "instrument": frame.instrument,
+            "site": frame.site,
+            "tube": frame.tube,
+            "camera": frame.camera,
+            "filter_name": frame.filter_name,
+            "x": measurement.x,
+            "y": measurement.y,
+            "flux": measurement.flux,
+            "flux_err": measurement.flux_err,
+            "mag_inst": measurement.mag_inst,
+            "mag_cal": measurement.mag_cal,
+            "mag_err": measurement.mag_err,
+            "mag_err_random": measurement.mag_err_random,
+            "mag_err_systematic": measurement.mag_err_systematic,
+            "aperture_radius_pix": measurement.aperture_radius_pix,
+            "local_background": measurement.local_background,
+            "local_zp_correction": measurement.local_zp_correction,
+            "centroid_dx_pix": measurement.centroid_dx_pix,
+            "centroid_dy_pix": measurement.centroid_dy_pix,
+            "measurement_flags": flags,
+            "frame_quality_flags": dict(frame.quality_flags or {}),
+            "object_qc_flags": dict(qc.flags or {}) if qc is not None else {},
+            "interseries_offset_mag": offset["offset_mag"] if offset is not None else None,
+            "interseries_offset_err": offset["offset_err"] if offset is not None else None,
+            "interseries_offset_status": offset_status,
+            "interseries_algorithm": offset["algorithm"] if offset is not None else None,
+            "interseries_generation_id": offset["interseries_generation_id"] if offset is not None else None,
+        }
 
 
 def _load_calibration_scope_contexts(
@@ -1439,15 +1564,23 @@ def _str_or_none(value: Any) -> str | None:
 
 
 def _science_row_from_db(row: dict[str, Any], *, reject_flags: set[str]) -> dict[str, Any]:
-    measurement_flags = _dict_or_empty(row.get("measurement_flags"))
-    object_flags = _dict_or_empty(row.get("object_qc_flags"))
-    frame_flags = _dict_or_empty(row.get("frame_quality_flags"))
-    quality_flags = merge_quality_flags(
-        measurement_flags=measurement_flags,
-        object_qc_flags=object_flags,
-        frame_quality_flags=frame_flags,
+    (
+        measurement_flags,
+        object_flags,
+        frame_flags,
+        quality_flags,
+        random_err,
+        is_rejected,
+        reject_reasons,
+    ) = _science_rejection_state(
+        measurement_flags=row.get("measurement_flags"),
+        object_qc_flags=row.get("object_qc_flags"),
+        frame_quality_flags=row.get("frame_quality_flags"),
+        mag_cal=row.get("mag_cal"),
+        mag_err=row.get("mag_err"),
+        mag_err_random=row.get("mag_err_random"),
+        reject_flags=reject_flags,
     )
-    random_err = row.get("mag_err_random") if row.get("mag_err_random") is not None else row.get("mag_err")
     systematic_err = row.get("mag_err_systematic")
     detector_err = measurement_flags.get("mag_err_detector")
     if not _is_finite(detector_err):
@@ -1472,12 +1605,6 @@ def _science_row_from_db(row: dict[str, Any], *, reject_flags: set[str]) -> dict
     effective_err = effective_total_err
     if not _is_finite(effective_err):
         effective_err = measurement_flags.get("mag_err_effective")
-    is_rejected, reject_reasons = evaluate_rejection(
-        quality_flags=quality_flags,
-        mag=row.get("mag_cal"),
-        mag_err=random_err,
-        reject_flags=reject_flags,
-    )
     mag_global = row.get("mag_cal")
     offset = row.get("interseries_offset_mag")
     if _is_finite(mag_global) and _is_finite(offset):
@@ -1548,6 +1675,50 @@ def _science_row_from_db(row: dict[str, Any], *, reject_flags: set[str]) -> dict
         "reject_reasons_list": reject_reasons,
     }
     return out
+
+
+def _science_rejection_state(
+    *,
+    measurement_flags: Any,
+    object_qc_flags: Any,
+    frame_quality_flags: Any,
+    mag_cal: Any,
+    mag_err: Any,
+    mag_err_random: Any,
+    reject_flags: set[str],
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    Any,
+    bool,
+    list[str],
+]:
+    measurement_flags = _dict_or_empty(measurement_flags)
+    object_flags = _dict_or_empty(object_qc_flags)
+    frame_flags = _dict_or_empty(frame_quality_flags)
+    quality_flags = merge_quality_flags(
+        measurement_flags=measurement_flags,
+        object_qc_flags=object_flags,
+        frame_quality_flags=frame_flags,
+    )
+    random_err = mag_err_random if mag_err_random is not None else mag_err
+    is_rejected, reject_reasons = evaluate_rejection(
+        quality_flags=quality_flags,
+        mag=mag_cal,
+        mag_err=random_err,
+        reject_flags=reject_flags,
+    )
+    return (
+        measurement_flags,
+        object_flags,
+        frame_flags,
+        quality_flags,
+        random_err,
+        is_rejected,
+        reject_reasons,
+    )
 
 
 def merge_quality_flags(

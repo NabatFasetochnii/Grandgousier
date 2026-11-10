@@ -237,6 +237,23 @@ def test_process_archive_path_plan_accepts_degree_pair_without_processing(monkey
     result = process_archive_path(object(), root=tmp_path, exact_paths=[], execute=False,
                                   target_ra_deg=0.0, target_dec_deg=90.0)
     assert result.status == "PLAN"
+    assert result.stage2_profile == "bulk"
+    assert result.effective_stage2_settings["profile"] == "bulk"
+    assert result.effective_stage2_settings["random_error_validation"] is True
+    assert result.effective_stage2_settings["random_error_legacy_comparison"] is False
+    assert (
+        result.effective_stage2_settings["random_error_residual_floor_diagnostics"]
+        is True
+    )
+    assert (
+        result.effective_stage2_settings[
+            "random_error_validation_and_legacy_comparison"
+        ]
+        is False
+    )
+    assert result.effective_stage2_settings["random_error_diagnostic_exports"] is False
+    assert result.effective_stage2_settings["light_curve_summary_row_materialization"] is False
+    assert result.effective_stage2_settings["light_curve_summary_compact_counts"] is True
     assert not result.pipeline_results
 
 
@@ -444,6 +461,177 @@ def test_classify_science_status_distinguishes_empty_science_products():
     assert _classify_science_status(0, 0, 0) == "WARNING_NO_MEASUREMENTS"
     assert _classify_science_status(10, 0, 1) == "WARNING_NO_ACCEPTED_POINTS"
     assert _classify_science_status(10, 3, 1) == "OK"
+
+
+@pytest.mark.parametrize("stage2_profile", ["bulk", "diagnostic"])
+@pytest.mark.parametrize(
+    ("accepted_points", "expected_status"),
+    [(4, "OK"), (0, "WARNING_NO_ACCEPTED_POINTS")],
+)
+def test_process_archive_path_uses_profile_appropriate_light_curve_summary(
+    monkeypatch, tmp_path, stage2_profile, accepted_points, expected_status
+):
+    import json
+
+    from grandgousier.lightcurves.product import LightCurveScope, LightCurveSummary
+
+    source_path = Path("synthetic_master.fits")
+    detected = _detected_master("SUMMARY_PATH")
+    series = {
+        "series_id": 12,
+        "field_id": 3,
+        "field_name": "synthetic_field",
+        "instrument_unit_id": 4,
+        "filter_name": "V",
+        "instrument": "MASTER",
+        "tube": "EAST",
+        "camera": "204",
+        "object_name": "synthetic",
+        "time_start": "2024-01-01T00:00:00+00:00",
+    }
+    pipeline_result = SimpleNamespace(
+        pipeline_run_id=None,
+        status="DONE",
+        calibration_names={"science": "science_12"},
+        outputs={},
+        quality_policy={"require_detection_support_effective": False},
+        steps=[],
+        log_files={},
+    )
+    summary_calls = {"compact": 0, "full": 0}
+
+    def fake_compact_summary(_session, **_kwargs):
+        summary_calls["compact"] += 1
+        return SimpleNamespace(
+            total_points=8,
+            accepted_points=accepted_points,
+            rejected_points=8 - accepted_points,
+            n_objects=3,
+        )
+
+    def fake_full_summary(_session, **_kwargs):
+        summary_calls["full"] += 1
+        return LightCurveSummary(
+            scope=LightCurveScope(
+                calibration_names=["science_12"],
+                calibration_version_ids=[101],
+                series_id=12,
+                field_name="synthetic_field",
+            ),
+            total_points=8,
+            accepted_points=accepted_points,
+            rejected_points=8 - accepted_points,
+            n_objects=3,
+            n_series=1,
+            n_frames=8,
+            n_calibrations=1,
+            n_with_interseries_offset=0,
+            n_without_interseries_offset=8,
+            n_reject_reasons={"HIGH_RMS": 4},
+            n_filters={"V": 8},
+        )
+
+    monkeypatch.setattr(
+        auto_process_module,
+        "scan_archive_paths",
+        lambda *_args, **_kwargs: ([detected], [], []),
+    )
+    monkeypatch.setattr(auto_process_module, "load_auto_profiles", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        auto_process_module,
+        "index_detected_archive_files",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            indexed_paths=[str(source_path)],
+            indexed_frame_ids=[101],
+            index_results=[],
+            failed_files=0,
+        ),
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "select_persisted_science_frames",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            selected_frame_ids=[101], summary={"selected_frames": 1}, rows=[]
+        ),
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "_observation_selection_warning",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(auto_process_module, "_series_ids_for_paths", lambda *_args: [])
+    monkeypatch.setattr(
+        auto_process_module,
+        "_inspect_existing_catalog",
+        lambda *_args, **_kwargs: {"status": "READY"},
+    )
+    monkeypatch.setattr(auto_process_module, "_catalog_precondition_ok", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        auto_process_module, "_frame_ids_by_instrument_unit", lambda *_args: {4: [101]}
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "build_field_series",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            rows=[{"series_id": 12, "status": "READY"}],
+            summary=lambda: {"ready_series": 1},
+            observation_selection_rows=[],
+        ),
+    )
+    monkeypatch.setattr(
+        auto_process_module, "_frame_ids_by_series_for_paths", lambda *_args: {12: [101]}
+    )
+    monkeypatch.setattr(
+        auto_process_module, "_load_series_for_pipeline", lambda *_args: [series]
+    )
+    monkeypatch.setattr(
+        auto_process_module, "run_field_pipeline", lambda *_args, **_kwargs: pipeline_result
+    )
+    monkeypatch.setattr(
+        auto_process_module, "build_light_curve_count_summary", fake_compact_summary
+    )
+    monkeypatch.setattr(
+        auto_process_module, "build_light_curve_summary", fake_full_summary
+    )
+
+    result = process_archive_path(
+        object(),
+        root=tmp_path,
+        exact_paths=[source_path],
+        catalog_name="synthetic_catalog",
+        execute=True,
+        out_root=tmp_path,
+        stage2_profile=stage2_profile,
+    )
+
+    expected_calls = {"compact": 1, "full": 0} if stage2_profile == "bulk" else {
+        "compact": 0,
+        "full": 1,
+    }
+    assert summary_calls == expected_calls
+    assert result.pipeline_results[0]["science_status"] == expected_status
+    assert result.pipeline_results[0]["total_points"] == 8
+    assert result.pipeline_results[0]["accepted_points"] == accepted_points
+    assert result.pipeline_results[0]["rejected_points"] == 8 - accepted_points
+    assert result.pipeline_results[0]["n_objects"] == 3
+
+    if expected_status == "OK":
+        assert result.warnings == []
+    else:
+        assert result.warnings == [
+            f"series_id=12 science_status={expected_status} total_points=8 accepted_points=0"
+        ]
+
+    summary_path = result.pipeline_results[0]["light_curve_summary_json"]
+    if stage2_profile == "bulk":
+        assert summary_path is None
+    else:
+        assert summary_path is not None
+        exported = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+        assert exported["total_points"] == 8
+        assert exported["accepted_points"] == accepted_points
+        assert exported["rejected_points"] == 8 - accepted_points
+        assert exported["n_objects"] == 3
 
 
 

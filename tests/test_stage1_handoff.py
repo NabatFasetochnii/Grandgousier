@@ -1564,8 +1564,11 @@ def test_new_physical_master_handoff_keeps_target_optional_and_persists_source_k
     assert result.status == "READY"
     assert result.selected_items == 1
     assert result.stage2_result is not None
+    assert result.stage2_profile == "bulk"
+    assert result.to_dict()["stage2_profile"] == "bulk"
     assert len(process_calls) == 1
     assert process_calls[0]["exact_paths"] == [product]
+    assert process_calls[0]["stage2_profile"] == "bulk"
     frame = db_session.scalar(select(Frame).where(Frame.frame_uid == "new-physical-frame"))
     assert frame is not None
     assert frame.header_json["raw_relative_physical_key"] == source_key
@@ -2323,6 +2326,7 @@ def test_stage1_handoff_cli_contract() -> None:
     assert args.execution_report == "execution.json"
     assert args.execute is False
     assert args.persist_only is False
+    assert args.stage2_profile == "bulk"
     assert args.catalog_name == "catalog"
     assert args.min_frames_per_series == 10
     assert args.ensemble_min_ref_stars_per_frame == 30
@@ -2367,11 +2371,13 @@ def test_stage1_handoff_cli_forwards_explicit_threshold_without_processing(monke
     args = build_parser().parse_args([
         "stage1-handoff", "--execution-report", "execution.json",
         "--ensemble-min-ref-stars-per-frame", "20", "--persist-only", "--format", "json",
+        "--stage2-profile", "diagnostic",
     ])
     assert args.func(args) == 0
     assert captured["ensemble_min_ref_stars_per_frame"] == 20
     assert captured["execute"] is False
     assert captured["persist_only"] is True
+    assert captured["stage2_profile"] == "diagnostic"
 
 
 def test_execution_report_validation_rejects_product_locator_mismatch(tmp_path: Path) -> None:
@@ -2693,6 +2699,13 @@ def test_twenty_stage1_reductions_handoff_to_one_series_with_pipeline_stub(
     monkeypatch.setattr(
         auto_process,
         "build_light_curve_summary",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            total_points=1, accepted_points=1, rejected_points=0, n_objects=1
+        ),
+    )
+    monkeypatch.setattr(
+        auto_process,
+        "build_light_curve_count_summary",
         lambda *_args, **_kwargs: SimpleNamespace(
             total_points=1, accepted_points=1, rejected_points=0, n_objects=1
         ),

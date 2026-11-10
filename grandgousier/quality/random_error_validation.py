@@ -86,7 +86,8 @@ class RandomErrorValidationResult:
     residual_floor_pairwise_abs_correlation_p90: float | None = None
     residual_floor_pairwise_correlation_after_common_median: float | None = None
     residual_floor_pairwise_abs_correlation_after_common_median: float | None = None
-    residual_floor_pairwise_pairs: int = 0
+    residual_floor_pairwise_pairs: int | None = 0
+    residual_floor_pairwise_correlations_evaluated: bool = True
     residual_floor_annotation_measurements: int = 0
     residual_floor_annotation_calibrations: int = 0
     analysis_snapshot_algorithm: str | None = None
@@ -120,6 +121,8 @@ def validate_random_error_model(
     diagnostic_calibration_names: list[str] | None = None,
     analysis_snapshot: CalibrationAnalysisSnapshot | None = None,
     annotate_residual_floor: bool = True,
+    include_legacy_comparison: bool = True,
+    include_pairwise_residual_correlations: bool = True,
 ) -> RandomErrorValidationResult:
     """Validate random errors and estimate an additive residual floor.
 
@@ -247,6 +250,10 @@ def validate_random_error_model(
         residual_floor_bin_width=float(residual_floor_bin_width),
         residual_floor_lower_quantile=float(residual_floor_lower_quantile),
         residual_floor_min_objects_per_bin=int(residual_floor_min_objects_per_bin),
+        include_legacy_comparison=include_legacy_comparison,
+        include_pairwise_residual_correlations=(
+            include_pairwise_residual_correlations
+        ),
     )
     for key, value in summary.items():
         if hasattr(result, key):
@@ -294,6 +301,8 @@ def summarize_random_error_rows(
     residual_floor_bin_width: float = 1.0,
     residual_floor_lower_quantile: float = 0.25,
     residual_floor_min_objects_per_bin: int = 3,
+    include_legacy_comparison: bool = True,
+    include_pairwise_residual_correlations: bool = True,
 ) -> dict[str, Any]:
     clean_rows: list[dict[str, Any]] = []
     by_object: dict[int, list[dict[str, Any]]] = {}
@@ -334,18 +343,28 @@ def summarize_random_error_rows(
         physical_errs = np.asarray(
             [row["physical_err"] for row in object_measurements], dtype=float
         )
-        legacy_errs = np.asarray(
-            [row["legacy_err"] for row in object_measurements], dtype=float
-        )
         total_errs = np.asarray(
             [row["total_err"] for row in object_measurements], dtype=float
         )
         center = float(np.median(mags))
         residuals = mags - center
         physical_norm = residuals / physical_errs
-        legacy_norm = residuals / legacy_errs
         physical_norm_all.extend(float(value) for value in physical_norm)
-        legacy_norm_all.extend(float(value) for value in legacy_norm)
+        legacy_metrics: dict[str, Any] = {}
+        if include_legacy_comparison:
+            legacy_errs = np.asarray(
+                [row["legacy_err"] for row in object_measurements], dtype=float
+            )
+            legacy_norm = residuals / legacy_errs
+            legacy_norm_all.extend(float(value) for value in legacy_norm)
+            legacy_metrics = {
+                "legacy_mag_err_median": float(np.median(legacy_errs)),
+                "legacy_normalized_robust_sigma": _robust_sigma(legacy_norm),
+                "legacy_normalized_rms": _rms(legacy_norm),
+                "legacy_reduced_chi2": _reduced_chi2(
+                    legacy_norm, fitted_parameters=1
+                ),
+            }
         observed_robust_sigma = _robust_sigma(residuals)
         detector_err = float(np.median(physical_errs))
         raw_floor = _quadrature_excess(observed_robust_sigma, detector_err)
@@ -359,19 +378,37 @@ def summarize_random_error_rows(
             "observed_mad": _mad(residuals),
             "observed_robust_sigma": observed_robust_sigma,
             "physical_mag_err_median": detector_err,
-            "legacy_mag_err_median": float(np.median(legacy_errs)),
+            **(
+                {"legacy_mag_err_median": legacy_metrics["legacy_mag_err_median"]}
+                if include_legacy_comparison
+                else {}
+            ),
             "mag_err_detector_median": detector_err,
             "mag_err_random_median": float(np.median(total_errs)),
             "residual_floor_raw_mag": raw_floor,
             "physical_normalized_robust_sigma": _robust_sigma(physical_norm),
-            "legacy_normalized_robust_sigma": _robust_sigma(legacy_norm),
+            **(
+                {
+                    "legacy_normalized_robust_sigma": legacy_metrics[
+                        "legacy_normalized_robust_sigma"
+                    ]
+                }
+                if include_legacy_comparison
+                else {}
+            ),
             "physical_normalized_rms": _rms(physical_norm),
-            "legacy_normalized_rms": _rms(legacy_norm),
+            **(
+                {"legacy_normalized_rms": legacy_metrics["legacy_normalized_rms"]}
+                if include_legacy_comparison
+                else {}
+            ),
             "physical_reduced_chi2": _reduced_chi2(
                 physical_norm, fitted_parameters=1
             ),
-            "legacy_reduced_chi2": _reduced_chi2(
-                legacy_norm, fitted_parameters=1
+            **(
+                {"legacy_reduced_chi2": legacy_metrics["legacy_reduced_chi2"]}
+                if include_legacy_comparison
+                else {}
             ),
         }
         object_rows.append(object_row)
@@ -501,8 +538,21 @@ def summarize_random_error_rows(
             "effective_total_reduced_chi2"
         ]
 
-    raw_pairwise = _pairwise_residual_correlations(residual_rows, floor_ids, after_common=False)
-    decommon_pairwise = _pairwise_residual_correlations(residual_rows, floor_ids, after_common=True)
+    if include_pairwise_residual_correlations:
+        raw_pairwise = _pairwise_residual_correlations(
+            residual_rows, floor_ids, after_common=False
+        )
+        decommon_pairwise = _pairwise_residual_correlations(
+            residual_rows, floor_ids, after_common=True
+        )
+    else:
+        raw_pairwise = {
+            "n_pairs": None,
+            "median": None,
+            "abs_median": None,
+            "abs_p90": None,
+        }
+        decommon_pairwise = raw_pairwise
     frame_common_support = _evaluate_frame_common_support(
         floor_mag=floor_mag,
         floor_after_common_mag=decommon_floor_summary["floor_mag"],
@@ -512,12 +562,24 @@ def summarize_random_error_rows(
     associations = _residual_floor_associations(object_rows, frame_common)
 
     physical_sigma = _robust_sigma(physical_norm_all)
-    legacy_sigma = _robust_sigma(legacy_norm_all)
     physical_distance = _log_distance_to_unity(physical_sigma)
-    legacy_distance = _log_distance_to_unity(legacy_sigma)
-    physical_closer = None
-    if physical_distance is not None and legacy_distance is not None:
-        physical_closer = bool(physical_distance < legacy_distance)
+    legacy_summary_metrics: dict[str, Any] = {}
+    if include_legacy_comparison:
+        legacy_sigma = _robust_sigma(legacy_norm_all)
+        legacy_distance = _log_distance_to_unity(legacy_sigma)
+        physical_closer = None
+        if physical_distance is not None and legacy_distance is not None:
+            physical_closer = bool(physical_distance < legacy_distance)
+        legacy_summary_metrics = {
+            "legacy_normalized_robust_sigma": legacy_sigma,
+            "legacy_normalized_rms": _rms(legacy_norm_all),
+            "legacy_reduced_chi2": _reduced_chi2(
+                legacy_norm_all, fitted_parameters=len(object_rows)
+            ),
+            "legacy_error_scale_recommendation": legacy_sigma,
+            "legacy_log_distance_to_unity": legacy_distance,
+            "physical_closer_to_unity": physical_closer,
+        }
 
     degrees_of_freedom = max(0, len(physical_norm_all) - len(object_rows))
     residual_status = "OK" if floor_mag is not None and floor_ids else "INSUFFICIENT_LOWER_ENVELOPE"
@@ -526,20 +588,60 @@ def summarize_random_error_rows(
         "n_measurements": len(physical_norm_all),
         "degrees_of_freedom": degrees_of_freedom,
         "physical_normalized_robust_sigma": physical_sigma,
-        "legacy_normalized_robust_sigma": legacy_sigma,
+        **(
+            {"legacy_normalized_robust_sigma": legacy_summary_metrics[
+                "legacy_normalized_robust_sigma"
+            ]}
+            if include_legacy_comparison
+            else {}
+        ),
         "physical_normalized_rms": _rms(physical_norm_all),
-        "legacy_normalized_rms": _rms(legacy_norm_all),
+        **(
+            {"legacy_normalized_rms": legacy_summary_metrics["legacy_normalized_rms"]}
+            if include_legacy_comparison
+            else {}
+        ),
         "physical_reduced_chi2": _reduced_chi2(
             physical_norm_all, fitted_parameters=len(object_rows)
         ),
-        "legacy_reduced_chi2": _reduced_chi2(
-            legacy_norm_all, fitted_parameters=len(object_rows)
+        **(
+            {
+                "legacy_reduced_chi2": legacy_summary_metrics[
+                    "legacy_reduced_chi2"
+                ]
+            }
+            if include_legacy_comparison
+            else {}
         ),
         "physical_error_scale_recommendation": physical_sigma,
-        "legacy_error_scale_recommendation": legacy_sigma,
+        **(
+            {
+                "legacy_error_scale_recommendation": legacy_summary_metrics[
+                    "legacy_error_scale_recommendation"
+                ]
+            }
+            if include_legacy_comparison
+            else {}
+        ),
         "physical_log_distance_to_unity": physical_distance,
-        "legacy_log_distance_to_unity": legacy_distance,
-        "physical_closer_to_unity": physical_closer,
+        **(
+            {
+                "legacy_log_distance_to_unity": legacy_summary_metrics[
+                    "legacy_log_distance_to_unity"
+                ]
+            }
+            if include_legacy_comparison
+            else {}
+        ),
+        **(
+            {
+                "physical_closer_to_unity": legacy_summary_metrics[
+                    "physical_closer_to_unity"
+                ]
+            }
+            if include_legacy_comparison
+            else {}
+        ),
         "residual_floor_status": residual_status,
         "residual_floor_suggested_mag": floor_mag,
         "residual_floor_after_frame_common_mag": decommon_floor_summary["floor_mag"],
@@ -552,6 +654,9 @@ def summarize_random_error_rows(
         "residual_floor_frame_common_supported": frame_common_support["supported"],
         "residual_floor_frame_common_support_status": frame_common_support["status"],
         "residual_floor_frame_common_support_reason": frame_common_support["reason"],
+        "residual_floor_pairwise_correlations_evaluated": (
+            include_pairwise_residual_correlations
+        ),
         "residual_floor_frame_common_min_floor_reduction_fraction": FRAME_COMMON_MIN_FLOOR_REDUCTION_FRACTION,
         "residual_floor_frame_common_min_abs_correlation_reduction": FRAME_COMMON_MIN_ABS_CORRELATION_REDUCTION,
         "residual_floor_frame_common_floor_reduction_mag": frame_common_support[
@@ -590,7 +695,10 @@ def summarize_random_error_rows(
         "residual_floor_pairwise_abs_correlation_after_common_median": decommon_pairwise["abs_median"],
         "residual_floor_pairwise_pairs": raw_pairwise["n_pairs"],
         "object_rows": object_rows,
-        "magnitude_bins": _magnitude_bins(object_rows),
+        "magnitude_bins": _magnitude_bins(
+            object_rows,
+            include_legacy_comparison=include_legacy_comparison,
+        ),
         "residual_floor_bins": floor_summary["bins"],
         "residual_floor_after_common_bins": decommon_floor_summary["bins"],
         "residual_floor_frame_rows": frame_common,
@@ -715,11 +823,17 @@ def _evaluate_frame_common_support(
     after = _finite_or_none(floor_after_common_mag)
     corr = _finite_or_none(pairwise_abs_correlation_median)
     corr_after = _finite_or_none(pairwise_abs_correlation_after_common_median)
+    floor_comparison_available = (
+        floor is not None and floor > 0 and after is not None and after >= 0
+    )
+    floor_reduction_mag = floor - after if floor_comparison_available else None
+    floor_reduction_fraction = (
+        floor_reduction_mag / floor
+        if floor_comparison_available and floor_reduction_mag is not None
+        else None
+    )
     if (
-        floor is None
-        or floor <= 0
-        or after is None
-        or after < 0
+        not floor_comparison_available
         or corr is None
         or corr_after is None
     ):
@@ -727,13 +841,13 @@ def _evaluate_frame_common_support(
             "supported": None,
             "status": "INSUFFICIENT_DATA",
             "reason": "frame-common support requires both floor and pairwise-correlation comparisons",
-            "floor_reduction_mag": None,
-            "floor_reduction_fraction": None,
+            "floor_reduction_mag": floor_reduction_mag,
+            "floor_reduction_fraction": floor_reduction_fraction,
             "abs_correlation_reduction": None,
         }
 
-    floor_reduction_mag = floor - after
-    floor_reduction_fraction = floor_reduction_mag / floor if floor > 0 else None
+    assert floor_reduction_mag is not None
+    assert floor_reduction_fraction is not None
     abs_correlation_reduction = corr - corr_after
     floor_pass = (
         floor_reduction_fraction is not None
@@ -1081,6 +1195,9 @@ def _write_validation_outputs(result: RandomErrorValidationResult, out_dir: Path
         "pairwise_correlation_after_common_median": result.residual_floor_pairwise_correlation_after_common_median,
         "pairwise_abs_correlation_after_common_median": result.residual_floor_pairwise_abs_correlation_after_common_median,
         "pairwise_pairs": result.residual_floor_pairwise_pairs,
+        "pairwise_correlations_evaluated": (
+            result.residual_floor_pairwise_correlations_evaluated
+        ),
         "annotation_measurements": result.residual_floor_annotation_measurements,
         "annotation_calibrations": result.residual_floor_annotation_calibrations,
         "magnitude_bins": result.residual_floor_bins,
@@ -1182,7 +1299,11 @@ def _measurement_is_hard_rejected(flags: dict[str, Any]) -> bool:
     return False
 
 
-def _magnitude_bins(object_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _magnitude_bins(
+    object_rows: list[dict[str, Any]],
+    *,
+    include_legacy_comparison: bool = True,
+) -> list[dict[str, Any]]:
     if not object_rows:
         return []
     mags = [float(row["mag_median"]) for row in object_rows]
@@ -1206,14 +1327,26 @@ def _magnitude_bins(object_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "physical_normalized_robust_sigma_median": _median_or_none(
                     row.get("physical_normalized_robust_sigma") for row in rows
                 ),
-                "legacy_normalized_robust_sigma_median": _median_or_none(
-                    row.get("legacy_normalized_robust_sigma") for row in rows
+                **(
+                    {
+                        "legacy_normalized_robust_sigma_median": _median_or_none(
+                            row.get("legacy_normalized_robust_sigma") for row in rows
+                        )
+                    }
+                    if include_legacy_comparison
+                    else {}
                 ),
                 "physical_mag_err_median": _median_or_none(
                     row.get("physical_mag_err_median") for row in rows
                 ),
-                "legacy_mag_err_median": _median_or_none(
-                    row.get("legacy_mag_err_median") for row in rows
+                **(
+                    {
+                        "legacy_mag_err_median": _median_or_none(
+                            row.get("legacy_mag_err_median") for row in rows
+                        )
+                    }
+                    if include_legacy_comparison
+                    else {}
                 ),
                 "residual_floor_raw_median": _median_or_none(
                     row.get("residual_floor_raw_mag") for row in rows

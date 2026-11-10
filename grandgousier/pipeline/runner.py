@@ -6,7 +6,7 @@ import math
 import re
 import time
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -17,6 +17,10 @@ from sqlalchemy.orm import Session
 
 from grandgousier.db.bulk import DEFAULT_BULK_INSERT_BATCH_SIZE
 from grandgousier.pipeline.provenance import summarize_candidate_ensemble_exclusions
+from grandgousier.pipeline.profiles import (
+    normalize_stage2_profile,
+    resolve_stage2_profile_settings,
+)
 from grandgousier.pipeline.candidate_ensemble_policy import (
     apply_candidate_ensemble_growth_policy,
     normalize_candidate_ensemble_growth_policy,
@@ -417,6 +421,7 @@ class FieldPipelineConfig:
     dry_run: bool = False
     record_run: bool = True
     continue_on_error: bool = False
+    stage2_profile: str = "diagnostic"
     log_dir: str | None = "logs"
     file_log_level: str = "INFO"
     no_file_log: bool = False
@@ -465,6 +470,8 @@ def _check_open_series_admission(session: Session, config: FieldPipelineConfig) 
 def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> PipelineRunResult:
     """Run the field pipeline, applying pre-QC exclusion safety gates first."""
 
+    config, _ = _apply_stage2_profile(config)
+
     validate_target_coordinates(config.target_ra_deg, config.target_dec_deg)
 
     pre_qc_exclusion_target = bool(
@@ -499,7 +506,74 @@ def run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipelin
     return _run_field_pipeline(session, config)
 
 
-def _run_field_pipeline(session: Session, config: FieldPipelineConfig) -> PipelineRunResult:
+def _stage2_profile_settings_for_config(config: FieldPipelineConfig) -> dict[str, Any]:
+    return resolve_stage2_profile_settings(
+        config.stage2_profile,
+        requested={
+            "enable_psf_field_diagnostics": config.enable_psf_field_diagnostics,
+            "enable_aperture_stability_qc": not config.skip_aperture_stability_qc,
+            "export_candidate_light_curves": config.export_candidate_light_curves,
+            "export_candidate_plots": config.export_candidate_plots,
+            "forced_photometry_diagnostics": config.forced_photometry_diagnostics,
+            "calibration_performance_diagnostics": config.calibration_performance_diagnostics,
+            "make_light_curve_summary": True,
+            "light_curve_summary_json_requested": bool(config.out_dir),
+            "random_error_validation": not config.skip_ensemble,
+            "random_error_diagnostic_exports_requested": bool(config.out_dir),
+            "exclude_candidates_from_ensemble": config.exclude_candidates_from_ensemble,
+            "enable_photometric_frame_qc": config.enable_photometric_frame_qc,
+            "field_report_enabled": not config.skip_field_report,
+        },
+    )
+
+
+def _apply_stage2_profile(
+    config: FieldPipelineConfig,
+) -> tuple[FieldPipelineConfig, dict[str, Any]]:
+    profile = normalize_stage2_profile(config.stage2_profile)
+    if config.exclude_candidates_from_ensemble:
+        if config.skip_field_report or config.skip_object_qc or config.skip_ensemble:
+            raise ValueError(
+                "exclude_candidates_from_ensemble requires field-QC candidate input, "
+                "object QC, and ensemble calibration; refusing to run with a required path disabled"
+            )
+        iteration_limit = (
+            max(2, int(config.candidate_ensemble_convergence_max_iterations or 10))
+            if config.candidate_ensemble_until_converged
+            else max(1, int(config.candidate_ensemble_max_iterations or 1))
+        )
+        if iteration_limit < 2:
+            raise ValueError(
+                "exclude_candidates_from_ensemble requires at least two ensemble iterations"
+            )
+
+    selected = replace(config, stage2_profile=profile)
+    settings = _stage2_profile_settings_for_config(selected)
+    if profile == "bulk":
+        selected = replace(
+            selected,
+            enable_psf_field_diagnostics=settings["psf_field_diagnostics"],
+            skip_aperture_stability_qc=not settings["aperture_stability_qc"],
+            export_candidate_light_curves=settings["candidate_light_curve_exports"],
+            export_candidate_plots=settings["candidate_plot_exports"],
+            forced_photometry_diagnostics=settings[
+                "forced_photometry_performance_diagnostics"
+            ],
+            calibration_performance_diagnostics=settings[
+                "calibration_performance_diagnostics"
+            ],
+            # Candidate triage is mandatory input to exclusion, but otherwise
+            # the full field-QC report is diagnostic-only.
+            skip_field_report=not bool(config.exclude_candidates_from_ensemble),
+        )
+        settings = _stage2_profile_settings_for_config(selected)
+    return selected, settings
+
+
+def _run_field_pipeline(
+    session: Session,
+    config: FieldPipelineConfig,
+) -> PipelineRunResult:
     """Run the main field-processing chain and optionally record its provenance.
 
     The runner intentionally orchestrates the already-tested low-level steps instead of
@@ -508,6 +582,7 @@ def _run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipeli
     `pipeline_run_steps`.
     """
 
+    profile_settings = _stage2_profile_settings_for_config(config)
     if config.frame_ids is not None and not config.frame_ids:
         raise ValueError("An explicit frame_ids selection must not be empty")
 
@@ -615,12 +690,15 @@ def _run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipeli
 
     require_detection_support_effective = _effective_require_detection_support(config)
     recipe = _to_jsonable(asdict(config))
+    recipe["effective_stage2_settings"] = _to_jsonable(profile_settings)
     recipe["recipe_version"] = PIPELINE_RECIPE_VERSION
     recipe["calibration_names"] = calibration_names
     recipe["field_id"] = field_id
     recipe["series_id"] = series_id
     recipe["frame_ids"] = selected_frame_ids
     recipe["quality_policy"] = {
+        "stage2_profile": config.stage2_profile,
+        "effective_stage2_settings": _to_jsonable(profile_settings),
         "random_error_model": config.random_error_model,
         "random_error_physical_model": PHYSICAL_APERTURE_ERROR_MODEL,
         "random_error_legacy_comparison_model": LEGACY_APERTURE_ERROR_MODEL,
@@ -1262,7 +1340,7 @@ def _run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipeli
         if not stop_due_to_no_usable_frames and not config.skip_forced_photometry:
             def _forced_photometry_step():
                 diagnostics_dir = None
-                if config.out_dir:
+                if config.out_dir and config.stage2_profile == "diagnostic":
                     diagnostics_dir = Path(config.out_dir) / "random_error_model"
                 res = run_forced_aperture_photometry(
                     session,
@@ -1896,6 +1974,7 @@ def _run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipeli
                 low_amplitude_min_robust_peak_to_peak=config.field_report_low_amplitude_min_robust_peak_to_peak,
                 borderline_threshold_ratio=config.field_report_borderline_threshold_ratio,
                 diagnostic_max_failed_criteria=config.field_report_diagnostic_max_failed_criteria,
+                include_diagnostics=config.stage2_profile == "diagnostic",
             )
             if analysis_snapshot is not None:
                 kwargs["analysis_snapshot"] = analysis_snapshot
@@ -1925,7 +2004,7 @@ def _run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipeli
             )
             summary = _good_frame_confirmation_summary(merged, len(good_ids), min_good_frames)
             summary["candidate_triage_good_frames"] = good_report.report.get("candidate_triage", {})
-            if config.out_dir:
+            if config.out_dir and config.stage2_profile == "diagnostic":
                 out_dir = Path(config.out_dir) / "candidate_good_frame_confirmation"
                 out_dir.mkdir(parents=True, exist_ok=True)
                 (out_dir / "summary.json").write_text(
@@ -1953,7 +2032,10 @@ def _run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipeli
                     candidate_rows=confirmed_rows,
                     calibration_name=current_ensemble_name,
                     good_frame_ids=latest_photometric_qc_good_frame_ids,
-                ) if config.enable_photometric_frame_qc else None
+                ) if (
+                    config.enable_photometric_frame_qc
+                    and config.stage2_profile == "diagnostic"
+                ) else None
                 correlation_rows = (
                     correlation_result.candidate_rows if correlation_result is not None else confirmed_rows
                 )
@@ -1961,42 +2043,75 @@ def _run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipeli
                     correlation_result.summary if correlation_result is not None else {"enabled": False}
                 )
                 latest_candidate_rows = list(correlation_rows)
-                membership_snapshot = _candidate_membership_snapshot(
-                    correlation_rows,
-                    calibration_name=current_ensemble_name,
-                    stage_index=len(candidate_membership_history) + 1,
-                )
-                if candidate_membership_history:
-                    membership_snapshot.update(
-                        _candidate_membership_transition(
-                            candidate_membership_history[-1],
-                            membership_snapshot,
-                        )
+                if config.stage2_profile == "diagnostic":
+                    membership_snapshot = _candidate_membership_snapshot(
+                        correlation_rows,
+                        calibration_name=current_ensemble_name,
+                        stage_index=len(candidate_membership_history) + 1,
                     )
-                candidate_membership_history.append(membership_snapshot)
+                    if candidate_membership_history:
+                        membership_snapshot.update(
+                            _candidate_membership_transition(
+                                candidate_membership_history[-1],
+                                membership_snapshot,
+                            )
+                        )
+                    candidate_membership_history.append(membership_snapshot)
+                else:
+                    membership_snapshot = {
+                        "stage_index": len(candidate_membership_history) + 1,
+                        "candidate_rows": len(correlation_rows),
+                        "accepted_candidates": sum(
+                            str(row.get("candidate_status") or "").upper() == "ACCEPTED"
+                            for row in correlation_rows
+                        ),
+                        "candidate_input_retained_for_ensemble_exclusion": bool(
+                            config.exclude_candidates_from_ensemble
+                        ),
+                    }
                 if not color_calibration_activated:
                     candidate_selection_rows = list(correlation_rows)
                 report_metadata = report.report.get("metadata", {})
-                payload: dict[str, Any] = {
-                    "summary_rows": report.summary_rows,
-                    "warnings": report.report.get("warnings", []),
-                    "candidate_triage": report.report.get("candidate_triage", {}),
-                    "candidate_triage_raw": report.report.get("candidate_triage", {}),
-                    "candidate_good_frame_confirmation": confirmation_summary,
-                    "candidate_axis_correlation": correlation_summary,
-                    "blend_diagnostics": report.report.get("blend_diagnostics", {}),
-                    "candidate_membership": membership_snapshot,
-                    "analysis_snapshot_algorithm": report_metadata.get(
-                        "analysis_snapshot_algorithm"
-                    ),
-                    "analysis_snapshot_cache_hit": report_metadata.get(
-                        "analysis_snapshot_cache_hit"
-                    ),
-                    "analysis_snapshot_measurements": report_metadata.get(
-                        "analysis_snapshot_measurements"
-                    ),
-                }
-                if config.out_dir:
+                if config.stage2_profile == "diagnostic":
+                    payload: dict[str, Any] = {
+                        "summary_rows": report.summary_rows,
+                        "warnings": report.report.get("warnings", []),
+                        "candidate_triage": report.report.get("candidate_triage", {}),
+                        "candidate_triage_raw": report.report.get("candidate_triage", {}),
+                        "candidate_good_frame_confirmation": confirmation_summary,
+                        "candidate_axis_correlation": correlation_summary,
+                        "blend_diagnostics": report.report.get("blend_diagnostics", {}),
+                        "candidate_membership": membership_snapshot,
+                        "analysis_snapshot_algorithm": report_metadata.get(
+                            "analysis_snapshot_algorithm"
+                        ),
+                        "analysis_snapshot_cache_hit": report_metadata.get(
+                            "analysis_snapshot_cache_hit"
+                        ),
+                        "analysis_snapshot_measurements": report_metadata.get(
+                            "analysis_snapshot_measurements"
+                        ),
+                    }
+                else:
+                    payload = {
+                        "warnings": report.report.get("warnings", []),
+                        "candidate_triage": report.report.get("candidate_triage", {}),
+                        "candidate_good_frame_confirmation": confirmation_summary,
+                        "candidate_membership": membership_snapshot,
+                        "candidate_input_retained_for_ensemble_exclusion": bool(
+                            config.exclude_candidates_from_ensemble
+                        ),
+                        "analysis_snapshot_algorithm": report_metadata.get(
+                            "analysis_snapshot_algorithm"
+                        ),
+                        "analysis_snapshot_cache_hit": report_metadata.get(
+                            "analysis_snapshot_cache_hit"
+                        ),
+                        "analysis_snapshot_measurements": report_metadata.get(
+                            "analysis_snapshot_measurements"
+                        ),
+                    }
+                if config.out_dir and config.stage2_profile == "diagnostic":
                     out_dir = Path(config.out_dir)
                     out_dir.mkdir(parents=True, exist_ok=True)
                     json_path = out_dir / f"{config.calibration_prefix}_field_qc_report.json"
@@ -2402,7 +2517,11 @@ def _run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipeli
                     lambda: _compute_object_qc_for(current_ensemble_name),
                 )
 
-            if color_calibration_activated and not config.skip_field_report:
+            if (
+                color_calibration_activated
+                and not config.skip_field_report
+                and config.stage2_profile == "diagnostic"
+            ):
                 add_step("field_qc_report_color_calibrated", _field_report_step)
 
             if (
@@ -2448,7 +2567,10 @@ def _run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipeli
                     calibration_names.get("ensemble_internal") or current_ensemble_name
                 )
                 validation_out_dir = None
-                if config.out_dir:
+                if (
+                    config.out_dir
+                    and profile_settings.get("random_error_diagnostic_exports", False)
+                ):
                     validation_out_dir = Path(config.out_dir) / "random_error_model"
                 validation = validate_random_error_model(
                     session,
@@ -2463,6 +2585,12 @@ def _run_field_pipeline(session: Session, config: FieldPipelineConfig) -> Pipeli
                     diagnostic_calibration_names=[validation_calibration, current_ensemble_name],
                     analysis_snapshot=_analysis_snapshot_for(validation_calibration),
                     annotate_residual_floor=not pre_qc_exclusion_zero_write_dry_run,
+                    include_legacy_comparison=profile_settings[
+                        "random_error_legacy_comparison"
+                    ],
+                    include_pairwise_residual_correlations=profile_settings[
+                        "random_error_pairwise_residual_correlations"
+                    ],
                 )
                 if validation.summary_json:
                     outputs["random_error_validation_summary_json"] = (
@@ -3589,6 +3717,8 @@ def _quality_policy_summary(config: FieldPipelineConfig, result: PipelineRunResu
         else max(1, int(config.candidate_ensemble_max_iterations or 1))
     )
     return {
+        "stage2_profile": config.stage2_profile,
+        "effective_stage2_settings": _stage2_profile_settings_for_config(config),
         "random_error_model": forced_result.get("random_error_model") or config.random_error_model,
         "random_error_physical_model": PHYSICAL_APERTURE_ERROR_MODEL,
         "random_error_legacy_comparison_model": LEGACY_APERTURE_ERROR_MODEL,

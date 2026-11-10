@@ -33,6 +33,7 @@ from grandgousier.io.fits_header import header_to_jsonable
 from grandgousier.io.frame_uid import make_frame_uid
 from grandgousier.io.parsing import parse_datetime, to_float
 from grandgousier.lightcurves.product import (
+    build_light_curve_count_summary,
     build_light_curve_summary,
     export_light_curve_summary_json,
     light_curve_reject_flags,
@@ -48,6 +49,11 @@ from grandgousier.pipeline.runner import (
     FieldPipelineConfig,
     PipelineRunResult,
     run_field_pipeline,
+)
+from grandgousier.pipeline.profiles import (
+    DEFAULT_STAGE2_PROFILE,
+    normalize_stage2_profile,
+    resolve_stage2_profile_settings,
 )
 from grandgousier.calibration.photometric_policy import (
     ColorCalibrationPolicy,
@@ -136,6 +142,8 @@ class ProcessArchiveResult:
     discovered_files: int
     detected_files: int
     failed_files: int
+    stage2_profile: str = DEFAULT_STAGE2_PROFILE
+    effective_stage2_settings: dict[str, Any] = field(default_factory=dict)
     indexed_frame_ids: list[int] = field(default_factory=list)
     created_series_ids: list[int] = field(default_factory=list)
     open_series_ids: list[int] = field(default_factory=list)
@@ -161,6 +169,8 @@ class ProcessArchiveResult:
             "discovered_files": self.discovered_files,
             "detected_files": self.detected_files,
             "failed_files": self.failed_files,
+            "stage2_profile": self.stage2_profile,
+            "effective_stage2_settings": self.effective_stage2_settings,
             "indexed_frame_ids": self.indexed_frame_ids,
             "created_series_ids": self.created_series_ids,
             "open_series_ids": self.open_series_ids,
@@ -346,6 +356,7 @@ def process_archive_path(
     root: str | Path,
     catalog_name: str | None = None,
     execute: bool = False,
+    stage2_profile: str = DEFAULT_STAGE2_PROFILE,
     instrument_profile: str = "auto",
     master_profile: str | Path | None = None,
     robophot_profile: str | Path | None = None,
@@ -489,7 +500,7 @@ def process_archive_path(
     auto_catalog_query: bool = True,
     auto_catalog_margin_arcmin: float = 2.0,
     auto_catalog_mag_limit: float | None = None,
-    auto_catalog_max_rows_per_frame: int = 50000,
+    auto_catalog_max_rows_per_frame: int = 20000,
     auto_catalog_query_mode: str = "frame_union",
     auto_catalog_max_radius_deg: float | None = None,
     auto_catalog_timeout_sec: float | None = 120.0,
@@ -499,6 +510,25 @@ def process_archive_path(
     from grandgousier.lightcurves.target import validate_target_coordinates
 
     validate_target_coordinates(target_ra_deg, target_dec_deg)
+    stage2_profile = normalize_stage2_profile(stage2_profile)
+    effective_stage2_settings = resolve_stage2_profile_settings(
+        stage2_profile,
+        requested={
+            "enable_psf_field_diagnostics": enable_psf_field_diagnostics,
+            "enable_aperture_stability_qc": enable_aperture_stability_qc,
+            "export_candidate_light_curves": export_candidate_light_curves,
+            "export_candidate_plots": export_candidate_plots,
+            "forced_photometry_diagnostics": forced_photometry_diagnostics,
+            "calibration_performance_diagnostics": calibration_performance_diagnostics,
+            "make_light_curve_summary": make_light_curve_summary,
+            "light_curve_summary_json_requested": bool(out_root),
+            "random_error_validation": True,
+            "random_error_diagnostic_exports_requested": bool(out_root),
+            "exclude_candidates_from_ensemble": exclude_candidates_from_ensemble,
+            "enable_photometric_frame_qc": enable_photometric_frame_qc,
+            "field_report_enabled": True,
+        },
+    )
     exact_path_list = [Path(value) for value in exact_paths] if exact_paths is not None else None
     if exact_path_list is None:
         detected, groups, warnings = scan_archive_path(
@@ -532,6 +562,8 @@ def process_archive_path(
         discovered_files=discovered_count,
         detected_files=len(detected),
         failed_files=len(warnings),
+        stage2_profile=stage2_profile,
+        effective_stage2_settings=effective_stage2_settings,
         groups=groups,
         warnings=warnings,
     )
@@ -797,8 +829,14 @@ def process_archive_path(
                     **build_result.summary(),
                     "observation_selection_rows": [
                         _json_safe(row) for row in build_result.observation_selection_rows
-                    ],
-                    "rows": [_json_safe(row) for row in build_result.rows],
+                    ] if stage2_profile == "diagnostic" else [],
+                    "rows": [_json_safe(row) for row in build_result.rows]
+                    if stage2_profile == "diagnostic"
+                    else [],
+                    "row_count": len(build_result.rows),
+                    "status_counts": dict(
+                        Counter(str(row.get("status") or "UNKNOWN") for row in build_result.rows)
+                    ),
                 }
             )
             created_series_ids.extend(ready)
@@ -1066,11 +1104,14 @@ def process_archive_path(
             photometry_telescope_aperture_m=resolved_telescope_aperture_m,
             photometry_site_altitude_m=resolved_site_altitude_m,
             record_run=True,
+            stage2_profile=stage2_profile,
             log_dir=str(log_dir) if log_dir else None,
             file_log_level=file_log_level,
             no_file_log=no_file_log,
             command_json={
                 "command": "process-archive-path",
+                "stage2_profile": stage2_profile,
+                "effective_stage2_settings": effective_stage2_settings,
                 "root": str(root),
                 "catalog_name": effective_catalog_name,
                 "working_catalog_mag_limit": working_catalog_mag_limit,
@@ -1141,7 +1182,12 @@ def process_archive_path(
         )
         try:
             pipeline_result = run_field_pipeline(session, config)
-            pipe_row = _pipeline_row(series, prefix, pipeline_result)
+            pipe_row = _pipeline_row(
+                series,
+                prefix,
+                pipeline_result,
+                compact=stage2_profile == "bulk",
+            )
             result.processed_series_ids.append(int(series["series_id"]))
             if pipeline_result.status == "DONE_WITH_WARNINGS":
                 warning_summary = pipeline_result.quality_policy.get(
@@ -1186,7 +1232,10 @@ def process_archive_path(
                 pipeline_result.calibration_names.get("science") or pipeline_result.calibration_names.get("ensemble")
             ):
                 summary_path = None
-                if series_out_dir:
+                if (
+                    series_out_dir
+                    and effective_stage2_settings.get("light_curve_summary_json", True)
+                ):
                     summary_path = str(Path(series_out_dir) / f"{prefix}_light_curve_summary.json")
                 require_detection_support_effective = bool(
                     pipeline_result.quality_policy.get("require_detection_support_effective", enable_detection_branch)
@@ -1195,7 +1244,12 @@ def process_archive_path(
                     pipeline_result.calibration_names.get("science")
                     or pipeline_result.calibration_names["ensemble"]
                 )
-                summary = build_light_curve_summary(
+                summary_builder = (
+                    build_light_curve_count_summary
+                    if stage2_profile == "bulk"
+                    else build_light_curve_summary
+                )
+                summary = summary_builder(
                     session,
                     calibration_names=[science_calibration],
                     catalog_name=effective_catalog_name,
@@ -2362,7 +2416,13 @@ def _pipeline_warning_message(
     return message
 
 
-def _pipeline_row(series: dict[str, Any], prefix: str, result: PipelineRunResult) -> dict[str, Any]:
+def _pipeline_row(
+    series: dict[str, Any],
+    prefix: str,
+    result: PipelineRunResult,
+    *,
+    compact: bool = False,
+) -> dict[str, Any]:
     return {
         "series_id": int(series["series_id"]),
         "field_id": series.get("field_id"),
@@ -2433,13 +2493,71 @@ def _pipeline_row(series: dict[str, Any], prefix: str, result: PipelineRunResult
                 "step_name": step.step_name,
                 "status": step.status,
                 "elapsed_sec": step.elapsed_sec,
-                "result": step.result,
+                "result": (
+                    _compact_step_result(step.result)
+                    if compact
+                    else step.result
+                ),
                 "error_message": step.error_message,
             }
             for step in result.steps
         ],
         "error_message": None,
     }
+
+
+def _compact_step_result(result: dict[str, Any] | None) -> dict[str, Any]:
+    """Retain small counters and warning evidence, not row-heavy diagnostic payloads."""
+
+    payload = result or {}
+    summary = payload.get("summary") if isinstance(payload, dict) else None
+    if isinstance(summary, dict):
+        payload = {**summary, **payload}
+    keep = {
+        "status",
+        "reason",
+        "stop_reason",
+        "science_status",
+        "warnings",
+        "failed_frames",
+        "failed_measurements",
+        "failure_samples",
+        "failure_samples_truncated",
+        "selected_frames",
+        "checked_frames",
+        "selected_links",
+        "measured",
+        "inserted_or_updated",
+        "matched",
+        "written",
+        "calibrated",
+        "frames_with_zp",
+        "frames_with_offsets",
+        "reference_candidates",
+        "usable_reference_objects",
+        "base_ensemble_reference_candidates",
+        "base_ensemble_usable_reference_objects",
+        "base_ensemble_required_references_per_frame",
+        "base_ensemble_selected_frames",
+        "base_ensemble_frames_with_offsets",
+        "base_ensemble_calibrated",
+        "raw_candidates",
+        "accepted",
+        "rejected",
+        "candidate_triage",
+        "candidate_input_retained_for_ensemble_exclusion",
+        "candidate_ensemble_iteration",
+        "candidate_ensemble_iteration_limit",
+        "requested_excluded_object_ids",
+        "actually_excluded_reference_object_ids",
+        "science_photometry",
+        "science_storage_mode",
+        "analysis_snapshot_algorithm",
+        "analysis_snapshot_cache_hit",
+        "analysis_snapshot_measurements",
+        "elapsed_sec",
+    }
+    return {key: payload[key] for key in keep if key in payload}
 
 
 def _step_metric(result: PipelineRunResult, step_name: str, metric: str) -> Any:

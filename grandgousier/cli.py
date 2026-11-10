@@ -436,6 +436,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional nested process-archive-path manifest for selected products",
     )
     p_stage1_handoff.add_argument(
+        "--stage2-profile",
+        choices=("bulk", "diagnostic"),
+        default="bulk",
+        help="Nested Stage-2 optional-work profile (default: bulk)",
+    )
+    p_stage1_handoff.add_argument(
         "--report-out", default="reports/stage1_handoff.json",
         help="Stage-1 handoff result report JSON",
     )
@@ -1502,6 +1508,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_process_path.add_argument("--native-observation-id", dest="native_observation_ids", action="append", help="Restrict detected MASTER FITS to this exact ordered native observation ID list; repeat once per ID")
     p_process_path.add_argument("--catalog-name", default=None, help="Catalog namespace already imported; omitted means auto_catalog_* with Gaia DR3 fetch")
     p_process_path.add_argument("--execute", action="store_true", help="Write to DB and run pipelines; omitted means plan-only")
+    p_process_path.add_argument(
+        "--stage2-profile",
+        choices=("bulk", "diagnostic"),
+        default="bulk",
+        help="Stage-2 optional-work profile (default: bulk)",
+    )
     p_process_path.add_argument("--plan-only", action="store_true", help="Alias for the default non-writing planning mode")
     p_process_path.add_argument("--instrument-profile", default="auto", choices=("auto", "MASTER", "RoboPhot"), help="Profile detection mode")
     p_process_path.add_argument("--master-profile", default=None, help="Override MASTER YAML profile path")
@@ -1668,7 +1680,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_process_path.set_defaults(auto_catalog_query=True)
     p_process_path.add_argument("--auto-catalog-margin-arcmin", type=float, default=2.0, help="Gaia cone margin for auto catalog generation")
     p_process_path.add_argument("--auto-catalog-mag-limit", type=float, default=None, help="Gaia G limit for auto catalog generation; default inherits --working-catalog-mag-limit")
-    p_process_path.add_argument("--auto-catalog-max-rows-per-frame", type=int, default=50000, help="Maximum Gaia rows in the auto catalog query")
+    p_process_path.add_argument("--auto-catalog-max-rows-per-frame", type=int, default=20000, help="Maximum Gaia rows in the auto catalog query")
     p_process_path.add_argument("--auto-catalog-query-mode", choices=("frame_union", "per_frame"), default="frame_union", help="Gaia query strategy for auto catalogs; frame_union queries one cone for the whole input field")
     p_process_path.add_argument("--auto-catalog-max-radius-deg", type=float, default=None, help="Gaia cone safety radius; default 1.6 deg for MASTER and 1.0 deg otherwise; oversized frame_union falls back to spatial clusters")
     p_process_path.add_argument("--auto-catalog-timeout-sec", type=float, default=120.0, help="Best-effort astroquery timeout for auto Gaia query")
@@ -2436,7 +2448,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_gaia.add_argument("--all-wcs-statuses", action="store_true", help="Do not require wcs_status=HEADER_WCS_OK")
     p_gaia.add_argument("--margin-arcmin", type=float, default=1.0, help="Extra cone radius margin around frame footprint")
     p_gaia.add_argument("--mag-limit", type=float, default=None, help="Optional Gaia G magnitude upper limit")
-    p_gaia.add_argument("--max-rows-per-frame", type=int, default=50000, help="Gaia TOP N per query")
+    p_gaia.add_argument("--max-rows-per-frame", type=int, default=20000, help="Gaia TOP N per query")
     p_gaia.add_argument("--query-mode", choices=("per_frame", "frame_union"), default="per_frame", help="Gaia query strategy")
     p_gaia.add_argument("--max-radius-deg", type=float, default=None, help="Skip a Gaia cone if its radius exceeds this value")
     p_gaia.add_argument("--gaia-timeout-sec", type=float, default=120.0, help="Best-effort astroquery timeout")
@@ -3089,6 +3101,7 @@ def cmd_stage1_handoff(args: argparse.Namespace) -> int:
                 out_root=out_root,
                 log_dir=args.log_dir,
                 manifest_out=args.stage2_manifest_out,
+                stage2_profile=args.stage2_profile,
             )
         report_path = write_stage1_handoff_json(report, args.report_out)
     except Exception as exc:
@@ -6204,6 +6217,7 @@ def cmd_process_archive_path(args: argparse.Namespace) -> int:
             root=args.path,
             catalog_name=args.catalog_name,
             execute=bool(args.execute),
+            stage2_profile=getattr(args, "stage2_profile", "bulk"),
             instrument_profile=args.instrument_profile,
             master_profile=args.master_profile,
             robophot_profile=args.robophot_profile,

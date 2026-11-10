@@ -31,6 +31,10 @@ from grandgousier.db.models import FieldSeriesFrame, Frame, FrameLocation, make_
 from grandgousier.identity.observation import MASTER_IDENTITY_SCHEME, make_observation_uid
 from grandgousier.io.frame_locations import add_or_touch_frame_location, find_frame_by_locator
 from grandgousier.io.parsing import parse_datetime
+from grandgousier.pipeline.profiles import (
+    DEFAULT_STAGE2_PROFILE,
+    normalize_stage2_profile,
+)
 
 STAGE1_HANDOFF_SCHEMA = "grandgousier.stage1.handoff.v1"
 _SUCCESS_EXECUTION_STATUSES = {
@@ -328,6 +332,7 @@ class Stage1HandoffReport:
     schema: str = STAGE1_HANDOFF_SCHEMA
     persistence_only: bool = False
     persistence_result: Mapping[str, Any] | None = None
+    stage2_profile: str = DEFAULT_STAGE2_PROFILE
 
     @property
     def blocked_items(self) -> int:
@@ -361,6 +366,7 @@ class Stage1HandoffReport:
             "generated_at_utc": self.generated_at_utc,
             "status": self.status,
             "execute": self.execute,
+            "stage2_profile": self.stage2_profile,
             "execution_report_path": self.execution_report_path,
             "summary": {
                 "items": len(self.items),
@@ -703,6 +709,7 @@ def handoff_stage1_execution(
     out_root: str | Path = "exports",
     log_dir: str | Path = "logs",
     manifest_out: str | Path | None = None,
+    stage2_profile: str = DEFAULT_STAGE2_PROFILE,
 ) -> Stage1HandoffReport:
     """Preflight or persist exact products from one Stage-1 execution report.
 
@@ -718,6 +725,10 @@ def handoff_stage1_execution(
         raise ValueError("persist_only and execute are mutually exclusive")
     if persist_only and manifest_out is not None:
         raise ValueError("Stage-2 manifest output is unavailable in persistence-only mode")
+    stage2_profile = normalize_stage2_profile(stage2_profile)
+
+    def _report(**kwargs: Any) -> Stage1HandoffReport:
+        return Stage1HandoffReport(stage2_profile=stage2_profile, **kwargs)
 
     products = load_validated_stage1_products(execution_report_path)
 
@@ -740,7 +751,7 @@ def handoff_stage1_execution(
         errors = tuple(scan_warnings) or (
             f"Stage-2 handoff scanned {len(detected)} of {len(products)} exact Stage-1 products",
         )
-        return Stage1HandoffReport(
+        return _report(
             execution_report_path=str(execution_report_path),
             generated_at_utc=_utc_now(),
             execute=bool(execute),
@@ -807,7 +818,7 @@ def handoff_stage1_execution(
         candidates.append(_candidate_from_detected(detected_item, expected))
 
     if identity_errors:
-        return Stage1HandoffReport(
+        return _report(
             execution_report_path=str(execution_report_path),
             generated_at_utc=_utc_now(),
             execute=bool(execute),
@@ -867,7 +878,7 @@ def handoff_stage1_execution(
         raise ValueError("P4 selection did not account for every Stage-1 product exactly once")
 
     if any(item.status == "BLOCKED" for item in items):
-        return Stage1HandoffReport(
+        return _report(
             execution_report_path=str(execution_report_path),
             generated_at_utc=_utc_now(),
             execute=bool(execute),
@@ -914,9 +925,10 @@ def handoff_stage1_execution(
                 out_root=out_root,
                 log_dir=log_dir,
                 manifest_out=nested_manifest,
+                stage2_profile=stage2_profile,
             )
         except Exception as exc:
-            return Stage1HandoffReport(
+            return _report(
                 execution_report_path=str(execution_report_path),
                 generated_at_utc=_utc_now(),
                 execute=bool(execute),
@@ -934,7 +946,7 @@ def handoff_stage1_execution(
                 "inserted": 0,
                 "skipped_existing": 0,
             }
-            return Stage1HandoffReport(
+            return _report(
                 execution_report_path=str(execution_report_path),
                 generated_at_utc=_utc_now(),
                 execute=False,
@@ -990,7 +1002,7 @@ def handoff_stage1_execution(
                 for item in items
             )
             failed_result = {**persistence_result, "status": "FAILED"}
-            return Stage1HandoffReport(
+            return _report(
                 execution_report_path=str(execution_report_path),
                 generated_at_utc=_utc_now(),
                 execute=False,
@@ -1010,7 +1022,7 @@ def handoff_stage1_execution(
             for item in items
         )
         persistence_result["status"] = "PERSISTED_IDENTITY_ONLY"
-        return Stage1HandoffReport(
+        return _report(
             execution_report_path=str(execution_report_path),
             generated_at_utc=_utc_now(),
             execute=False,
@@ -1025,14 +1037,14 @@ def handoff_stage1_execution(
             _persist_selected_evidence(session, items, result_dict.get("indexed_frame_ids", []))
         except Exception as exc:
             session.rollback()
-            return Stage1HandoffReport(
+            return _report(
                 execution_report_path=str(execution_report_path), generated_at_utc=_utc_now(),
                 execute=True, items=tuple(items),
                 errors=(f"Stage-1 evidence handoff failed: {type(exc).__name__}: {exc}",),
             )
         stage2_result = result_dict
 
-    return Stage1HandoffReport(
+    return _report(
         execution_report_path=str(execution_report_path),
         generated_at_utc=_utc_now(),
         execute=bool(execute),
