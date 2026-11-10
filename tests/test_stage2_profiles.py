@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +11,10 @@ pytest.importorskip("astropy")
 from grandgousier.archive.auto_process import _pipeline_row, process_archive_path
 from grandgousier.catalogs.gaia_query import query_gaia_for_frames
 from grandgousier.cli import build_parser
+from grandgousier.artifacts import registry as artifact_registry
+from grandgousier.calibration.aperture_correction import ApertureCorrectionResult
 from grandgousier.photometry.error_model import PHYSICAL_APERTURE_ERROR_MODEL
+from grandgousier.pipeline import runner as runner_module
 from grandgousier.pipeline.runner import (
     FieldPipelineConfig,
     PipelineRunResult,
@@ -46,7 +50,7 @@ def test_stage2_and_gaia_profile_defaults():
     )
 
 
-def test_bulk_profile_keeps_candidate_exclusion_input_and_random_error_validation():
+def test_bulk_profile_keeps_candidate_exclusion_input_but_skips_error_validation():
     original = FieldPipelineConfig(
         catalog_name="cat",
         calibration_prefix="p",
@@ -74,11 +78,13 @@ def test_bulk_profile_keeps_candidate_exclusion_input_and_random_error_validatio
     assert settings["field_qc_detail_reports"] is False
     assert settings["field_qc_candidate_input"] is True
     assert settings["random_error_validation_and_legacy_comparison"] is False
-    assert settings["random_error_validation"] is True
+    assert settings["random_error_validation"] is False
+    assert settings["random_error_validation_status"] == "SKIPPED_BULK_PROFILE"
     assert settings["random_error_legacy_comparison"] is False
     assert settings["random_error_pairwise_residual_correlations"] is False
-    assert settings["random_error_residual_floor_diagnostics"] is True
+    assert settings["random_error_residual_floor_diagnostics"] is False
     assert settings["random_error_diagnostic_exports"] is False
+    assert settings["aperture_correction_diagnostic_exports"] is False
     assert settings["light_curve_summary_row_materialization"] is False
     assert settings["light_curve_summary_compact_counts"] is True
     assert settings["light_curve_summary_json"] is False
@@ -97,10 +103,194 @@ def test_diagnostic_profile_keeps_legacy_error_comparison_enabled():
 
     assert selected.stage2_profile == "diagnostic"
     assert settings["random_error_validation"] is True
+    assert settings["random_error_validation_status"] == "ENABLED_DIAGNOSTIC_PROFILE"
     assert settings["random_error_legacy_comparison"] is True
     assert settings["random_error_pairwise_residual_correlations"] is True
     assert settings["random_error_residual_floor_diagnostics"] is True
     assert settings["random_error_validation_and_legacy_comparison"] is True
+
+
+def test_bulk_aperture_correction_runs_without_outputs_or_export_tree_snapshots(
+    monkeypatch, tmp_path
+):
+    calls = []
+    snapshots = []
+    log_registrations = []
+    tree_snapshots = []
+
+    class FakeSession:
+        def execute(self, *_args, **_kwargs):
+            return SimpleNamespace(scalar_one_or_none=lambda: None)
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+    monkeypatch.setattr(runner_module, "_check_open_series_admission", lambda *_: None)
+    monkeypatch.setattr(runner_module, "_insert_pipeline_run", lambda *_a, **_k: 88)
+    monkeypatch.setattr(runner_module, "_insert_pipeline_step", lambda *_a, **_k: 9)
+    monkeypatch.setattr(runner_module, "_finish_pipeline_step", lambda *_a, **_k: None)
+    monkeypatch.setattr(runner_module, "_finish_pipeline_run", lambda *_a, **_k: None)
+    monkeypatch.setattr(runner_module, "_emit_pipeline_log", lambda *_a, **_k: None)
+    monkeypatch.setattr(runner_module, "stamp_calibration_product", lambda *_a, **_k: None)
+
+    def fake_register_logs(_session, *, log_files, **_kwargs):
+        log_registrations.append(dict(log_files))
+        return ["registered-log-provenance"]
+
+    monkeypatch.setattr(runner_module, "register_run_log_artifacts", fake_register_logs)
+
+    def fake_register_file(_session, **kwargs):
+        snapshots.append(kwargs)
+        return SimpleNamespace(artifact_id=len(snapshots))
+
+    monkeypatch.setattr(artifact_registry, "register_file_artifact", fake_register_file)
+    snapshot_changed_export_tree = runner_module.snapshot_changed_export_tree
+
+    def record_tree_snapshot(_session, **kwargs):
+        tree_snapshots.append(kwargs)
+        return snapshot_changed_export_tree(_session, **kwargs)
+
+    monkeypatch.setattr(
+        runner_module, "snapshot_changed_export_tree", record_tree_snapshot
+    )
+
+    def fake_aperture_correction(_session, **kwargs):
+        calls.append(kwargs)
+        result = ApertureCorrectionResult(
+            source_calibration_name=kwargs["source_calibration_name"],
+            target_calibration_name=kwargs["target_calibration_name"],
+            target_calibration_version_id=101,
+            quality_gate_passed=False,
+            reference_radius_pix=kwargs["reference_radius_pix"],
+        )
+        if kwargs["out_dir"] is not None:
+            diagnostic_dir = Path(kwargs["out_dir"]) / "aperture_correction"
+            diagnostic_dir.mkdir(parents=True, exist_ok=True)
+            output_files = {
+                "diagnostics_summary_json": "aperture_correction_summary.json",
+                "diagnostics_frames_csv": "aperture_correction_frames.csv",
+                "diagnostics_context_summary_json": "aperture_correction_context_summary.json",
+                "diagnostics_context_frames_csv": "aperture_correction_context_frames.csv",
+                "diagnostics_context_plot_png": "aperture_correction_context.png",
+            }
+            for attr, filename in output_files.items():
+                path = diagnostic_dir / filename
+                path.write_text("diagnostic", encoding="utf-8")
+                setattr(result, attr, str(path))
+        return result
+
+    monkeypatch.setattr(
+        runner_module, "apply_aperture_correction", fake_aperture_correction
+    )
+
+    results = {}
+    for profile in ("bulk", "diagnostic"):
+        output_dir = tmp_path / profile / "exports"
+        config = FieldPipelineConfig(
+            catalog_name="cat",
+            calibration_prefix=f"p_{profile}",
+            frame_ids=[1],
+            stage2_profile=profile,
+            run_pre_photometry_qc=False,
+            skip_wcs=True,
+            skip_catalog_frame_match=True,
+            skip_detection=True,
+            skip_detection_catalog_match=True,
+            photometry_estimator="circular",
+            skip_forced_photometry=True,
+            skip_aperture_correction=False,
+            skip_aperture_zp=True,
+            skip_ensemble=True,
+            skip_object_qc=True,
+            skip_field_report=True,
+            skip_aperture_stability_qc=True,
+            record_run=True,
+            no_file_log=True,
+            log_dir=None,
+            out_dir=str(output_dir),
+            artifact_root=str(tmp_path / "immutable-artifacts" / profile),
+        )
+        results[profile] = runner_module.run_field_pipeline(FakeSession(), config)
+
+    assert len(calls) == 2
+    assert len(tree_snapshots) == 1
+    assert tree_snapshots[0]["publication_root"] == tmp_path / "diagnostic" / "exports"
+    assert calls[0]["out_dir"] is None
+    assert calls[1]["out_dir"] == str(tmp_path / "diagnostic" / "exports")
+    assert not (tmp_path / "bulk" / "exports" / "aperture_correction").exists()
+    diagnostic_files = list(
+        (tmp_path / "diagnostic" / "exports" / "aperture_correction").glob("*")
+    )
+    assert len(diagnostic_files) == 5
+    assert {
+        Path(item["publication_uri"]).name for item in snapshots
+    } == {path.name for path in diagnostic_files}
+    assert all(
+        item["artifact_type"] == "APERTURE_CORRECTION_DIAGNOSTIC"
+        for item in snapshots
+    )
+    assert all(item["pipeline_run_id"] == 88 for item in snapshots)
+    assert all(Path(item["path"]).is_file() for item in snapshots)
+    assert all(
+        Path(item["path"]).read_text(encoding="utf-8") == "diagnostic"
+        for item in snapshots
+    )
+    assert len(log_registrations) == 2
+    assert results["bulk"].outputs["artifact_count"] == 1
+    assert results["diagnostic"].outputs["artifact_count"] == 6
+    assert "aperture_correction_summary_json" not in results["bulk"].outputs
+    assert "aperture_correction_summary_json" in results["diagnostic"].outputs
+
+
+def test_bulk_profile_disables_legacy_aperture_budget_in_forced_photometry(monkeypatch):
+    observed = []
+
+    class FakeSession:
+        def rollback(self):
+            pass
+
+    monkeypatch.setattr(runner_module, "_check_open_series_admission", lambda *_: None)
+
+    def fake_forced_photometry(_session, **kwargs):
+        observed.append(kwargs["include_legacy_comparison"])
+        return SimpleNamespace(
+            diagnostics_summary_json=None,
+            diagnostics_frames_csv=None,
+            calibration_version_id=None,
+        )
+
+    monkeypatch.setattr(
+        runner_module, "run_forced_aperture_photometry", fake_forced_photometry
+    )
+    config = FieldPipelineConfig(
+        catalog_name="cat",
+        calibration_prefix="p_bulk",
+        frame_ids=[1],
+        stage2_profile="bulk",
+        run_pre_photometry_qc=False,
+        skip_wcs=True,
+        skip_catalog_frame_match=True,
+        skip_detection=True,
+        skip_detection_catalog_match=True,
+        photometry_estimator="circular",
+        skip_forced_photometry=False,
+        skip_aperture_correction=True,
+        skip_aperture_zp=True,
+        skip_ensemble=True,
+        skip_object_qc=True,
+        skip_field_report=True,
+        skip_aperture_stability_qc=True,
+        record_run=False,
+        no_file_log=True,
+        log_dir=None,
+    )
+
+    runner_module.run_field_pipeline(FakeSession(), config)
+
+    assert observed == [False]
 
 
 @pytest.mark.parametrize(

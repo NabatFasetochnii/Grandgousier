@@ -299,6 +299,7 @@ def run_forced_aperture_photometry(
     dry_run: bool = False,
     insert_batch_size: int = DEFAULT_BULK_INSERT_BATCH_SIZE,
     random_error_model: str = PHYSICAL_APERTURE_ERROR_MODEL,
+    include_legacy_comparison: bool = True,
     gain_e_per_adu: float | None = None,
     read_noise_e: float | None = None,
     background_estimator_variance_factor: float = MEDIAN_BACKGROUND_VARIANCE_FACTOR,
@@ -878,6 +879,7 @@ def run_forced_aperture_photometry(
                             gain_e_per_adu=(None if gain_fallback else resolved_gain),
                             read_noise_e=(None if read_noise_fallback else resolved_read_noise),
                             random_error_model=random_error_model,
+                            include_legacy_comparison=include_legacy_comparison,
                             background_estimator_variance_factor=background_estimator_variance_factor,
                             empirical_background_floor=empirical_background_floor,
                             fractional_flux_floor=fractional_flux_floor,
@@ -900,6 +902,7 @@ def run_forced_aperture_photometry(
                                     gain_e_per_adu=(None if gain_fallback else resolved_gain),
                                     read_noise_e=(None if read_noise_fallback else resolved_read_noise),
                                     random_error_model=random_error_model,
+                                    include_legacy_comparison=include_legacy_comparison,
                                     background_estimator_variance_factor=background_estimator_variance_factor,
                                     empirical_background_floor=empirical_background_floor,
                                     fractional_flux_floor=fractional_flux_floor,
@@ -915,7 +918,8 @@ def run_forced_aperture_photometry(
                                     annulus_inner_pix=annulus_inner_pix, annulus_outer_pix=annulus_outer_pix,
                                     exptime=exptime, zero_point=zero_point, saturation_level_adu=frame_saturation,
                                     gain_e_per_adu=(None if gain_fallback else resolved_gain), read_noise_e=(None if read_noise_fallback else resolved_read_noise),
-                                    random_error_model=random_error_model, background_estimator_variance_factor=background_estimator_variance_factor,
+                                    random_error_model=random_error_model, include_legacy_comparison=include_legacy_comparison,
+                                    background_estimator_variance_factor=background_estimator_variance_factor,
                                     empirical_background_floor=empirical_background_floor, fractional_flux_floor=fractional_flux_floor,
                                     scintillation_enabled=scintillation_enabled, scintillation_coefficient=scintillation_coefficient,
                                     telescope_aperture_m=telescope_aperture_m, site_altitude_m=site_altitude_m, airmass=frame.airmass,
@@ -942,6 +946,7 @@ def run_forced_aperture_photometry(
                             gain_e_per_adu=(None if gain_fallback else resolved_gain),
                             read_noise_e=(None if read_noise_fallback else resolved_read_noise),
                             random_error_model=random_error_model,
+                            include_legacy_comparison=include_legacy_comparison,
                             background_estimator_variance_factor=background_estimator_variance_factor,
                             empirical_background_floor=empirical_background_floor,
                             fractional_flux_floor=fractional_flux_floor,
@@ -966,6 +971,7 @@ def run_forced_aperture_photometry(
                                 gain_e_per_adu=(None if gain_fallback else resolved_gain),
                                 read_noise_e=(None if read_noise_fallback else resolved_read_noise),
                                 random_error_model=random_error_model,
+                                include_legacy_comparison=include_legacy_comparison,
                                 background_estimator_variance_factor=background_estimator_variance_factor,
                                 empirical_background_floor=empirical_background_floor,
                                 fractional_flux_floor=fractional_flux_floor,
@@ -983,6 +989,7 @@ def run_forced_aperture_photometry(
                             gain_e_per_adu=(None if gain_fallback else resolved_gain),
                             read_noise_e=(None if read_noise_fallback else resolved_read_noise),
                             random_error_model=random_error_model,
+                            include_legacy_comparison=include_legacy_comparison,
                             background_estimator_variance_factor=background_estimator_variance_factor,
                             empirical_background_floor=empirical_background_floor,
                             fractional_flux_floor=fractional_flux_floor,
@@ -999,6 +1006,7 @@ def run_forced_aperture_photometry(
                             gain_e_per_adu=(None if gain_fallback else resolved_gain),
                             read_noise_e=(None if read_noise_fallback else resolved_read_noise),
                             random_error_model=random_error_model,
+                            include_legacy_comparison=include_legacy_comparison,
                             background_estimator_variance_factor=background_estimator_variance_factor,
                             empirical_background_floor=empirical_background_floor,
                             fractional_flux_floor=fractional_flux_floor,
@@ -1019,7 +1027,8 @@ def run_forced_aperture_photometry(
                             annulus_inner_pix=annulus_inner_pix, annulus_outer_pix=annulus_outer_pix,
                             exptime=exptime, zero_point=zero_point, saturation_level_adu=frame_saturation,
                             gain_e_per_adu=(None if gain_fallback else resolved_gain), read_noise_e=(None if read_noise_fallback else resolved_read_noise),
-                            random_error_model=random_error_model, background_estimator_variance_factor=background_estimator_variance_factor,
+                            random_error_model=random_error_model, include_legacy_comparison=include_legacy_comparison,
+                            background_estimator_variance_factor=background_estimator_variance_factor,
                             empirical_background_floor=empirical_background_floor, fractional_flux_floor=fractional_flux_floor,
                             scintillation_enabled=scintillation_enabled, scintillation_coefficient=scintillation_coefficient,
                             telescope_aperture_m=telescope_aperture_m, site_altitude_m=site_altitude_m, airmass=frame.airmass,
@@ -1059,6 +1068,7 @@ def run_forced_aperture_photometry(
                         gain_e_per_adu=(None if gain_fallback else resolved_gain),
                         read_noise_e=(None if read_noise_fallback else resolved_read_noise),
                         random_error_model=random_error_model,
+                        include_legacy_comparison=include_legacy_comparison,
                         background_estimator_variance_factor=background_estimator_variance_factor,
                         empirical_background_floor=empirical_background_floor,
                         fractional_flux_floor=fractional_flux_floor,
@@ -1340,6 +1350,7 @@ def run_forced_aperture_photometry(
             session,
             calibration_version_id=int(result.calibration_version_id),
             frame_ids=[int(frame.frame_id) for frame in frames],
+            include_legacy_comparison=include_legacy_comparison,
         )
         if persisted["n_rows"]:
             selected_mag_errors = persisted["selected_mag_errors"]
@@ -1483,6 +1494,7 @@ def measure_one_source(
     site_altitude_m: float | None = None,
     airmass: float | None = None,
     performance_timings: dict[str, float] | None = None,
+    include_legacy_comparison: bool = True,
 ) -> ApertureMeasurement:
     phase_started = time.perf_counter() if performance_timings is not None else None
     flags: dict[str, object] = {}
@@ -1576,6 +1588,7 @@ def measure_one_source(
         site_altitude_m=site_altitude_m,
         airmass=airmass,
         exptime_s=exptime,
+        include_legacy_comparison=include_legacy_comparison,
     )
     flux_err = error_budget.selected_flux_err_adu
 
@@ -2007,6 +2020,7 @@ def _load_persisted_error_diagnostics(
     *,
     calibration_version_id: int,
     frame_ids: list[int],
+    include_legacy_comparison: bool = True,
 ) -> dict[str, Any]:
     stmt = (
         select(
@@ -2071,9 +2085,17 @@ def _load_persisted_error_diagnostics(
 
         selected = _finite_float(measurement["mag_err_random"] or measurement["mag_err"])
         physical = _finite_float(flags.get("random_error_physical_mag_err"))
-        legacy = _finite_float(flags.get("random_error_legacy_mag_err"))
-        ratio = _finite_float(
-            flags.get("random_error_physical_to_legacy_mag_err_ratio")
+        legacy = (
+            _finite_float(flags.get("random_error_legacy_mag_err"))
+            if include_legacy_comparison
+            else None
+        )
+        ratio = (
+            _finite_float(
+                flags.get("random_error_physical_to_legacy_mag_err_ratio")
+            )
+            if include_legacy_comparison
+            else None
         )
         gain = _finite_float(flags.get("random_error_gain_e_per_adu"))
         read_noise = _finite_float(flags.get("random_error_read_noise_e"))

@@ -518,6 +518,7 @@ def _stage2_profile_settings_for_config(config: FieldPipelineConfig) -> dict[str
             "calibration_performance_diagnostics": config.calibration_performance_diagnostics,
             "make_light_curve_summary": True,
             "light_curve_summary_json_requested": bool(config.out_dir),
+            "aperture_correction_diagnostic_exports_requested": bool(config.out_dir),
             "random_error_validation": not config.skip_ensemble,
             "random_error_diagnostic_exports_requested": bool(config.out_dir),
             "exclude_candidates_from_ensemble": config.exclude_candidates_from_ensemble,
@@ -699,9 +700,15 @@ def _run_field_pipeline(
     recipe["quality_policy"] = {
         "stage2_profile": config.stage2_profile,
         "effective_stage2_settings": _to_jsonable(profile_settings),
+        "random_error_validation_status": profile_settings[
+            "random_error_validation_status"
+        ],
         "random_error_model": config.random_error_model,
         "random_error_physical_model": PHYSICAL_APERTURE_ERROR_MODEL,
         "random_error_legacy_comparison_model": LEGACY_APERTURE_ERROR_MODEL,
+        "random_error_legacy_comparison_enabled": profile_settings[
+            "random_error_legacy_comparison"
+        ],
         "random_error_gain_e_per_adu_override": config.photometry_gain_e_per_adu,
         "random_error_read_noise_e_override": config.photometry_read_noise_e,
         "random_error_background_estimator_variance_factor": (
@@ -815,18 +822,19 @@ def _run_field_pipeline(
                 pipeline_run_id=pipeline_run_id,
                 artifact_root=config.artifact_root,
             )
-            registered.extend(
-                snapshot_changed_export_tree(
-                    session,
-                    publication_root=artifact_publication_root,
-                    run_dir=run_dir,
-                    baseline_state=artifact_publication_baseline,
-                    pipeline_run_id=pipeline_run_id,
-                    series_id=series_id,
-                    calibration_version_id=science_calibration_version_id,
-                    calibration_version_ids_by_type=artifact_calibration_ids,
+            if config.stage2_profile == "diagnostic":
+                registered.extend(
+                    snapshot_changed_export_tree(
+                        session,
+                        publication_root=artifact_publication_root,
+                        run_dir=run_dir,
+                        baseline_state=artifact_publication_baseline,
+                        pipeline_run_id=pipeline_run_id,
+                        series_id=series_id,
+                        calibration_version_id=science_calibration_version_id,
+                        calibration_version_ids_by_type=artifact_calibration_ids,
+                    )
                 )
-            )
             outputs["artifact_run_dir"] = str(run_dir)
 
         registered.extend(
@@ -1389,6 +1397,9 @@ def _run_field_pipeline(
                     dry_run=config.dry_run,
                     insert_batch_size=config.bulk_insert_batch_size,
                     random_error_model=config.random_error_model,
+                    include_legacy_comparison=profile_settings[
+                        "random_error_legacy_comparison"
+                    ],
                     gain_e_per_adu=config.photometry_gain_e_per_adu,
                     read_noise_e=config.photometry_read_noise_e,
                     background_estimator_variance_factor=(
@@ -1454,7 +1465,11 @@ def _run_field_pipeline(
                     min_good_frame_fraction=config.aperture_correction_min_good_frame_fraction,
                     max_global_median_residual_mad=config.aperture_correction_max_global_median_residual_mad,
                     fwhm_header_unit=config.fwhm_header_unit,
-                    out_dir=config.out_dir,
+                    out_dir=(
+                        config.out_dir
+                        if profile_settings["aperture_correction_diagnostic_exports"]
+                        else None
+                    ),
                     dry_run=config.dry_run,
                     insert_batch_size=config.bulk_insert_batch_size,
                     materialize_measurements=False,
@@ -2561,7 +2576,10 @@ def _run_field_pipeline(
 
                 add_step("export_target_light_curve_color_calibrated", _target_light_curve_color_step)
 
-        if not stop_due_to_no_usable_frames and not config.skip_ensemble:
+        if (
+            not stop_due_to_no_usable_frames
+            and profile_settings["random_error_validation"]
+        ):
             def _random_error_validation_step():
                 validation_calibration = (
                     calibration_names.get("ensemble_internal") or current_ensemble_name
@@ -3697,6 +3715,25 @@ def _quality_policy_summary(config: FieldPipelineConfig, result: PipelineRunResu
     candidate_export_result = _step_result(result, "export_candidate_light_curves") or {}
     ensemble_step_results = _step_results_with_prefix(result, "ensemble_calibrate")
     final_ensemble_result = ensemble_step_results[-1] if ensemble_step_results else {}
+    effective_stage2_settings = _stage2_profile_settings_for_config(config)
+    validation_step = next(
+        (
+            step
+            for step in result.steps
+            if step.step_name == "validate_random_error_model"
+        ),
+        None,
+    )
+    if validation_step is None:
+        validation_status = (
+            "SKIPPED_NO_USABLE_FRAMES"
+            if _step_result(result, "stop_no_usable_frames") is not None
+            else effective_stage2_settings["random_error_validation_status"]
+        )
+    elif validation_step.status == "FAILED":
+        validation_status = "FAILED"
+    else:
+        validation_status = error_validation_result.get("status") or validation_step.status
     aperture_requested = not bool(config.skip_aperture_correction)
     aperture_activated = bool(aperture_result.get("quality_gate_passed"))
     aperture_effective_calibration = (
@@ -3718,10 +3755,13 @@ def _quality_policy_summary(config: FieldPipelineConfig, result: PipelineRunResu
     )
     return {
         "stage2_profile": config.stage2_profile,
-        "effective_stage2_settings": _stage2_profile_settings_for_config(config),
+        "effective_stage2_settings": effective_stage2_settings,
         "random_error_model": forced_result.get("random_error_model") or config.random_error_model,
         "random_error_physical_model": PHYSICAL_APERTURE_ERROR_MODEL,
         "random_error_legacy_comparison_model": LEGACY_APERTURE_ERROR_MODEL,
+        "random_error_legacy_comparison_enabled": effective_stage2_settings[
+            "random_error_legacy_comparison"
+        ],
         "random_error_gain_e_per_adu_median": forced_result.get("gain_e_per_adu_median"),
         "random_error_read_noise_e_median": forced_result.get("read_noise_e_median"),
         "random_error_measurements_with_selected_error": forced_result.get(
@@ -3801,7 +3841,7 @@ def _quality_policy_summary(config: FieldPipelineConfig, result: PipelineRunResu
         ),
         "random_error_model_summary_json": forced_result.get("diagnostics_summary_json"),
         "random_error_model_frames_csv": forced_result.get("diagnostics_frames_csv"),
-        "random_error_validation_status": error_validation_result.get("status"),
+        "random_error_validation_status": validation_status,
         "random_error_validation_calibration": error_validation_result.get(
             "calibration_name"
         ),

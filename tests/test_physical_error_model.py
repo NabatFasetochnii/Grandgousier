@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import pytest
 
 from grandgousier.photometry.error_model import (
@@ -7,6 +8,7 @@ from grandgousier.photometry.error_model import (
     PHYSICAL_APERTURE_ERROR_MODEL,
     aperture_error_budget,
 )
+from grandgousier.photometry.forced_aperture import measure_one_source
 
 
 def test_physical_aperture_error_budget_decomposes_variance():
@@ -86,6 +88,49 @@ def test_legacy_comparison_exactly_reproduces_pre_05370_formula():
     assert budget.physical_to_legacy_mag_err_ratio == pytest.approx(
         budget.physical_mag_err / expected_mag_err
     )
+
+
+def test_legacy_comparison_off_preserves_physical_measurement_scalars():
+    yy, xx = np.indices((41, 41), dtype=float)
+    data = 100.0 + 1200.0 * np.exp(-((xx - 20.2) ** 2 + (yy - 19.7) ** 2) / 4.0)
+    common = {
+        "x": 20.2,
+        "y": 19.7,
+        "aperture_radius_pix": 3.5,
+        "annulus_inner_pix": 7.0,
+        "annulus_outer_pix": 10.0,
+        "exptime": 30.0,
+        "zero_point": 0.0,
+        "saturation_level_adu": None,
+        "gain_e_per_adu": 1.7,
+        "read_noise_e": 4.0,
+        "telescope_aperture_m": None,
+        "site_altitude_m": None,
+        "airmass": None,
+        "scintillation_enabled": False,
+    }
+
+    diagnostic = measure_one_source(data, **common)
+    bulk = measure_one_source(data, include_legacy_comparison=False, **common)
+
+    assert bulk.flux == diagnostic.flux
+    assert bulk.flux_err == diagnostic.flux_err
+    assert bulk.mag_inst == diagnostic.mag_inst
+    assert bulk.mag_err == diagnostic.mag_err
+    assert bulk.error_budget is not None and diagnostic.error_budget is not None
+    for key in (
+        "physical_total_variance_adu2",
+        "physical_flux_err_adu",
+        "physical_mag_err",
+        "selected_flux_err_adu",
+        "selected_mag_err",
+    ):
+        assert bulk.error_budget[key] == diagnostic.error_budget[key]
+    assert "legacy_total_variance_adu2" in diagnostic.error_budget
+    assert "physical_to_legacy_mag_err_ratio" in diagnostic.error_budget
+    assert "legacy_total_variance_adu2" not in bulk.error_budget
+    assert "legacy_mag_err" not in bulk.error_budget
+    assert "physical_to_legacy_mag_err_ratio" not in bulk.error_budget
 
 
 def test_missing_detector_metadata_is_explicit_in_provenance():

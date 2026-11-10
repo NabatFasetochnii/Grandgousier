@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 MAGNITUDE_ERROR_FACTOR = 2.5 / math.log(10.0)
@@ -47,7 +47,7 @@ class ApertureErrorBudget:
     fractional_floor_variance_adu2: float
     scintillation_variance_adu2: float
     physical_total_variance_adu2: float
-    legacy_total_variance_adu2: float
+    legacy_total_variance_adu2: float | None
     physical_flux_err_adu: float | None
     legacy_flux_err_adu: float | None
     physical_mag_err: float | None
@@ -60,9 +60,20 @@ class ApertureErrorBudget:
     background_estimate_fraction: float | None
     fractional_floor_fraction: float | None
     scintillation_fraction: float | None
+    _include_legacy_comparison: bool = field(default=True, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        include_legacy_comparison = values.pop("_include_legacy_comparison", True)
+        if not include_legacy_comparison:
+            for key in (
+                "legacy_total_variance_adu2",
+                "legacy_flux_err_adu",
+                "legacy_mag_err",
+                "physical_to_legacy_mag_err_ratio",
+            ):
+                values.pop(key, None)
+        return values
 
     def to_flags(self, *, prefix: str = "random_error_") -> dict[str, Any]:
         return {f"{prefix}{key}": value for key, value in self.to_dict().items()}
@@ -87,6 +98,7 @@ def aperture_error_budget(
     site_altitude_m: float | None = None,
     airmass: float | None = None,
     exptime_s: float | None = None,
+    include_legacy_comparison: bool = True,
 ) -> ApertureErrorBudget:
     """Return a physically decomposed random-error budget for aperture photometry.
 
@@ -99,8 +111,11 @@ def aperture_error_budget(
     fractional flat/intrapixel and Young-type scintillation terms are represented
     as flux-proportional variances rather than being mixed into frame-common ZP.
 
-    The legacy model is evaluated in parallel for A/B provenance. It reproduces
-    the pre-0.5.37.0 formula ``max(flux, 0) + n_ap * annulus_sigma**2``.
+    By default, the legacy model is evaluated in parallel for A/B provenance. It
+    reproduces the pre-0.5.37.0 formula
+    ``max(flux, 0) + n_ap * annulus_sigma**2``. Set
+    ``include_legacy_comparison=False`` to omit those comparison values while
+    retaining the selected model's output and all physical terms.
     """
 
     if model not in SUPPORTED_APERTURE_ERROR_MODELS:
@@ -176,10 +191,21 @@ def aperture_error_budget(
         + scintillation_variance
     )
 
-    legacy_total_variance = max(0.0, flux) + n_ap * empirical_background_variance
+    # A selected legacy model still needs its value to produce the requested
+    # physical scalar output, even when A/B comparison fields are disabled.
+    legacy_required = bool(include_legacy_comparison) or model == LEGACY_APERTURE_ERROR_MODEL
+    legacy_total_variance = (
+        max(0.0, flux) + n_ap * empirical_background_variance
+        if legacy_required
+        else None
+    )
 
     physical_flux_err = _sqrt_or_none(physical_total_variance)
-    legacy_flux_err = _sqrt_or_none(legacy_total_variance)
+    legacy_flux_err = (
+        _sqrt_or_none(legacy_total_variance)
+        if legacy_total_variance is not None
+        else None
+    )
     physical_mag_err = _magnitude_error(physical_flux_err, flux)
     legacy_mag_err = _magnitude_error(legacy_flux_err, flux)
 
@@ -187,10 +213,15 @@ def aperture_error_budget(
         selected_flux_err = physical_flux_err
         selected_mag_err = physical_mag_err
     else:
+        assert legacy_flux_err is not None
         selected_flux_err = legacy_flux_err
         selected_mag_err = legacy_mag_err
 
-    ratio = _ratio_or_none(physical_mag_err, legacy_mag_err)
+    ratio = (
+        _ratio_or_none(physical_mag_err, legacy_mag_err)
+        if include_legacy_comparison
+        else None
+    )
     source_fraction = _ratio_or_none(source_poisson_variance, physical_total_variance)
     aperture_fraction = _ratio_or_none(aperture_background_variance, physical_total_variance)
     estimate_fraction = _ratio_or_none(background_estimate_variance, physical_total_variance)
@@ -228,7 +259,11 @@ def aperture_error_budget(
         fractional_floor_variance_adu2=float(fractional_floor_variance),
         scintillation_variance_adu2=float(scintillation_variance),
         physical_total_variance_adu2=float(physical_total_variance),
-        legacy_total_variance_adu2=float(legacy_total_variance),
+        legacy_total_variance_adu2=(
+            float(legacy_total_variance)
+            if legacy_total_variance is not None
+            else None
+        ),
         physical_flux_err_adu=physical_flux_err,
         legacy_flux_err_adu=legacy_flux_err,
         physical_mag_err=physical_mag_err,
@@ -241,6 +276,7 @@ def aperture_error_budget(
         background_estimate_fraction=estimate_fraction,
         fractional_floor_fraction=floor_fraction,
         scintillation_fraction=scintillation_fraction,
+        _include_legacy_comparison=bool(include_legacy_comparison),
     )
 
 

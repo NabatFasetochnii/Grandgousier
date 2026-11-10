@@ -571,7 +571,7 @@ def test_run_field_pipeline_without_target_keeps_artifacts_and_skips_target_expo
         "ensemble": 1,
         "object_qc": 1,
         "field_report": 1,
-        "error_validation": 1,
+        "error_validation": 0,
     }
     assert candidate_result.quality_policy["random_error_model"] == (
         runner_module.PHYSICAL_APERTURE_ERROR_MODEL
@@ -581,7 +581,10 @@ def test_run_field_pipeline_without_target_keeps_artifacts_and_skips_target_expo
     ] is False
     assert candidate_result.quality_policy["effective_stage2_settings"][
         "random_error_validation"
-    ] is True
+    ] is False
+    assert candidate_result.quality_policy["random_error_validation_status"] == (
+        "SKIPPED_BULK_PROFILE"
+    )
     assert candidate_result.quality_policy["effective_stage2_settings"][
         "random_error_legacy_comparison"
     ] is False
@@ -590,10 +593,11 @@ def test_run_field_pipeline_without_target_keeps_artifacts_and_skips_target_expo
     ] is False
     assert candidate_result.quality_policy["effective_stage2_settings"][
         "random_error_residual_floor_diagnostics"
-    ] is True
-    assert validation_out_dirs == [None]
-    assert validation_legacy_comparison == [False]
+    ] is False
+    assert validation_out_dirs == []
+    assert validation_legacy_comparison == []
     assert not (tmp_path / "random_error_model").exists()
+    assert "validate_random_error_model" not in step_names
     assert "ensemble_calibrate_candidate_excluded" not in step_names
     assert "compute_object_qc_candidate_excluded" not in step_names
     assert "field_qc_report_candidate_excluded" not in step_names
@@ -620,12 +624,14 @@ def test_run_field_pipeline_without_target_keeps_artifacts_and_skips_target_expo
     config.stage2_profile = "diagnostic"
     field_result = runner_module.run_field_pipeline(FakeSession(), config)
     assert field_result.status == "DONE"
-    assert "export_target_light_curve" not in [step.step_name for step in field_result.steps]
+    diagnostic_step_names = [step.step_name for step in field_result.steps]
+    assert "export_target_light_curve" not in diagnostic_step_names
+    assert "validate_random_error_model" in diagnostic_step_names
     assert calls == {
         "ensemble": 2,
         "object_qc": 2,
         "field_report": 2,
-        "error_validation": 2,
+        "error_validation": 1,
     }
     assert observed == {
         "ensemble_exclusions": [[], []],
@@ -633,8 +639,8 @@ def test_run_field_pipeline_without_target_keeps_artifacts_and_skips_target_expo
         "field_target_ids": [[], []],
         "field_report_diagnostics": [False, True],
     }
-    assert validation_out_dirs == [None, tmp_path / "random_error_model"]
-    assert validation_legacy_comparison == [False, True]
+    assert validation_out_dirs == [tmp_path / "random_error_model"]
+    assert validation_legacy_comparison == [True]
     assert (tmp_path / "random_error_model" / "random_error_validation_summary.json").is_file()
     assert all(
         (tmp_path / f"p_target_light_curve.{suffix}").read_bytes() == content

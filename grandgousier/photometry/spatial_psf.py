@@ -59,6 +59,7 @@ def measure_spatial_psf_source(
     centroid_grid_steps: int = 3,
     residual_clip_sigma: float = 5.0,
     residual_clip_iterations: int = 2,
+    include_legacy_comparison: bool = True,
 ) -> SpatialPsfMeasurement:
     """Fit a local spatially varying PSF profile at a forced catalog position.
 
@@ -262,6 +263,7 @@ def measure_spatial_psf_source(
         site_altitude_m=site_altitude_m,
         airmass=airmass,
         exptime_s=exptime,
+        include_legacy_comparison=include_legacy_comparison,
     )
 
     mag = None

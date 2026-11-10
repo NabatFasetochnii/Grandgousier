@@ -239,11 +239,15 @@ def test_process_archive_path_plan_accepts_degree_pair_without_processing(monkey
     assert result.status == "PLAN"
     assert result.stage2_profile == "bulk"
     assert result.effective_stage2_settings["profile"] == "bulk"
-    assert result.effective_stage2_settings["random_error_validation"] is True
+    assert result.effective_stage2_settings["random_error_validation"] is False
+    assert (
+        result.effective_stage2_settings["random_error_validation_status"]
+        == "SKIPPED_BULK_PROFILE"
+    )
     assert result.effective_stage2_settings["random_error_legacy_comparison"] is False
     assert (
         result.effective_stage2_settings["random_error_residual_floor_diagnostics"]
-        is True
+        is False
     )
     assert (
         result.effective_stage2_settings[

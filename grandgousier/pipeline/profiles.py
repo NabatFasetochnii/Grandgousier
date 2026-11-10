@@ -37,7 +37,19 @@ def resolve_stage2_profile_settings(
     candidate_exports = bool(requested.get("export_candidate_light_curves", True))
     make_summary = bool(requested.get("make_light_curve_summary", True))
     field_report_requested = bool(requested.get("field_report_enabled", True))
-    random_error_validation = bool(requested.get("random_error_validation", True))
+    random_error_validation_requested = bool(
+        requested.get("random_error_validation", True)
+    )
+    random_error_validation = random_error_validation_requested and diagnostic
+    random_error_validation_status = (
+        "DISABLED_BY_PIPELINE_CONFIGURATION"
+        if not random_error_validation_requested
+        else (
+            "ENABLED_DIAGNOSTIC_PROFILE"
+            if diagnostic
+            else "SKIPPED_BULK_PROFILE"
+        )
+    )
     diagnostic_output_requested = bool(
         requested.get("random_error_diagnostic_exports_requested", True)
     )
@@ -74,9 +86,15 @@ def resolve_stage2_profile_settings(
         "light_curve_summary_json": (
             diagnostic and make_summary and summary_output_requested
         ),
-        # Bulk retains physical validation and residual-floor work but skips
-        # legacy-error comparison and pairwise-correlation diagnostics.
+        "aperture_correction_diagnostic_exports": (
+            diagnostic
+            and bool(requested.get("aperture_correction_diagnostic_exports_requested", True))
+        ),
+        # The error-model validation, residual-floor branch, and legacy A/B
+        # diagnostics are diagnostic-profile work; bulk keeps only the physical
+        # per-measurement error model used by forced photometry.
         "random_error_validation": random_error_validation,
+        "random_error_validation_status": random_error_validation_status,
         "random_error_legacy_comparison": random_error_validation and diagnostic,
         "random_error_pairwise_residual_correlations": (
             random_error_validation and diagnostic

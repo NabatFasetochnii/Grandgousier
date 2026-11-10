@@ -457,6 +457,7 @@ def measure_elliptical_source(
     telescope_aperture_m: float | None = None,
     site_altitude_m: float | None = None,
     airmass: float | None = None,
+    include_legacy_comparison: bool = True,
 ) -> EllipticalApertureMeasurement:
     """Measure flux in a PSF-aligned ellipse with the standard random-error model.
 
@@ -560,6 +561,7 @@ def measure_elliptical_source(
         site_altitude_m=site_altitude_m,
         airmass=airmass,
         exptime_s=exptime,
+        include_legacy_comparison=include_legacy_comparison,
     )
 
     mag = None

@@ -55,6 +55,31 @@ def test_public_error_budget_is_exact_adapter() -> None:
     assert public == internal
 
 
+def test_public_error_budget_can_omit_legacy_comparison_without_changing_physics() -> None:
+    kwargs = dict(
+        net_flux_adu=12000.0,
+        local_background_adu_per_pix=110.0,
+        annulus_sigma_adu_per_pix=7.5,
+        n_aperture_pixels=29,
+        n_annulus_pixels=80,
+        gain_e_per_adu=1.4,
+        read_noise_e=8.3,
+    )
+    diagnostic = compute_aperture_error_budget(**kwargs)
+    bulk = compute_aperture_error_budget(
+        **kwargs, include_legacy_comparison=False
+    )
+
+    assert bulk.physical_total_variance_adu2 == diagnostic.physical_total_variance_adu2
+    assert bulk.physical_mag_err == diagnostic.physical_mag_err
+    assert bulk.selected_flux_err_adu == diagnostic.selected_flux_err_adu
+    assert bulk.selected_mag_err == diagnostic.selected_mag_err
+    assert bulk.legacy_mag_err is None
+    assert bulk.physical_to_legacy_mag_err_ratio is None
+    assert "legacy_mag_err" not in bulk.to_dict()
+    assert "physical_to_legacy_mag_err_ratio" not in bulk.to_dict()
+
+
 def _state(object_id: int, mag: float, err: float = 0.01, eligible: bool = True):
     return InterseriesObjectState(
         object_id=object_id,

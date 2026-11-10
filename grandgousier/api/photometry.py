@@ -61,13 +61,16 @@ def compute_aperture_error_budget(
     site_altitude_m: float | None = None,
     airmass: float | None = None,
     exptime_s: float | None = None,
+    include_legacy_comparison: bool = True,
 ) -> ApertureErrorBudget:
     """Compute the validated aperture-photometry random-error budget.
 
     Inputs use ADU/electron/second units as named.  The function performs no I/O and
     does not access the Grandgousier database.  It delegates directly to the
     production ``physical_aperture_v1``/legacy A/B implementation, so validation and
-    exception semantics are identical to the Stage-2 kernel.
+    exception semantics are identical to the Stage-2 kernel. Set
+    ``include_legacy_comparison=False`` to omit only the parallel legacy budget and
+    ratio; selected and physical values are unchanged.
 
     Raises
     ------
@@ -93,6 +96,7 @@ def compute_aperture_error_budget(
         site_altitude_m=site_altitude_m,
         airmass=airmass,
         exptime_s=exptime_s,
+        include_legacy_comparison=include_legacy_comparison,
     )
 
 
