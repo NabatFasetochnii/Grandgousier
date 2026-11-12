@@ -14,6 +14,7 @@ from grandgousier.db.detection_io import (
     source_detection_copy_tuple,
 )
 from grandgousier.quality.detection_catalog_qc import (
+    aggregate_detection_catalog_support,
     _select_catalog_sources_bulk,
     _select_detections_bulk,
 )
@@ -34,12 +35,110 @@ class _FakeSession:
     def __init__(self, result_sets):
         self._result_sets = list(result_sets)
         self.execute_calls = 0
+        self.statements = []
+        self.parameters = []
 
-    def execute(self, statement):
-        del statement
+    def execute(self, statement, parameters=None):
+        self.statements.append(statement)
+        self.parameters.append(parameters)
         rows = self._result_sets[self.execute_calls]
         self.execute_calls += 1
         return _FakeMappingResult(rows)
+
+
+class _SupportAggregationSession:
+    """Mock the grouped query using source/frame pairs, including duplicate matches."""
+
+    def __init__(self, matched_rows):
+        self.matched_rows = list(matched_rows)
+        self.statements = []
+        self.parameters = []
+
+    def execute(self, statement, parameters):
+        self.statements.append(statement)
+        self.parameters.append(parameters)
+        selected_frames = (
+            None if parameters.get("frame_ids") is None else set(parameters["frame_ids"])
+        )
+        frames_by_source = {}
+        for source_id, frame_id in self.matched_rows:
+            if selected_frames is None or frame_id in selected_frames:
+                frames_by_source.setdefault(source_id, set()).add(frame_id)
+        return _FakeMappingResult(
+            [(source_id, len(frame_ids)) for source_id, frame_ids in sorted(frames_by_source.items())]
+        )
+
+
+@pytest.mark.parametrize(
+    ("matched_rows", "expected_support"),
+    [
+        ([(100, 4), (100, 4)], {100: 1}),  # one supported frame, repeated match rows count once
+        ([(100, frame_id) for frame_id in range(1, 11)], {100: 10}),
+        ([], {}),
+    ],
+    ids=["support-1-of-10-repeat-frame-once", "support-10-of-10", "support-0-of-10"],
+)
+def test_detection_catalog_support_counts_distinct_frames(matched_rows, expected_support):
+    session = _SupportAggregationSession(matched_rows)
+
+    support = aggregate_detection_catalog_support(
+        session,
+        catalog_name="auto_catalog_field_17",
+        detection_run_id=55,
+        frame_ids=list(range(1, 11)),
+    )
+
+    assert support == expected_support
+    sql = str(session.statements[0])
+    assert "COUNT(DISTINCT fr.frame_id)" in sql
+    assert "observation_uid" not in sql
+    assert "observations" not in sql
+    assert session.parameters[0] == {
+        "detection_run_id": 55,
+        "catalog_name": "auto_catalog_field_17",
+        "frame_ids": list(range(1, 11)),
+    }
+
+
+def test_detection_catalog_support_empty_scope_does_not_query():
+    session = _FakeSession([])
+    assert aggregate_detection_catalog_support(
+        session,
+        catalog_name="cat",
+        detection_run_id=55,
+        frame_ids=[],
+    ) == {}
+    assert session.execute_calls == 0
+
+
+def test_detection_catalog_support_uses_complete_match_run_when_frame_scope_is_unspecified():
+    session = _SupportAggregationSession([(100, 1), (100, 2)])
+
+    support = aggregate_detection_catalog_support(
+        session,
+        catalog_name="cat",
+        detection_run_id=55,
+        frame_ids=None,
+    )
+
+    assert support == {100: 2}
+    assert "fr.frame_id IN" not in str(session.statements[0])
+    assert "frame_ids" not in session.parameters[0]
+
+
+def test_zero_detection_support_keeps_uniquely_selected_explicit_source_eligible():
+    from grandgousier.pipeline.runner import _eligible_catalog_sources_for_forced_photometry
+
+    explicit_target = {
+        "eligible": True,
+        "catalog_source_id": 100,
+        "identity_link_exists": False,
+    }
+
+    assert _eligible_catalog_sources_for_forced_photometry({}, explicit_target) == [100]
+    assert _eligible_catalog_sources_for_forced_photometry(
+        {}, {"eligible": False, "catalog_source_id": 101}
+    ) == []
 
 
 def _legacy_select(scored, *, max_sources, min_separation_pix):

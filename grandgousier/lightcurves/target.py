@@ -8,7 +8,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from sqlalchemy import bindparam, select, text
+from sqlalchemy import bindparam, or_, select, text
 from sqlalchemy.orm import Session
 
 from grandgousier.db.models import (
@@ -492,6 +492,134 @@ def validate_target_coordinates(
     if not _valid_sky_position(ra, dec):
         raise ValueError("target RA must be finite in [0, 360), Dec finite in [-90, 90] degrees")
     return ra, dec
+
+
+def resolve_explicit_target_catalog_source(
+    session: Session,
+    *,
+    catalog_name: str,
+    target_source_id: str | None = None,
+    target_object_id: int | None = None,
+    target_ra_deg: float | None = None,
+    target_dec_deg: float | None = None,
+) -> dict[str, Any]:
+    """Select an explicit target's unique catalog source before photometry.
+
+    This read-only pre-photometry lookup never creates an Object or
+    ObjectCatalogLink. Source-ID and coordinate selectors can select an existing
+    CatalogSource without an identity link so it can enter forced photometry.
+    Object-ID selection is deliberately stricter: it must already identify one
+    unique linked CatalogSource in the requested namespace.
+    """
+
+    target_coords = validate_target_coordinates(target_ra_deg, target_dec_deg)
+    if target_object_id is None and not target_source_id and target_coords is None:
+        return {"eligible": False, "reason": "no explicit target selector"}
+    if not catalog_name:
+        return {"eligible": False, "reason": "catalog namespace is required"}
+
+    statement = select(
+        CatalogSource.catalog_source_id,
+        CatalogSource.source_id,
+        CatalogSource.ra_deg,
+        CatalogSource.dec_deg,
+        ObjectCatalogLink.object_id,
+    ).select_from(CatalogSource)
+    if target_object_id is not None:
+        # Check uniqueness over all links in this namespace before applying
+        # any other selector. Coordinates/source IDs must not astrometrically
+        # guess which of several links represents an opaque object ID.
+        statement = statement.join(
+            ObjectCatalogLink,
+            ObjectCatalogLink.catalog_source_id == CatalogSource.catalog_source_id,
+        ).where(ObjectCatalogLink.object_id == int(target_object_id))
+    else:
+        statement = statement.outerjoin(
+            ObjectCatalogLink,
+            ObjectCatalogLink.catalog_source_id == CatalogSource.catalog_source_id,
+        )
+    statement = statement.where(CatalogSource.catalog_name == str(catalog_name))
+
+    if target_object_id is None and target_source_id:
+        statement = statement.where(CatalogSource.source_id == str(target_source_id))
+    elif target_object_id is None and target_coords is not None:
+        ra, dec = target_coords
+        dec_radius = 2.0 / 3600.0
+        dec_low = max(-90.0, dec - dec_radius)
+        dec_high = min(90.0, dec + dec_radius)
+        cos_dec_min = min(
+            abs(math.cos(math.radians(dec_low))),
+            abs(math.cos(math.radians(dec_high))),
+        )
+        ra_radius = dec_radius / max(cos_dec_min, 1e-12)
+        statement = statement.where(
+            CatalogSource.dec_deg >= dec_low,
+            CatalogSource.dec_deg <= dec_high,
+        )
+        if ra_radius < 180.0:
+            low_ra = (ra - ra_radius) % 360.0
+            high_ra = (ra + ra_radius) % 360.0
+            ra_predicate = (
+                (CatalogSource.ra_deg >= low_ra)
+                & (CatalogSource.ra_deg <= high_ra)
+                if low_ra <= high_ra
+                else or_(CatalogSource.ra_deg >= low_ra, CatalogSource.ra_deg <= high_ra)
+            )
+            statement = statement.where(ra_predicate)
+
+    rows = list(session.execute(statement).all())
+    if target_object_id is not None:
+        rows = [
+            row
+            for row in rows
+            if row[4] is not None and int(row[4]) == int(target_object_id)
+        ]
+    if target_object_id is not None and len(rows) != 1:
+        reason = (
+            "target object has multiple catalog source links in the selected namespace"
+            if len(rows) > 1
+            else "target object has no unique catalog source link in the selected namespace"
+        )
+        return {"eligible": False, "reason": reason, "candidate_count": len(rows)}
+
+    if target_source_id:
+        rows = [row for row in rows if str(row[1]) == str(target_source_id)]
+    if target_coords is not None:
+        rows = [
+            row
+            for row in rows
+            if _valid_sky_position(row[2], row[3])
+            and _sky_separation_arcsec(
+                target_coords[0], target_coords[1], float(row[2]), float(row[3])
+            ) <= 2.0
+        ]
+    if len(rows) != 1:
+        reason = (
+            "explicit target matches multiple catalog sources within 2 arcsec"
+            if len(rows) > 1 and target_coords is not None
+            else "explicit target does not map to exactly one catalog source"
+        )
+        return {"eligible": False, "reason": reason, "candidate_count": len(rows)}
+
+    row = rows[0]
+    if target_coords is not None and _sky_separation_arcsec(
+        target_coords[0], target_coords[1], float(row[2]), float(row[3])
+    ) > 2.0:
+        return {
+            "eligible": False,
+            "reason": "explicit target coordinates disagree with catalog source",
+        }
+    return {
+        "eligible": True,
+        "catalog_name": str(catalog_name),
+        "catalog_source_id": int(row[0]),
+        "source_id": str(row[1]),
+        "object_id": int(row[4]) if row[4] is not None else None,
+        "identity_link_exists": row[4] is not None,
+        "ra_deg": float(row[2]) if _is_finite(row[2]) else None,
+        "dec_deg": float(row[3]) if _is_finite(row[3]) else None,
+        "coordinate_match_radius_arcsec": 2.0 if target_coords is not None else None,
+    }
 
 
 def _valid_sky_position(ra: Any, dec: Any) -> bool:

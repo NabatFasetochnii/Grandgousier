@@ -1058,11 +1058,24 @@ def test_process_archive_path_replay_does_not_queue_historical_series() -> None:
     body = source[process_start:process_end]
 
     guard_pos = body.index("if not science_input_frame_ids:")
-    catalog_pos = body.index("if catalog_name is None:")
+    guard_return_pos = body.index("return result", guard_pos)
+    catalog_inspect_pos = body.index("_inspect_existing_catalog(")
+    auto_catalog_guard_pos = body.index(
+        "if catalog_name is None and finalized_series_rows:"
+    )
+    auto_catalog_prepare_pos = body.index("_prepare_auto_catalog(", auto_catalog_guard_pos)
+    auto_catalog_block_end = body.index(
+        "\n    for series in finalized_series_rows:", auto_catalog_guard_pos
+    )
     queue_pos = body.index("pipeline_series_ids = sorted(set(created_series_ids))")
-    load_pos = body.index("for series in _load_series_for_pipeline(session, pipeline_series_ids):")
+    load_pos = body.index(
+        "pipeline_series_rows = _load_series_for_pipeline(session, pipeline_series_ids)"
+    )
 
-    assert guard_pos < catalog_pos
+    assert guard_pos < guard_return_pos < catalog_inspect_pos < auto_catalog_guard_pos
+    assert auto_catalog_guard_pos < auto_catalog_prepare_pos < auto_catalog_block_end
+    assert body.count("_prepare_auto_catalog(") == 1
+    assert body.count("pipeline_series_ids = sorted(set(created_series_ids))") == 1
     assert queue_pos < load_pos
     assert "pipeline_series_ids = current_series_ids" not in body
 

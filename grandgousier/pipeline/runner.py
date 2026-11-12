@@ -58,7 +58,10 @@ from grandgousier.photometry.error_model import (
 from grandgousier.photometry.forced_aperture import run_forced_aperture_photometry
 from grandgousier.photometry.science_photometry import materialize_science_photometry
 from grandgousier.photometry.source_detection import detect_sources_in_frames
-from grandgousier.quality.detection_catalog_qc import match_detections_to_catalog
+from grandgousier.quality.detection_catalog_qc import (
+    aggregate_detection_catalog_support,
+    match_detections_to_catalog,
+)
 from grandgousier.quality.candidate_aperture_stability import (
     compute_candidate_aperture_stability_qc,
     export_candidate_aperture_stability_csv,
@@ -91,6 +94,7 @@ from grandgousier.lightcurves.candidates import export_accepted_candidate_light_
 from grandgousier.lightcurves.target import (
     TargetResolution,
     export_target_light_curve_product,
+    resolve_explicit_target_catalog_source,
     resolve_target_object,
     validate_target_coordinates,
 )
@@ -635,6 +639,10 @@ def _run_field_pipeline(
     pre_qc_detection_seeds: dict[int, dict[str, Any]] = {}
     target_resolution: dict[str, Any] = {"resolved": False, "method": "not_run"}
     target_object_ids: list[int] = []
+    eligible_catalog_source_ids: list[int] | None = None
+    explicit_target_catalog_source_ids: list[int] = []
+    explicit_target_catalog_selection: dict[str, Any] | None = None
+    detection_support_selection: dict[str, Any] = {"status": "NOT_RUN"}
     latest_candidate_rows: list[dict[str, Any]] = []
     candidate_selection_rows: list[dict[str, Any]] = []
     candidate_membership_history: list[dict[str, Any]] = []
@@ -1149,6 +1157,25 @@ def _run_field_pipeline(
             if not config.continue_on_error:
                 raise
 
+    def _ensure_explicit_target_catalog_selection() -> dict[str, Any]:
+        nonlocal explicit_target_catalog_selection, explicit_target_catalog_source_ids
+        if explicit_target_catalog_selection is None:
+            explicit_target_catalog_selection = resolve_explicit_target_catalog_source(
+                session,
+                catalog_name=config.catalog_name,
+                target_source_id=config.target_source_id,
+                target_object_id=config.target_object_id,
+                target_ra_deg=config.target_ra_deg,
+                target_dec_deg=config.target_dec_deg,
+            )
+        source_id = explicit_target_catalog_selection.get("catalog_source_id")
+        explicit_target_catalog_source_ids = (
+            [int(source_id)]
+            if explicit_target_catalog_selection.get("eligible") and source_id is not None
+            else []
+        )
+        return explicit_target_catalog_selection
+
     try:
         if not config.skip_wcs:
             add_step(
@@ -1239,33 +1266,6 @@ def _run_field_pipeline(
                 },
             )
 
-        if not stop_due_to_no_usable_frames and not config.skip_catalog_frame_match:
-            add_step(
-                "match_catalog_to_frames",
-                lambda: match_catalog_to_frames(
-                    session,
-                    catalog_name=config.catalog_name,
-                    instrument_unit_id=config.instrument_unit_id,
-                    frame_ids=(
-                        _frame_ids_for_step(selected_frame_ids)
-                        if (
-                            series_id is not None
-                            or has_explicit_frame_selection
-                            or pre_qc_resolved_runtime_scope
-                        )
-                        else None
-                    ),
-                    margin_pix=config.margin_pix,
-                    mag_key=config.mag_key,
-                    working_mag_limit=config.working_catalog_mag_limit,
-                    max_sources_per_frame=config.max_working_sources_per_frame,
-                    edge_margin_pix=config.catalog_edge_margin_pix,
-                    replace_existing=config.replace_frame_catalog_links,
-                    dry_run=config.dry_run,
-                    insert_batch_size=config.bulk_insert_batch_size,
-                ),
-            )
-
         if not stop_due_to_no_usable_frames and (not config.skip_detection or config.photometry_estimator in {"adaptive_ellipse", "spatial_psf", "empirical_psf"}):
             add_step(
                 "detect_sources",
@@ -1312,6 +1312,94 @@ def _run_field_pipeline(
                 ),
             )
 
+            def _aggregate_detection_support_step() -> dict[str, Any]:
+                nonlocal eligible_catalog_source_ids
+                nonlocal detection_support_selection
+                # Distinguish an enabled-but-unavailable/failed support pass from
+                # the disabled branch, whose None value means unfiltered projection.
+                eligible_catalog_source_ids = []
+                match_result = _step_result(result, "match_detections_to_catalog") or {}
+                detection_run_id = match_result.get("detection_run_id")
+                if detection_run_id is None:
+                    support_counts: dict[int, int] = {}
+                    support_status = "UNAVAILABLE_NO_PERSISTED_MATCH_RUN"
+                else:
+                    support_counts = aggregate_detection_catalog_support(
+                        session,
+                        catalog_name=config.catalog_name,
+                        detection_run_id=int(detection_run_id),
+                        frame_ids=(
+                            _frame_ids_for_step(selected_frame_ids)
+                            if selected_frame_ids
+                            else None
+                        ),
+                    )
+                    support_status = "DONE"
+
+                explicit_target = _ensure_explicit_target_catalog_selection()
+
+                eligible_catalog_source_ids = _eligible_catalog_sources_for_forced_photometry(
+                    support_counts, explicit_target
+                )
+                support_values = list(support_counts.values())
+                detection_support_selection = {
+                    "status": support_status,
+                    "minimum_distinct_physical_frames": 1,
+                    "supported_catalog_sources": len(support_counts),
+                    "sources_supported_by_one_frame": sum(
+                        1 for count in support_values if count == 1
+                    ),
+                    "sources_supported_by_multiple_frames": sum(
+                        1 for count in support_values if count > 1
+                    ),
+                    "max_distinct_physical_frame_support": max(support_values, default=0),
+                    "explicit_target": explicit_target,
+                    "explicit_target_source_included": bool(
+                        explicit_target_catalog_source_ids
+                    ),
+                    "eligible_catalog_sources": len(eligible_catalog_source_ids),
+                    "detection_run_id": int(detection_run_id)
+                    if detection_run_id is not None
+                    else None,
+                }
+                result.quality_policy["detection_support_selection"] = dict(
+                    detection_support_selection
+                )
+                return dict(detection_support_selection)
+
+            add_step("aggregate_detection_support", _aggregate_detection_support_step)
+
+        if not stop_due_to_no_usable_frames and not config.skip_catalog_frame_match:
+            def _match_catalog_to_frames_step():
+                _ensure_explicit_target_catalog_selection()
+                return match_catalog_to_frames(
+                    session,
+                    catalog_name=config.catalog_name,
+                    instrument_unit_id=config.instrument_unit_id,
+                    frame_ids=(
+                        _frame_ids_for_step(selected_frame_ids)
+                        if (
+                            series_id is not None
+                            or has_explicit_frame_selection
+                            or pre_qc_resolved_runtime_scope
+                        )
+                        else None
+                    ),
+                    margin_pix=config.margin_pix,
+                    mag_key=config.mag_key,
+                    working_mag_limit=config.working_catalog_mag_limit,
+                    include_catalog_source_ids=explicit_target_catalog_source_ids,
+                    eligible_catalog_source_ids=eligible_catalog_source_ids,
+                    priority_catalog_source_ids=explicit_target_catalog_source_ids,
+                    max_sources_per_frame=config.max_working_sources_per_frame,
+                    edge_margin_pix=config.catalog_edge_margin_pix,
+                    replace_existing=config.replace_frame_catalog_links,
+                    dry_run=config.dry_run,
+                    insert_batch_size=config.bulk_insert_batch_size,
+                )
+
+            add_step("match_catalog_to_frames", _match_catalog_to_frames_step)
+
         if not stop_due_to_no_usable_frames and config.enable_psf_field_diagnostics:
             def _psf_field_diagnostics_step() -> dict[str, Any]:
                 diagnostics_dir = None
@@ -1350,9 +1438,13 @@ def _run_field_pipeline(
                 diagnostics_dir = None
                 if config.out_dir and config.stage2_profile == "diagnostic":
                     diagnostics_dir = Path(config.out_dir) / "random_error_model"
+                _ensure_explicit_target_catalog_selection()
                 res = run_forced_aperture_photometry(
                     session,
                     catalog_name=config.catalog_name,
+                    eligible_catalog_source_ids=eligible_catalog_source_ids,
+                    priority_catalog_source_ids=explicit_target_catalog_source_ids,
+                    limit_links=config.max_working_sources_per_frame,
                     instrument_unit_id=config.instrument_unit_id,
                     frame_ids=(
                         _frame_ids_for_step(selected_frame_ids)
@@ -1423,6 +1515,17 @@ def _run_field_pipeline(
                     )
                 if res.diagnostics_frames_csv:
                     outputs["random_error_model_frames_csv"] = res.diagnostics_frames_csv
+                result.quality_policy["forced_photometry_selection"] = {
+                    **detection_support_selection,
+                    "eligible_links_before_cap": int(
+                        getattr(res, "eligible_links_before_cap", 0) or 0
+                    ),
+                    "selected_links_after_cap": int(
+                        getattr(res, "selected_links_after_cap", 0) or 0
+                    ),
+                    "cap_dropped_links": int(getattr(res, "cap_dropped_links", 0) or 0),
+                    "source_cap_per_frame": config.max_working_sources_per_frame,
+                }
                 _stamp_product(
                     calibration_names["raw"],
                     product_kind="BASE_PHOTOMETRY",
@@ -1651,18 +1754,38 @@ def _run_field_pipeline(
         if not stop_due_to_no_usable_frames and not config.skip_ensemble:
             def _resolve_target_step() -> dict[str, Any]:
                 nonlocal target_resolution, target_object_ids
-                source_name = calibration_names["aperture_zp"] if not config.skip_aperture_zp else aperture_photometry_source_name
-                target = resolve_target_object(
-                    session,
-                    calibration_name=source_name,
-                    catalog_name=config.catalog_name,
-                    frame_ids=_frame_ids_for_step(selected_frame_ids),
-                    target_source_id=config.target_source_id,
-                    target_object_id=config.target_object_id,
-                    target_ra_deg=config.target_ra_deg,
-                    target_dec_deg=config.target_dec_deg,
-                    max_sep_arcsec=config.target_max_sep_arcsec,
+                nonlocal explicit_target_catalog_selection
+                has_explicit_selector = bool(
+                    config.target_source_id
+                    or config.target_object_id is not None
+                    or config.target_ra_deg is not None
+                    or config.target_dec_deg is not None
                 )
+                if has_explicit_selector and explicit_target_catalog_selection is None:
+                    explicit_target_catalog_selection = resolve_explicit_target_catalog_source(
+                        session,
+                        catalog_name=config.catalog_name,
+                        target_source_id=config.target_source_id,
+                        target_object_id=config.target_object_id,
+                        target_ra_deg=config.target_ra_deg,
+                        target_dec_deg=config.target_dec_deg,
+                    )
+                target = _unresolved_explicit_target_resolution(
+                    config, explicit_target_catalog_selection
+                )
+                if target is None:
+                    source_name = calibration_names["aperture_zp"] if not config.skip_aperture_zp else aperture_photometry_source_name
+                    target = resolve_target_object(
+                        session,
+                        calibration_name=source_name,
+                        catalog_name=config.catalog_name,
+                        frame_ids=_frame_ids_for_step(selected_frame_ids),
+                        target_source_id=config.target_source_id,
+                        target_object_id=config.target_object_id,
+                        target_ra_deg=config.target_ra_deg,
+                        target_dec_deg=config.target_dec_deg,
+                        max_sep_arcsec=config.target_max_sep_arcsec,
+                    )
                 target_resolution = target.to_dict()
                 target_object_ids = [int(target.object_id)] if target.resolved and target.object_id is not None else []
                 return dict(target_resolution)
@@ -3496,6 +3619,41 @@ def _target_provenance_status(config: FieldPipelineConfig) -> str:
     return "UNRESOLVED_NO_TRUSTED_TARGET_INPUT"
 
 
+def _unresolved_explicit_target_resolution(
+    config: FieldPipelineConfig,
+    catalog_selection: dict[str, Any] | None,
+) -> TargetResolution | None:
+    """Gate ambiguous catalog selectors while preserving opaque-object fallback."""
+
+    has_explicit_selector = bool(
+        config.target_source_id
+        or config.target_object_id is not None
+        or config.target_ra_deg is not None
+        or config.target_dec_deg is not None
+    )
+    # An opaque Object ID is resolved against measured Objects by the normal
+    # post-measurement resolver. A missing catalog link only prevents using it
+    # to expand the pre-photometry CatalogSource working set.
+    if config.target_object_id is not None and not config.target_source_id:
+        return None
+    if not has_explicit_selector or catalog_selection is None or catalog_selection.get("eligible"):
+        return None
+    return TargetResolution(
+        resolved=False,
+        object_id=config.target_object_id,
+        source_id=config.target_source_id,
+        catalog_name=config.catalog_name,
+        target_ra_deg=config.target_ra_deg,
+        target_dec_deg=config.target_dec_deg,
+        coordinate_provenance=(
+            "explicit_object_coordinates" if config.target_ra_deg is not None else None
+        ),
+        method="explicit_catalog_source",
+        reason=catalog_selection.get("reason")
+        or "explicit target did not map to one unique catalog source",
+    )
+
+
 def _target_resolution_provenance_status(
     config: FieldPipelineConfig, target_result: dict[str, Any]
 ) -> str:
@@ -3504,6 +3662,18 @@ def _target_resolution_provenance_status(
 
 def _detection_branch_enabled(config: FieldPipelineConfig) -> bool:
     return not config.skip_detection and not config.skip_detection_catalog_match
+
+
+def _eligible_catalog_sources_for_forced_photometry(
+    support_counts: dict[int, int], explicit_target: dict[str, Any]
+) -> list[int]:
+    """Combine positive detection support with a uniquely selected explicit source."""
+
+    eligible = {int(source_id) for source_id, count in support_counts.items() if int(count) > 0}
+    source_id = explicit_target.get("catalog_source_id")
+    if explicit_target.get("eligible") and source_id is not None:
+        eligible.add(int(source_id))
+    return sorted(eligible)
 
 
 def _effective_require_detection_support(config: FieldPipelineConfig) -> bool:
@@ -3522,13 +3692,27 @@ def _forced_photometry_failure_counts(payload: dict[str, Any]) -> dict[str, int]
     return counts
 
 
+def _projection_limited_link_count(payload: dict[str, Any]) -> int:
+    try:
+        return max(0, int(payload.get("limited_links") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _completed_step_status(step_name: str, payload: dict[str, Any]) -> str:
+    if step_name == "match_catalog_to_frames":
+        return (
+            "DONE_WITH_WARNINGS"
+            if _projection_limited_link_count(payload)
+            else "DONE"
+        )
     if step_name != "run_forced_photometry":
         return "DONE"
     counts = _forced_photometry_failure_counts(payload)
+    cap_dropped_links = max(0, int(payload.get("cap_dropped_links") or 0))
     return (
         "DONE_WITH_WARNINGS"
-        if counts["failed_frames"] or counts["failed_measurements"]
+        if counts["failed_frames"] or counts["failed_measurements"] or cap_dropped_links
         else "DONE"
     )
 
@@ -3538,7 +3722,25 @@ def _completed_step_log(
 ) -> tuple[str, str, str]:
     if status != "DONE_WITH_WARNINGS":
         return "INFO", "step_done", f"step {step_name} finished"
+    if step_name == "match_catalog_to_frames":
+        projection_limited_links = _projection_limited_link_count(payload)
+        return (
+            "WARNING",
+            "step_done_with_warnings",
+            "frame-catalog projection applied the per-frame link cap: "
+            f"projection_limited_links={projection_limited_links}",
+        )
     counts = _forced_photometry_failure_counts(payload)
+    cap_dropped_links = max(0, int(payload.get("cap_dropped_links") or 0))
+    if cap_dropped_links and not counts["failed_frames"] and not counts["failed_measurements"]:
+        return (
+            "WARNING",
+            "step_done_with_warnings",
+            "working-source cap applied after detection-support eligibility: "
+            f"eligible_links_before_cap={payload.get('eligible_links_before_cap', 0)}, "
+            f"selected_links_after_cap={payload.get('selected_links_after_cap', 0)}, "
+            f"cap_dropped_links={cap_dropped_links}",
+        )
     return (
         "WARNING",
         "step_done_with_warnings",
@@ -3573,10 +3775,16 @@ def _pipeline_warning_summary(steps: list[PipelineStepRecord]) -> dict[str, Any]
     warning_step_rows: list[dict[str, Any]] = []
     total_failed_frames = 0
     total_failed_measurements = 0
+    total_cap_dropped_links = 0
+    total_projection_limited_links = 0
     for step in warning_steps:
         counts = _forced_photometry_failure_counts(step.result)
         total_failed_frames += counts["failed_frames"]
         total_failed_measurements += counts["failed_measurements"]
+        cap_dropped_links = max(0, int(step.result.get("cap_dropped_links") or 0))
+        total_cap_dropped_links += cap_dropped_links
+        projection_limited_links = _projection_limited_link_count(step.result)
+        total_projection_limited_links += projection_limited_links
         raw_samples = step.result.get("failure_samples") or []
         samples = [item for item in raw_samples if isinstance(item, dict)]
         remaining = max(0, sample_limit - len(failure_samples))
@@ -3591,6 +3799,8 @@ def _pipeline_warning_summary(steps: list[PipelineStepRecord]) -> dict[str, Any]
                 "status": step.status,
                 "failed_frames": counts["failed_frames"],
                 "failed_measurements": counts["failed_measurements"],
+                "cap_dropped_links": cap_dropped_links,
+                "projection_limited_links": projection_limited_links,
                 "failure_samples_count": len(samples),
             }
         )
@@ -3601,6 +3811,8 @@ def _pipeline_warning_summary(steps: list[PipelineStepRecord]) -> dict[str, Any]
         "warning_steps": warning_step_rows,
         "failed_frames": total_failed_frames,
         "failed_measurements": total_failed_measurements,
+        "cap_dropped_links": total_cap_dropped_links,
+        "projection_limited_links": total_projection_limited_links,
         "failure_samples": failure_samples,
         "failure_samples_truncated": failure_samples_truncated,
     }
@@ -3710,6 +3922,9 @@ def _quality_policy_summary(config: FieldPipelineConfig, result: PipelineRunResu
     convergence_result = _step_result(result, "candidate_ensemble_convergence") or {}
     color_result = _step_result(result, "apply_color_calibration") or {}
     forced_result = _step_result(result, "run_forced_photometry") or {}
+    detection_support_result = _step_result(result, "aggregate_detection_support") or {
+        "status": "NOT_RUN"
+    }
     error_validation_result = _step_result(result, "validate_random_error_model") or {}
     aperture_result = _step_result(result, "apply_aperture_correction") or {}
     candidate_export_result = _step_result(result, "export_candidate_light_curves") or {}
@@ -3916,6 +4131,22 @@ def _quality_policy_summary(config: FieldPipelineConfig, result: PipelineRunResu
         "psf_field_diagnostics_algorithm": "second_moments_spatial_v1",
         "detection_matching_executed": bool(match_result),
         "detection_matches_count": int(match_result.get("matched") or 0),
+        "detection_support_selection": detection_support_result,
+        "forced_photometry_selection": (
+            {
+                **detection_support_result,
+                "eligible_links_before_cap": int(
+                    forced_result.get("eligible_links_before_cap") or 0
+                ),
+                "selected_links_after_cap": int(
+                    forced_result.get("selected_links_after_cap") or 0
+                ),
+                "cap_dropped_links": int(forced_result.get("cap_dropped_links") or 0),
+                "source_cap_per_frame": config.max_working_sources_per_frame,
+            }
+            if _step_result(result, "run_forced_photometry") is not None
+            else None
+        ),
         "require_detection_support_requested": config.require_detection_support,
         "require_detection_support_effective": _effective_require_detection_support(config),
         "target_source_id": config.target_source_id,

@@ -70,6 +70,9 @@ def match_catalog_to_frames(
     limit_sources: int | None = None,
     mag_key: str = "G",
     working_mag_limit: float | None = None,
+    include_catalog_source_ids: list[int] | None = None,
+    eligible_catalog_source_ids: list[int] | None = None,
+    priority_catalog_source_ids: list[int] | None = None,
     max_sources_per_frame: int | None = None,
     edge_margin_pix: float = 0.0,
     replace_existing: bool = False,
@@ -111,14 +114,36 @@ def match_catalog_to_frames(
     # construction.
     for source in sources:
         source["_match_mag"] = _source_mag(source, mag_key)
+    included_source_ids = {
+        int(source_id) for source_id in (include_catalog_source_ids or [])
+    }
+    eligible_source_ids = (
+        None
+        if eligible_catalog_source_ids is None
+        else {int(source_id) for source_id in eligible_catalog_source_ids}
+    )
+    priority_source_ids = {
+        int(source_id) for source_id in (priority_catalog_source_ids or [])
+    }
     if working_mag_limit is not None:
         limit_value = float(working_mag_limit)
         sources = [
             source
             for source in sources
-            if source["_match_mag"] is not None and source["_match_mag"] <= limit_value
+            if (
+                source["_match_mag"] is not None
+                and source["_match_mag"] <= limit_value
+            )
+            or int(source["catalog_source_id"]) in included_source_ids
         ]
     result.mag_limited_sources = len(sources)
+    if eligible_source_ids is not None:
+        eligible_source_ids.update(included_source_ids)
+        sources = [
+            source
+            for source in sources
+            if int(source["catalog_source_id"]) in eligible_source_ids
+        ]
     sources.sort(
         key=lambda source: (
             source["_match_mag"] is None,
@@ -203,10 +228,18 @@ def match_catalog_to_frames(
                 selected_indices = np.flatnonzero(valid)
                 if max_sources_per_frame is not None and len(selected_indices) > int(max_sources_per_frame):
                     result.limited_links += len(selected_indices) - int(max_sources_per_frame)
-                    # ``sources`` is already ordered by the exact legacy
-                    # brightness/source-id key, so an in-footprint subsequence is
-                    # already in the order used by the old per-frame sort.
-                    selected_indices = selected_indices[: int(max_sources_per_frame)]
+                    # Preserve the exact legacy brightness/source-id order apart
+                    # from placing explicit target priorities first at the cap.
+                    selected_order = sorted(
+                        selected_indices.tolist(),
+                        key=lambda index: (
+                            0 if source_ids[index] in priority_source_ids else 1,
+                            index,
+                        ),
+                    )
+                    selected_indices = np.asarray(
+                        selected_order[: int(max_sources_per_frame)], dtype=int
+                    )
 
                 common_details = {
                     "naxis1": naxis1,

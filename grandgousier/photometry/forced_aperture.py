@@ -67,6 +67,10 @@ class ForcedPhotometryResult:
     selected_frames: int = 0
     checked_frames: int = 0
     selected_links: int = 0
+    eligible_links_before_cap: int = 0
+    selected_links_after_cap: int = 0
+    cap_dropped_links: int = 0
+    selection_warnings: list[str] = field(default_factory=list)
     measured: int = 0
     inserted_or_updated: int = 0
     insert_batches: int = 0
@@ -253,6 +257,8 @@ def run_forced_aperture_photometry(
     session: Session,
     *,
     catalog_name: str | None = None,
+    eligible_catalog_source_ids: Iterable[int] | None = None,
+    priority_catalog_source_ids: Iterable[int] | None = None,
     frame_ids: list[int] | None = None,
     instrument: str | None = None,
     instrument_unit_id: int | None = None,
@@ -326,6 +332,15 @@ def run_forced_aperture_photometry(
 
     if frame_ids is not None and not frame_ids:
         raise ValueError("An explicit frame_ids selection must not be empty")
+
+    eligible_source_ids = (
+        None
+        if eligible_catalog_source_ids is None
+        else {int(value) for value in eligible_catalog_source_ids}
+    )
+    priority_source_ids = {int(value) for value in (priority_catalog_source_ids or [])}
+    if eligible_source_ids is not None:
+        eligible_source_ids.update(priority_source_ids)
 
     photometry_estimator = str(photometry_estimator or "circular").strip().lower()
     if photometry_estimator not in {"circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"}:
@@ -451,7 +466,16 @@ def run_forced_aperture_photometry(
     reuse_published_calibration_version_id: int | None = None
     reuse_scope_link_counts: dict[int, int] | None = None
     reuse_scope_existing_counts: dict[int, int] | None = None
-    if not dry_run and immutable_generation and reuse_existing and not force_recompute:
+    if (
+        not dry_run
+        and immutable_generation
+        and reuse_existing
+        and not force_recompute
+        # Count-only reuse cannot prove that the existing immutable generation
+        # contains this run's newly eligible source identities or target priority.
+        and eligible_source_ids is None
+        and not priority_source_ids
+    ):
         published = session.scalar(select(CalibrationVersion).where(CalibrationVersion.name == calibration_name))
         if (
             published is not None
@@ -459,11 +483,20 @@ def run_forced_aperture_photometry(
         ):
             reuse_published_calibration_version_id = int(published.calibration_version_id)
             result.reuse_preflight_strategy = "BULK_GROUPED_COUNTS_V1"
-            reuse_scope_link_counts = _select_frame_link_counts_bulk(
+            eligible_link_counts = _select_frame_link_counts_bulk(
                 session,
                 frame_ids=[int(frame.frame_id) for frame in frames],
                 catalog_name=catalog_name,
-                limit_per_frame=limit_links,
+                limit_per_frame=None,
+                eligible_catalog_source_ids=eligible_source_ids,
+            )
+            reuse_scope_link_counts = _cap_frame_link_counts(
+                eligible_link_counts, limit_per_frame=limit_links
+            )
+            result.eligible_links_before_cap = sum(eligible_link_counts.values())
+            result.selected_links_after_cap = sum(reuse_scope_link_counts.values())
+            result.cap_dropped_links = (
+                result.eligible_links_before_cap - result.selected_links_after_cap
             )
             reuse_scope_existing_counts = _existing_measurement_counts_bulk(
                 session,
@@ -576,6 +609,7 @@ def run_forced_aperture_photometry(
         and int(result.calibration_version_id) == reuse_published_calibration_version_id
     )
     prefetched_links: dict[int, list[tuple[ForcedFrameLink, ForcedCatalogSource]]] = {}
+    link_selection_stats: dict[str, int] = {}
     existing_measurement_counts: dict[int, int] = {}
     if fast_complete_reuse:
         result.reuse_fast_path = True
@@ -593,6 +627,9 @@ def run_forced_aperture_photometry(
             frame_ids=[int(frame.frame_id) for frame in frames],
             catalog_name=catalog_name,
             limit_per_frame=limit_links,
+            eligible_catalog_source_ids=eligible_source_ids,
+            priority_catalog_source_ids=priority_source_ids,
+            selection_stats=link_selection_stats,
         )
         _timing_add("select_frame_links", phase_started)
         result.link_read_strategy = "BULK_SCALAR_2QUERY_V1"
@@ -612,6 +649,22 @@ def run_forced_aperture_photometry(
             )
             _timing_add("prefetch_existing_measurement_counts", phase_started)
             result.existing_measurement_check_strategy = "BULK_GROUPED_COUNTS_V1"
+
+        result.eligible_links_before_cap = int(
+            link_selection_stats.get("eligible_links_before_cap", 0)
+        )
+        result.selected_links_after_cap = int(
+            link_selection_stats.get("selected_links_after_cap", 0)
+        )
+        result.cap_dropped_links = int(link_selection_stats.get("cap_dropped_links", 0))
+
+    if result.cap_dropped_links > 0:
+        result.selection_warnings.append(
+            "working-source cap applied after detection-support eligibility: "
+            f"eligible_links_before_cap={result.eligible_links_before_cap}, "
+            f"selected_links_after_cap={result.selected_links_after_cap}, "
+            f"cap_per_frame={int(limit_links)}"
+        )
 
     adaptive_detections_by_frame: dict[int, list[dict[str, Any]]] = {}
     if photometry_estimator in {"adaptive_ellipse", "spatial_psf", "empirical_psf"} and not fast_complete_reuse:
@@ -1672,17 +1725,36 @@ def _select_frame_links_bulk(
     frame_ids: list[int],
     catalog_name: str | None,
     limit_per_frame: int | None,
+    eligible_catalog_source_ids: set[int] | None = None,
+    priority_catalog_source_ids: set[int] | None = None,
+    selection_stats: dict[str, int] | None = None,
 ) -> dict[int, list[tuple[ForcedFrameLink, ForcedCatalogSource]]]:
     """Prefetch the forced-photometry link scope without ORM hydration.
 
     The hot path historically executed one ``FrameCatalogLink + CatalogSource``
     ORM join per frame. Here link geometry is fetched once for the full frame
     scope, then the much smaller unique catalog-source set is fetched once.
-    Per-frame ordering and ``limit_per_frame`` semantics are preserved exactly.
+    Eligibility is applied before the deterministic per-frame safety cap.
     """
 
     if not frame_ids:
         return {}
+    priority_ids = {int(value) for value in (priority_catalog_source_ids or set())}
+    eligible_ids = (
+        None
+        if eligible_catalog_source_ids is None
+        else {int(value) for value in eligible_catalog_source_ids} | priority_ids
+    )
+    if eligible_ids is not None and not eligible_ids:
+        if selection_stats is not None:
+            selection_stats.update(
+                {
+                    "eligible_links_before_cap": 0,
+                    "selected_links_after_cap": 0,
+                    "cap_dropped_links": 0,
+                }
+            )
+        return {int(frame_id): [] for frame_id in frame_ids}
 
     stmt = (
         select(
@@ -1701,16 +1773,15 @@ def _select_frame_links_bulk(
             CatalogSource,
             CatalogSource.catalog_source_id == FrameCatalogLink.catalog_source_id,
         ).where(CatalogSource.catalog_name == catalog_name)
+    if eligible_ids is not None:
+        stmt = stmt.where(FrameCatalogLink.catalog_source_id.in_(sorted(eligible_ids)))
 
     raw_links = list(session.execute(stmt).mappings().all())
     link_rows_by_frame: dict[int, list[ForcedFrameLink]] = {}
     source_ids: set[int] = set()
-    per_frame_limit = None if limit_per_frame is None else max(0, int(limit_per_frame))
     for row in raw_links:
         frame_id = int(row["frame_id"])
         bucket = link_rows_by_frame.setdefault(frame_id, [])
-        if per_frame_limit is not None and len(bucket) >= per_frame_limit:
-            continue
         link = ForcedFrameLink(
             frame_catalog_link_id=int(row["frame_catalog_link_id"]),
             frame_id=frame_id,
@@ -1722,6 +1793,14 @@ def _select_frame_links_bulk(
         source_ids.add(link.catalog_source_id)
 
     if not source_ids:
+        if selection_stats is not None:
+            selection_stats.update(
+                {
+                    "eligible_links_before_cap": 0,
+                    "selected_links_after_cap": 0,
+                    "cap_dropped_links": 0,
+                }
+            )
         return {frame_id: [] for frame_id in link_rows_by_frame}
 
     source_stmt = (
@@ -1758,13 +1837,40 @@ def _select_frame_links_bulk(
     }
 
     grouped: dict[int, list[tuple[ForcedFrameLink, ForcedCatalogSource]]] = {}
+    eligible_link_count = 0
+    selected_link_count = 0
+    per_frame_limit = (
+        None
+        if limit_per_frame is None or int(limit_per_frame) <= 0
+        else int(limit_per_frame)
+    )
     for frame_id, links in link_rows_by_frame.items():
         items: list[tuple[ForcedFrameLink, ForcedCatalogSource]] = []
         for link in links:
             source = sources.get(link.catalog_source_id)
             if source is not None:
                 items.append((link, source))
+        eligible_link_count += len(items)
+        if per_frame_limit is not None:
+            # Preserve the historic link-ID order except for placing an explicit
+            # target ahead of other eligible links before applying the cap.
+            items.sort(
+                key=lambda item: (
+                    0 if item[0].catalog_source_id in priority_ids else 1,
+                    item[0].frame_catalog_link_id,
+                )
+            )
+            items = items[:per_frame_limit]
+        selected_link_count += len(items)
         grouped[frame_id] = items
+    if selection_stats is not None:
+        selection_stats.update(
+            {
+                "eligible_links_before_cap": eligible_link_count,
+                "selected_links_after_cap": selected_link_count,
+                "cap_dropped_links": eligible_link_count - selected_link_count,
+            }
+        )
     return grouped
 
 
@@ -1808,17 +1914,19 @@ def _select_frame_link_counts_bulk(
     frame_ids: list[int],
     catalog_name: str | None,
     limit_per_frame: int | None,
+    eligible_catalog_source_ids: set[int] | None = None,
 ) -> dict[int, int]:
     """Return required forced-photometry link counts with one grouped query.
 
     Only counts are needed when validating/reusing an immutable BASE generation.
-    Applying ``min(count, limit_per_frame)`` is exactly equivalent to the historic
-    per-frame ``ORDER BY ... LIMIT`` for the completeness predicate because that
-    predicate compares row cardinality only, not specific link identities.
+    Eligibility is applied before the optional cap. The completeness predicate
+    compares only cardinality, so the cap is applied to each eligible count.
     """
 
     if not frame_ids:
         return {}
+    if eligible_catalog_source_ids is not None and not eligible_catalog_source_ids:
+        return {int(frame_id): 0 for frame_id in frame_ids}
 
     stmt = (
         select(
@@ -1834,9 +1942,17 @@ def _select_frame_link_counts_bulk(
             CatalogSource,
             CatalogSource.catalog_source_id == FrameCatalogLink.catalog_source_id,
         ).where(CatalogSource.catalog_name == catalog_name)
+    if eligible_catalog_source_ids is not None:
+        stmt = stmt.where(
+            FrameCatalogLink.catalog_source_id.in_(sorted(eligible_catalog_source_ids))
+        )
 
     rows = session.execute(stmt).mappings().all()
-    per_frame_limit = None if limit_per_frame is None else max(0, int(limit_per_frame))
+    per_frame_limit = (
+        None
+        if limit_per_frame is None or int(limit_per_frame) <= 0
+        else int(limit_per_frame)
+    )
     counts: dict[int, int] = {}
     for row in rows:
         value = int(row["n_links"] or 0)
@@ -1844,6 +1960,15 @@ def _select_frame_link_counts_bulk(
             value = min(value, per_frame_limit)
         counts[int(row["frame_id"])] = value
     return counts
+
+
+def _cap_frame_link_counts(
+    counts: dict[int, int], *, limit_per_frame: int | None
+) -> dict[int, int]:
+    if limit_per_frame is None or int(limit_per_frame) <= 0:
+        return dict(counts)
+    limit = int(limit_per_frame)
+    return {int(frame_id): min(int(count), limit) for frame_id, count in counts.items()}
 
 
 def _existing_measurement_counts_bulk(

@@ -297,6 +297,16 @@ def test_process_archive_path_cli_passes_coordinate_pair_before_db_open(monkeypa
     assert observed["finalize_tail"] is False
 
 
+def test_process_archive_detection_support_is_default_with_explicit_opt_out():
+    from grandgousier.cli import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args(["process-archive-path", "--path", "synthetic"]).enable_detection_branch
+    assert not parser.parse_args(
+        ["process-archive-path", "--path", "synthetic", "--disable-detection-branch"]
+    ).enable_detection_branch
+
+
 def test_discover_fits_files_is_suffix_based_and_sorted(tmp_path):
     (tmp_path / "b.FITS").write_text("")
     (tmp_path / "a.fit").write_text("")
@@ -439,6 +449,16 @@ def test_default_auto_catalog_name_uses_detected_group_metadata(tmp_path):
 
     assert warnings == []
     assert _default_auto_catalog_name(groups, root=tmp_path) == "auto_catalog_robophot_20240101_RoboPhotTarget_i"
+
+
+def test_default_field_catalog_name_uses_only_persistent_field_id():
+    from grandgousier.archive.auto_process import _default_field_auto_catalog_name
+
+    assert _default_field_auto_catalog_name(17) == "auto_catalog_field_17"
+    assert _default_field_auto_catalog_name(17) == _default_field_auto_catalog_name(17)
+    assert _default_field_auto_catalog_name(17) != _default_field_auto_catalog_name(18)
+    with pytest.raises(ValueError, match="persisted positive field_id"):
+        _default_field_auto_catalog_name(-1)
 
 
 def test_auto_catalog_mag_limit_inherits_working_limit_unless_explicit():
@@ -639,34 +659,148 @@ def test_process_archive_path_uses_profile_appropriate_light_curve_summary(
 
 
 
-def test_prepare_auto_catalog_reuses_populated_exact_name_without_gaia(monkeypatch):
-    calls = {"gaia": 0}
+class _AutoCatalogSession:
+    def __init__(self):
+        self.commits = 0
+        self.rollbacks = 0
 
-    monkeypatch.setattr(
-        "grandgousier.archive.auto_process._inspect_existing_catalog",
-        lambda _session, *, catalog_name: {
-            "mode": "explicit_existing",
-            "catalog_name": catalog_name,
-            "status": "DONE",
-            "inserted_or_updated": 123,
-            "n_sources": 123,
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+def _fake_coverage_query_result(**overrides):
+    values = {
+        "selected_frames": 3,
+        "queried_frames": 3,
+        "queried_cones": 5,
+        "row_limit_reached_cones": 1,
+        "read_rows": 52000,
+        "inserted_or_updated": 32000,
+        "failed_frames": 0,
+        "skipped_missing_file": 0,
+        "skipped_oversized_cones": 0,
+        "failed_footprint_reasons": {},
+        "sample_failed_footprints": [],
+        "query_provider": "test-fake",
+        "query_provider_failures": {},
+        "query_mode": "frame_union",
+        "effective_query_mode": "frame_union",
+        "effective_max_rows": 20000,
+        "skipped_covered_cones": 0,
+        "phase_timings_sec": {
+            "footprint_calculation": 0.125,
+            "tap_attempts": 2.5,
+            "catalog_source_upserts": 0.75,
+            "total_query": 3.4,
         },
+        "skipped_already_covered": False,
+        "query_disabled": False,
+        "coverage_complete": True,
+        "completed_cones": [
+            {
+                "status": "COMPLETE",
+                "completion_method": "four_child_recursive_cover",
+                "query_outcome": "MAXREC_SPLIT",
+                "cone": {"ra_deg": 10.0, "dec_deg": 20.0, "radius_deg": 0.2},
+                "provider": "test-fake",
+                "rows_returned": 20000,
+                "maxrec_per_query": 20000,
+                "children": [
+                    {
+                        "status": "COMPLETE",
+                        "completion_method": "direct_query",
+                        "query_outcome": "BELOW_MAXREC",
+                        "rows_returned": 10,
+                        "maxrec_per_query": 20000,
+                    }
+                    for _ in range(4)
+                ],
+            }
+        ],
+        "cone_attempts": [
+            {
+                "status": "MAXREC_TRUNCATED",
+                "depth": 0,
+                "children": [
+                    {"ra_deg": 10.0 + index, "dec_deg": 20.0, "radius_deg": 0.1}
+                    for index in range(4)
+                ],
+            },
+            *(
+                {"status": "COMPLETE_BELOW_MAXREC", "depth": 1}
+                for _ in range(4)
+            ),
+        ],
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_prepare_auto_catalog_reuses_only_durable_single_cone_coverage(monkeypatch):
+    from grandgousier.catalogs import gaia_query
+
+    warnings = []
+    stored_cone = {"ra_deg": 12.0, "dec_deg": -15.0, "radius_deg": 0.4}
+    coverage = {
+        "version": 1,
+        "complete_cones": [
+            {
+                "status": "COMPLETE",
+                "field_id": 17,
+                "catalog_name": "auto_catalog_field_17",
+                "catalog_release": "Gaia DR3",
+                "mag_limit": None,
+                "cone": stored_cone,
+                "maxrec_per_query": 20000,
+                "completed_at": "2026-11-12T00:00:00+00:00",
+                "proof": {
+                    "status": "COMPLETE",
+                    "completion_method": "direct_query",
+                    "query_outcome": "BELOW_MAXREC",
+                    "rows_returned": 123,
+                    "maxrec_per_query": 20000,
+                    "cone": stored_cone,
+                },
+            }
+        ],
+    }
+    monkeypatch.setattr(auto_process_module, "_lock_field_gaia_coverage", lambda *_a, **_k: coverage)
+    monkeypatch.setattr(
+        auto_process_module,
+        "_inspect_existing_catalog",
+        lambda *_a, **_k: {"n_sources": 123, "inserted_or_updated": 123},
+    )
+    observed = {}
+
+    def fake_query(_session, **kwargs):
+        observed.update(kwargs)
+        return _fake_coverage_query_result(
+            queried_frames=0,
+            queried_cones=0,
+            row_limit_reached_cones=0,
+            read_rows=0,
+            inserted_or_updated=0,
+            skipped_covered_cones=1,
+            skipped_already_covered=True,
+            coverage_complete=True,
+            completed_cones=[],
+        )
+
+    monkeypatch.setattr(gaia_query, "query_gaia_for_frames", fake_query)
+    monkeypatch.setattr(
+        auto_process_module,
+        "_append_field_gaia_coverage",
+        lambda *_a, **_k: pytest.fail("cached coverage must not be rewritten"),
     )
 
-    # Importing/querying Gaia must never be reached when the preserved catalog
-    # is already populated.  Patching the query symbol gives the test a clear
-    # failure mode if that contract regresses.
-    import grandgousier.catalogs.gaia_query as gaia_query
-
-    def _unexpected_gaia(*_args, **_kwargs):
-        calls["gaia"] += 1
-        raise AssertionError("Gaia query should not run for a populated preserved catalog")
-
-    monkeypatch.setattr(gaia_query, "query_gaia_for_frames", _unexpected_gaia)
-
+    session = _AutoCatalogSession()
     row = _prepare_auto_catalog(
-        object(),
-        catalog_name="auto_catalog_master_20230916_TIC13533330_01_V",
+        session,
+        field_id=17,
+        catalog_name="auto_catalog_field_17",
         frame_ids=[1, 2, 3],
         enabled=True,
         margin_arcmin=10.0,
@@ -675,22 +809,304 @@ def test_prepare_auto_catalog_reuses_populated_exact_name_without_gaia(monkeypat
         query_mode="frame_union",
         max_radius_deg=1.0,
         timeout_sec=120.0,
-        warnings=[],
+        warnings=warnings,
     )
 
-    assert calls["gaia"] == 0
+    assert observed["coverage_cones"] == [stored_cone]
+    assert observed["commit"] is False
+    assert observed["enabled"] is True
     assert row["mode"] == "auto_existing_reuse"
-    assert row["status"] == "DONE"
-    assert row["reused_existing"] is True
-    assert row["n_sources"] == 123
-    assert row["inserted_or_updated"] == 123
-    assert row["queried_frames"] == 0
-    assert row["queried_cones"] == 0
+    assert row["gaia_query_status"] == "SKIPPED_ALREADY_COVERED"
+    assert row["coverage_complete"] is True
     assert _catalog_precondition_ok(row, allow_empty_catalog=False)
+    assert any("GAIA_QUERY=SKIPPED_ALREADY_COVERED" in item for item in warnings)
+    assert session.commits == 1
 
 
-def test_process_archive_path_forwards_indexed_frame_ids_to_gaia(monkeypatch, tmp_path):
-    indexed_frame_ids = [17, 9]
+def test_prepare_auto_catalog_expands_uncovered_field_and_records_only_complete(monkeypatch):
+    from grandgousier.catalogs import gaia_query
+
+    warnings = []
+    observed = {}
+    appended = {}
+    monkeypatch.setattr(
+        auto_process_module,
+        "_lock_field_gaia_coverage",
+        lambda *_a, **_k: {"version": 1, "complete_cones": []},
+    )
+    source_counts = iter((123, 32000))
+    monkeypatch.setattr(
+        auto_process_module,
+        "_inspect_existing_catalog",
+        lambda *_a, **_k: {"n_sources": next(source_counts), "inserted_or_updated": 123},
+    )
+
+    def fake_query(_session, **kwargs):
+        observed.update(kwargs)
+        return _fake_coverage_query_result()
+
+    def fake_append(_session, **kwargs):
+        appended.update(kwargs)
+        return 1
+
+    monkeypatch.setattr(gaia_query, "query_gaia_for_frames", fake_query)
+    monkeypatch.setattr(auto_process_module, "_append_field_gaia_coverage", fake_append)
+    session = _AutoCatalogSession()
+    row = _prepare_auto_catalog(
+        session,
+        field_id=17,
+        catalog_name="auto_catalog_field_17",
+        frame_ids=[1, 2, 3],
+        enabled=True,
+        margin_arcmin=2.0,
+        mag_limit=18.0,
+        max_rows_per_frame=50000,
+        query_mode="frame_union",
+        max_radius_deg=1.0,
+        timeout_sec=120.0,
+        warnings=warnings,
+    )
+
+    assert observed["frame_ids"] == [1, 2, 3]
+    assert observed["coverage_cones"] == []
+    assert observed["max_rows_per_frame"] == 50000
+    assert observed["commit"] is False
+    assert appended["field_id"] == 17
+    assert appended["catalog_name"] == "auto_catalog_field_17"
+    assert appended["mag_limit"] == 18.0
+    assert row["mode"] == "auto_existing_expansion"
+    assert row["n_sources"] == 32000
+    assert row["effective_max_rows"] == 20000
+    assert row["coverage_complete"] is True
+    assert row["phase_timings_sec"] == {
+        "footprint_calculation": 0.125,
+        "tap_attempts": 2.5,
+        "catalog_source_upserts": 0.75,
+        "total_query": 3.4,
+    }
+    assert row["status"] == "DONE_WITH_WARNINGS"
+    assert _catalog_precondition_ok(row, allow_empty_catalog=False)
+    assert any("recursive coverage complete=True" in item for item in warnings)
+    assert session.commits == 1
+
+    bulk_result = auto_process_module.ProcessArchiveResult(
+        status="DONE",
+        path="archive",
+        catalog_name="auto_catalog_field_17",
+        execute=True,
+        discovered_files=3,
+        detected_files=3,
+        failed_files=0,
+        catalog_results=[row],
+    )
+    catalog_result = bulk_result.to_dict()["catalog_results"][0]
+    assert "completed_cones" not in catalog_result
+    assert "cone_attempts" not in catalog_result
+    assert catalog_result["completed_cones_count"] == 1
+    assert catalog_result["cone_attempts_count"] == 5
+    assert catalog_result["failed_cone_attempts_count"] == 0
+    assert catalog_result["skipped_covered_cones"] == 0
+    assert catalog_result["row_limit_reached_cones"] == 1
+    assert catalog_result["maxrec_attempts_count"] == 1
+    assert catalog_result["effective_max_rows"] == 20000
+    assert catalog_result["coverage_complete"] is True
+    assert catalog_result["gaia_query_status"] == "QUERIED_COMPLETE_AFTER_MAXREC_SPLIT"
+    assert catalog_result["phase_timings_sec"] == {
+        "footprint_calculation": 0.125,
+        "tap_attempts": 2.5,
+        "catalog_source_upserts": 0.75,
+        "total_query": 3.4,
+    }
+
+    def contains_proof_tree(value):
+        if isinstance(value, dict):
+            if any(key in value for key in ("proof", "children", "cone_attempts", "completed_cones")):
+                return True
+            return any(contains_proof_tree(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_proof_tree(item) for item in value)
+        return False
+
+    assert not contains_proof_tree(catalog_result)
+
+
+def test_auto_catalog_failed_or_disabled_uncovered_coverage_fails_precondition(monkeypatch):
+    from grandgousier.catalogs import gaia_query
+
+    monkeypatch.setattr(
+        auto_process_module,
+        "_lock_field_gaia_coverage",
+        lambda *_a, **_k: {"version": 1, "complete_cones": []},
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "_inspect_existing_catalog",
+        lambda *_a, **_k: {"n_sources": 123, "inserted_or_updated": 123},
+    )
+
+    def failed_query(_session, **_kwargs):
+        return _fake_coverage_query_result(
+            failed_frames=1,
+            coverage_complete=False,
+            completed_cones=[],
+        )
+
+    monkeypatch.setattr(gaia_query, "query_gaia_for_frames", failed_query)
+    monkeypatch.setattr(
+        auto_process_module,
+        "_append_field_gaia_coverage",
+        lambda *_a, **_k: pytest.fail("failed query must not persist coverage"),
+    )
+    row = _prepare_auto_catalog(
+        _AutoCatalogSession(),
+        field_id=17,
+        catalog_name="auto_catalog_field_17",
+        frame_ids=[1],
+        enabled=True,
+        margin_arcmin=1.0,
+        mag_limit=None,
+        max_rows_per_frame=20000,
+        query_mode="per_frame",
+        max_radius_deg=1.0,
+        timeout_sec=1.0,
+        warnings=[],
+    )
+    assert row["status"] == "DONE_WITH_FAILED_FRAMES"
+    assert row["coverage_complete"] is False
+    assert not _catalog_precondition_ok(row, allow_empty_catalog=True)
+
+    def disabled_query(_session, **_kwargs):
+        return _fake_coverage_query_result(
+            query_disabled=True,
+            coverage_complete=False,
+            completed_cones=[],
+            row_limit_reached_cones=0,
+        )
+
+    monkeypatch.setattr(gaia_query, "query_gaia_for_frames", disabled_query)
+    disabled_row = _prepare_auto_catalog(
+        _AutoCatalogSession(),
+        field_id=17,
+        catalog_name="auto_catalog_field_17",
+        frame_ids=[1],
+        enabled=False,
+        margin_arcmin=1.0,
+        mag_limit=None,
+        max_rows_per_frame=20000,
+        query_mode="per_frame",
+        max_radius_deg=1.0,
+        timeout_sec=1.0,
+        warnings=[],
+    )
+    assert disabled_row["status"] == "SKIPPED_DISABLED"
+    assert disabled_row["gaia_query_status"] == "SKIPPED_DISABLED_UNCOVERED"
+    assert not _catalog_precondition_ok(disabled_row, allow_empty_catalog=True)
+
+
+def test_field_gaia_coverage_uses_locked_jsonb_append_and_preserves_other_keys():
+    class _Mappings:
+        def first(self):
+            return {"metadata_json": {"unrelated": {"keep": True}}}
+
+    class _Result:
+        rowcount = 1
+
+        def mappings(self):
+            return _Mappings()
+
+    class _Session:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement, params):
+            self.statements.append((str(statement), params))
+            return _Result()
+
+    session = _Session()
+    coverage = auto_process_module._lock_field_gaia_coverage(session, field_id=17)
+    direct = {
+        "status": "COMPLETE",
+        "completion_method": "direct_query",
+        "query_outcome": "BELOW_MAXREC",
+        "rows_returned": 10,
+        "maxrec_per_query": 20000,
+        "cone": {"ra_deg": 10.0, "dec_deg": 20.0, "radius_deg": 0.1},
+        "provider": "test",
+        "completed_at": "2026-11-12T00:00:00+00:00",
+    }
+    assert auto_process_module._append_field_gaia_coverage(
+        session,
+        field_id=17,
+        coverage=coverage,
+        proofs=[direct],
+        catalog_name="auto_catalog_field_17",
+        mag_limit=None,
+        query_mode="per_frame",
+    ) == 1
+    assert "FOR UPDATE" in session.statements[0][0]
+    update_sql = session.statements[1][0]
+    assert "jsonb_set(" in update_sql
+    assert "COALESCE(metadata_json" in update_sql
+    saved = __import__("json").loads(session.statements[1][1]["coverage_document"])
+    assert saved["version"] == 1
+    assert saved["complete_cones"][0]["status"] == "COMPLETE"
+    assert saved["complete_cones"][0]["field_id"] == 17
+    assert saved["complete_cones"][0]["catalog_release"] == "Gaia DR3"
+    assert saved["complete_cones"][0]["cone"] == direct["cone"]
+
+
+def test_field_gaia_coverage_reuse_respects_field_release_and_magnitude_limit():
+    cone = {"ra_deg": 10.0, "dec_deg": 20.0, "radius_deg": 0.1}
+
+    def record(*, field_id=17, release="Gaia DR3", mag_limit=None, status="COMPLETE"):
+        proof = {
+            "status": "COMPLETE",
+            "completion_method": "direct_query",
+            "query_outcome": "BELOW_MAXREC",
+            "rows_returned": 2,
+            "maxrec_per_query": 20000,
+            "cone": cone,
+        }
+        return {
+            "status": status,
+            "field_id": field_id,
+            "catalog_name": "auto_catalog_field_17",
+            "catalog_release": release,
+            "mag_limit": mag_limit,
+            "cone": cone,
+            "maxrec_per_query": 20000,
+            "completed_at": "2026-11-12T00:00:00+00:00",
+            "proof": proof,
+        }
+
+    coverage = {
+        "version": 1,
+        "complete_cones": [
+            record(),
+            record(mag_limit=20.0),
+            record(mag_limit=17.0),
+            record(release="Gaia DR2"),
+            record(field_id=18),
+            record(status="FAILED"),
+        ],
+    }
+    matching = auto_process_module._compatible_field_gaia_coverage(
+        coverage,
+        field_id=17,
+        catalog_name="auto_catalog_field_17",
+        mag_limit=18.0,
+    )
+    assert matching == [cone, cone]
+    assert auto_process_module._compatible_field_gaia_coverage(
+        coverage,
+        field_id=17,
+        catalog_name="auto_catalog_field_17",
+        mag_limit=None,
+    ) == [cone]
+
+
+def test_auto_catalog_names_and_footprints_follow_physical_field_id(monkeypatch, tmp_path):
+    indexed_frame_ids = [1, 2, 3]
     source_path = tmp_path / "indexed.fits"
     detected = SimpleNamespace(path=str(source_path), profile_name="MASTER")
     monkeypatch.setattr(
@@ -701,13 +1117,13 @@ def test_process_archive_path_forwards_indexed_frame_ids_to_gaia(monkeypatch, tm
     monkeypatch.setattr(auto_process_module, "load_auto_profiles", lambda **_kwargs: {"MASTER": object()})
     monkeypatch.setattr(
         auto_process_module,
-        "index_archive_paths",
-        lambda **_kwargs: SimpleNamespace(discovered=1, inserted=1, skipped_existing=0, failed=0),
-    )
-    monkeypatch.setattr(
-        auto_process_module,
-        "_frame_ids_for_paths",
-        lambda *_args: list(indexed_frame_ids),
+        "index_detected_archive_files",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            indexed_paths=[source_path],
+            index_results=[],
+            indexed_frame_ids=list(indexed_frame_ids),
+            failed_files=0,
+        ),
     )
     monkeypatch.setattr(auto_process_module, "_series_ids_for_paths", lambda *_args: [])
     monkeypatch.setattr(
@@ -718,44 +1134,67 @@ def test_process_archive_path_forwards_indexed_frame_ids_to_gaia(monkeypatch, tm
         ),
     )
     monkeypatch.setattr(auto_process_module, "_observation_selection_warning", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(auto_process_module, "_default_auto_catalog_name", lambda *_args, **_kwargs: "auto-test")
     monkeypatch.setattr(
         auto_process_module,
-        "_inspect_existing_catalog",
-        lambda *_args, **_kwargs: {"n_sources": 0},
+        "_frame_ids_by_instrument_unit",
+        lambda *_args: {101: [1], 102: [2], 103: [3]},
     )
-    monkeypatch.setattr(auto_process_module, "_frame_ids_by_instrument_unit", lambda *_args: {})
-    monkeypatch.setattr(auto_process_module, "_frame_ids_by_series_for_paths", lambda *_args: {})
-    monkeypatch.setattr(auto_process_module, "_load_series_for_pipeline", lambda *_args: [])
-    monkeypatch.setattr(auto_process_module, "_write_manifest_if_requested", lambda *_args, **_kwargs: None)
 
-    import grandgousier.catalogs.gaia_query as gaia_query_module
-
-    observed_frame_ids: list[list[int] | None] = []
-
-    def fake_gaia_query(_session, **kwargs):
-        observed_frame_ids.append(kwargs["frame_ids"])
+    def fake_build_field_series(_session, *, instrument_unit_id, frame_ids, **_kwargs):
+        assert frame_ids == [instrument_unit_id - 100]
         return SimpleNamespace(
-            selected_frames=len(indexed_frame_ids),
-            queried_frames=len(indexed_frame_ids),
-            queried_cones=1,
-            row_limit_reached_cones=0,
-            read_rows=2,
-            inserted_or_updated=2,
-            failed_frames=0,
-            skipped_missing_file=0,
-            skipped_oversized_cones=0,
-            failed_footprint_reasons={},
-            sample_failed_footprints=[],
-            query_provider="test-fake",
-            query_provider_failures={},
-            query_mode="frame_union",
-            effective_query_mode="frame_union",
+            rows=[{"series_id": instrument_unit_id, "status": "READY"}],
+            summary=lambda: {},
+            observation_selection_rows=[],
         )
 
-    monkeypatch.setattr(gaia_query_module, "query_gaia_for_frames", fake_gaia_query)
+    monkeypatch.setattr(auto_process_module, "build_field_series", fake_build_field_series)
+    frame_ids_by_series = {101: [1], 102: [2], 103: [3]}
+    monkeypatch.setattr(
+        auto_process_module,
+        "_frame_ids_by_series_for_paths",
+        lambda *_args: frame_ids_by_series,
+    )
+    series_rows = {
+        101: {"series_id": 101, "field_id": 17, "status": "READY", "filter_name": "V"},
+        102: {"series_id": 102, "field_id": 17, "status": "READY", "filter_name": "R"},
+        103: {"series_id": 103, "field_id": 18, "status": "READY", "filter_name": "V"},
+    }
+    monkeypatch.setattr(
+        auto_process_module,
+        "_load_series_for_pipeline",
+        lambda _session, series_ids: [series_rows[int(value)] for value in series_ids],
+    )
+    monkeypatch.setattr(auto_process_module, "_write_manifest_if_requested", lambda *_args, **_kwargs: None)
 
-    process_archive_path(
+    observed_catalogs = []
+
+    def fake_prepare_catalog(_session, **kwargs):
+        observed_catalogs.append((kwargs["catalog_name"], kwargs["frame_ids"], kwargs["max_rows_per_frame"]))
+        # Fail after both distinct field namespaces have been prepared, before
+        # the test needs to stub the downstream pipeline stages.
+        return {
+            "status": "DONE",
+            "n_sources": 5 if kwargs["catalog_name"] == "auto_catalog_field_17" else 0,
+            "inserted_or_updated": 0,
+            "catalog_name": kwargs["catalog_name"],
+            "selected_frames": len(kwargs["frame_ids"]),
+            "queried_frames": len(kwargs["frame_ids"]),
+            "row_limit_reached_cones": 0,
+            "query_provider": "test-fake",
+            "query_provider_failures": {},
+            "read_rows": 0,
+            "failed_frames": 0,
+            "failed_footprint_reasons": {},
+            "sample_failed_footprints": [],
+            "skipped_missing_file": 0,
+            "skipped_oversized_cones": 0,
+            "effective_query_mode": "frame_union",
+        }
+
+    monkeypatch.setattr(auto_process_module, "_prepare_auto_catalog", fake_prepare_catalog)
+
+    result = process_archive_path(
         object(),
         root=tmp_path,
         exact_paths=[source_path],
@@ -764,7 +1203,13 @@ def test_process_archive_path_forwards_indexed_frame_ids_to_gaia(monkeypatch, tm
         auto_catalog_max_radius_deg=1.0,
     )
 
-    assert observed_frame_ids == [indexed_frame_ids]
+    assert observed_catalogs == [
+        ("auto_catalog_field_17", [1, 2], 20000),
+        ("auto_catalog_field_18", [3], 20000),
+    ]
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert [row["field_id"] for row in result.catalog_results] == [17, 18]
+    assert result.catalog_name == "auto_catalog_field_17"
 
 
 @pytest.mark.parametrize("with_manifest", [False, True])
@@ -836,6 +1281,15 @@ def test_catalog_precondition_blocks_failed_or_empty_auto_catalogs():
     assert not _catalog_precondition_ok({"status": "DONE", "inserted_or_updated": 0}, allow_empty_catalog=False)
     assert _catalog_precondition_ok({"status": "DONE", "inserted_or_updated": 3}, allow_empty_catalog=False)
     assert _catalog_precondition_ok({"status": "FAILED", "inserted_or_updated": 0}, allow_empty_catalog=True)
+    assert not _catalog_precondition_ok(
+        {
+            "status": "DONE_WITH_FAILED_FRAMES",
+            "n_sources": 123,
+            "coverage_required": True,
+            "coverage_complete": False,
+        },
+        allow_empty_catalog=True,
+    )
 
 
 def test_combine_gaia_cones_keeps_union_radius_reasonable():

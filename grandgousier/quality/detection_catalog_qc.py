@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
-from sqlalchemy import delete, func, select
+from sqlalchemy import bindparam, delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, joinedload
 from tqdm import tqdm
@@ -99,6 +99,49 @@ class CatalogMatchLink:
     catalog_source_id: int
     x: float | None
     y: float | None
+
+
+def aggregate_detection_catalog_support(
+    session: Session,
+    *,
+    catalog_name: str,
+    detection_run_id: int,
+    frame_ids: list[int] | None,
+) -> dict[int, int]:
+    """Count distinct selected-frame support for each matched catalog source."""
+
+    if frame_ids is not None and not frame_ids:
+        return {}
+    sql = """
+        SELECT dcm.catalog_source_id,
+               COUNT(DISTINCT fr.frame_id) AS n_frames
+        FROM detection_catalog_matches dcm
+        JOIN detection_run_frames drf
+          ON drf.detection_run_frame_id = dcm.detection_run_frame_id
+        JOIN detection_runs dr ON dr.detection_run_id = drf.detection_run_id
+        JOIN frames fr ON fr.frame_id = drf.frame_id
+        WHERE dr.detection_run_id = :detection_run_id
+          AND dr.run_kind = 'CATALOG_MATCH'
+          AND dr.catalog_name = :catalog_name
+          AND drf.status = 'DONE'
+          AND dcm.match_status = 'MATCHED'
+    """
+    if frame_ids is not None:
+        sql += " AND fr.frame_id IN :frame_ids\n"
+    sql += """
+        GROUP BY dcm.catalog_source_id
+        ORDER BY dcm.catalog_source_id
+        """
+    statement = text(sql)
+    parameters = {
+        "detection_run_id": int(detection_run_id),
+        "catalog_name": str(catalog_name),
+    }
+    if frame_ids is not None:
+        statement = statement.bindparams(bindparam("frame_ids", expanding=True))
+        parameters["frame_ids"] = sorted({int(value) for value in frame_ids})
+    rows = session.execute(statement, parameters).all()
+    return {int(source_id): int(n_frames) for source_id, n_frames in rows}
 
 
 def match_detections_to_catalog(

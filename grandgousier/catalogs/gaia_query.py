@@ -4,8 +4,10 @@ import csv
 import io
 import math
 import re
+from time import perf_counter
 import warnings
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,12 @@ from tqdm import tqdm
 from grandgousier.catalogs.frame_match import match_catalog_to_frames
 from grandgousier.catalogs.import_catalog import make_catalog_source_uid
 from grandgousier.db.models import CatalogSource, Frame
+
+
+MAX_GAIA_QUERY_ROWS = 20_000
+MAX_GAIA_SPLIT_DEPTH = 16
+MAX_GAIA_SPLIT_QUERIES_PER_CONE = 4096
+MIN_GAIA_SPLIT_RADIUS_DEG = 1e-8
 
 
 @dataclass
@@ -45,6 +53,21 @@ class GaiaQueryResult:
     catalog_name: str = "gaia_dr3"
     query_mode: str = "per_frame"
     effective_query_mode: str | None = None
+    effective_max_rows: int = MAX_GAIA_QUERY_ROWS
+    skipped_covered_cones: int = 0
+    skipped_already_covered: bool = False
+    query_disabled: bool = False
+    coverage_complete: bool = False
+    completed_cones: list[dict[str, Any]] = field(default_factory=list)
+    cone_attempts: list[dict[str, Any]] = field(default_factory=list)
+    phase_timings_sec: dict[str, float] = field(
+        default_factory=lambda: {
+            "footprint_calculation": 0.0,
+            "tap_attempts": 0.0,
+            "catalog_source_upserts": 0.0,
+            "total_query": 0.0,
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -196,19 +219,23 @@ def query_gaia_for_frames(
     match_margin_pix: float = 2.0,
     limit_frames: int | None = None,
     dry_run: bool = False,
+    coverage_cones: list[dict[str, Any] | tuple[float, float, float]] | None = None,
+    commit: bool = True,
+    enabled: bool = True,
 ) -> GaiaQueryResult:
-    """Query Gaia DR3 cone catalogs for selected frame footprints and insert catalog_sources.
+    """Query Gaia DR3 cones for selected frames and insert catalog sources.
 
     This function intentionally depends on astroquery only at runtime. Grandgousier can be
     installed and used for local catalogs without astroquery; this command fails with a clear
-    message if the optional dependency is absent.
+    message if the optional dependency is absent. Each TAP request is capped at 20,000 rows;
+    a response reaching that cap is recursively split using a four-child spherical cover.
+    Optional ``coverage_cones`` are already-validated durable COMPLETE cones; a request is
+    skipped only when one such cone contains the entire actual query cone.
     """
 
+    query_started = perf_counter()
     if frame_ids is not None and not frame_ids:
         raise ValueError("An explicit frame_ids selection must not be empty")
-
-    providers = _build_gaia_tap_providers(gaia_timeout_sec)
-
     if margin_arcmin < 0:
         raise ValueError("margin_arcmin must be non-negative")
     if max_rows_per_frame <= 0:
@@ -218,8 +245,20 @@ def query_gaia_for_frames(
     query_mode = (query_mode or "per_frame").strip().lower()
     if query_mode not in {"per_frame", "frame_union"}:
         raise ValueError("query_mode must be one of: per_frame, frame_union")
+    if not commit and match:
+        raise ValueError("commit=False cannot be combined with catalog matching")
 
-    result = GaiaQueryResult(dry_run=dry_run, catalog_name=catalog_name, query_mode=query_mode, effective_query_mode=query_mode)
+    effective_max_rows = min(int(max_rows_per_frame), MAX_GAIA_QUERY_ROWS)
+    if effective_max_rows <= 0:
+        raise ValueError("max_rows_per_frame must be positive")
+
+    result = GaiaQueryResult(
+        dry_run=dry_run,
+        catalog_name=catalog_name,
+        query_mode=query_mode,
+        effective_query_mode=query_mode,
+        effective_max_rows=effective_max_rows,
+    )
     frames = _select_frames(
         session,
         frame_ids=frame_ids,
@@ -229,79 +268,103 @@ def query_gaia_for_frames(
         limit=limit_frames,
     )
     result.selected_frames = len(frames)
+    requests: list[dict[str, Any]] = []
+    frames_by_id = {int(frame.frame_id): frame for frame in frames}
+    footprint_started = perf_counter()
+    for frame in tqdm(frames, desc="Computing Gaia footprints", unit="frame"):
+        footprint, reason = _frame_cone_for_frame_diagnostic(
+            frame, margin_arcmin=margin_arcmin
+        )
+        if footprint is None:
+            _record_failed_footprint(result, frame, reason or "unknown")
+            if reason == "missing_file":
+                result.skipped_missing_file += 1
+            continue
+        requests.append(
+            {
+                "cone": _cone_dict(footprint),
+                "frame_ids": [int(frame.frame_id)],
+            }
+        )
+    result.phase_timings_sec["footprint_calculation"] += (
+        perf_counter() - footprint_started
+    )
 
     if query_mode == "frame_union":
-        _query_gaia_for_frame_union(
-            session,
-            providers,
-            frames=frames,
-            result=result,
-            margin_arcmin=margin_arcmin,
-            mag_limit=mag_limit,
-            max_rows=max_rows_per_frame,
-            max_radius_deg=max_radius_deg,
+        if requests and max_radius_deg is not None:
+            requested_union = _combine_cones(
+                [_cone_tuple(item["cone"]) for item in requests]
+            )
+            if requested_union[2] > float(max_radius_deg):
+                result.effective_query_mode = "frame_clusters"
+        requests, oversized = _frame_union_requests(
+            requests, max_radius_deg=max_radius_deg
         )
-        if not dry_run:
-            session.commit()
-        if match and not dry_run and result.failed_frames == 0 and result.inserted_or_updated > 0:
-            match_result = match_catalog_to_frames(
-                session,
-                catalog_name=catalog_name,
-                frame_ids=frame_ids,
-                instrument=instrument,
-                instrument_unit_id=instrument_unit_id,
-                only_wcs_ok=only_wcs_ok,
-                margin_pix=match_margin_pix,
-                limit_frames=limit_frames,
-                limit_sources=None,
-                dry_run=False,
-            )
-            result.linked = match_result.linked
-        return result
-
-    for frame in tqdm(frames, desc="Querying Gaia DR3", unit="frame"):
-        path = Path(frame.raw_path)
-        if not path.exists():
-            result.skipped_missing_file += 1
-            continue
-        try:
-            footprint, reason = _frame_cone_for_frame_diagnostic(frame, margin_arcmin=margin_arcmin)
-            if footprint is None:
-                _record_failed_footprint(result, frame, reason or "unknown")
-                continue
-            center_ra, center_dec, radius_deg = footprint
-            if max_radius_deg is not None and radius_deg > max_radius_deg:
+        for item in oversized:
+            result.skipped_oversized_cones += 1
+            for frame_id in item["frame_ids"]:
+                frame = frames_by_id.get(int(frame_id))
+                if frame is not None:
+                    _record_failed_footprint(result, frame, "oversized_cone")
+    elif max_radius_deg is not None:
+        kept_requests = []
+        for item in requests:
+            if float(item["cone"]["radius_deg"]) > float(max_radius_deg):
                 result.skipped_oversized_cones += 1
-                _record_failed_footprint(result, frame, "oversized_cone")
-                continue
-            table, provider_name, provider_failures = _query_gaia_cone(
-                providers,
-                center_ra_deg=center_ra,
-                center_dec_deg=center_dec,
-                radius_deg=radius_deg,
-                mag_limit=mag_limit,
-                max_rows=max_rows_per_frame,
-            )
-            _record_query_provider(result, provider_name, provider_failures)
-            result.queried_frames += 1
-            result.queried_cones += 1
-            result.read_rows += len(table)
-            if len(table) >= int(max_rows_per_frame):
-                result.row_limit_reached_cones += 1
-            rows = [_gaia_row_to_catalog_source(row, catalog_name=catalog_name) for row in table]
-            if rows and not dry_run:
-                _upsert_catalog_sources(session, rows)
-                result.inserted_or_updated += len(rows)
-        except _GaiaAllProvidersFailed as exc:
-            result.query_provider_failures.update(exc.failures)
-            _record_failed_footprint(result, frame, "gaia_query_all_providers_failed")
-        except Exception as exc:
-            _record_failed_footprint(result, frame, f"exception:{type(exc).__name__}")
+                for frame_id in item["frame_ids"]:
+                    frame = frames_by_id.get(int(frame_id))
+                    if frame is not None:
+                        _record_failed_footprint(result, frame, "oversized_cone")
+            else:
+                kept_requests.append(item)
+        requests = kept_requests
 
-    if not dry_run:
+    uncovered_requests: list[dict[str, Any]] = []
+    for request in requests:
+        if _covered_by_one_cone(request["cone"], coverage_cones or []):
+            result.skipped_covered_cones += 1
+            continue
+        uncovered_requests.append(request)
+
+    if requests and not uncovered_requests and result.failed_frames == 0:
+        result.skipped_already_covered = True
+        result.coverage_complete = True
+    elif uncovered_requests:
+        if not enabled:
+            result.query_disabled = True
+        else:
+            providers = _build_gaia_tap_providers(gaia_timeout_sec)
+            with tqdm(desc="Querying Gaia DR3 TAP", unit="attempt") as progress:
+                for request in uncovered_requests:
+                    result.queried_frames += len(request["frame_ids"])
+                    proof = _query_gaia_cone_recursive(
+                        session,
+                        providers,
+                        cone=request["cone"],
+                        result=result,
+                        catalog_name=catalog_name,
+                        mag_limit=mag_limit,
+                        max_rows=effective_max_rows,
+                        dry_run=dry_run,
+                        depth=0,
+                        frame_ids=request["frame_ids"],
+                        query_count=[0],
+                        progress=progress,
+                    )
+                    if proof is None:
+                        result.failed_frames += len(request["frame_ids"])
+                    else:
+                        result.completed_cones.append(proof)
+
+            result.coverage_complete = (
+                result.failed_frames == 0
+                and len(result.completed_cones) == len(uncovered_requests)
+            )
+
+    if not dry_run and commit:
         session.commit()
 
-    if match and not dry_run and result.failed_frames == 0:
+    if match and not dry_run and result.failed_frames == 0 and result.inserted_or_updated > 0:
         match_result = match_catalog_to_frames(
             session,
             catalog_name=catalog_name,
@@ -315,112 +378,335 @@ def query_gaia_for_frames(
             dry_run=False,
         )
         result.linked = match_result.linked
+    result.phase_timings_sec["total_query"] = perf_counter() - query_started
     return result
 
 
+def _frame_union_requests(
+    requests: list[dict[str, Any]], *, max_radius_deg: float | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build actual cone requests for frame-union mode, retaining frame provenance."""
 
-def _query_gaia_for_frame_union(
+    if not requests:
+        return [], []
+    combined = _combine_cones([_cone_tuple(item["cone"]) for item in requests])
+    if max_radius_deg is None or combined[2] <= float(max_radius_deg):
+        return [
+            {
+                "cone": _cone_dict(combined),
+                "frame_ids": sorted(
+                    int(frame_id)
+                    for item in requests
+                    for frame_id in item["frame_ids"]
+                ),
+            }
+        ], []
+
+    clusters: list[list[dict[str, Any]]] = []
+    oversized: list[dict[str, Any]] = []
+    for request in requests:
+        cone = request["cone"]
+        if float(cone["radius_deg"]) > float(max_radius_deg):
+            oversized.append(request)
+            continue
+        best_index = None
+        best_radius = None
+        for index, cluster in enumerate(clusters):
+            candidate = cluster + [request]
+            radius = _combine_cones(
+                [_cone_tuple(item["cone"]) for item in candidate]
+            )[2]
+            if radius <= float(max_radius_deg) and (
+                best_radius is None or radius < best_radius
+            ):
+                best_index = index
+                best_radius = radius
+        if best_index is None:
+            clusters.append([request])
+        else:
+            clusters[best_index].append(request)
+    grouped = []
+    for cluster in clusters:
+        grouped.append(
+            {
+                "cone": _cone_dict(
+                    _combine_cones([_cone_tuple(item["cone"]) for item in cluster])
+                ),
+                "frame_ids": sorted(
+                    int(frame_id)
+                    for item in cluster
+                    for frame_id in item["frame_ids"]
+                ),
+            }
+        )
+    return grouped, oversized
+
+
+def _query_gaia_cone_recursive(
     session: Session,
     providers: list[_GaiaTapProvider],
     *,
-    frames: list[Frame],
+    cone: dict[str, float],
     result: GaiaQueryResult,
-    margin_arcmin: float,
+    catalog_name: str,
     mag_limit: float | None,
     max_rows: int,
-    max_radius_deg: float | None,
-) -> None:
-    cones: list[tuple[float, float, float]] = []
-    for frame in tqdm(frames, desc="Computing Gaia footprint", unit="frame"):
-        path = Path(frame.raw_path)
-        if not path.exists():
-            result.skipped_missing_file += 1
-            continue
-        footprint, reason = _frame_cone_for_frame_diagnostic(frame, margin_arcmin=margin_arcmin)
-        if footprint is None:
-            _record_failed_footprint(result, frame, reason or "unknown")
-            continue
-        cones.append(footprint)
-
-    if not cones:
-        return
-
-    center_ra, center_dec, radius_deg = _combine_cones(cones)
-    if max_radius_deg is not None and radius_deg > max_radius_deg:
-        # A wide multi-night archive can exceed the safety radius even when each
-        # individual full-frame footprint is valid.  Falling back to spatial
-        # clusters preserves the safety guard without exploding into one Gaia
-        # request per frame for repeated pointings.
-        result.effective_query_mode = "frame_clusters"
-        clusters, oversized = _cluster_cones(cones, max_radius_deg=float(max_radius_deg))
-        result.skipped_oversized_cones += len(oversized)
-        result.failed_frames += len(oversized)
-        if oversized:
-            result.failed_footprint_reasons["oversized_individual_cone"] = (
-                result.failed_footprint_reasons.get("oversized_individual_cone", 0) + len(oversized)
-            )
-        for cluster in clusters:
-            _query_gaia_cone_group(
-                session,
+    dry_run: bool,
+    depth: int,
+    frame_ids: list[int],
+    query_count: list[int],
+    progress: Any,
+) -> dict[str, Any] | None:
+    center_ra, center_dec, radius_deg = _cone_tuple(cone)
+    if not _valid_cone(center_ra, center_dec, radius_deg):
+        result.failed_footprint_reasons["invalid_query_cone"] = (
+            result.failed_footprint_reasons.get("invalid_query_cone", 0) + 1
+        )
+        result.cone_attempts.append(
+            {"cone": dict(cone), "depth": depth, "status": "FAILED_INVALID_GEOMETRY"}
+        )
+        return None
+    if query_count[0] >= MAX_GAIA_SPLIT_QUERIES_PER_CONE:
+        result.failed_footprint_reasons["maxrec_split_query_budget"] = (
+            result.failed_footprint_reasons.get("maxrec_split_query_budget", 0) + 1
+        )
+        result.cone_attempts.append(
+            {"cone": dict(cone), "depth": depth, "status": "FAILED_QUERY_BUDGET"}
+        )
+        return None
+    query_count[0] += 1
+    attempt = {
+        "cone": dict(cone),
+        "depth": depth,
+        "frame_ids": list(frame_ids),
+        "maxrec": int(max_rows),
+        "status": "RUNNING",
+    }
+    result.cone_attempts.append(attempt)
+    result.queried_cones += 1
+    progress.update(1)
+    try:
+        tap_attempt_started = perf_counter()
+        try:
+            table, provider_name, provider_failures = _query_gaia_cone(
                 providers,
-                cones=cluster,
-                result=result,
+                center_ra_deg=center_ra,
+                center_dec_deg=center_dec,
+                radius_deg=radius_deg,
                 mag_limit=mag_limit,
                 max_rows=max_rows,
             )
-        return
+        finally:
+            result.phase_timings_sec["tap_attempts"] += (
+                perf_counter() - tap_attempt_started
+            )
+        _record_query_provider(result, provider_name, provider_failures)
+        result.read_rows += len(table)
+        rows = [_gaia_row_to_catalog_source(row, catalog_name=catalog_name) for row in table]
+        if rows and not dry_run:
+            upsert_started = perf_counter()
+            try:
+                _upsert_catalog_sources(session, rows)
+            finally:
+                result.phase_timings_sec["catalog_source_upserts"] += (
+                    perf_counter() - upsert_started
+                )
+            result.inserted_or_updated += len(rows)
+        attempt.update(
+            {
+                "provider": provider_name,
+                "provider_failures": dict(provider_failures),
+                "rows_returned": len(table),
+            }
+        )
+        if len(table) >= int(max_rows):
+            result.row_limit_reached_cones += 1
+            attempt["status"] = "MAXREC_TRUNCATED"
+            if depth >= MAX_GAIA_SPLIT_DEPTH or radius_deg <= MIN_GAIA_SPLIT_RADIUS_DEG:
+                reason = (
+                    "maxrec_split_depth_exceeded"
+                    if depth >= MAX_GAIA_SPLIT_DEPTH
+                    else "maxrec_split_min_radius_reached"
+                )
+                result.failed_footprint_reasons[reason] = (
+                    result.failed_footprint_reasons.get(reason, 0) + 1
+                )
+                return None
+            try:
+                children = _split_gaia_cone_four(center_ra, center_dec, radius_deg)
+            except ValueError:
+                result.failed_footprint_reasons["maxrec_split_invalid_geometry"] = (
+                    result.failed_footprint_reasons.get("maxrec_split_invalid_geometry", 0) + 1
+                )
+                return None
+            child_proofs = []
+            for child in children:
+                child_proof = _query_gaia_cone_recursive(
+                    session,
+                    providers,
+                    cone=_cone_dict(child),
+                    result=result,
+                    catalog_name=catalog_name,
+                    mag_limit=mag_limit,
+                    max_rows=max_rows,
+                    dry_run=dry_run,
+                    depth=depth + 1,
+                    frame_ids=frame_ids,
+                    query_count=query_count,
+                    progress=progress,
+                )
+                if child_proof is None:
+                    child_proofs = []
+                    break
+                child_proofs.append(child_proof)
+            if len(child_proofs) != 4:
+                return None
+            attempt["children"] = [child["cone"] for child in child_proofs]
+            return {
+                "cone": dict(cone),
+                "status": "COMPLETE",
+                "completion_method": "four_child_recursive_cover",
+                "query_outcome": "MAXREC_SPLIT",
+                "rows_returned": len(table),
+                "maxrec_per_query": int(max_rows),
+                "provider": provider_name,
+                "provider_failures": dict(provider_failures),
+                "frame_ids": list(frame_ids),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "children": child_proofs,
+            }
+        attempt["status"] = "COMPLETE_BELOW_MAXREC"
+        return {
+            "cone": dict(cone),
+            "status": "COMPLETE",
+            "completion_method": "direct_query",
+            "query_outcome": "BELOW_MAXREC",
+            "rows_returned": len(table),
+            "maxrec_per_query": int(max_rows),
+            "provider": provider_name,
+            "provider_failures": dict(provider_failures),
+            "frame_ids": list(frame_ids),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except _GaiaAllProvidersFailed as exc:
+        result.query_provider_failures.update(exc.failures)
+        reason = "gaia_query_all_providers_failed"
+        result.failed_footprint_reasons[reason] = result.failed_footprint_reasons.get(reason, 0) + 1
+        attempt.update({"status": "FAILED", "provider_failures": dict(exc.failures)})
+        return None
+    except Exception as exc:
+        reason = f"gaia_query_exception:{type(exc).__name__}"
+        result.failed_footprint_reasons[reason] = result.failed_footprint_reasons.get(reason, 0) + 1
+        attempt.update({"status": "FAILED", "error_type": type(exc).__name__})
+        return None
 
-    _query_gaia_cone_group(
-        session,
-        providers,
-        cones=cones,
-        result=result,
-        mag_limit=mag_limit,
-        max_rows=max_rows,
+
+def _split_gaia_cone_four(
+    center_ra_deg: float, center_dec_deg: float, radius_deg: float
+) -> list[tuple[float, float, float]]:
+    """Return four overlapping spherical child caps that cover the parent.
+
+    Child centers are geodesic offsets by R/2 at PAs 0/90/180/270 degrees. Any
+    parent point is at PA delta <=45 degrees from its nearest child center. With
+    d=R/2, the haversine identity gives
+    ``hav(delta) = hav(R-d) + sin(R)*sin(d)*hav(45 degrees)``. This form avoids
+    the small-angle cancellation of the cosine law. The child radius is the
+    maximum of that bound and R/2, plus a 1e-12-radian (or relative 1e-12)
+    outward safety margin. Degrees are used at the API/storage boundary; the
+    bound is evaluated in radians. Astropy directional offsets handle RA wrap
+    and polar centers without a planar approximation.
+    """
+
+    if not _valid_cone(center_ra_deg, center_dec_deg, radius_deg):
+        raise ValueError("cannot split invalid Gaia cone geometry")
+    radius = math.radians(float(radius_deg))
+    offset = radius / 2.0
+    haversine_bound = (
+        math.sin((radius - offset) / 2.0) ** 2
+        + math.sin(radius)
+        * math.sin(offset)
+        * math.sin(math.radians(45.0) / 2.0) ** 2
+    )
+    bound = 2.0 * math.asin(math.sqrt(max(0.0, min(1.0, haversine_bound))))
+    safety_margin = max(1e-12, radius * 1e-12)
+    child_radius = min(math.pi, max(offset, bound) + safety_margin)
+    if child_radius >= radius:
+        raise ValueError("four-child Gaia split does not shrink this cone")
+
+    parent = SkyCoord(
+        float(center_ra_deg) % 360.0 * u.deg,
+        float(center_dec_deg) * u.deg,
+        frame="icrs",
+    )
+    children = []
+    for position_angle_deg in (0.0, 90.0, 180.0, 270.0):
+        child_center = parent.directional_offset_by(
+            float(position_angle_deg) * u.deg, offset * u.rad
+        )
+        ra = float(child_center.ra.deg) % 360.0
+        dec = float(child_center.dec.deg)
+        child = (ra, dec, math.degrees(child_radius))
+        if not _valid_cone(*child):
+            raise ValueError("four-child Gaia split generated invalid geometry")
+        children.append(child)
+    return children
+
+
+def _valid_cone(ra_deg: float, dec_deg: float, radius_deg: float) -> bool:
+    try:
+        values = (float(ra_deg), float(dec_deg), float(radius_deg))
+    except (TypeError, ValueError):
+        return False
+    return (
+        all(math.isfinite(value) for value in values)
+        and -90.0 <= values[1] <= 90.0
+        and 0.0 < values[2] <= 180.0
     )
 
 
+def _cone_dict(cone: tuple[float, float, float]) -> dict[str, float]:
+    ra, dec, radius = (float(value) for value in cone)
+    if not _valid_cone(ra, dec, radius):
+        raise ValueError("invalid Gaia cone geometry")
+    return {"ra_deg": ra % 360.0, "dec_deg": dec, "radius_deg": radius}
 
-def _query_gaia_cone_group(
-    session: Session,
-    providers: list[_GaiaTapProvider],
-    *,
-    cones: list[tuple[float, float, float]],
-    result: GaiaQueryResult,
-    mag_limit: float | None,
-    max_rows: int,
-) -> None:
-    if not cones:
-        return
-    center_ra, center_dec, radius_deg = _combine_cones(cones)
-    try:
-        table, provider_name, provider_failures = _query_gaia_cone(
-            providers,
-            center_ra_deg=center_ra,
-            center_dec_deg=center_dec,
-            radius_deg=radius_deg,
-            mag_limit=mag_limit,
-            max_rows=max_rows,
+
+def _cone_tuple(cone: dict[str, Any] | tuple[float, float, float]) -> tuple[float, float, float]:
+    if isinstance(cone, dict):
+        return (
+            float(cone["ra_deg"]),
+            float(cone["dec_deg"]),
+            float(cone["radius_deg"]),
         )
-        _record_query_provider(result, provider_name, provider_failures)
-        result.queried_frames += len(cones)
-        result.queried_cones += 1
-        result.read_rows += len(table)
-        if len(table) >= int(max_rows):
-            result.row_limit_reached_cones += 1
-        rows = [_gaia_row_to_catalog_source(row, catalog_name=result.catalog_name) for row in table]
-        if rows and not result.dry_run:
-            _upsert_catalog_sources(session, rows)
-            result.inserted_or_updated += len(rows)
-    except _GaiaAllProvidersFailed as exc:
-        result.query_provider_failures.update(exc.failures)
-        result.failed_frames += len(cones)
-        reason = "gaia_query_all_providers_failed"
-        result.failed_footprint_reasons[reason] = result.failed_footprint_reasons.get(reason, 0) + len(cones)
-    except Exception as exc:
-        result.failed_frames += len(cones)
-        reason = f"gaia_query_exception:{type(exc).__name__}"
-        result.failed_footprint_reasons[reason] = result.failed_footprint_reasons.get(reason, 0) + len(cones)
+    return tuple(float(value) for value in cone)  # type: ignore[return-value]
+
+
+def _covered_by_one_cone(
+    requested: dict[str, Any] | tuple[float, float, float],
+    coverage_cones: list[dict[str, Any] | tuple[float, float, float]],
+) -> bool:
+    req_ra, req_dec, req_radius = _cone_tuple(requested)
+    if not _valid_cone(req_ra, req_dec, req_radius):
+        return False
+    req_ra %= 360.0
+    for saved in coverage_cones:
+        try:
+            old_ra, old_dec, old_radius = _cone_tuple(saved)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not _valid_cone(old_ra, old_dec, old_radius):
+            continue
+        old_ra %= 360.0
+        if old_ra == req_ra and old_dec == req_dec and old_radius >= req_radius:
+            return True
+        old_center = SkyCoord(old_ra * u.deg, old_dec * u.deg, frame="icrs")
+        req_center = SkyCoord(req_ra * u.deg, req_dec * u.deg, frame="icrs")
+        separation = float(old_center.separation(req_center).deg)
+        # The negative tolerance makes non-identical containment conservative;
+        # exact repeated coordinates/radii take the equality branch above.
+        if separation + req_radius <= old_radius - 1e-12:
+            return True
+    return False
 
 
 def _cluster_cones(
@@ -791,6 +1077,9 @@ def _query_gaia_cone(
 ):
     if not providers:
         raise RuntimeError("no Gaia TAP providers configured")
+    max_rows = min(int(max_rows), MAX_GAIA_QUERY_ROWS)
+    if max_rows <= 0:
+        raise ValueError("max_rows must be positive")
 
     failures: dict[str, str] = {}
     for provider in providers:
@@ -813,6 +1102,10 @@ def _query_gaia_cone(
 
 def _launch_tap_job(client: Any, *, query: str, max_rows: int):
     """Launch a small public TAP query with broad astroquery compatibility."""
+
+    max_rows = min(int(max_rows), MAX_GAIA_QUERY_ROWS)
+    if max_rows <= 0:
+        raise ValueError("max_rows must be positive")
 
     launch_sync = getattr(client, "launch_job", None)
     if callable(launch_sync):
@@ -839,6 +1132,9 @@ def _build_gaia_cone_adql(
     mag_limit: float | None,
     max_rows: int,
 ) -> str:
+    max_rows = min(int(max_rows), MAX_GAIA_QUERY_ROWS)
+    if max_rows <= 0:
+        raise ValueError("max_rows must be positive")
     mag_clause = ""
     if mag_limit is not None:
         mag_clause = f"AND phot_g_mean_mag <= {float(mag_limit):.6f}"

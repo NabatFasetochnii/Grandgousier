@@ -423,7 +423,7 @@ def process_archive_path(
     skip_aperture_correction: bool = False,
     bulk_insert_batch_size: int = 1000,
     make_light_curve_summary: bool = True,
-    enable_detection_branch: bool = False,
+    enable_detection_branch: bool = True,
     enable_psf_field_diagnostics: bool = False,
     psf_diagnostics_max_sources_per_frame: int = 500,
     psf_diagnostics_min_snr: float = 20.0,
@@ -753,35 +753,7 @@ def process_archive_path(
             _write_manifest_if_requested(result, manifest_out, session=session)
             return result
 
-    if catalog_name is None:
-        effective_auto_catalog_mag_limit = _effective_auto_catalog_mag_limit(
-            explicit=auto_catalog_mag_limit, working=working_catalog_mag_limit
-        )
-        effective_auto_catalog_max_radius_deg = _effective_auto_catalog_max_radius_deg(
-            groups, explicit=auto_catalog_max_radius_deg
-        )
-        catalog_row = _prepare_auto_catalog(
-            session,
-            catalog_name=effective_catalog_name,
-            frame_ids=indexed_frame_ids,
-            enabled=auto_catalog_query,
-            margin_arcmin=auto_catalog_margin_arcmin,
-            mag_limit=effective_auto_catalog_mag_limit,
-            max_rows_per_frame=auto_catalog_max_rows_per_frame,
-            query_mode=auto_catalog_query_mode,
-            max_radius_deg=effective_auto_catalog_max_radius_deg,
-            timeout_sec=auto_catalog_timeout_sec,
-            warnings=result.warnings,
-        )
-        result.catalog_results.append(catalog_row)
-        if not _catalog_precondition_ok(catalog_row, allow_empty_catalog=allow_empty_catalog):
-            result.status = "FAILED_PRECONDITION_CATALOG"
-            result.warnings.append(
-                "auto catalog did not produce usable sources; install/fix astroquery, retry later, pass --catalog-name, or use --allow-empty-catalog for debugging"
-            )
-            _write_manifest_if_requested(result, manifest_out, session=session)
-            return result
-    else:
+    if catalog_name is not None:
         catalog_row = _inspect_existing_catalog(session, catalog_name=effective_catalog_name)
         result.catalog_results.append(catalog_row)
         if not _catalog_precondition_ok(catalog_row, allow_empty_catalog=allow_empty_catalog):
@@ -872,7 +844,115 @@ def process_archive_path(
             "OPEN field_series were not submitted to Stage 2; explicitly finalize eligible tails first: "
             + ", ".join(str(series_id) for series_id in open_ids)
         )
+
+    catalog_name_by_field_id: dict[int, str] = {}
+    if catalog_name is None and finalized_series_rows:
+        input_series_rows = _load_series_for_pipeline(
+            session, sorted(frame_ids_by_series_id)
+        )
+        field_ids_by_series = {
+            int(row["series_id"]): int(row["field_id"])
+            for row in input_series_rows
+            if row.get("series_id") is not None and row.get("field_id") is not None
+        }
+        frame_ids_by_field: dict[int, set[int]] = {}
+        for input_series_id, frame_ids in frame_ids_by_series_id.items():
+            field_id = field_ids_by_series.get(int(input_series_id))
+            if field_id is not None:
+                frame_ids_by_field.setdefault(field_id, set()).update(
+                    int(frame_id) for frame_id in frame_ids
+                )
+        for series in finalized_series_rows:
+            try:
+                field_id = int(series["field_id"])
+            except (KeyError, TypeError, ValueError):
+                result.status = "FAILED_PRECONDITION_CATALOG"
+                result.warnings.append(
+                    "a finalized series has no persistent field_id; refusing to assign an "
+                    "automatic catalog namespace from mutable archive metadata"
+                )
+                _write_manifest_if_requested(result, manifest_out, session=session)
+                return result
+            if field_id <= 0:
+                result.status = "FAILED_PRECONDITION_CATALOG"
+                result.warnings.append(
+                    f"finalized series has invalid field_id={field_id}; refusing automatic catalog namespace"
+                )
+                _write_manifest_if_requested(result, manifest_out, session=session)
+                return result
+            catalog_frame_ids = sorted(frame_ids_by_field.get(field_id, set()))
+            if not catalog_frame_ids:
+                catalog_frame_ids = frame_ids_by_series_id.get(
+                    int(series["series_id"]), []
+                )
+            if not catalog_frame_ids:
+                result.status = "FAILED_PRECONDITION_CATALOG"
+                result.warnings.append(
+                    f"field_id={field_id} has no current input frames for its automatic catalog namespace"
+                )
+                _write_manifest_if_requested(result, manifest_out, session=session)
+                return result
+            frame_ids_by_field.setdefault(field_id, set()).update(
+                int(frame_id) for frame_id in catalog_frame_ids
+            )
+            catalog_name_by_field_id.setdefault(
+                field_id,
+                _default_field_auto_catalog_name(field_id),
+            )
+
+        effective_auto_catalog_mag_limit = _effective_auto_catalog_mag_limit(
+            explicit=auto_catalog_mag_limit, working=working_catalog_mag_limit
+        )
+        effective_auto_catalog_max_radius_deg = _effective_auto_catalog_max_radius_deg(
+            groups, explicit=auto_catalog_max_radius_deg
+        )
+        if catalog_name_by_field_id:
+            result.catalog_name = catalog_name_by_field_id[min(catalog_name_by_field_id)]
+        for field_id, field_catalog_name in sorted(catalog_name_by_field_id.items()):
+            # Legacy date/filter-based namespaces are historical identities. Leave
+            # their CatalogSource/Object rows untouched; only new automatic work
+            # uses the stable physical-field namespace, and existing cross-catalog
+            # association continues through the normal identity policy.
+            catalog_row = _prepare_auto_catalog(
+                session,
+                field_id=field_id,
+                catalog_name=field_catalog_name,
+                frame_ids=sorted(frame_ids_by_field.get(field_id, set())),
+                enabled=auto_catalog_query,
+                margin_arcmin=auto_catalog_margin_arcmin,
+                mag_limit=effective_auto_catalog_mag_limit,
+                max_rows_per_frame=auto_catalog_max_rows_per_frame,
+                query_mode=auto_catalog_query_mode,
+                max_radius_deg=effective_auto_catalog_max_radius_deg,
+                timeout_sec=auto_catalog_timeout_sec,
+                warnings=result.warnings,
+            )
+            catalog_row["field_id"] = field_id
+            catalog_row["namespace_policy"] = "physical_field_id_v1"
+            result.catalog_results.append(catalog_row)
+            if not _catalog_precondition_ok(
+                catalog_row, allow_empty_catalog=allow_empty_catalog
+            ):
+                result.status = "FAILED_PRECONDITION_CATALOG"
+                result.warnings.append(
+                    f"auto catalog did not produce usable sources for field_id={field_id}; "
+                    "install/fix astroquery, retry later, or use --allow-empty-catalog for debugging"
+                )
+                _write_manifest_if_requested(result, manifest_out, session=session)
+                return result
+
+        if catalog_name_by_field_id:
+            effective_catalog_name = catalog_name_by_field_id[
+                min(catalog_name_by_field_id)
+            ]
+
     for series in finalized_series_rows:
+        series_catalog_name = (
+            effective_catalog_name
+            if catalog_name is not None
+            else catalog_name_by_field_id[int(series["field_id"])]
+        )
+        series["catalog_name"] = series_catalog_name
         prefix = _format_calibration_prefix(calibration_prefix_template, series)
         series_out_dir = str(Path(out_root) / prefix) if out_root else None
         profile = profiles.get(str(series.get("instrument") or ""))
@@ -930,7 +1010,7 @@ def process_archive_path(
                 session,
                 series=series,
                 policy=color_policy,
-                identity_catalog_name=effective_catalog_name,
+                identity_catalog_name=series_catalog_name,
                 out_dir=series_out_dir,
                 allow_remote_fetch=auto_reference_photometry,
             )
@@ -945,7 +1025,7 @@ def process_archive_path(
                     f"{color_calibration_skip_reason}"
                 )
         config = FieldPipelineConfig(
-            catalog_name=effective_catalog_name,
+            catalog_name=series_catalog_name,
             calibration_prefix=prefix,
             series_id=int(series["series_id"]),
             frame_ids=frame_ids_by_series_id.get(int(series["series_id"]), []),
@@ -1043,7 +1123,7 @@ def process_archive_path(
             color_calibration_requested=bool(enable_color_calibration),
             color_reference_ready=(bool(color_reference_ready) if enable_color_calibration else None),
             color_calibration_skip_reason=color_calibration_skip_reason,
-            color_identity_catalog_name=effective_catalog_name,
+            color_identity_catalog_name=series_catalog_name,
             color_reference_catalog_name=(
                 reference_result.get("effective_reference_catalog_name")
                 if reference_result is not None
@@ -1113,7 +1193,7 @@ def process_archive_path(
                 "stage2_profile": stage2_profile,
                 "effective_stage2_settings": effective_stage2_settings,
                 "root": str(root),
-                "catalog_name": effective_catalog_name,
+                "catalog_name": series_catalog_name,
                 "working_catalog_mag_limit": working_catalog_mag_limit,
                 "max_working_sources_per_frame": max_working_sources_per_frame,
                 "catalog_edge_margin_pix": catalog_edge_margin_pix,
@@ -1252,7 +1332,7 @@ def process_archive_path(
                 summary = summary_builder(
                     session,
                     calibration_names=[science_calibration],
-                    catalog_name=effective_catalog_name,
+                    catalog_name=series_catalog_name,
                     series_id=int(series["series_id"]),
                     reject_flags=light_curve_reject_flags(
                         require_detection_support=require_detection_support_effective,
@@ -2024,6 +2104,14 @@ def _default_auto_catalog_name(groups: list[ArchiveGroupPlan], *, root: str | Pa
     return f"auto_catalog_archive_{_slug(Path(root).name or 'field')}"
 
 
+def _default_field_auto_catalog_name(field_id: int) -> str:
+    """Return the stable Gaia namespace for one persistent physical field."""
+
+    value = int(field_id)
+    if value <= 0:
+        raise ValueError("automatic field catalog names require a persisted positive field_id")
+    return f"auto_catalog_field_{value}"
+
 
 def _inspect_existing_catalog(session: Session, *, catalog_name: str) -> dict[str, Any]:
     from sqlalchemy import func, select
@@ -2045,9 +2133,227 @@ def _inspect_existing_catalog(session: Session, *, catalog_name: str) -> dict[st
         "n_sources": n_sources,
     }
 
+
+_GAIA_FIELD_COVERAGE_KEY = "gaia_query_coverage_v1"
+_GAIA_CATALOG_RELEASE = "Gaia DR3"
+
+
+def _lock_field_gaia_coverage(session: Session, *, field_id: int) -> dict[str, Any]:
+    """Read field coverage while holding the row lock through query and update."""
+
+    row = (
+        session.execute(
+            text(
+                "SELECT metadata_json FROM fields "
+                "WHERE field_id = :field_id FOR UPDATE"
+            ),
+            {"field_id": int(field_id)},
+        )
+        .mappings()
+        .first()
+    )
+    if row is None:
+        raise RuntimeError(f"field_id={field_id} is not present for Gaia coverage")
+    metadata = row.get("metadata_json")
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        raise RuntimeError(f"field_id={field_id} metadata_json is not an object")
+    coverage = metadata.get(_GAIA_FIELD_COVERAGE_KEY)
+    if coverage is None:
+        return {"version": 1, "complete_cones": []}
+    if (
+        not isinstance(coverage, dict)
+        or coverage.get("version") != 1
+        or not isinstance(coverage.get("complete_cones"), list)
+    ):
+        raise RuntimeError(
+            f"field_id={field_id} has unsupported {_GAIA_FIELD_COVERAGE_KEY} metadata"
+        )
+    return {"version": 1, "complete_cones": list(coverage["complete_cones"])}
+
+
+def _compatible_field_gaia_coverage(
+    coverage: dict[str, Any], *, field_id: int, catalog_name: str, mag_limit: float | None
+) -> list[dict[str, Any]]:
+    from grandgousier.catalogs.gaia_query import _valid_cone
+
+    if mag_limit is not None and not math.isfinite(float(mag_limit)):
+        return []
+    matches = []
+    for record in coverage["complete_cones"]:
+        if not isinstance(record, dict) or record.get("status") != "COMPLETE":
+            continue
+        if (
+            record.get("field_id") != int(field_id)
+            or record.get("catalog_name") != catalog_name
+            or record.get("catalog_release") != _GAIA_CATALOG_RELEASE
+        ):
+            continue
+        proof = record.get("proof")
+        try:
+            maxrec = int(record.get("maxrec_per_query", 0))
+        except (TypeError, ValueError):
+            continue
+        if (
+            not isinstance(proof, dict)
+            or not _coverage_proof_is_complete(proof)
+            or proof.get("cone") != record.get("cone")
+            or not isinstance(record.get("completed_at"), str)
+            or maxrec <= 0
+            or maxrec > 20_000
+        ):
+            continue
+        saved_limit = record.get("mag_limit")
+        if saved_limit is not None:
+            try:
+                saved_limit = float(saved_limit)
+                if (
+                    not math.isfinite(saved_limit)
+                    or mag_limit is None
+                    or saved_limit < float(mag_limit)
+                ):
+                    continue
+            except (TypeError, ValueError):
+                continue
+        cone = record.get("cone")
+        if not isinstance(cone, dict):
+            continue
+        try:
+            values = (
+                float(cone["ra_deg"]),
+                float(cone["dec_deg"]),
+                float(cone["radius_deg"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if _valid_cone(*values):
+            matches.append(cone)
+    return matches
+
+
+def _coverage_proof_is_complete(proof: dict[str, Any]) -> bool:
+    if proof.get("status") != "COMPLETE":
+        return False
+    try:
+        maxrec = int(proof.get("maxrec_per_query", 0))
+        rows_returned = int(proof.get("rows_returned", -1))
+    except (TypeError, ValueError):
+        return False
+    if maxrec <= 0 or maxrec > 20_000:
+        return False
+    if proof.get("completion_method") == "four_child_recursive_cover":
+        children = proof.get("children")
+        return (
+            isinstance(children, list)
+            and len(children) == 4
+            and proof.get("query_outcome") == "MAXREC_SPLIT"
+            and rows_returned >= maxrec
+            and all(isinstance(child, dict) for child in children)
+            and all(_coverage_proof_is_complete(child) for child in children)
+        )
+    return (
+        proof.get("completion_method") == "direct_query"
+        and proof.get("query_outcome") == "BELOW_MAXREC"
+        and 0 <= rows_returned < maxrec
+    )
+
+
+def _append_field_gaia_coverage(
+    session: Session,
+    *,
+    field_id: int,
+    coverage: dict[str, Any],
+    proofs: list[dict[str, Any]],
+    catalog_name: str,
+    mag_limit: float | None,
+    query_mode: str,
+) -> int:
+    """Append a successful coverage proof atomically, preserving other metadata."""
+
+    existing = list(coverage["complete_cones"])
+    additions = []
+    for proof in proofs:
+        if not _coverage_proof_is_complete(proof):
+            raise RuntimeError("refusing to persist an incomplete Gaia coverage proof")
+        cone = proof.get("cone")
+        if not isinstance(cone, dict):
+            raise RuntimeError("complete Gaia coverage proof has no cone geometry")
+        record = {
+            "status": "COMPLETE",
+            "field_id": int(field_id),
+            "catalog_name": catalog_name,
+            "catalog_release": _GAIA_CATALOG_RELEASE,
+            "mag_limit": mag_limit,
+            "cone": dict(cone),
+            "query_mode": query_mode,
+            "provider": proof.get("provider"),
+            "row_count": proof.get("rows_returned"),
+            "maxrec_per_query": proof.get("maxrec_per_query"),
+            "completion_method": proof.get("completion_method"),
+            "completed_at": proof.get("completed_at"),
+            "frame_ids": list(proof.get("frame_ids") or []),
+            "proof": proof,
+        }
+        identity = (
+            record["catalog_name"],
+            record["catalog_release"],
+            record["mag_limit"],
+            record["cone"]["ra_deg"],
+            record["cone"]["dec_deg"],
+            record["cone"]["radius_deg"],
+        )
+        duplicate = False
+        for prior in existing + additions:
+            prior_cone = prior.get("cone") if isinstance(prior, dict) else None
+            if not isinstance(prior_cone, dict):
+                continue
+            prior_identity = (
+                prior.get("catalog_name"),
+                prior.get("catalog_release"),
+                prior.get("mag_limit"),
+                prior_cone.get("ra_deg"),
+                prior_cone.get("dec_deg"),
+                prior_cone.get("radius_deg"),
+            )
+            if prior_identity == identity and prior.get("status") == "COMPLETE":
+                duplicate = True
+                break
+        if not duplicate:
+            additions.append(record)
+    if not additions:
+        return 0
+
+    updated_coverage = {"version": 1, "complete_cones": existing + additions}
+    update_result = session.execute(
+        text(
+            """
+            UPDATE fields
+            SET metadata_json = jsonb_set(
+                    COALESCE(metadata_json, '{}'::jsonb),
+                    '{gaia_query_coverage_v1}',
+                    CAST(:coverage_document AS jsonb),
+                    true
+                ),
+                updated_at = now()
+            WHERE field_id = :field_id
+            """
+        ),
+        {
+            "field_id": int(field_id),
+            "coverage_document": json.dumps(updated_coverage, separators=(",", ":")),
+        },
+    )
+    if update_result.rowcount != 1:
+        raise RuntimeError(
+            f"expected one fields row while saving Gaia coverage for field_id={field_id}"
+        )
+    return len(additions)
+
 def _prepare_auto_catalog(
     session: Session,
     *,
+    field_id: int,
     catalog_name: str,
     frame_ids: list[int],
     enabled: bool,
@@ -2068,44 +2374,13 @@ def _prepare_auto_catalog(
         "max_radius_deg": max_radius_deg,
         "mag_limit": mag_limit,
         "timeout_sec": timeout_sec,
-        "status": "SKIPPED_DISABLED" if not enabled else "RUNNING",
+        "field_id": int(field_id),
+        "coverage_required": True,
+        "coverage_complete": False,
+        "status": "RUNNING",
     }
-
-    # Auto-generated catalog names are deterministic for the same archive group.
-    # A clean Stage-2 rebuild deliberately preserves CatalogSource identity, so
-    # querying Gaia again here would be both unnecessary and harmful: it makes
-    # a rebuild depend on network availability and can replace a previously
-    # established catalog namespace.  Reuse a populated exact-name catalog
-    # before considering any remote query.
-    existing = _inspect_existing_catalog(session, catalog_name=catalog_name)
-    existing_sources = int(existing.get("n_sources") or 0)
-    if existing_sources > 0:
-        row.update(
-            {
-                "mode": "auto_existing_reuse",
-                "status": "DONE",
-                "reused_existing": True,
-                "n_sources": existing_sources,
-                "inserted_or_updated": existing_sources,
-                "selected_frames": 0,
-                "queried_frames": 0,
-                "queried_cones": 0,
-                "effective_query_mode": "local_reuse",
-                "row_limit_reached_cones": 0,
-                "query_provider": "local_preserved_catalog",
-                "query_provider_failures": {},
-                "read_rows": 0,
-                "failed_frames": 0,
-                "failed_footprint_reasons": {},
-                "sample_failed_footprints": [],
-                "skipped_missing_file": 0,
-                "skipped_oversized_cones": 0,
-            }
-        )
-        return row
-
-    if not enabled:
-        warnings.append(f"auto catalog name generated but Gaia query disabled: {catalog_name}")
+    if int(field_id) <= 0:
+        row.update({"status": "FAILED", "error_message": "field_id must be positive"})
         return row
     if not frame_ids:
         row["status"] = "SKIPPED_NO_FRAMES"
@@ -2114,10 +2389,22 @@ def _prepare_auto_catalog(
     try:
         from grandgousier.catalogs.gaia_query import query_gaia_for_frames
 
+        # Hold a field-row lock while coverage is checked and Gaia queries/upserts
+        # run. The query helper is explicitly told not to commit; the coverage
+        # JSONB append and source upserts therefore share one transaction.
+        coverage = _lock_field_gaia_coverage(session, field_id=int(field_id))
+        existing = _inspect_existing_catalog(session, catalog_name=catalog_name)
+        existing_sources = int(existing.get("n_sources") or 0)
+        coverage_cones = _compatible_field_gaia_coverage(
+            coverage,
+            field_id=int(field_id),
+            catalog_name=catalog_name,
+            mag_limit=mag_limit,
+        )
         res = query_gaia_for_frames(
             session,
             catalog_name=catalog_name,
-            frame_ids=frame_ids,
+            frame_ids=list(frame_ids),
             only_wcs_ok=False,
             margin_arcmin=margin_arcmin,
             mag_limit=mag_limit,
@@ -2127,17 +2414,104 @@ def _prepare_auto_catalog(
             gaia_timeout_sec=timeout_sec,
             match=False,
             dry_run=False,
+            coverage_cones=coverage_cones,
+            commit=False,
+            enabled=enabled,
         )
         row_limit_reached_cones = int(getattr(res, "row_limit_reached_cones", 0) or 0)
-        if res.failed_frames > 0:
+        coverage_complete = bool(getattr(res, "coverage_complete", False))
+        skipped_already_covered = bool(getattr(res, "skipped_already_covered", False))
+        query_disabled = bool(getattr(res, "query_disabled", False))
+        proofs = list(getattr(res, "completed_cones", []) or [])
+        if coverage_complete and not skipped_already_covered and (
+            not proofs
+            or not all(
+                isinstance(proof, dict) and _coverage_proof_is_complete(proof)
+                for proof in proofs
+            )
+        ):
+            coverage_complete = False
+        if skipped_already_covered:
+            status = "DONE"
+            gaia_query_status = "SKIPPED_ALREADY_COVERED"
+        elif query_disabled:
+            status = "SKIPPED_DISABLED"
+            gaia_query_status = "SKIPPED_DISABLED_UNCOVERED"
+        elif int(res.selected_frames or 0) <= 0:
+            status = "SKIPPED_NO_FRAMES"
+            gaia_query_status = "NO_FRAMES"
+        elif res.failed_frames > 0 or not coverage_complete:
             status = "DONE_WITH_FAILED_FRAMES"
         elif row_limit_reached_cones > 0:
             status = "DONE_WITH_WARNINGS"
+            gaia_query_status = "QUERIED_COMPLETE_AFTER_MAXREC_SPLIT"
         else:
             status = "DONE"
+            gaia_query_status = "QUERIED_COMPLETE"
+
+        if (
+            not skipped_already_covered
+            and not query_disabled
+            and int(res.selected_frames or 0) > 0
+            and (
+                res.failed_frames > 0 or not coverage_complete
+            )
+        ):
+            gaia_query_status = "INCOMPLETE"
+        if coverage_complete and not skipped_already_covered:
+            _append_field_gaia_coverage(
+                session,
+                field_id=int(field_id),
+                coverage=coverage,
+                proofs=proofs,
+                catalog_name=catalog_name,
+                mag_limit=mag_limit,
+                query_mode=query_mode,
+            )
+        cone_attempts = list(getattr(res, "cone_attempts", []) or [])
+        failed_cone_attempts_count = sum(
+            1
+            for attempt in cone_attempts
+            if isinstance(attempt, dict)
+            and str(attempt.get("status", "")).startswith("FAILED")
+        )
+        raw_phase_timings = getattr(res, "phase_timings_sec", {})
+        phase_timings_sec: dict[str, float] = {}
+        if isinstance(raw_phase_timings, dict):
+            for phase in (
+                "footprint_calculation",
+                "tap_attempts",
+                "catalog_source_upserts",
+                "total_query",
+            ):
+                try:
+                    elapsed = float(raw_phase_timings[phase])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if math.isfinite(elapsed) and elapsed >= 0.0:
+                    phase_timings_sec[phase] = elapsed
+        # Commit partial source rows even when a separate requested cone failed,
+        # but persist no new coverage unless the complete request set succeeded.
+        # This also releases the field lock before downstream pipeline work.
+        session.commit()
+        total_sources = int(
+            _inspect_existing_catalog(session, catalog_name=catalog_name).get("n_sources")
+            or 0
+        )
         row.update(
             {
                 "status": status,
+                "mode": (
+                    "auto_existing_reuse"
+                    if skipped_already_covered and existing_sources > 0
+                    else "auto_existing_expansion"
+                    if existing_sources > 0 and not query_disabled
+                    else "auto_gaia_query"
+                ),
+                "reused_existing": existing_sources > 0,
+                "existing_n_sources": existing_sources,
+                "gaia_query_status": gaia_query_status,
+                "coverage_complete": coverage_complete,
                 "selected_frames": res.selected_frames,
                 "queried_frames": res.queried_frames,
                 "queried_cones": getattr(res, "queried_cones", None),
@@ -2148,19 +2522,49 @@ def _prepare_auto_catalog(
                 "query_provider_failures": getattr(res, "query_provider_failures", {}),
                 "read_rows": res.read_rows,
                 "inserted_or_updated": res.inserted_or_updated,
+                "n_sources": total_sources,
                 "failed_frames": res.failed_frames,
                 "failed_footprint_reasons": getattr(res, "failed_footprint_reasons", {}),
                 "sample_failed_footprints": getattr(res, "sample_failed_footprints", []),
                 "skipped_missing_file": res.skipped_missing_file,
                 "skipped_oversized_cones": getattr(res, "skipped_oversized_cones", 0),
+                "skipped_covered_cones": getattr(res, "skipped_covered_cones", 0),
+                "effective_max_rows": getattr(res, "effective_max_rows", 20_000),
+                "completed_cones_count": len(proofs),
+                "cone_attempts_count": len(cone_attempts),
+                "failed_cone_attempts_count": failed_cone_attempts_count,
+                "maxrec_attempts_count": row_limit_reached_cones,
+                "phase_timings_sec": phase_timings_sec,
             }
         )
-        if res.inserted_or_updated == 0:
+        if skipped_already_covered:
+            row["query_provider"] = "local_field_coverage"
+            row["effective_query_mode"] = "local_coverage_reuse"
+            warnings.append(
+                f"GAIA_QUERY=SKIPPED_ALREADY_COVERED field_id={field_id} catalog={catalog_name}"
+            )
+        elif query_disabled:
+            warnings.append(
+                f"GAIA_QUERY=SKIPPED_DISABLED_UNCOVERED field_id={field_id} "
+                f"catalog={catalog_name}; uncovered requested cones remain"
+            )
+        elif int(res.selected_frames or 0) <= 0:
+            warnings.append(
+                f"GAIA_QUERY=NO_FRAMES field_id={field_id} catalog={catalog_name}; "
+                "no selected frame footprints"
+            )
+        elif not coverage_complete:
+            warnings.append(
+                f"GAIA_QUERY=INCOMPLETE field_id={field_id} catalog={catalog_name}; "
+                "no COMPLETE coverage was recorded"
+            )
+        if res.inserted_or_updated == 0 and existing_sources == 0:
             warnings.append(f"auto catalog query inserted zero sources: {catalog_name}")
         if row_limit_reached_cones > 0:
             warnings.append(
-                f"auto Gaia query reached MAXREC={max_rows_per_frame} in {row_limit_reached_cones} cone(s); "
-                "catalog may be truncated; use a brighter --auto-catalog-mag-limit or raise --auto-catalog-max-rows-per-frame"
+                f"auto Gaia query reached MAXREC={getattr(res, 'effective_max_rows', 20_000)} "
+                f"in {row_limit_reached_cones} cone attempt(s); recursive coverage complete="
+                f"{coverage_complete}"
             )
         return row
     except Exception as exc:  # noqa: BLE001 - one-command processing should continue and report the catalog failure.
@@ -2172,12 +2576,19 @@ def _prepare_auto_catalog(
 
 
 def _catalog_precondition_ok(row: dict[str, Any], *, allow_empty_catalog: bool) -> bool:
+    status = row.get("status")
+    if row.get("coverage_required"):
+        if not row.get("coverage_complete"):
+            return False
+        if status not in {"DONE", "DONE_WITH_WARNINGS"}:
+            return False
+    if row.get("status") == "DONE_WITH_FAILED_FRAMES":
+        return False
     if allow_empty_catalog:
         return True
-    status = row.get("status")
-    if status not in {"DONE", "DONE_WITH_WARNINGS", "DONE_WITH_FAILED_FRAMES"}:
+    if status not in {"DONE", "DONE_WITH_WARNINGS"}:
         return False
-    if int(row.get("inserted_or_updated") or 0) <= 0:
+    if int(row.get("n_sources") or row.get("inserted_or_updated") or 0) <= 0:
         return False
     return True
 
@@ -2408,6 +2819,8 @@ def _pipeline_warning_message(
         f"failed_frames={count('failed_frames')} "
         f"failed_measurements={count('failed_measurements')}"
     )
+    if count("cap_dropped_links"):
+        message += f" cap_dropped_links={count('cap_dropped_links')}"
     if sample_descriptions:
         message += " samples=[" + "; ".join(sample_descriptions) + "]"
     samples_truncated = count("failure_samples_truncated")
@@ -2427,6 +2840,7 @@ def _pipeline_row(
         "series_id": int(series["series_id"]),
         "field_id": series.get("field_id"),
         "field_name": series.get("field_name"),
+        "catalog_name": series.get("catalog_name"),
         "instrument_unit_id": series.get("instrument_unit_id"),
         "filter_name": series.get("filter_name"),
         "calibration_prefix": prefix,

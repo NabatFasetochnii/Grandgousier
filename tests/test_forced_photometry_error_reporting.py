@@ -271,6 +271,20 @@ def test_forced_step_persists_warning_status_and_emits_warning_event():
     assert runner_module._completed_step_status(
         "run_forced_photometry", {"failed_frames": 0, "failed_measurements": 0}
     ) == "DONE"
+    cap_only = {
+        "eligible_links_before_cap": 5,
+        "selected_links_after_cap": 3,
+        "cap_dropped_links": 2,
+    }
+    assert runner_module._completed_step_status("run_forced_photometry", cap_only) == (
+        "DONE_WITH_WARNINGS"
+    )
+    _level, _event, cap_warning = runner_module._completed_step_log(
+        "run_forced_photometry", "DONE_WITH_WARNINGS", cap_only
+    )
+    assert "eligible_links_before_cap=5" in cap_warning
+    assert "selected_links_after_cap=3" in cap_warning
+    assert "cap_dropped_links=2" in cap_warning
 
     session = _FakeSession()
     runner_module._finish_pipeline_step(
@@ -295,6 +309,48 @@ def test_forced_step_persists_warning_status_and_emits_warning_event():
     _log_sql, log_params = session.calls[-1]
     assert log_params["level"] == "WARNING"
     assert log_params["event_type"] == "step_done_with_warnings"
+
+
+def test_catalog_projection_limited_links_are_reported_separately():
+    projection_result = {"limited_links": 4}
+    assert runner_module._completed_step_status(
+        "match_catalog_to_frames", projection_result
+    ) == "DONE_WITH_WARNINGS"
+    warning_level, warning_event, warning_message = runner_module._completed_step_log(
+        "match_catalog_to_frames", "DONE_WITH_WARNINGS", projection_result
+    )
+    assert warning_level == "WARNING"
+    assert warning_event == "step_done_with_warnings"
+    assert "projection_limited_links=4" in warning_message
+
+    projection_step = runner_module.PipelineStepRecord(
+        step_name="match_catalog_to_frames",
+        status="DONE_WITH_WARNINGS",
+        result=projection_result,
+    )
+    summary = runner_module._pipeline_warning_summary([projection_step])
+    assert summary is not None
+    assert summary["projection_limited_links"] == 4
+    assert summary["cap_dropped_links"] == 0
+    assert summary["warning_steps"][0]["projection_limited_links"] == 4
+    pipeline_result = runner_module.PipelineRunResult(
+        run_uid="run-projection-warning",
+        pipeline_run_id=None,
+        status="DONE_WITH_WARNINGS",
+        calibration_names={},
+        steps=[projection_step],
+    )
+    attached_summary = runner_module._attach_pipeline_warning_summary(pipeline_result)
+    assert attached_summary == pipeline_result.quality_policy["pipeline_warning_summary"]
+    assert attached_summary["projection_limited_links"] == 4
+
+    zero_limited = {"limited_links": 0}
+    assert runner_module._completed_step_status(
+        "match_catalog_to_frames", zero_limited
+    ) == "DONE"
+    assert runner_module._completed_step_log(
+        "match_catalog_to_frames", "DONE", zero_limited
+    ) == ("INFO", "step_done", "step match_catalog_to_frames finished")
 
 
 def test_pipeline_log_database_binding_sanitizes_normal_and_direct_failure_routes():
@@ -381,6 +437,9 @@ def test_pipeline_warning_rollup_keeps_failure_and_no_usable_precedence():
         result={
             "failed_frames": 1,
             "failed_measurements": 2,
+            "eligible_links_before_cap": 30,
+            "selected_links_after_cap": 25,
+            "cap_dropped_links": 5,
             "failure_samples": [
                 {"frame_id": frame_id, "stage": "fits_read", "reason": "fits_read_failed"}
                 for frame_id in range(25)
@@ -394,6 +453,7 @@ def test_pipeline_warning_rollup_keeps_failure_and_no_usable_precedence():
     assert summary["requested_pipeline_status"] == "DONE_WITH_WARNINGS"
     assert summary["failed_frames"] == 1
     assert summary["failed_measurements"] == 2
+    assert summary["cap_dropped_links"] == 5
     assert summary["failure_samples_truncated"] == 8
     assert len(summary["failure_samples"]) == 20
     assert summary["failure_samples"][0]["frame_id"] == 0

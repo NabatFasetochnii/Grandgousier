@@ -736,6 +736,8 @@ def test_runner_passes_none_only_for_unscoped_mutator_calls(
     expected_frame_ids,
 ):
     observed_frame_ids: list[list[int] | None] = []
+    observed_kwargs: list[dict] = []
+    monkeypatch.setattr(runner_module, "_check_open_series_admission", lambda *_args: None)
     if series_id is not None:
         monkeypatch.setattr(
             runner_module,
@@ -748,6 +750,7 @@ def test_runner_passes_none_only_for_unscoped_mutator_calls(
         )
 
     def capture_call(_session, **kwargs):
+        observed_kwargs.append(dict(kwargs))
         value = kwargs["frame_ids"]
         observed_frame_ids.append(None if value is None else list(value))
         if target == "wcs":
@@ -787,10 +790,13 @@ def test_runner_passes_none_only_for_unscoped_mutator_calls(
     runner_module.run_field_pipeline(_NoSessionOperations(), config)
 
     assert observed_frame_ids == [expected_frame_ids]
+    if target == "catalog_match":
+        assert observed_kwargs[0]["max_sources_per_frame"] is None
 
 
 def test_runner_skips_both_mutators_when_pre_qc_eliminates_the_resolved_scope(monkeypatch):
     mutator_calls: list[str] = []
+    monkeypatch.setattr(runner_module, "_check_open_series_admission", lambda *_args: None)
     monkeypatch.setattr(
         runner_module,
         "run_frame_pre_qc",
@@ -837,6 +843,43 @@ def test_runner_skips_both_mutators_when_pre_qc_eliminates_the_resolved_scope(mo
     assert mutator_calls == []
     assert result.status == runner_module.NO_USABLE_FRAMES_STATUS
     assert "stop_no_usable_frames" in [step.step_name for step in result.steps]
+
+
+def test_runner_detects_matches_once_then_aggregates_physical_support(monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner_module, "_check_open_series_admission", lambda *_args: None)
+    monkeypatch.setattr(
+        runner_module,
+        "detect_sources_in_frames",
+        lambda *_args, **_kwargs: calls.append("detect") or {"selected_frames": 1},
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "match_detections_to_catalog",
+        lambda *_args, **_kwargs: calls.append("match") or {"detection_run_id": 44},
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "aggregate_detection_catalog_support",
+        lambda *_args, **_kwargs: calls.append("support") or {77: 1},
+    )
+
+    config = _runner_config(
+        frame_ids=[10],
+        series_id=None,
+        run_detection=True,
+        run_forced_photometry=False,
+    )
+    config.skip_detection_catalog_match = False
+
+    result = runner_module.run_field_pipeline(_NoSessionOperations(), config)
+
+    assert calls == ["detect", "match", "support"]
+    selection = result.quality_policy["detection_support_selection"]
+    assert selection["status"] == "DONE"
+    assert selection["supported_catalog_sources"] == 1
+    assert selection["eligible_catalog_sources"] == 1
+    assert selection["detection_run_id"] == 44
 
 
 def test_runner_rejects_explicit_empty_scope_before_session_operations():

@@ -6,6 +6,7 @@ from grandgousier.lightcurves import target as target_module
 from grandgousier.lightcurves.target import (
     TargetResolution,
     export_target_light_curve_product,
+    resolve_explicit_target_catalog_source,
     resolve_target_object,
     validate_target_coordinates,
 )
@@ -73,6 +74,589 @@ def test_target_export_keeps_series_selector_when_no_explicit_frames(monkeypatch
 
     assert calls["series_id"] == 3
     assert calls["frame_ids"] is None
+
+
+def test_explicit_target_catalog_source_selects_unique_link_and_rejects_ambiguous_coordinates():
+    class FakeResult:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def all(self):
+            return list(self.rows)
+
+    class FakeSession:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self, _statement):
+            return FakeResult(self.rows)
+
+    resolved = resolve_explicit_target_catalog_source(
+        FakeSession([(100, "gaia-100", 10.0, 20.0, 7)]),
+        catalog_name="auto_catalog_field_17",
+        target_source_id="gaia-100",
+        target_object_id=7,
+        target_ra_deg=10.0,
+        target_dec_deg=20.0,
+    )
+    assert resolved["eligible"] is True
+    assert resolved["catalog_source_id"] == 100
+    assert resolved["object_id"] == 7
+
+    ambiguous = resolve_explicit_target_catalog_source(
+        FakeSession(
+            [
+                (100, "gaia-100", 10.0, 20.0, 7),
+                (101, "gaia-101", 10.0001, 20.0, 8),
+            ]
+        ),
+        catalog_name="auto_catalog_field_17",
+        target_ra_deg=10.0,
+        target_dec_deg=20.0,
+    )
+    assert ambiguous["eligible"] is False
+    assert ambiguous["candidate_count"] == 2
+
+
+def test_exact_source_id_is_eligible_before_object_catalog_link_exists():
+    class FakeResult:
+        def all(self):
+            return [(100, "gaia-100", 10.0, 20.0, None)]
+
+    class FakeSession:
+        def execute(self, statement):
+            self.statement = statement
+            return FakeResult()
+
+    session = FakeSession()
+    selected = resolve_explicit_target_catalog_source(
+        session,
+        catalog_name="auto_catalog_field_17",
+        target_source_id="gaia-100",
+    )
+
+    assert selected["eligible"] is True
+    assert selected["catalog_source_id"] == 100
+    assert selected["object_id"] is None
+    assert selected["identity_link_exists"] is False
+    assert "catalog_sources.catalog_name" in str(session.statement)
+    assert "catalog_sources.source_id" in str(session.statement)
+
+
+@pytest.mark.parametrize(
+    (
+        "selectors",
+        "resolver_rows",
+        "support_enabled",
+        "expected_linked_ids",
+        "expected_cap_id",
+        "expected_projected_ra",
+    ),
+    [
+        (
+            {"target_source_id": "faint-target"},
+            [(201, "faint-target", 10.0, 20.0, None)],
+            True,
+            [201],
+            201,
+            [9.0, 10.0],
+        ),
+        (
+            {"target_ra_deg": 10.0, "target_dec_deg": 20.0},
+            [
+                (201, "faint-target", 10.0, 20.0, None),
+                (202, "nearby-source", 10.0001, 20.0, None),
+            ],
+            True,
+            [100],
+            100,
+            [9.0],
+        ),
+        (
+            {
+                "target_source_id": "faint-target",
+                "target_ra_deg": 10.1,
+                "target_dec_deg": 20.0,
+            },
+            [(201, "faint-target", 10.0, 20.0, None)],
+            True,
+            [100],
+            100,
+            [9.0],
+        ),
+        (
+            {"target_source_id": "faint-target"},
+            [(201, "faint-target", 10.0, 20.0, None)],
+            False,
+            [201],
+            201,
+            [8.0, 9.0, 10.0],
+        ),
+    ],
+    ids=[
+        "unique-explicit-source",
+        "ambiguous-coordinates",
+        "conflicting-source-coordinates",
+        "detection-support-disabled",
+    ],
+)
+def test_faint_target_projection_is_supported_bounded_and_prioritized(
+    monkeypatch,
+    tmp_path,
+    selectors,
+    resolver_rows,
+    support_enabled,
+    expected_linked_ids,
+    expected_cap_id,
+    expected_projected_ra,
+):
+    import numpy as np
+
+    from grandgousier.catalogs import frame_match
+    from grandgousier.photometry import forced_aperture
+    from grandgousier.pipeline import runner
+
+    sources = [
+        {
+            "catalog_source_id": 100,
+            "ra_deg": 9.0,
+            "dec_deg": 19.0,
+            "ref_mags": {"G": 18.0},
+        },
+        {
+            "catalog_source_id": 101,
+            "ra_deg": 8.0,
+            "dec_deg": 18.0,
+            "ref_mags": {"G": 17.0},
+        },
+        {
+            "catalog_source_id": 201,
+            "ra_deg": 10.0,
+            "dec_deg": 20.0,
+            "ref_mags": {"G": 20.0},
+        },
+        {
+            "catalog_source_id": 202,
+            "ra_deg": 10.0001,
+            "dec_deg": 20.0,
+            "ref_mags": {"G": 20.0},
+        },
+    ]
+    events = []
+
+    class FakeResult:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def all(self):
+            return list(self.rows)
+
+        def mappings(self):
+            return self
+
+    class FakeSession:
+        def __init__(self):
+            self.link_rows = []
+            self.statements = []
+
+        def add(self, _row):
+            raise AssertionError("pre-photometry target selection must not create identity rows")
+
+        def execute(self, statement, *_args, **_kwargs):
+            sql = str(statement)
+            self.statements.append(sql)
+            if "object_catalog_links" in sql:
+                events.append("resolve-explicit-target")
+                return FakeResult(resolver_rows)
+            if "FROM frame_catalog_links" in sql:
+                return FakeResult(self.link_rows)
+            if "catalog_sources.catalog_name AS catalog_name" in sql:
+                linked_ids = {int(row["catalog_source_id"]) for row in self.link_rows}
+                source_rows = []
+                for source in sources:
+                    if int(source["catalog_source_id"]) not in linked_ids:
+                        continue
+                    source_rows.append(
+                        {
+                            "catalog_source_id": source["catalog_source_id"],
+                            "catalog_name": "cat",
+                            "source_id": {
+                                100: "bright-source",
+                                101: "unsupported-source",
+                                201: "faint-target",
+                                202: "ordinary-faint-source",
+                            }[int(source["catalog_source_id"])],
+                            "ra_deg": source["ra_deg"],
+                            "dec_deg": source["dec_deg"],
+                            "epoch": None,
+                            "pmra_masyr": None,
+                            "pmdec_masyr": None,
+                            "ref_mags": source["ref_mags"],
+                            "colors": {},
+                        }
+                    )
+                return FakeResult(source_rows)
+            if "FROM catalog_sources" in sql:
+                return FakeResult(
+                    [SimpleNamespace(_mapping=source) for source in sources]
+                )
+            raise AssertionError(f"unexpected mocked query: {sql}")
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+    session = FakeSession()
+    raw_path = tmp_path / "frame.fits"
+    raw_path.write_bytes(b"synthetic test frame")
+    monkeypatch.setattr(
+        frame_match,
+        "_select_frames",
+        lambda *_args, **_kwargs: [
+            SimpleNamespace(frame_id=1, raw_path=raw_path, header_json={})
+        ],
+    )
+    monkeypatch.setattr(
+        frame_match,
+        "_frame_wcs",
+        lambda *_args, **_kwargs: (
+            SimpleNamespace(has_celestial=True),
+            100,
+            100,
+            "DB_HEADER_JSON",
+        ),
+    )
+    projected_source_ra = []
+
+    def project_sources(_wcs, *, source_ra, source_dec):
+        events.append("project-sources")
+        assert len(source_dec) == len(source_ra)
+        projected_source_ra.extend(source_ra.tolist())
+        return (
+            np.arange(len(source_ra), dtype=float) + 10.0,
+            np.arange(len(source_dec), dtype=float) + 10.0,
+            True,
+        )
+
+    monkeypatch.setattr(frame_match, "_project_sources", project_sources)
+    monkeypatch.setattr(frame_match, "postgres_copy_capable", lambda _session: False)
+
+    def capture_upsert(_session, rows, *, insert_batch_size=None):
+        events.append("upsert-frame-links")
+        session.link_rows = [
+            {**row, "frame_catalog_link_id": index}
+            for index, row in enumerate(rows, start=1)
+        ]
+        return 1
+
+    monkeypatch.setattr(frame_match, "_upsert_frame_catalog_links", capture_upsert)
+    actual_match_catalog_to_frames = frame_match.match_catalog_to_frames
+    match_kwargs = {}
+
+    def run_match(*args, **kwargs):
+        events.append("match-catalog-to-frames")
+        match_kwargs.update(kwargs)
+        matched = actual_match_catalog_to_frames(*args, **kwargs)
+        assert matched.linked, (matched, session.statements, events)
+        return matched
+
+    monkeypatch.setattr(runner, "match_catalog_to_frames", run_match)
+    monkeypatch.setattr(runner, "_check_open_series_admission", lambda *_args: None)
+    monkeypatch.setattr(
+        runner,
+        "detect_sources_in_frames",
+        lambda *_args, **_kwargs: events.append("detect-sources")
+        or {"selected_frames": 1},
+    )
+    monkeypatch.setattr(
+        runner,
+        "match_detections_to_catalog",
+        lambda *_args, **_kwargs: events.append("match-detections")
+        or {"detection_run_id": 44},
+    )
+
+    def aggregate_support(*_args, **_kwargs):
+        events.append("aggregate-support")
+        return {100: 1, 202: 1}
+
+    monkeypatch.setattr(
+        runner,
+        "aggregate_detection_catalog_support",
+        aggregate_support,
+    )
+    forced_selection = {}
+
+    def fake_forced_photometry(_session, **kwargs):
+        forced_selection.update(kwargs)
+        assert session.link_rows
+        counts = {}
+        grouped = forced_aperture._select_frame_links_bulk(
+            session,
+            frame_ids=[1],
+            catalog_name="cat",
+            limit_per_frame=kwargs["limit_links"],
+            eligible_catalog_source_ids=(
+                None
+                if kwargs["eligible_catalog_source_ids"] is None
+                else set(kwargs["eligible_catalog_source_ids"])
+            ),
+            priority_catalog_source_ids=set(kwargs["priority_catalog_source_ids"]),
+            selection_stats=counts,
+        )
+        forced_selection.update(counts)
+        forced_selection["selected_source_ids"] = [
+            item[0].catalog_source_id for item in grouped[1]
+        ]
+        return forced_aperture.ForcedPhotometryResult(
+            eligible_links_before_cap=counts["eligible_links_before_cap"],
+            selected_links_after_cap=counts["selected_links_after_cap"],
+            cap_dropped_links=counts["cap_dropped_links"],
+        )
+
+    monkeypatch.setattr(
+        runner, "run_forced_aperture_photometry", fake_forced_photometry
+    )
+
+    config = runner.FieldPipelineConfig(
+        catalog_name="cat",
+        calibration_prefix="synthetic",
+        frame_ids=[1],
+        record_run=False,
+        no_file_log=True,
+        log_dir=None,
+        run_pre_photometry_qc=False,
+        working_catalog_mag_limit=19.0,
+        max_working_sources_per_frame=1,
+        photometry_estimator=("adaptive_ellipse" if support_enabled else "circular"),
+        skip_wcs=True,
+        skip_detection=not support_enabled,
+        skip_detection_catalog_match=not support_enabled,
+        skip_aperture_correction=True,
+        skip_aperture_zp=True,
+        skip_ensemble=True,
+        skip_object_qc=True,
+        skip_aperture_stability_qc=True,
+        skip_field_report=True,
+        replace_frame_catalog_links=False,
+        **selectors,
+    )
+    result = runner.run_field_pipeline(session, config)
+
+    linked_source_ids = [int(row["catalog_source_id"]) for row in session.link_rows]
+    assert linked_source_ids == expected_linked_ids
+    assert len(session.link_rows) <= 1
+    assert 202 not in linked_source_ids  # An ordinary G=20 source stays filtered.
+    assert projected_source_ra == expected_projected_ra
+    match_step = next(step for step in result.steps if step.step_name == "match_catalog_to_frames")
+    assert match_step.result["linked"] == len(expected_linked_ids)
+    assert match_step.result["projected_source_points"] == len(expected_projected_ra)
+    assert match_step.result["limited_links"] == (
+        len(expected_projected_ra) - len(expected_linked_ids)
+    )
+    assert match_kwargs["max_sources_per_frame"] == 1
+    assert match_kwargs["include_catalog_source_ids"] == (
+        [201] if expected_cap_id == 201 else []
+    )
+    assert match_kwargs["priority_catalog_source_ids"] == (
+        [201] if expected_cap_id == 201 else []
+    )
+    assert match_kwargs["eligible_catalog_source_ids"] == (
+        [100, 201, 202] if support_enabled and expected_cap_id == 201
+        else [100, 202] if support_enabled
+        else None
+    )
+    if support_enabled:
+        assert (
+            events.index("detect-sources")
+            < events.index("match-detections")
+            < events.index("aggregate-support")
+            < events.index("resolve-explicit-target")
+            < events.index("match-catalog-to-frames")
+            < events.index("project-sources")
+            < events.index("upsert-frame-links")
+        )
+        assert 8.0 not in projected_source_ra  # Unsupported G=17 source is excluded.
+    else:
+        assert "aggregate-support" not in events
+        assert (
+            events.index("resolve-explicit-target")
+            < events.index("match-catalog-to-frames")
+            < events.index("project-sources")
+        )
+        assert projected_source_ra == [8.0, 9.0, 10.0]  # Unfiltered, but magnitude/cap bounded.
+    assert forced_selection["priority_catalog_source_ids"] == (
+        [201] if expected_cap_id == 201 else []
+    )
+    assert forced_selection["selected_source_ids"] == [expected_cap_id]
+    if expected_cap_id == 201:
+        assert forced_selection["eligible_catalog_source_ids"] == (
+            [100, 201, 202] if support_enabled else None
+        )
+    else:
+        assert forced_selection["eligible_catalog_source_ids"] == [100, 202]
+    assert not any("INSERT INTO objects" in sql or "INSERT INTO object_catalog_links" in sql
+                   for sql in session.statements)
+
+
+def test_unique_explicit_coordinates_select_unlinked_source_within_two_arcsec():
+    class FakeResult:
+        def all(self):
+            # At Dec=20, this RA offset is under 2 arcsec.
+            return [(100, "gaia-100", 10.0002, 20.0, None)]
+
+    class FakeSession:
+        def execute(self, _statement):
+            return FakeResult()
+
+    selected = resolve_explicit_target_catalog_source(
+        FakeSession(),
+        catalog_name="auto_catalog_field_17",
+        target_ra_deg=10.0,
+        target_dec_deg=20.0,
+    )
+
+    assert selected["eligible"] is True
+    assert selected["catalog_source_id"] == 100
+    assert selected["identity_link_exists"] is False
+    assert selected["coordinate_match_radius_arcsec"] == 2.0
+
+
+@pytest.mark.parametrize(
+    ("rows", "selectors"),
+    [
+        ([(100, "source-a", 10.0, 20.0, None)], {"target_object_id": 7}),
+        (
+            [
+                (100, "source-a", 10.0, 20.0, 7),
+                (101, "source-b", 10.0001, 20.0, 7),
+            ],
+            {"target_object_id": 7, "target_source_id": "source-a"},
+        ),
+        (
+            [(100, "source-a", 10.0, 20.0, 7)],
+            {"target_object_id": 8, "target_source_id": "source-a"},
+        ),
+        (
+            [(100, "source-a", 10.0, 20.0, None)],
+            {"target_source_id": "source-a", "target_ra_deg": 10.01, "target_dec_deg": 20.0},
+        ),
+    ],
+    ids=["opaque-object-no-link", "object-link-not-unique", "conflicting-object-source", "source-coordinate-conflict"],
+)
+def test_conflicting_or_ambiguous_explicit_selectors_stay_unresolved(rows, selectors):
+    class FakeResult:
+        def all(self):
+            return list(rows)
+
+    class FakeSession:
+        def execute(self, _statement):
+            return FakeResult()
+
+        def add(self, _row):
+            raise AssertionError("the pre-photometry resolver must not create identity rows")
+
+    selected = resolve_explicit_target_catalog_source(
+        FakeSession(), catalog_name="auto_catalog_field_17", **selectors
+    )
+
+    assert selected["eligible"] is False
+
+
+def test_explicit_source_resolves_normally_after_measurement_and_identity_link(
+    monkeypatch,
+):
+    measurement = SimpleNamespace(
+        object_id=777,
+        frame_id=1,
+        flags={
+            "catalog_name": "cat",
+            "source_id": "target-201",
+            "catalog_source_id": 201,
+        },
+    )
+    monkeypatch.setattr(
+        target_module,
+        "_load_calibration_rows",
+        lambda *_args, **_kwargs: [{"calibration_version_id": 5}],
+    )
+    monkeypatch.setattr(
+        target_module,
+        "load_calibration_photometry_view",
+        lambda *_args, **_kwargs: SimpleNamespace(rows=[measurement]),
+    )
+    monkeypatch.setattr(
+        target_module,
+        "_identity_rows_from_photometry_view",
+        lambda *_args, **_kwargs: {
+            777: {
+                "object_id": 777,
+                "ra_deg": 10.0,
+                "dec_deg": 20.0,
+                "source_id": "target-201",
+                "catalog_source_id": 201,
+                "n_measurements": 1,
+            }
+        },
+    )
+    monkeypatch.setattr(target_module, "_measured_scope_instrument", lambda *_args: "RoboPhot")
+
+    class FakeResult:
+        def all(self):
+            return [(777, 201, 10.0, 20.0)]
+
+    class FakeSession:
+        def get(self, _model, object_id):
+            assert object_id == 5
+            return SimpleNamespace(calibration_version_id=5)
+
+        def execute(self, _statement):
+            return FakeResult()
+
+    target = resolve_target_object(
+        FakeSession(),
+        calibration_name="raw",
+        catalog_name="cat",
+        frame_ids=[1],
+        target_source_id="target-201",
+    )
+
+    assert target.resolved is True
+    assert target.object_id == 777
+    assert target.catalog_source_id == 201
+
+
+def test_runner_preserves_ambiguous_explicit_catalog_selection_as_unresolved():
+    from grandgousier.pipeline.runner import (
+        FieldPipelineConfig,
+        _unresolved_explicit_target_resolution,
+    )
+
+    config = FieldPipelineConfig(
+        catalog_name="cat",
+        calibration_prefix="synthetic",
+        target_ra_deg=10.0,
+        target_dec_deg=20.0,
+    )
+    unresolved = _unresolved_explicit_target_resolution(
+        config,
+        {
+            "eligible": False,
+            "reason": "explicit target matches multiple catalog sources within 2 arcsec",
+            "candidate_count": 2,
+        },
+    )
+
+    assert unresolved is not None
+    assert unresolved.resolved is False
+    assert unresolved.method == "explicit_catalog_source"
+    assert unresolved.reason == (
+        "explicit target matches multiple catalog sources within 2 arcsec"
+    )
+    assert _unresolved_explicit_target_resolution(
+        config, {"eligible": True, "catalog_source_id": 201}
+    ) is None
 
 
 def test_cleanup_target_light_curve_artifacts_removes_stale_products(tmp_path):
@@ -200,6 +784,43 @@ def _resolve_measured(monkeypatch, session, **overrides):
     frame_ids = overrides.pop("frame_ids", [10, 11])
     return resolve_target_object(session, calibration_name="cal", catalog_name="local_catalog",
                                  frame_ids=frame_ids, **overrides)
+
+
+def test_object_id_without_preselection_link_falls_back_to_measured_scope(monkeypatch):
+    from grandgousier.pipeline.runner import (
+        FieldPipelineConfig,
+        _unresolved_explicit_target_resolution,
+    )
+
+    config = FieldPipelineConfig(
+        catalog_name="local_catalog",
+        calibration_prefix="synthetic",
+        target_object_id=7,
+    )
+    missing_catalog_link = {
+        "eligible": False,
+        "reason": "target object has no unique catalog source link in the selected namespace",
+    }
+
+    # The source preselection failure must not block the normal measured-object
+    # route for an opaque object-ID selector.
+    assert _unresolved_explicit_target_resolution(config, missing_catalog_link) is None
+    measured_session = _MeasuredSession(
+        {7: (10.0, 20.0, "measured-target", "local_catalog", [10, 11])}
+    )
+    measured = _resolve_measured(
+        monkeypatch, measured_session, target_object_id=7
+    )
+    assert measured.resolved and measured.object_id == 7
+    assert measured.method == "target_object_id"
+
+    # No matching measurements still fails closed in the normal resolver.
+    empty_session = _MeasuredSession({})
+    unresolved = _resolve_measured(monkeypatch, empty_session, target_object_id=7)
+    assert not unresolved.resolved
+    assert unresolved.object_id == 7
+    assert unresolved.method == "target_object_id"
+    assert "no measurements" in unresolved.reason
 
 
 def test_robophot_sky_target_off_center_beats_bright_center_star(monkeypatch):
