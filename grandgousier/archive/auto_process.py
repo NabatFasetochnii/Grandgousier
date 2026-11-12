@@ -1318,7 +1318,7 @@ def process_archive_path(
                 ):
                     summary_path = str(Path(series_out_dir) / f"{prefix}_light_curve_summary.json")
                 require_detection_support_effective = bool(
-                    pipeline_result.quality_policy.get("require_detection_support_effective", enable_detection_branch)
+                    pipeline_result.quality_policy.get("require_detection_support_effective", False)
                 )
                 science_calibration = (
                     pipeline_result.calibration_names.get("science")

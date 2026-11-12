@@ -554,6 +554,45 @@ def test_pipeline_quality_policy_exposes_selection_measurement_ensemble_and_scie
     }
     assert diagnostics["science_acceptance_rejection"]["accepted_points"] == 35
     assert diagnostics["science_acceptance_rejection"]["rejected_points"] == 5
+    assert diagnostics["detection_support_selection_enabled"] is True
+    assert diagnostics["detection_support_selection"] == {
+        "status": "DONE",
+        "supported_catalog_sources": 4,
+    }
+    assert diagnostics["require_detection_support_requested"] is None
+    assert diagnostics["require_detection_support_effective"] is False
+
+
+def test_runner_detection_support_veto_requires_explicit_opt_in():
+    from grandgousier.pipeline.runner import (
+        FieldPipelineConfig,
+        _effective_require_detection_support,
+        _science_reject_flags,
+    )
+
+    common = {
+        "catalog_name": "cat",
+        "calibration_prefix": "detection-policy",
+        "skip_detection": False,
+        "skip_detection_catalog_match": False,
+    }
+    default = FieldPipelineConfig(**common)
+    explicit_true = FieldPipelineConfig(**common, require_detection_support=True)
+    explicit_false = FieldPipelineConfig(**common, require_detection_support=False)
+
+    assert default.require_detection_support is None
+    assert _effective_require_detection_support(default) is False
+    assert _science_reject_flags(default, False).isdisjoint(
+        {"NO_DETECTION_SUPPORT", "WEAK_DETECTION_SUPPORT"}
+    )
+    assert _effective_require_detection_support(explicit_true) is True
+    assert {"NO_DETECTION_SUPPORT", "WEAK_DETECTION_SUPPORT"} <= _science_reject_flags(
+        explicit_true, _effective_require_detection_support(explicit_true)
+    )
+    assert _effective_require_detection_support(explicit_false) is False
+    assert _science_reject_flags(
+        explicit_false, _effective_require_detection_support(explicit_false)
+    ).isdisjoint({"NO_DETECTION_SUPPORT", "WEAK_DETECTION_SUPPORT"})
 
 
 

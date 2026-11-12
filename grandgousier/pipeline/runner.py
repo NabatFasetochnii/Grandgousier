@@ -733,6 +733,7 @@ def _run_field_pipeline(
         "random_error_telescope_aperture_m": config.photometry_telescope_aperture_m,
         "random_error_site_altitude_m": config.photometry_site_altitude_m,
         "detection_branch_enabled": _detection_branch_enabled(config),
+        "detection_support_selection_enabled": _detection_support_selection_enabled(config),
         "psf_field_diagnostics_enabled": config.enable_psf_field_diagnostics,
         "psf_field_diagnostics_algorithm": "second_moments_spatial_v1",
         "require_detection_support_requested": config.require_detection_support,
@@ -3730,6 +3731,10 @@ def _detection_branch_enabled(config: FieldPipelineConfig) -> bool:
     return not config.skip_detection and not config.skip_detection_catalog_match
 
 
+def _detection_support_selection_enabled(config: FieldPipelineConfig) -> bool:
+    return not config.skip_detection_catalog_match
+
+
 def _eligible_catalog_sources_for_forced_photometry(
     support_counts: dict[int, int], explicit_target: dict[str, Any]
 ) -> list[int]:
@@ -3745,7 +3750,7 @@ def _eligible_catalog_sources_for_forced_photometry(
 def _effective_require_detection_support(config: FieldPipelineConfig) -> bool:
     if config.require_detection_support is not None:
         return bool(config.require_detection_support)
-    return _detection_branch_enabled(config)
+    return False
 
 
 def _forced_photometry_failure_counts(payload: dict[str, Any]) -> dict[str, int]:
@@ -4204,6 +4209,7 @@ def _quality_policy_summary(config: FieldPipelineConfig, result: PipelineRunResu
         "residual_noise_floor_objects_csv": error_validation_result.get("residual_floor_objects_csv"),
         "residual_noise_floor_frames_csv": error_validation_result.get("residual_floor_frames_csv"),
         "detection_branch_enabled": _detection_branch_enabled(config),
+        "detection_support_selection_enabled": _detection_support_selection_enabled(config),
         "psf_field_diagnostics_enabled": config.enable_psf_field_diagnostics,
         "psf_field_diagnostics_algorithm": "second_moments_spatial_v1",
         "detection_matching_executed": bool(match_result),

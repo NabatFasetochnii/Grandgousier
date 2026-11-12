@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from grandgousier.db.models import CalibrationVersion, ObjectQc
 from grandgousier.quality import object_quality as object_quality_module
 from grandgousier.quality.object_quality import (
+    ObjectQcCatalogSourceRow,
     ObjectQcSupportSnapshot,
     _infer_source_aperture_calibration_name,
     _merge_preserved_qc_details,
@@ -183,3 +184,103 @@ def test_empty_target_ids_do_not_set_field_target(monkeypatch):
 
     assert result.checked_objects == 1
     assert "FIELD_TARGET" not in observed_flags
+
+
+def test_weak_detection_support_is_persisted_but_not_default_science_veto(monkeypatch):
+    from grandgousier.lightcurves.product import evaluate_rejection, merge_quality_flags
+    from grandgousier.pipeline.runner import (
+        FieldPipelineConfig,
+        _effective_require_detection_support,
+        _science_reject_flags,
+    )
+
+    row = SimpleNamespace(
+        object_id=10,
+        source_id="source-10",
+        mag_rms=0.01,
+        mag_err_median=0.01,
+        n_measurements=5,
+        mag_median=12.0,
+        mag_mad=0.01,
+        ref_mag=None,
+        mag_err_systematic_median=None,
+        ra_deg=10.0,
+        dec_deg=20.0,
+        color=None,
+        catalog_name="cat",
+        instrument_unit_id=1,
+        reference_catalog_name=None,
+        reference_band=None,
+    )
+    analysis_snapshot = SimpleNamespace(
+        timings_sec={"_runner_cache_hit": 1.0},
+        algorithm="test",
+        materialization_source=None,
+        measurement_rows=[],
+        object_rows=[row],
+        measurement_geometry={},
+        matches=lambda **_kwargs: True,
+    )
+    support_snapshot = ObjectQcSupportSnapshot(
+        catalog_name="cat",
+        instrument_unit_id=1,
+        frame_ids=None,
+        target_source_ids=("source-10",),
+        catalog_sources_by_id={
+            "source-10": ObjectQcCatalogSourceRow(7, "cat", "source-10", 10.0, 20.0)
+        },
+        neighbor_stats={},
+        neighbor_diagnostics={
+            "algorithm": "test",
+            "catalog_sources": 1,
+            "target_sources": 1,
+            "pair_evaluations": 1,
+            "cache_hit": False,
+        },
+        detection_stats={7: {"n_detection_match_frames": 2}},
+    )
+    session = SimpleNamespace(
+        scalar=lambda _statement: SimpleNamespace(calibration_version_id=1),
+        commit=lambda: None,
+    )
+    monkeypatch.setattr(object_quality_module, "load_object_qc_map", lambda *_a, **_k: {})
+    monkeypatch.setattr(object_quality_module, "resolve_source_calibration", lambda *_a: None)
+    monkeypatch.setattr(object_quality_module, "get_source_calibration_name", lambda *_a: None)
+    monkeypatch.setattr(object_quality_module, "get_source_calibration_version_id", lambda *_a: None)
+    persisted_rows = []
+
+    def capture_upsert(_session, rows, *, insert_batch_size=None):
+        persisted_rows.extend(rows)
+        return 1
+
+    monkeypatch.setattr(object_quality_module, "_upsert_object_qc_rows", capture_upsert)
+
+    result = object_quality_module.compute_object_qc(
+        session,
+        calibration_name="synthetic",
+        catalog_name="cat",
+        instrument_unit_id=1,
+        analysis_snapshot=analysis_snapshot,
+        support_snapshot=support_snapshot,
+    )
+
+    assert result.weak_detection_support == 1
+    assert result.written == 1
+    assert persisted_rows[0]["flags"]["WEAK_DETECTION_SUPPORT"] is True
+    assert persisted_rows[0]["details"]["detection_support"]["n_detection_match_frames"] == 2
+
+    config = FieldPipelineConfig(catalog_name="cat", calibration_prefix="policy")
+    quality_flags = merge_quality_flags(
+        measurement_flags={},
+        object_qc_flags=persisted_rows[0]["flags"],
+        frame_quality_flags={},
+    )
+    rejection = evaluate_rejection(
+        quality_flags=quality_flags,
+        mag=12.0,
+        mag_err=0.01,
+        reject_flags=_science_reject_flags(
+            config, _effective_require_detection_support(config)
+        ),
+    )
+    assert rejection == (False, [])

@@ -75,7 +75,7 @@ def test_empty_frame_selection_remains_explicit_after_pre_qc_exclusion():
     assert _frame_ids_for_step([106, 107]) == [106, 107]
 
 
-def test_detection_support_requirement_follows_detection_branch_by_default():
+def test_detection_support_veto_defaults_off_independent_of_detection_branch():
     forced_only = FieldPipelineConfig(catalog_name="cat", calibration_prefix="p", skip_detection=True, skip_detection_catalog_match=True)
     detection_enabled = FieldPipelineConfig(catalog_name="cat", calibration_prefix="p", skip_detection=False, skip_detection_catalog_match=False)
     explicit_strict = FieldPipelineConfig(
@@ -87,7 +87,7 @@ def test_detection_support_requirement_follows_detection_branch_by_default():
     )
 
     assert _effective_require_detection_support(forced_only) is False
-    assert _effective_require_detection_support(detection_enabled) is True
+    assert _effective_require_detection_support(detection_enabled) is False
     assert _effective_require_detection_support(explicit_strict) is True
 
 

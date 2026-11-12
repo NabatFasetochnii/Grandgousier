@@ -301,7 +301,15 @@ def test_process_archive_detection_support_is_default_with_explicit_opt_out():
     from grandgousier.cli import build_parser
 
     parser = build_parser()
-    assert parser.parse_args(["process-archive-path", "--path", "synthetic"]).enable_detection_branch
+    default_args = parser.parse_args(["process-archive-path", "--path", "synthetic"])
+    assert default_args.enable_detection_branch
+    assert default_args.require_detection_support is None
+    assert parser.parse_args(
+        ["process-archive-path", "--path", "synthetic", "--require-detection-support"]
+    ).require_detection_support is True
+    assert parser.parse_args(
+        ["process-archive-path", "--path", "synthetic", "--no-require-detection-support"]
+    ).require_detection_support is False
     assert not parser.parse_args(
         ["process-archive-path", "--path", "synthetic", "--disable-detection-branch"]
     ).enable_detection_branch
@@ -518,14 +526,16 @@ def test_process_archive_path_uses_profile_appropriate_light_curve_summary(
         status="DONE",
         calibration_names={"science": "science_12"},
         outputs={},
-        quality_policy={"require_detection_support_effective": False},
+        quality_policy={},
         steps=[],
         log_files={},
     )
     summary_calls = {"compact": 0, "full": 0}
+    summary_reject_flags = []
 
-    def fake_compact_summary(_session, **_kwargs):
+    def fake_compact_summary(_session, **kwargs):
         summary_calls["compact"] += 1
+        summary_reject_flags.append(kwargs["reject_flags"])
         return SimpleNamespace(
             total_points=8,
             accepted_points=accepted_points,
@@ -533,8 +543,9 @@ def test_process_archive_path_uses_profile_appropriate_light_curve_summary(
             n_objects=3,
         )
 
-    def fake_full_summary(_session, **_kwargs):
+    def fake_full_summary(_session, **kwargs):
         summary_calls["full"] += 1
+        summary_reject_flags.append(kwargs["reject_flags"])
         return LightCurveSummary(
             scope=LightCurveScope(
                 calibration_names=["science_12"],
@@ -633,6 +644,10 @@ def test_process_archive_path_uses_profile_appropriate_light_curve_summary(
         "full": 1,
     }
     assert summary_calls == expected_calls
+    assert len(summary_reject_flags) == 1
+    assert summary_reject_flags[0].isdisjoint(
+        {"NO_DETECTION_SUPPORT", "WEAK_DETECTION_SUPPORT"}
+    )
     assert result.pipeline_results[0]["science_status"] == expected_status
     assert result.pipeline_results[0]["total_points"] == 8
     assert result.pipeline_results[0]["accepted_points"] == accepted_points

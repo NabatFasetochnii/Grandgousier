@@ -224,11 +224,9 @@ def parse_reject_flags(value: str | None, *, use_defaults: bool = True) -> set[s
 def light_curve_reject_flags(*, require_detection_support: bool = True, extra_flags: str | None = None) -> set[str]:
     """Return science-light-curve reject flags for the requested QC policy.
 
-    Detection support is a powerful veto only when detection-to-catalog matching
-    has actually been executed for the current catalog/frame set.  In
-    forced-photometry-only runs the NO/WEAK detection flags remain diagnostic
-    object_qc flags, but they must not reject every light-curve point by
-    default.
+    Detection-support flags remain diagnostic Object-QC evidence unless the
+    caller explicitly enables their science-light-curve veto. Runner defaults
+    keep them diagnostic even when detection matching and source selection run.
     """
 
     flags = parse_reject_flags(extra_flags, use_defaults=True)

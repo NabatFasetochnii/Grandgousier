@@ -89,6 +89,27 @@ def test_light_curve_reject_flags_can_make_detection_support_diagnostic_only():
     assert "HIGH_RMS" in relaxed
 
 
+def test_default_science_rejection_does_not_veto_on_detection_support_alone():
+    from grandgousier.pipeline.runner import (
+        FieldPipelineConfig,
+        _effective_require_detection_support,
+        _science_reject_flags,
+    )
+
+    config = FieldPipelineConfig(catalog_name="cat", calibration_prefix="policy")
+    reject, reasons = evaluate_rejection(
+        quality_flags={"WEAK_DETECTION_SUPPORT": True},
+        mag=12.0,
+        mag_err=0.01,
+        reject_flags=_science_reject_flags(
+            config, _effective_require_detection_support(config)
+        ),
+    )
+
+    assert reject is False
+    assert reasons == []
+
+
 def test_compact_count_summary_matches_full_summary_with_merged_rejection_flags(
     monkeypatch,
 ):

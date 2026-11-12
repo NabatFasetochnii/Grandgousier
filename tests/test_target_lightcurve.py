@@ -527,6 +527,9 @@ def test_faint_target_projection_is_supported_bounded_and_prioritized(
     assert session.link_snapshots[0]
     assert not any(step.step_name == "bootstrap_catalog_to_frames" for step in result.steps)
     if support_enabled:
+        assert result.quality_policy["detection_support_selection_enabled"] is True
+        assert result.quality_policy["require_detection_support_requested"] is None
+        assert result.quality_policy["require_detection_support_effective"] is False
         match_detection_step = next(
             step for step in result.steps if step.step_name == "match_detections_to_catalog"
         )
@@ -541,6 +544,10 @@ def test_faint_target_projection_is_supported_bounded_and_prioritized(
         assert forced_selection["eligible_catalog_source_ids"] == (
             [100, 201] if expected_cap_id == 201 else [100]
         )
+        assert 100 in forced_selection["eligible_catalog_source_ids"]
+        assert 101 not in forced_selection["eligible_catalog_source_ids"]
+        if expected_cap_id == 201:
+            assert 201 in forced_selection["eligible_catalog_source_ids"]
         assert (
             events.index("detect-sources")
             < events.index("resolve-explicit-target")
