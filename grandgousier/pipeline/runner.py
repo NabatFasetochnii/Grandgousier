@@ -1176,6 +1176,15 @@ def _run_field_pipeline(
         )
         return explicit_target_catalog_selection
 
+    def _catalog_frame_scope() -> list[int] | None:
+        if (
+            series_id is not None
+            or has_explicit_frame_selection
+            or pre_qc_resolved_runtime_scope
+        ):
+            return _frame_ids_for_step(selected_frame_ids)
+        return None
+
     try:
         if not config.skip_wcs:
             add_step(
@@ -1291,6 +1300,33 @@ def _run_field_pipeline(
                 ),
             )
 
+        if (
+            not stop_due_to_no_usable_frames
+            and not config.skip_catalog_frame_match
+            and not config.skip_detection_catalog_match
+        ):
+            def _bootstrap_catalog_to_frames_step():
+                _ensure_explicit_target_catalog_selection()
+                return match_catalog_to_frames(
+                    session,
+                    catalog_name=config.catalog_name,
+                    instrument_unit_id=config.instrument_unit_id,
+                    frame_ids=_catalog_frame_scope(),
+                    margin_pix=config.margin_pix,
+                    mag_key=config.mag_key,
+                    working_mag_limit=config.working_catalog_mag_limit,
+                    include_catalog_source_ids=explicit_target_catalog_source_ids,
+                    eligible_catalog_source_ids=None,
+                    priority_catalog_source_ids=explicit_target_catalog_source_ids,
+                    max_sources_per_frame=None,
+                    edge_margin_pix=config.catalog_edge_margin_pix,
+                    replace_existing=True,
+                    dry_run=config.dry_run,
+                    insert_batch_size=config.bulk_insert_batch_size,
+                )
+
+            add_step("bootstrap_catalog_to_frames", _bootstrap_catalog_to_frames_step)
+
         if not stop_due_to_no_usable_frames and not config.skip_detection_catalog_match:
             add_step(
                 "match_detections_to_catalog",
@@ -1376,15 +1412,7 @@ def _run_field_pipeline(
                     session,
                     catalog_name=config.catalog_name,
                     instrument_unit_id=config.instrument_unit_id,
-                    frame_ids=(
-                        _frame_ids_for_step(selected_frame_ids)
-                        if (
-                            series_id is not None
-                            or has_explicit_frame_selection
-                            or pre_qc_resolved_runtime_scope
-                        )
-                        else None
-                    ),
+                    frame_ids=_catalog_frame_scope(),
                     margin_pix=config.margin_pix,
                     mag_key=config.mag_key,
                     working_mag_limit=config.working_catalog_mag_limit,
@@ -1393,7 +1421,11 @@ def _run_field_pipeline(
                     priority_catalog_source_ids=explicit_target_catalog_source_ids,
                     max_sources_per_frame=config.max_working_sources_per_frame,
                     edge_margin_pix=config.catalog_edge_margin_pix,
-                    replace_existing=config.replace_frame_catalog_links,
+                    replace_existing=(
+                        True
+                        if not config.skip_detection_catalog_match
+                        else config.replace_frame_catalog_links
+                    ),
                     dry_run=config.dry_run,
                     insert_batch_size=config.bulk_insert_batch_size,
                 )
