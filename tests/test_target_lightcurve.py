@@ -243,6 +243,7 @@ def test_faint_target_projection_is_supported_bounded_and_prioritized(
         },
     ]
     events = []
+    projection_kwargs = {}
 
     class FakeResult:
         def __init__(self, rows):
@@ -274,7 +275,21 @@ def test_faint_target_projection_is_supported_bounded_and_prioritized(
                 events.append("resolve-explicit-target")
                 return FakeResult(resolver_rows)
             if "FROM frame_catalog_links" in sql:
-                return FakeResult(self.link_rows)
+                assert "project-sources" in events, (
+                    "FrameCatalogLink reads are allowed only after final projection"
+                )
+                eligible_ids = projection_kwargs.get("eligible_catalog_source_ids")
+                if eligible_ids is not None:
+                    eligible_ids = set(eligible_ids) | set(
+                        projection_kwargs.get("priority_catalog_source_ids") or []
+                    )
+                selected_links = [
+                    row
+                    for row in self.link_rows
+                    if eligible_ids is None
+                    or int(row["catalog_source_id"]) in eligible_ids
+                ]
+                return FakeResult(selected_links)
             if "catalog_sources.catalog_name AS catalog_name" in sql:
                 linked_ids = {int(row["catalog_source_id"]) for row in self.link_rows}
                 source_rows = []
@@ -302,9 +317,24 @@ def test_faint_target_projection_is_supported_bounded_and_prioritized(
                     )
                 return FakeResult(source_rows)
             if "FROM catalog_sources" in sql:
-                return FakeResult(
-                    [SimpleNamespace(_mapping=source) for source in sources]
-                )
+                kwargs = projection_kwargs
+                include_ids = set(kwargs.get("include_catalog_source_ids") or [])
+                eligible_ids = kwargs.get("eligible_catalog_source_ids")
+                eligible_ids = None if eligible_ids is None else set(eligible_ids) | include_ids
+                if eligible_ids is not None:
+                    assert "catalog_sources.catalog_source_id IN" in sql
+                assert "catalog_sources.ref_mags" in sql
+                mag_limit = kwargs.get("working_mag_limit")
+                selected_sources = []
+                for source in sources:
+                    source_id = int(source["catalog_source_id"])
+                    mag = source["ref_mags"].get("G")
+                    if eligible_ids is not None and source_id not in eligible_ids:
+                        continue
+                    if mag_limit is not None and (mag is None or mag > mag_limit) and source_id not in include_ids:
+                        continue
+                    selected_sources.append(SimpleNamespace(_mapping=source))
+                return FakeResult(selected_sources)
             raise AssertionError(f"unexpected mocked query: {sql}")
 
         def commit(self):
@@ -353,6 +383,8 @@ def test_faint_target_projection_is_supported_bounded_and_prioritized(
     def run_match(*args, **kwargs):
         events.append("match-catalog-to-frames")
         match_calls.append(dict(kwargs))
+        projection_kwargs.clear()
+        projection_kwargs.update(kwargs)
         matched = actual_match_catalog_to_frames(*args, **kwargs)
         assert matched.linked, (matched, session.statements, events)
         return matched
@@ -382,18 +414,15 @@ def test_faint_target_projection_is_supported_bounded_and_prioritized(
 
     def fake_match_detections(_session, **_kwargs):
         events.append("match-detections")
-        # Candidate selection is intentionally driven by the bootstrap links;
-        # the fake detector is at (11, 11), matching catalog source 100 only.
-        candidate_rows = list(session.link_rows)
-        assert candidate_rows
-        matched_source_ids[:] = [
-            int(row["catalog_source_id"])
-            for row in candidate_rows
-            if row["x"] == 11.0 and row["y"] == 11.0
-        ]
+        assert session.link_rows == []
+        assert _kwargs["working_mag_limit"] == 19.0
+        assert _kwargs["include_catalog_source_ids"] == (
+            [201] if expected_cap_id == 201 else []
+        )
+        matched_source_ids[:] = [100]
         return {
             "detection_run_id": 44,
-            "selected_catalog_sources": len(candidate_rows),
+            "selected_catalog_sources": 1,
             "matched": len(matched_source_ids),
         }
 
@@ -471,7 +500,7 @@ def test_faint_target_projection_is_supported_bounded_and_prioritized(
     assert linked_source_ids == expected_linked_ids
     assert len(session.link_rows) <= 1
     assert 202 not in linked_source_ids  # An ordinary G=20 source stays filtered.
-    assert projected_source_ra_by_call[-1] == expected_projected_ra
+    assert projected_source_ra_by_call == [expected_projected_ra]
     match_step = next(step for step in result.steps if step.step_name == "match_catalog_to_frames")
     assert match_step.result["linked"] == len(expected_linked_ids)
     assert match_step.result["projected_source_points"] == len(expected_projected_ra)
@@ -490,82 +519,44 @@ def test_faint_target_projection_is_supported_bounded_and_prioritized(
         else [100] if support_enabled
         else None
     )
+    assert len(match_calls) == 1
+    assert match_calls[0]["frame_ids"] == [1]
+    assert match_calls[0]["working_mag_limit"] == 19.0
+    assert match_calls[0]["max_sources_per_frame"] == 1
+    assert match_calls[0]["replace_existing"] is True
+    assert session.link_snapshots[0]
+    assert not any(step.step_name == "bootstrap_catalog_to_frames" for step in result.steps)
     if support_enabled:
-        assert len(match_calls) == 2
-        assert match_calls[0]["frame_ids"] == [1]
-        assert match_calls[1]["frame_ids"] == [1]
-        assert match_calls[0]["working_mag_limit"] == 19.0
-        assert match_calls[0]["include_catalog_source_ids"] == (
-            [201] if expected_cap_id == 201 else []
-        )
-        assert match_calls[0]["eligible_catalog_source_ids"] is None
-        assert match_calls[0]["max_sources_per_frame"] is None
-        assert match_calls[0]["replace_existing"] is True
-        assert match_calls[1]["replace_existing"] is True
-        assert session.link_snapshots[0]
-        bootstrap_step = next(
-            step
-            for step in result.steps
-            if step.step_name == "bootstrap_catalog_to_frames"
-        )
-        for counter in (
-            "selected_frames",
-            "selected_sources",
-            "mag_limited_sources",
-            "linked",
-            "limited_links",
-        ):
-            assert counter in bootstrap_step.result
-        assert bootstrap_step.result["selected_frames"] == 1
-        assert bootstrap_step.result["selected_sources"] == len(sources)
-        assert bootstrap_step.result["linked"] == len(session.link_snapshots[0]) > 0
-        assert bootstrap_step.result["limited_links"] == 0
-        assert bootstrap_step.elapsed_sec is not None
         match_detection_step = next(
             step for step in result.steps if step.step_name == "match_detections_to_catalog"
         )
         assert match_detection_step.result["selected_catalog_sources"] > 0
-        assert (
-            match_detection_step.result["selected_catalog_sources"]
-            == len(session.link_snapshots[0])
-        )
         assert match_detection_step.result["matched"] > 0
+        assert match_detection_step.elapsed_sec is not None
         assert result.quality_policy["detection_support_selection"][
             "supported_catalog_sources"
         ] > 0
-        assert len(session.link_snapshots) == 2
-        assert linked_source_ids == [int(row["catalog_source_id"]) for row in session.link_snapshots[-1]]
-        assert projected_source_ra_by_call[0] == (
-            [8.0, 9.0, 10.0] if expected_cap_id == 201 else [8.0, 9.0]
-        )
-        assert len(projected_source_ra_by_call) == 2
+        assert len(session.link_snapshots) == 1
+        assert linked_source_ids == [int(row["catalog_source_id"]) for row in session.link_snapshots[0]]
         assert forced_selection["eligible_catalog_source_ids"] == (
             [100, 201] if expected_cap_id == 201 else [100]
         )
         assert (
             events.index("detect-sources")
             < events.index("resolve-explicit-target")
-            < events.index("match-catalog-to-frames")
             < events.index("match-detections")
             < events.index("aggregate-support")
-            < max(
-                index
-                for index, event in enumerate(events)
-                if event == "match-catalog-to-frames"
-            )
+            < events.index("match-catalog-to-frames")
+            < events.index("project-sources")
         )
     else:
-        assert len(match_calls) == 1
         assert "aggregate-support" not in events
         assert (
             events.index("resolve-explicit-target")
             < events.index("match-catalog-to-frames")
             < events.index("project-sources")
         )
-        assert projected_source_ra_by_call == [
-            [8.0, 9.0, 10.0]
-        ]  # Unfiltered, but magnitude/cap bounded.
-        assert match_calls[0]["replace_existing"] is False
+        assert projected_source_ra_by_call == [[8.0, 9.0, 10.0]]
     assert forced_selection["priority_catalog_source_ids"] == (
         [201] if expected_cap_id == 201 else []
     )

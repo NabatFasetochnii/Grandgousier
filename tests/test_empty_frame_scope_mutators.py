@@ -845,6 +845,61 @@ def test_runner_skips_both_mutators_when_pre_qc_eliminates_the_resolved_scope(mo
     assert "stop_no_usable_frames" in [step.step_name for step in result.steps]
 
 
+def test_runner_reports_object_qc_preparation_progress_and_phase_timings(monkeypatch):
+    from grandgousier.quality.object_quality import ObjectQcResult
+
+    progress_messages = []
+    monkeypatch.setattr(runner_module, "_check_open_series_admission", lambda *_args: None)
+    monkeypatch.setattr(runner_module.tqdm, "write", progress_messages.append)
+    monkeypatch.setattr(
+        runner_module,
+        "load_calibration_analysis_snapshot",
+        lambda *_args, **_kwargs: runner_module.CalibrationAnalysisSnapshot(
+            calibration_version_id=1,
+            calibration_name="qc-test",
+            catalog_name="cat",
+            instrument_unit_id=None,
+            frame_ids=(1,),
+            min_measurements=10,
+            mag_key="G",
+            color_key="BP_RP",
+            y_key="mag_cal",
+            fwhm_header_unit="arcsec",
+            measurement_rows=(),
+            frames_by_id={},
+            objects_by_id={},
+            object_rows=[],
+            measurement_geometry={},
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "load_object_qc_support_snapshot",
+        lambda *_args, **_kwargs: SimpleNamespace(timings_sec={}),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "compute_object_qc",
+        lambda *_args, **_kwargs: ObjectQcResult(),
+    )
+
+    config = _runner_config(
+        frame_ids=[1],
+        series_id=None,
+        run_detection=False,
+        run_forced_photometry=False,
+    )
+    config.skip_object_qc = False
+    result = runner_module.run_field_pipeline(_NoSessionOperations(), config)
+
+    step = next(step for step in result.steps if step.step_name == "compute_object_qc")
+    timings = step.result["timings_sec"]
+    assert timings["runner_analysis_snapshot_preparation"] >= 0.0
+    assert timings["runner_support_snapshot_preparation"] >= 0.0
+    assert timings["runner_object_qc_preparation"] >= 0.0
+    assert progress_messages and "Object-QC preparation finished" in progress_messages[0]
+
+
 def test_runner_detects_matches_once_then_aggregates_physical_support(monkeypatch):
     calls = []
     monkeypatch.setattr(runner_module, "_check_open_series_admission", lambda *_args: None)

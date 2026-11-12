@@ -3,13 +3,19 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
-from sqlalchemy import bindparam, delete, func, select, text
+from sqlalchemy import and_, bindparam, delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, joinedload
 from tqdm import tqdm
 
+from grandgousier.catalogs.frame_match import (
+    _frame_wcs,
+    _project_sources,
+    _source_mag_sql_expression,
+)
 from grandgousier.db.bulk import DEFAULT_BULK_INSERT_BATCH_SIZE, iter_sized_chunks, row_column_count
 from grandgousier.db.detection_io import PostgresDetectionCatalogMatchCopyStage, postgres_copy_capable
 from grandgousier.db.detection_runs import (
@@ -24,7 +30,6 @@ from grandgousier.db.models import (
     DetectionRun,
     DetectionRunFrame,
     Frame,
-    FrameCatalogLink,
     FrameQc,
     SourceDetection,
 )
@@ -60,6 +65,10 @@ class DetectionCatalogQcResult:
     detection_load_sec: float = 0.0
     catalog_load_sec: float = 0.0
     matching_sec: float = 0.0
+    catalog_projection_sec: float = 0.0
+    spatial_index_sources: int = 0
+    spatial_candidate_checks: int = 0
+    candidate_pairs: int = 0
     qc_build_sec: float = 0.0
     delete_existing_sec: float = 0.0
     staging_copy_sec: float = 0.0
@@ -94,11 +103,11 @@ class CatalogMatchSource:
 
 
 @dataclass(frozen=True, slots=True)
-class CatalogMatchLink:
-    frame_id: int
-    catalog_source_id: int
-    x: float | None
-    y: float | None
+class _SkyQueryBox:
+    ra_min_deg: float
+    ra_max_deg: float
+    dec_min_deg: float
+    dec_max_deg: float
 
 
 def aggregate_detection_catalog_support(
@@ -155,6 +164,8 @@ def match_detections_to_catalog(
     detection_algorithm: str = "numpy_localmax_v1",
     radius_arcsec: float = 2.0,
     mag_key: str = "G",
+    working_mag_limit: float | None = None,
+    include_catalog_source_ids: list[int] | None = None,
     min_snr: float | None = None,
     limit_frames: int | None = None,
     replace_existing: bool = False,
@@ -206,13 +217,20 @@ def match_detections_to_catalog(
     result.prefetched_detection_rows = int(sum(len(rows) for rows in detections_by_frame.values()))
 
     started = time.perf_counter()
-    catalog_by_frame = _select_catalog_sources_bulk(
+    catalog_rows = _select_catalog_sources_bulk(
         session,
-        frame_ids=selected_frame_ids,
+        detections_by_frame=detections_by_frame,
         catalog_name=catalog_name,
+        radius_arcsec=radius_arcsec,
+        mag_key=mag_key,
+        working_mag_limit=working_mag_limit,
+        include_catalog_source_ids=include_catalog_source_ids,
     )
     result.catalog_load_sec = float(time.perf_counter() - started)
-    result.prefetched_catalog_rows = int(sum(len(rows) for rows in catalog_by_frame.values()))
+    result.prefetched_catalog_rows = len(catalog_rows)
+    result.selected_catalog_sources = len(catalog_rows)
+    catalog_index = _CatalogSkyIndex(catalog_rows, radius_arcsec=radius_arcsec)
+    result.spatial_index_sources = len(catalog_rows)
 
     match_run = None
     if not dry_run:
@@ -225,6 +243,10 @@ def match_detections_to_catalog(
                 "detection_algorithm": detection_algorithm,
                 "radius_arcsec": radius_arcsec,
                 "mag_key": mag_key,
+                "working_mag_limit": working_mag_limit,
+                "include_catalog_source_ids": sorted(
+                    {int(value) for value in (include_catalog_source_ids or [])}
+                ),
                 "min_snr": min_snr,
             },
             pipeline_run_id=pipeline_run_id,
@@ -249,17 +271,28 @@ def match_detections_to_catalog(
             result.checked_frames += 1
             try:
                 detections = detections_by_frame.get(int(frame.frame_id), [])
-                catalog_rows = catalog_by_frame.get(int(frame.frame_id), [])
                 result.selected_detections += len(detections)
-                result.selected_catalog_sources += len(catalog_rows)
 
                 started = time.perf_counter()
-                rows = _match_frame(
-                    frame=frame,
+                checks_before = catalog_index.total_query_checks
+                frame_pairs = _candidate_pairs(
                     detections=detections,
                     catalog_rows=catalog_rows,
                     radius_arcsec=radius_arcsec,
+                    spatial_index=catalog_index,
+                )
+                result.spatial_candidate_checks += (
+                    catalog_index.total_query_checks - checks_before
+                )
+                result.candidate_pairs += len(frame_pairs)
+                frame_catalog_sources = _unique_candidate_sources(frame_pairs)
+                rows = _match_frame(
+                    frame=frame,
+                    detections=detections,
+                    candidate_pairs=frame_pairs,
+                    radius_arcsec=radius_arcsec,
                     mag_key=mag_key,
+                    projection_timing=result,
                 )
                 result.matching_sec += float(time.perf_counter() - started)
                 result.matched += len(rows)
@@ -269,7 +302,7 @@ def match_detections_to_catalog(
                     frame=frame,
                     catalog_name=catalog_name,
                     detections=detections,
-                    catalog_rows=catalog_rows,
+                    catalog_rows=frame_catalog_sources,
                     match_rows=rows,
                     mag_key=mag_key,
                     radius_arcsec=radius_arcsec,
@@ -315,7 +348,7 @@ def match_detections_to_catalog(
                 status="DONE",
                 diagnostics={
                     "n_detections": int(len(detections)),
-                    "n_catalog_sources": int(len(catalog_rows)),
+                    "n_catalog_sources": len(frame_catalog_sources),
                     "n_matched": int(len(rows)),
                 },
             )
@@ -559,125 +592,247 @@ def _select_detections_bulk(
 def _select_catalog_sources_bulk(
     session: Session,
     *,
-    frame_ids: list[int],
+    detections_by_frame: dict[int, list[DetectionMatchInput]],
     catalog_name: str,
-) -> dict[int, list[tuple[CatalogMatchSource, CatalogMatchLink]]]:
-    if not frame_ids:
-        return {}
+    radius_arcsec: float,
+    mag_key: str,
+    working_mag_limit: float | None,
+    include_catalog_source_ids: list[int] | None = None,
+) -> list[CatalogMatchSource]:
+    """Load only catalog rows in selected detection footprints and match radius.
+
+    The match radius is expanded around each selected frame's detection envelope.
+    Explicitly requested target IDs are the only exception to the sky scope and
+    remain subject to the exact sky-distance check before they can gain support.
+    """
+
+    include_ids = sorted({int(value) for value in (include_catalog_source_ids or [])})
+    boxes = _sky_query_boxes(detections_by_frame, radius_arcsec=radius_arcsec)
+    if not boxes and not include_ids:
+        return []
+
     stmt = (
         select(
-            FrameCatalogLink.frame_id,
-            FrameCatalogLink.catalog_source_id,
-            FrameCatalogLink.x,
-            FrameCatalogLink.y,
+            CatalogSource.catalog_source_id,
             CatalogSource.source_id,
             CatalogSource.ra_deg,
             CatalogSource.dec_deg,
             CatalogSource.ref_mags,
         )
-        .select_from(FrameCatalogLink)
-        .join(CatalogSource, CatalogSource.catalog_source_id == FrameCatalogLink.catalog_source_id)
-        .where(
-            FrameCatalogLink.frame_id.in_(frame_ids),
-            FrameCatalogLink.in_footprint.is_(True),
-            CatalogSource.catalog_name == catalog_name,
-        )
-        .order_by(FrameCatalogLink.frame_id, CatalogSource.catalog_source_id)
+        .where(CatalogSource.catalog_name == catalog_name)
     )
+    scope_terms = [
+        and_(
+            CatalogSource.ra_deg >= box.ra_min_deg,
+            CatalogSource.ra_deg <= box.ra_max_deg,
+            CatalogSource.dec_deg >= box.dec_min_deg,
+            CatalogSource.dec_deg <= box.dec_max_deg,
+        )
+        for box in boxes
+    ]
+    source_scope = or_(*scope_terms) if scope_terms else None
+    if include_ids:
+        include_scope = CatalogSource.catalog_source_id.in_(include_ids)
+        source_scope = or_(source_scope, include_scope) if source_scope is not None else include_scope
+    if source_scope is not None:
+        stmt = stmt.where(source_scope)
+    if working_mag_limit is not None:
+        mag_limit = _source_mag_sql_expression(mag_key) <= float(working_mag_limit)
+        if include_ids:
+            mag_limit = or_(mag_limit, CatalogSource.catalog_source_id.in_(include_ids))
+        stmt = stmt.where(mag_limit)
+    stmt = stmt.order_by(CatalogSource.catalog_source_id)
 
-    grouped: dict[int, list[tuple[CatalogMatchSource, CatalogMatchLink]]] = {}
-    source_cache: dict[int, CatalogMatchSource] = {}
+    sources: list[CatalogMatchSource] = []
     for row in session.execute(stmt).mappings().all():
-        frame_id = int(row["frame_id"])
-        catalog_source_id = int(row["catalog_source_id"])
-        source = source_cache.get(catalog_source_id)
-        if source is None:
-            source = CatalogMatchSource(
-                catalog_source_id=catalog_source_id,
+        sources.append(
+            CatalogMatchSource(
+                catalog_source_id=int(row["catalog_source_id"]),
                 source_id=str(row["source_id"]),
                 ra_deg=float(row["ra_deg"]),
                 dec_deg=float(row["dec_deg"]),
                 ref_mags=dict(row["ref_mags"] or {}),
             )
-            source_cache[catalog_source_id] = source
-        link = CatalogMatchLink(
-            frame_id=frame_id,
-            catalog_source_id=catalog_source_id,
-            x=_safe_float(row["x"]),
-            y=_safe_float(row["y"]),
         )
-        grouped.setdefault(frame_id, []).append((source, link))
-    return grouped
+    return sources
 
 
-def _select_detections(
-    session: Session,
+def _sky_query_boxes(
+    detections_by_frame: dict[int, list[DetectionMatchInput]],
     *,
-    frame_id: int,
-    algorithm: str,
-    min_snr: float | None,
-) -> list[DetectionMatchInput]:
-    return _select_detections_bulk(
-        session,
-        frame_ids=[int(frame_id)],
-        algorithm=algorithm,
-        min_snr=min_snr,
-    ).get(int(frame_id), [])
+    radius_arcsec: float,
+) -> list[_SkyQueryBox]:
+    boxes: list[_SkyQueryBox] = []
+    for detections in detections_by_frame.values():
+        positions = [
+            (float(det.ra_deg), float(det.dec_deg))
+            for det in detections
+            if _safe_float(det.ra_deg) is not None and _safe_float(det.dec_deg) is not None
+        ]
+        boxes.extend(_sky_query_boxes_for_positions(positions, radius_arcsec=radius_arcsec))
+    return boxes
 
 
-def _select_catalog_sources_for_frame(
-    session: Session,
+def _sky_query_boxes_for_positions(
+    positions: list[tuple[float, float]],
     *,
-    frame_id: int,
-    catalog_name: str,
-) -> list[tuple[CatalogSource, FrameCatalogLink]]:
-    stmt = (
-        select(CatalogSource, FrameCatalogLink)
-        .select_from(FrameCatalogLink)
-        .join(CatalogSource, CatalogSource.catalog_source_id == FrameCatalogLink.catalog_source_id)
-        .where(
-            FrameCatalogLink.frame_id == frame_id,
-            FrameCatalogLink.in_footprint.is_(True),
-            CatalogSource.catalog_name == catalog_name,
+    radius_arcsec: float,
+) -> list[_SkyQueryBox]:
+    if not positions:
+        return []
+    radius_deg = min(180.0, float(radius_arcsec) / 3600.0)
+    dec_values = [max(-90.0, min(90.0, dec)) for _, dec in positions]
+    dec_min = max(-90.0, min(dec_values) - radius_deg)
+    dec_max = min(90.0, max(dec_values) + radius_deg)
+
+    ra_values = sorted(float(ra) % 360.0 for ra, _ in positions)
+    if len(ra_values) == 1:
+        ra_start = ra_end = ra_values[0]
+        ra_span = 0.0
+    else:
+        gaps = [
+            (ra_values[(index + 1) % len(ra_values)] + (360.0 if index == len(ra_values) - 1 else 0.0) - value,
+             index)
+            for index, value in enumerate(ra_values)
+        ]
+        largest_gap, gap_index = max(gaps)
+        ra_start = ra_values[(gap_index + 1) % len(ra_values)]
+        ra_end = ra_values[gap_index]
+        if ra_end < ra_start:
+            ra_end += 360.0
+        ra_span = max(0.0, 360.0 - largest_gap)
+
+    if dec_min <= -90.0 or dec_max >= 90.0:
+        ra_margin = 180.0
+    else:
+        cos_floor = math.cos(math.radians(max(abs(dec_min), abs(dec_max))))
+        ratio = math.sin(math.radians(radius_deg)) / max(cos_floor, 1e-12)
+        ra_margin = (
+            180.0
+            if ratio >= 1.0
+            else math.degrees(math.asin(ratio))
         )
-        .order_by(CatalogSource.catalog_source_id)
-    )
-    return [(row[0], row[1]) for row in session.execute(stmt).all()]
+    if ra_span + 2.0 * ra_margin >= 360.0:
+        return [_SkyQueryBox(0.0, 360.0, dec_min, dec_max)]
+
+    expanded_start = ra_start - ra_margin
+    expanded_end = ra_end + ra_margin
+    normalized_start = expanded_start % 360.0
+    normalized_end = expanded_end % 360.0
+    if expanded_start < 0.0 or expanded_end >= 360.0 or normalized_start > normalized_end:
+        return [
+            _SkyQueryBox(normalized_start, 360.0, dec_min, dec_max),
+            _SkyQueryBox(0.0, normalized_end, dec_min, dec_max),
+        ]
+    return [_SkyQueryBox(normalized_start, normalized_end, dec_min, dec_max)]
+
+
+class _CatalogSkyIndex:
+    """Uniform hash over unit-sphere coordinates for bounded radius lookups."""
+
+    def __init__(self, sources: list[CatalogMatchSource], *, radius_arcsec: float):
+        self.radius_rad = math.radians(float(radius_arcsec) / 3600.0)
+        self.chord_radius = 2.0 * math.sin(self.radius_rad / 2.0)
+        self.cell_size = max(self.chord_radius, 1e-12)
+        self.chord_radius_squared = self.chord_radius * self.chord_radius
+        self.cells: dict[tuple[int, int, int], list[tuple[CatalogMatchSource, tuple[float, float, float]]]] = {}
+        self.total_query_checks = 0
+        self.last_query_checks = 0
+        self.indexed_sources = 0
+        for source in sources:
+            vector = _unit_vector(source.ra_deg, source.dec_deg)
+            if vector is None:
+                continue
+            self.cells.setdefault(self._cell(vector), []).append((source, vector))
+            self.indexed_sources += 1
+
+    def _cell(self, vector: tuple[float, float, float]) -> tuple[int, int, int]:
+        return tuple(int(math.floor(value / self.cell_size)) for value in vector)
+
+    def query(self, ra_deg: float, dec_deg: float) -> list[CatalogMatchSource]:
+        vector = _unit_vector(ra_deg, dec_deg)
+        self.last_query_checks = 0
+        if vector is None:
+            return []
+        cx, cy, cz = self._cell(vector)
+        matches: list[CatalogMatchSource] = []
+        for ix in range(cx - 1, cx + 2):
+            for iy in range(cy - 1, cy + 2):
+                for iz in range(cz - 1, cz + 2):
+                    for source, source_vector in self.cells.get((ix, iy, iz), ()):
+                        self.last_query_checks += 1
+                        if sum((a - b) ** 2 for a, b in zip(vector, source_vector, strict=True)) <= (
+                            self.chord_radius_squared * (1.0 + 1e-12)
+                        ):
+                            matches.append(source)
+        self.total_query_checks += self.last_query_checks
+        matches.sort(key=lambda source: int(source.catalog_source_id))
+        return matches
+
+
+def _unit_vector(ra_deg: float, dec_deg: float) -> tuple[float, float, float] | None:
+    ra = _safe_float(ra_deg)
+    dec = _safe_float(dec_deg)
+    if ra is None or dec is None or not -90.0 <= dec <= 90.0:
+        return None
+    ra_rad = math.radians(ra % 360.0)
+    dec_rad = math.radians(dec)
+    cos_dec = math.cos(dec_rad)
+    return cos_dec * math.cos(ra_rad), cos_dec * math.sin(ra_rad), math.sin(dec_rad)
 
 
 def _match_frame(
     *,
     frame: Frame,
     detections: list[DetectionMatchInput],
-    catalog_rows: list[tuple[CatalogMatchSource, CatalogMatchLink]],
+    candidate_pairs: list[tuple[DetectionMatchInput, CatalogMatchSource]],
     radius_arcsec: float,
     mag_key: str,
+    projection_timing: DetectionCatalogQcResult | None = None,
 ) -> list[dict]:
-    if not detections or not catalog_rows:
+    if not detections or not candidate_pairs:
         return []
 
-    candidates: list[tuple[float, DetectionMatchInput, CatalogMatchSource, CatalogMatchLink]] = []
-    for det, source, link in _candidate_pairs(frame=frame, detections=detections, catalog_rows=catalog_rows, radius_arcsec=radius_arcsec):
-        if det.ra_deg is None or det.dec_deg is None:
-            continue
+    candidates: list[tuple[float, DetectionMatchInput, CatalogMatchSource]] = []
+    for det, source in candidate_pairs:
         sep = _sky_sep_arcsec(det.ra_deg, det.dec_deg, source.ra_deg, source.dec_deg)
         if sep is not None and sep <= radius_arcsec:
-            candidates.append((sep, det, source, link))
-    candidates.sort(key=lambda item: item[0])
+            candidates.append((sep, det, source))
+    candidates.sort(
+        key=lambda item: (
+            item[0],
+            int(item[1].source_detection_id),
+            int(item[2].catalog_source_id),
+        )
+    )
 
     used_detections: set[int] = set()
     used_sources: set[int] = set()
-    rows: list[dict] = []
-    for sep, det, source, link in candidates:
+    accepted: list[tuple[float, DetectionMatchInput, CatalogMatchSource]] = []
+    for sep, det, source in candidates:
         if det.source_detection_id in used_detections:
             continue
         if source.catalog_source_id in used_sources:
             continue
         used_detections.add(det.source_detection_id)
         used_sources.add(source.catalog_source_id)
+        accepted.append((sep, det, source))
 
-        dx = _safe_sub(det.x, link.x)
-        dy = _safe_sub(det.y, link.y)
+    projection_started = time.perf_counter()
+    pixel_positions = _project_catalog_sources_to_frame(
+        frame,
+        [source for _, _, source in accepted],
+    )
+    if projection_timing is not None:
+        projection_timing.catalog_projection_sec += float(
+            time.perf_counter() - projection_started
+        )
+
+    rows: list[dict] = []
+    for sep, det, source in accepted:
+        projected = pixel_positions.get(int(source.catalog_source_id))
+        dx = _safe_sub(det.x, projected[0]) if projected is not None else None
+        dy = _safe_sub(det.y, projected[1]) if projected is not None else None
         det_mag_inst = _mag_inst(det.flux)
         cat_mag = _catalog_mag(source, mag_key)
         zp = None
@@ -699,68 +854,56 @@ def _match_frame(
     return rows
 
 
+def _project_catalog_sources_to_frame(
+    frame: Frame,
+    sources: list[CatalogMatchSource],
+) -> dict[int, tuple[float, float]]:
+    if not sources:
+        return {}
+    raw_path = getattr(frame, "raw_path", None)
+    try:
+        wcs, _, _, _ = _frame_wcs(frame, Path(str(raw_path or "")))
+        source_ra = np.asarray([source.ra_deg for source in sources], dtype=float)
+        source_dec = np.asarray([source.dec_deg for source in sources], dtype=float)
+        x_values, y_values, _ = _project_sources(
+            wcs,
+            source_ra=source_ra,
+            source_dec=source_dec,
+        )
+    except Exception:
+        return {}
+    projected: dict[int, tuple[float, float]] = {}
+    for source, x, y in zip(sources, x_values, y_values, strict=True):
+        x_value = _safe_float(x)
+        y_value = _safe_float(y)
+        if x_value is not None and y_value is not None:
+            projected[int(source.catalog_source_id)] = (x_value, y_value)
+    return projected
+
+
 def _candidate_pairs(
     *,
-    frame: Frame,
     detections: list[DetectionMatchInput],
-    catalog_rows: list[tuple[CatalogMatchSource, CatalogMatchLink]],
+    catalog_rows: list[CatalogMatchSource],
     radius_arcsec: float,
-) -> list[tuple[DetectionMatchInput, CatalogMatchSource, CatalogMatchLink]]:
-    """Return plausible detection/catalog pairs using a pixel-space prefilter.
+    spatial_index: _CatalogSkyIndex | None = None,
+) -> list[tuple[DetectionMatchInput, CatalogMatchSource]]:
+    """Return sky-radius candidates using a unit-sphere spatial hash."""
 
-    The final acceptance is still performed in sky coordinates.  This grid only
-    prevents the O(N_detection * N_catalog) all-pairs loop that becomes very slow
-    for auto-generated Gaia catalogs.
-    """
-
-    radius_pix = _prefilter_radius_pix(frame, radius_arcsec=radius_arcsec)
-    if radius_pix is None:
-        return [(det, source, link) for det in detections for source, link in catalog_rows]
-
-    cell = max(1.0, float(radius_pix))
-    r2 = float(radius_pix) * float(radius_pix)
-    grid: dict[tuple[int, int], list[tuple[CatalogMatchSource, CatalogMatchLink]]] = {}
-    for source, link in catalog_rows:
-        x = _safe_float(link.x)
-        y = _safe_float(link.y)
-        if x is None or y is None:
-            continue
-        key = (int(math.floor(x / cell)), int(math.floor(y / cell)))
-        grid.setdefault(key, []).append((source, link))
-
-    pairs: list[tuple[DetectionMatchInput, CatalogMatchSource, CatalogMatchLink]] = []
-    neighbor_span = max(1, int(math.ceil(radius_pix / cell)))
+    index = spatial_index or _CatalogSkyIndex(catalog_rows, radius_arcsec=radius_arcsec)
+    pairs: list[tuple[DetectionMatchInput, CatalogMatchSource]] = []
     for det in detections:
-        dx0 = _safe_float(det.x)
-        dy0 = _safe_float(det.y)
-        if dx0 is None or dy0 is None:
+        if _safe_float(det.ra_deg) is None or _safe_float(det.dec_deg) is None:
             continue
-        cx = int(math.floor(dx0 / cell))
-        cy = int(math.floor(dy0 / cell))
-        for ix in range(cx - neighbor_span, cx + neighbor_span + 1):
-            for iy in range(cy - neighbor_span, cy + neighbor_span + 1):
-                for source, link in grid.get((ix, iy), []):
-                    lx = _safe_float(link.x)
-                    ly = _safe_float(link.y)
-                    if lx is None or ly is None:
-                        continue
-                    if (dx0 - lx) ** 2 + (dy0 - ly) ** 2 <= r2:
-                        pairs.append((det, source, link))
+        pairs.extend((det, source) for source in index.query(det.ra_deg, det.dec_deg))
     return pairs
 
 
-def _prefilter_radius_pix(frame: Frame, *, radius_arcsec: float) -> float | None:
-    scale = None
-    try:
-        unit = frame.instrument_unit
-        if unit is not None and unit.pixel_scale_arcsec is not None:
-            scale = float(unit.pixel_scale_arcsec)
-    except Exception:
-        scale = None
-    if scale is None or not math.isfinite(scale) or scale <= 0:
-        return None
-    # Conservative factor protects binned frames and imperfect WCS scale metadata.
-    return max(2.0, float(radius_arcsec) / scale * 4.0)
+def _unique_candidate_sources(
+    pairs: list[tuple[DetectionMatchInput, CatalogMatchSource]],
+) -> list[CatalogMatchSource]:
+    by_id = {int(source.catalog_source_id): source for _, source in pairs}
+    return [by_id[source_id] for source_id in sorted(by_id)]
 
 
 def _build_frame_qc_row(
@@ -768,7 +911,7 @@ def _build_frame_qc_row(
     frame: Frame,
     catalog_name: str,
     detections: list[DetectionMatchInput],
-    catalog_rows: list[tuple[CatalogMatchSource, CatalogMatchLink]],
+    catalog_rows: list[CatalogMatchSource],
     match_rows: list[dict],
     mag_key: str,
     radius_arcsec: float,

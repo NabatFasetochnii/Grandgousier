@@ -68,22 +68,27 @@ def test_measurement_upsert_is_chunked():
     assert len(session.statements) == 3
 
 
-def test_detection_catalog_candidate_pairs_uses_pixel_prefilter():
-    frame = SimpleNamespace(instrument_unit=SimpleNamespace(pixel_scale_arcsec=1.0))
+def test_detection_catalog_candidate_pairs_uses_spherical_prefilter():
+    from grandgousier.quality.detection_catalog_qc import CatalogMatchSource
+
     detections = [
         SimpleNamespace(x=10.0, y=10.0, ra_deg=1.0, dec_deg=1.0),
-        SimpleNamespace(x=100.0, y=100.0, ra_deg=1.0, dec_deg=1.0),
+        SimpleNamespace(x=100.0, y=100.0, ra_deg=1.0, dec_deg=1.001),
     ]
-    near_source = SimpleNamespace(catalog_source_id=1)
-    far_source = SimpleNamespace(catalog_source_id=2)
+    near_source = CatalogMatchSource(1, "near", 1.0 + 1.0 / 3600.0, 1.0, {})
+    far_source = CatalogMatchSource(2, "far", 1.0, 1.1, {})
     catalog_rows = [
-        (near_source, SimpleNamespace(x=11.0, y=10.5)),
-        (far_source, SimpleNamespace(x=500.0, y=500.0)),
+        near_source,
+        far_source,
     ]
 
-    pairs = _candidate_pairs(frame=frame, detections=detections, catalog_rows=catalog_rows, radius_arcsec=2.0)
+    pairs = _candidate_pairs(
+        detections=detections,
+        catalog_rows=catalog_rows,
+        radius_arcsec=2.0,
+    )
 
-    assert pairs == [(detections[0], near_source, catalog_rows[0][1])]
+    assert pairs == [(detections[0], near_source)]
 
 
 def test_measurement_copy_tuple_matches_column_order_and_serializes_flags() -> None:

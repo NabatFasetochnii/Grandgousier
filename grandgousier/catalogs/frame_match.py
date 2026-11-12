@@ -10,9 +10,10 @@ from typing import Any
 import numpy as np
 from astropy.io import fits
 from astropy.wcs import FITSFixedWarning, WCS
-from sqlalchemy import delete, select
+from sqlalchemy import case, cast, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
+from sqlalchemy.types import Float
 from tqdm import tqdm
 
 from grandgousier.db.bulk import DEFAULT_BULK_INSERT_BATCH_SIZE, iter_sized_chunks, row_column_count
@@ -94,6 +95,17 @@ def match_catalog_to_frames(
     result.selected_frames = len(frames)
 
     source_started = time.perf_counter()
+    included_source_ids = {
+        int(source_id) for source_id in (include_catalog_source_ids or [])
+    }
+    eligible_source_ids = (
+        None
+        if eligible_catalog_source_ids is None
+        else {int(source_id) for source_id in eligible_catalog_source_ids}
+    )
+    if eligible_source_ids is not None:
+        eligible_source_ids.update(included_source_ids)
+
     sources_stmt = (
         select(
             CatalogSource.catalog_source_id,
@@ -104,6 +116,22 @@ def match_catalog_to_frames(
         .where(CatalogSource.catalog_name == catalog_name)
         .order_by(CatalogSource.catalog_source_id)
     )
+    if eligible_source_ids is not None:
+        if eligible_source_ids:
+            sources_stmt = sources_stmt.where(
+                CatalogSource.catalog_source_id.in_(sorted(eligible_source_ids))
+            )
+        else:
+            # An empty enabled selection means no ordinary sources are eligible.
+            sources_stmt = sources_stmt.where(False)
+    if working_mag_limit is not None:
+        mag_limit = _source_mag_sql_expression(mag_key) <= float(working_mag_limit)
+        if included_source_ids:
+            mag_limit = or_(
+                mag_limit,
+                CatalogSource.catalog_source_id.in_(sorted(included_source_ids)),
+            )
+        sources_stmt = sources_stmt.where(mag_limit)
     if limit_sources is not None:
         sources_stmt = sources_stmt.limit(limit_sources)
     sources = [dict(row._mapping) for row in session.execute(sources_stmt).all()]
@@ -114,14 +142,6 @@ def match_catalog_to_frames(
     # construction.
     for source in sources:
         source["_match_mag"] = _source_mag(source, mag_key)
-    included_source_ids = {
-        int(source_id) for source_id in (include_catalog_source_ids or [])
-    }
-    eligible_source_ids = (
-        None
-        if eligible_catalog_source_ids is None
-        else {int(source_id) for source_id in eligible_catalog_source_ids}
-    )
     priority_source_ids = {
         int(source_id) for source_id in (priority_catalog_source_ids or [])
     }
@@ -137,13 +157,6 @@ def match_catalog_to_frames(
             or int(source["catalog_source_id"]) in included_source_ids
         ]
     result.mag_limited_sources = len(sources)
-    if eligible_source_ids is not None:
-        eligible_source_ids.update(included_source_ids)
-        sources = [
-            source
-            for source in sources
-            if int(source["catalog_source_id"]) in eligible_source_ids
-        ]
     sources.sort(
         key=lambda source: (
             source["_match_mag"] is None,
@@ -153,9 +166,6 @@ def match_catalog_to_frames(
     )
     result.source_load_sec = float(time.perf_counter() - source_started)
 
-    if not sources:
-        return result
-
     source_ids = [int(source["catalog_source_id"]) for source in sources]
     source_mags = [source["_match_mag"] for source in sources]
     source_ra = np.asarray([float(source["ra_deg"]) for source in sources], dtype=float)
@@ -164,7 +174,7 @@ def match_catalog_to_frames(
     copy_stage: PostgresFrameCatalogLinkCopyStage | None = None
     if dry_run:
         result.write_strategy = "DRY_RUN"
-    elif postgres_copy_capable(session):
+    elif sources and postgres_copy_capable(session):
         copy_stage = PostgresFrameCatalogLinkCopyStage.create(session)
         result.write_strategy = "POSTGRESQL_COPY_STAGING"
     else:
@@ -431,8 +441,7 @@ def _source_mag(source: dict, mag_key: str) -> float | None:
     ref_mags = source.get("ref_mags") or {}
     if not isinstance(ref_mags, dict):
         return None
-    candidates = [mag_key, mag_key.upper(), mag_key.lower(), "G", "g", "phot_g_mean_mag"]
-    for key in candidates:
+    for key in _source_mag_keys(mag_key):
         if key in ref_mags:
             try:
                 value = float(ref_mags[key])
@@ -441,6 +450,33 @@ def _source_mag(source: dict, mag_key: str) -> float | None:
             if math.isfinite(value):
                 return value
     return None
+
+
+def _source_mag_keys(mag_key: str) -> list[str]:
+    """Return ordered aliases shared by Python and SQL working-magnitude selection."""
+
+    return list(
+        dict.fromkeys(
+            [mag_key, mag_key.upper(), mag_key.lower(), "G", "g", "phot_g_mean_mag"]
+        )
+    )
+
+
+def _source_mag_sql_expression(mag_key: str):
+    """Parse the same ordered JSONB magnitude aliases as ``_source_mag`` in SQL."""
+
+    numeric_pattern = r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+    parsed = []
+    for key in _source_mag_keys(mag_key):
+        raw_value = CatalogSource.ref_mags[key].astext
+        trimmed_value = func.btrim(raw_value, " \t\n\r\f\v")
+        parsed.append(
+            case(
+                (trimmed_value.op("~")(numeric_pattern), cast(trimmed_value, Float)),
+                else_=None,
+            )
+        )
+    return func.coalesce(*parsed)
 
 
 def _select_frames(

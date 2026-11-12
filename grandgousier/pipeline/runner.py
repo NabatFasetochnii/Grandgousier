@@ -90,6 +90,7 @@ from grandgousier.quality.candidate_axis_correlation import (
 )
 from grandgousier.quality.frame_pre_qc import filter_bad_pre_qc_frame_ids, run_frame_pre_qc
 from grandgousier.lightcurves.product import light_curve_reject_flags
+from grandgousier.lightcurves.product import build_light_curve_count_summary
 from grandgousier.lightcurves.candidates import export_accepted_candidate_light_curves
 from grandgousier.lightcurves.target import (
     TargetResolution,
@@ -108,6 +109,7 @@ from grandgousier.archive.fields_series import (
     mark_series_pipeline_result,
     mark_series_pipeline_started,
 )
+from tqdm import tqdm
 
 
 PIPELINE_RECIPE_VERSION = "field_pipeline_v9"
@@ -1031,9 +1033,21 @@ def _run_field_pipeline(
         return snapshot
 
     def _compute_object_qc_for(calibration_name: str):
+        preparation_started = time.perf_counter()
+        analysis_started = time.perf_counter()
         analysis_snapshot = _analysis_snapshot_for(calibration_name)
+        analysis_preparation_sec = float(time.perf_counter() - analysis_started)
+        support_started = time.perf_counter()
         support_snapshot = _object_qc_support_for(analysis_snapshot)
-        return compute_object_qc(
+        support_preparation_sec = float(time.perf_counter() - support_started)
+        preparation_sec = float(time.perf_counter() - preparation_started)
+        tqdm.write(
+            "Object-QC preparation finished: "
+            f"analysis_snapshot={analysis_preparation_sec:.3f}s, "
+            f"support_snapshot={support_preparation_sec:.3f}s, "
+            f"total={preparation_sec:.3f}s"
+        )
+        result = compute_object_qc(
             session,
             calibration_name=calibration_name,
             catalog_name=config.catalog_name,
@@ -1057,6 +1071,12 @@ def _run_field_pipeline(
             analysis_snapshot=analysis_snapshot,
             support_snapshot=support_snapshot,
         )
+        timings = getattr(result, "timings_sec", None)
+        if isinstance(timings, dict):
+            timings["runner_analysis_snapshot_preparation"] = analysis_preparation_sec
+            timings["runner_support_snapshot_preparation"] = support_preparation_sec
+            timings["runner_object_qc_preparation"] = preparation_sec
+        return result
 
     _emit_pipeline_log(
         session,
@@ -1175,6 +1195,10 @@ def _run_field_pipeline(
             else []
         )
         return explicit_target_catalog_selection
+
+    def _explicit_target_source_ids() -> list[int]:
+        _ensure_explicit_target_catalog_selection()
+        return list(explicit_target_catalog_source_ids)
 
     def _catalog_frame_scope() -> list[int] | None:
         if (
@@ -1300,33 +1324,6 @@ def _run_field_pipeline(
                 ),
             )
 
-        if (
-            not stop_due_to_no_usable_frames
-            and not config.skip_catalog_frame_match
-            and not config.skip_detection_catalog_match
-        ):
-            def _bootstrap_catalog_to_frames_step():
-                _ensure_explicit_target_catalog_selection()
-                return match_catalog_to_frames(
-                    session,
-                    catalog_name=config.catalog_name,
-                    instrument_unit_id=config.instrument_unit_id,
-                    frame_ids=_catalog_frame_scope(),
-                    margin_pix=config.margin_pix,
-                    mag_key=config.mag_key,
-                    working_mag_limit=config.working_catalog_mag_limit,
-                    include_catalog_source_ids=explicit_target_catalog_source_ids,
-                    eligible_catalog_source_ids=None,
-                    priority_catalog_source_ids=explicit_target_catalog_source_ids,
-                    max_sources_per_frame=None,
-                    edge_margin_pix=config.catalog_edge_margin_pix,
-                    replace_existing=True,
-                    dry_run=config.dry_run,
-                    insert_batch_size=config.bulk_insert_batch_size,
-                )
-
-            add_step("bootstrap_catalog_to_frames", _bootstrap_catalog_to_frames_step)
-
         if not stop_due_to_no_usable_frames and not config.skip_detection_catalog_match:
             add_step(
                 "match_detections_to_catalog",
@@ -1341,6 +1338,8 @@ def _run_field_pipeline(
                     ),
                     radius_arcsec=config.detection_match_radius_arcsec,
                     mag_key=config.mag_key,
+                    working_mag_limit=config.working_catalog_mag_limit,
+                    include_catalog_source_ids=_explicit_target_source_ids(),
                     replace_existing=config.replace_detection_matches,
                     dry_run=config.dry_run,
                     insert_batch_size=config.bulk_insert_batch_size,
@@ -1421,11 +1420,7 @@ def _run_field_pipeline(
                     priority_catalog_source_ids=explicit_target_catalog_source_ids,
                     max_sources_per_frame=config.max_working_sources_per_frame,
                     edge_margin_pix=config.catalog_edge_margin_pix,
-                    replace_existing=(
-                        True
-                        if not config.skip_detection_catalog_match
-                        else config.replace_frame_catalog_links
-                    ),
+                    replace_existing=True,
                     dry_run=config.dry_run,
                     insert_batch_size=config.bulk_insert_batch_size,
                 )
@@ -2235,6 +2230,18 @@ def _run_field_pipeline(
                             str(row.get("candidate_status") or "").upper() == "ACCEPTED"
                             for row in correlation_rows
                         ),
+                        "borderline_candidates": sum(
+                            str(row.get("candidate_status") or "").upper() == "BORDERLINE"
+                            for row in correlation_rows
+                        ),
+                        "diagnostic_candidates": sum(
+                            str(row.get("candidate_status") or "").upper() == "DIAGNOSTIC"
+                            for row in correlation_rows
+                        ),
+                        "rejected_candidates": sum(
+                            str(row.get("candidate_status") or "").upper() == "REJECTED"
+                            for row in correlation_rows
+                        ),
                         "candidate_input_retained_for_ensemble_exclusion": bool(
                             config.exclude_candidates_from_ensemble
                         ),
@@ -2920,6 +2927,22 @@ def _run_field_pipeline(
                     ),
                     insert_batch_size=config.bulk_insert_batch_size,
                 )
+                science_frame_ids = (
+                    _frame_ids_for_step(selected_frame_ids)
+                    if series_id is not None or has_explicit_frame_selection
+                    else None
+                )
+                science_counts = build_light_curve_count_summary(
+                    session,
+                    calibration_names=[science_name],
+                    catalog_name=config.catalog_name,
+                    instrument_unit_id=config.instrument_unit_id,
+                    frame_ids=science_frame_ids,
+                    interseries_generation_ids=config.interseries_generation_ids,
+                    reject_flags=_science_reject_flags(
+                        config, require_detection_support_effective
+                    ),
+                )
                 outputs["science_photometry_calibration"] = science_name
                 outputs["science_photometry_rows"] = science_result.science_rows_after
                 outputs["science_photometry_pruned_non_science_rows"] = (
@@ -2932,6 +2955,17 @@ def _run_field_pipeline(
                     "status": science_result.status,
                     "science_storage_mode": outputs["science_storage_mode"],
                     "science_photometry": science_result.to_dict(),
+                    "science_acceptance_rejection": {
+                        "total_points": int(science_counts.total_points),
+                        "accepted_points": int(science_counts.accepted_points),
+                        "rejected_points": int(science_counts.rejected_points),
+                        "objects": int(science_counts.n_objects),
+                        "reject_flags": sorted(
+                            _science_reject_flags(
+                                config, require_detection_support_effective
+                            )
+                        ),
+                    },
                 }
 
             add_step("materialize_science_photometry", _science_materialization_step)
@@ -3948,12 +3982,23 @@ def _candidate_ensemble_exclusion_history(result: PipelineRunResult) -> list[dic
 
 def _quality_policy_summary(config: FieldPipelineConfig, result: PipelineRunResult) -> dict[str, Any]:
     match_result = _step_result(result, "match_detections_to_catalog") or {}
+    projection_result = _step_result(result, "match_catalog_to_frames") or {}
     target_result = _step_result(result, "resolve_target_object") or {}
     target_resolved = bool(target_result.get("resolved"))
     exclusion_history = _candidate_ensemble_exclusion_history(result)
     convergence_result = _step_result(result, "candidate_ensemble_convergence") or {}
     color_result = _step_result(result, "apply_color_calibration") or {}
     forced_result = _step_result(result, "run_forced_photometry") or {}
+    science_materialization_result = (
+        _step_result(result, "materialize_science_photometry") or {}
+    )
+    science_acceptance_rejection = science_materialization_result.get(
+        "science_acceptance_rejection"
+    )
+    field_report_result = _step_results_with_prefix(result, "field_qc_report")
+    final_field_report = field_report_result[-1] if field_report_result else {}
+    candidate_triage = final_field_report.get("candidate_triage") or {}
+    candidate_membership = final_field_report.get("candidate_membership") or {}
     detection_support_result = _step_result(result, "aggregate_detection_support") or {
         "status": "NOT_RUN"
     }
@@ -4164,6 +4209,69 @@ def _quality_policy_summary(config: FieldPipelineConfig, result: PipelineRunResu
         "detection_matching_executed": bool(match_result),
         "detection_matches_count": int(match_result.get("matched") or 0),
         "detection_support_selection": detection_support_result,
+        "selection_diagnostics": {
+            "detection_support": detection_support_result,
+            "catalog_projection": {
+                "selected_frames": projection_result.get("selected_frames"),
+                "selected_sources": projection_result.get("selected_sources"),
+                "mag_limited_sources": projection_result.get("mag_limited_sources"),
+                "linked": projection_result.get("linked"),
+                "limited_links": projection_result.get("limited_links"),
+                "deleted_existing": projection_result.get("deleted_existing"),
+                "source_cap_per_frame": config.max_working_sources_per_frame,
+                "replace_existing": (
+                    True if _step_result(result, "match_catalog_to_frames") is not None else None
+                ),
+                "phase_timings_sec": {
+                    label: projection_result[key]
+                    for label, key in (
+                        ("source_load", "source_load_sec"),
+                        ("header_wcs", "header_wcs_sec"),
+                        ("wcs_projection", "wcs_projection_sec"),
+                        ("row_build", "row_build_sec"),
+                        ("delete_existing", "delete_existing_sec"),
+                        ("staging_copy", "staging_copy_sec"),
+                        ("insert_select", "insert_select_sec"),
+                        ("write_finalize", "write_finalize_sec"),
+                    )
+                    if key in projection_result
+                },
+            },
+            "direct_detection_matching": {
+                "selected_frames": match_result.get("selected_frames"),
+                "loaded_detections": match_result.get("prefetched_detection_rows"),
+                "loaded_catalog_sources": match_result.get(
+                    "prefetched_catalog_rows",
+                    match_result.get("selected_catalog_sources"),
+                ),
+                "matches": match_result.get("matched"),
+                "spatial_index_sources": match_result.get("spatial_index_sources"),
+                "spatial_candidate_checks": match_result.get(
+                    "spatial_candidate_checks"
+                ),
+                "candidate_pairs": match_result.get("candidate_pairs"),
+                "phase_timings_sec": {
+                    label: match_result[key]
+                    for label, key in (
+                        ("frame_load", "frame_load_sec"),
+                        ("detection_load", "detection_load_sec"),
+                        ("catalog_load", "catalog_load_sec"),
+                        ("matching", "matching_sec"),
+                        ("catalog_projection", "catalog_projection_sec"),
+                    )
+                    if key in match_result
+                },
+            },
+            "forced_photometry_links": {
+                "eligible_links_before_cap": forced_result.get(
+                    "eligible_links_before_cap"
+                ),
+                "selected_links_after_cap": forced_result.get(
+                    "selected_links_after_cap"
+                ),
+                "cap_dropped_links": forced_result.get("cap_dropped_links"),
+            },
+        },
         "forced_photometry_selection": (
             {
                 **detection_support_result,
@@ -4179,6 +4287,45 @@ def _quality_policy_summary(config: FieldPipelineConfig, result: PipelineRunResu
             if _step_result(result, "run_forced_photometry") is not None
             else None
         ),
+        "measurement_diagnostics": {
+            "selected_frames": forced_result.get("selected_frames"),
+            "selected_links": forced_result.get("selected_links"),
+            "eligible_links_before_cap": forced_result.get(
+                "eligible_links_before_cap"
+            ),
+            "selected_links_after_cap": forced_result.get(
+                "selected_links_after_cap"
+            ),
+            "cap_dropped_links": forced_result.get("cap_dropped_links"),
+            "measured": forced_result.get("measured"),
+            "inserted_or_updated": forced_result.get("inserted_or_updated"),
+            "failed_frames": forced_result.get("failed_frames"),
+            "failed_measurements": forced_result.get("failed_measurements"),
+        },
+        "ensemble_diagnostics": {
+            "selected_measurements": final_ensemble_result.get("selected_measurements"),
+            "checked_measurements": final_ensemble_result.get("checked_measurements"),
+            "selected_objects": final_ensemble_result.get("selected_objects"),
+            "reference_candidates": final_ensemble_result.get("reference_candidates"),
+            "usable_reference_objects": final_ensemble_result.get(
+                "usable_reference_objects"
+            ),
+            "selected_frames": final_ensemble_result.get("selected_frames"),
+            "frames_with_offsets": final_ensemble_result.get("frames_with_offsets"),
+            "calibrated": final_ensemble_result.get("calibrated"),
+            "skipped_other_catalog": final_ensemble_result.get("skipped_other_catalog"),
+            "skipped_no_input_mag": final_ensemble_result.get("skipped_no_input_mag"),
+            "skipped_no_frame_offset": final_ensemble_result.get("skipped_no_frame_offset"),
+            "skipped_nonfinite": final_ensemble_result.get("skipped_nonfinite"),
+        },
+        "science_acceptance_rejection": science_acceptance_rejection,
+        "candidate_acceptance_rejection": {
+            "accepted": candidate_triage.get("accepted", candidate_membership.get("accepted_candidates")),
+            "borderline": candidate_triage.get("borderline", candidate_membership.get("borderline_objects")),
+            "diagnostic": candidate_triage.get("diagnostic", candidate_membership.get("diagnostic_objects")),
+            "rejected": candidate_triage.get("rejected", candidate_membership.get("rejected_objects")),
+            "rejection_counts": candidate_triage.get("rejection_counts"),
+        },
         "require_detection_support_requested": config.require_detection_support,
         "require_detection_support_effective": _effective_require_detection_support(config),
         "target_source_id": config.target_source_id,

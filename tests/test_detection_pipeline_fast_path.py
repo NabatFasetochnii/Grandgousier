@@ -14,6 +14,11 @@ from grandgousier.db.detection_io import (
     source_detection_copy_tuple,
 )
 from grandgousier.quality.detection_catalog_qc import (
+    CatalogMatchSource,
+    DetectionMatchInput,
+    _CatalogSkyIndex,
+    _candidate_pairs,
+    _match_frame,
     aggregate_detection_catalog_support,
     _select_catalog_sources_bulk,
     _select_detections_bulk,
@@ -209,7 +214,7 @@ def test_spatial_hash_preserves_strict_boundary_rule():
     )
 
 
-def test_detection_and_catalog_bulk_prefetch_are_scalar_and_grouped():
+def test_detection_and_catalog_bulk_prefetch_are_scalar_and_sky_scoped():
     detection_rows = [
         {
             "source_detection_id": 10,
@@ -238,23 +243,10 @@ def test_detection_and_catalog_bulk_prefetch_are_scalar_and_grouped():
     ]
     catalog_rows = [
         {
-            "frame_id": 1,
             "catalog_source_id": 100,
-            "x": 11.1,
-            "y": 12.1,
             "source_id": "A",
-            "ra_deg": 10.0,
-            "dec_deg": 20.0,
-            "ref_mags": {"G": 12.3},
-        },
-        {
-            "frame_id": 2,
-            "catalog_source_id": 100,
-            "x": 21.1,
-            "y": 22.1,
-            "source_id": "A",
-            "ra_deg": 10.0,
-            "dec_deg": 20.0,
+            "ra_deg": 10.0001,
+            "dec_deg": 20.0001,
             "ref_mags": {"G": 12.3},
         },
     ]
@@ -268,16 +260,300 @@ def test_detection_and_catalog_bulk_prefetch_are_scalar_and_grouped():
     )
     catalogs = _select_catalog_sources_bulk(
         session,
-        frame_ids=[1, 2],
+        detections_by_frame=detections,
         catalog_name="cat",
+        radius_arcsec=2.0,
+        mag_key="G",
+        working_mag_limit=19.0,
+        include_catalog_source_ids=[200],
     )
 
     assert session.execute_calls == 2
     assert [row.source_detection_id for row in detections[1]] == [10]
     assert [row.source_detection_id for row in detections[2]] == [20]
-    assert catalogs[1][0][0] is catalogs[2][0][0]
-    assert catalogs[1][0][0].ref_mags == {"G": 12.3}
-    assert catalogs[2][0][1].x == 21.1
+    assert len(catalogs) == 1
+    assert catalogs[0].catalog_source_id == 100
+    assert catalogs[0].ref_mags == {"G": 12.3}
+    sql = str(session.statements[1]).lower()
+    assert "catalog_sources.ra_deg" in sql
+    assert "catalog_sources.dec_deg" in sql
+    assert "catalog_sources.catalog_source_id in" in sql
+    assert "frame_catalog_links" not in sql
+    assert "ref_mags" in sql
+    assert "btrim(" in sql
+
+
+def test_run_frame_diagnostics_count_unique_candidates_for_each_frame(monkeypatch):
+    from types import SimpleNamespace
+
+    import grandgousier.quality.detection_catalog_qc as module
+
+    frames = [
+        SimpleNamespace(frame_id=1, quality_flags={}),
+        SimpleNamespace(frame_id=2, quality_flags={}),
+    ]
+    detections = {
+        1: [DetectionMatchInput(101, 1, 1.0, 1.0, 5.0, 0.0, None, 100.0, 10.0, "test")],
+        2: [DetectionMatchInput(201, 2, 1.0, 1.0, 25.0, 0.0, None, 100.0, 10.0, "test")],
+    }
+    catalog_sources = [
+        CatalogMatchSource(11, "frame-1", 5.0, 0.0, {"G": 12.0}),
+        CatalogMatchSource(22, "frame-2a", 25.0, 0.0, {"G": 12.0}),
+        CatalogMatchSource(23, "frame-2b", 25.0 + 1.0 / 3600.0, 0.0, {"G": 12.0}),
+    ]
+    run_frame_diagnostics = {}
+    monkeypatch.setattr(module, "_select_frames", lambda *_args, **_kwargs: frames)
+    monkeypatch.setattr(
+        module, "_select_detections_bulk", lambda *_args, **_kwargs: detections
+    )
+    monkeypatch.setattr(
+        module,
+        "_select_catalog_sources_bulk",
+        lambda *_args, **_kwargs: catalog_sources,
+    )
+    monkeypatch.setattr(
+        module,
+        "create_detection_run",
+        lambda *_args, **_kwargs: SimpleNamespace(detection_run_id=70),
+    )
+
+    def capture_run_frame(_session, *, frame_id, diagnostics, **_kwargs):
+        run_frame_diagnostics[int(frame_id)] = diagnostics
+        return SimpleNamespace(detection_run_frame_id=100 + int(frame_id))
+
+    monkeypatch.setattr(module, "create_detection_run_frame", capture_run_frame)
+    monkeypatch.setattr(module, "postgres_copy_capable", lambda _session: False)
+    monkeypatch.setattr(module, "_project_catalog_sources_to_frame", lambda *_args: {})
+    monkeypatch.setattr(
+        module, "_upsert_detection_catalog_matches", lambda *_args, **_kwargs: 1
+    )
+    monkeypatch.setattr(module, "_upsert_frame_qc", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module, "_merge_frame_quality_flags", lambda *_args: None)
+
+    class FakeSession:
+        def commit(self):
+            pass
+
+    module.match_detections_to_catalog(
+        FakeSession(),
+        catalog_name="cat",
+        frame_ids=[1, 2],
+        radius_arcsec=2.0,
+    )
+
+    assert run_frame_diagnostics[1]["n_catalog_sources"] == 1
+    assert run_frame_diagnostics[2]["n_catalog_sources"] == 2
+
+
+def test_direct_sky_match_is_nearest_one_to_one_and_radius_bounded(monkeypatch):
+    import grandgousier.quality.detection_catalog_qc as module
+
+    detections = [
+        DetectionMatchInput(100, 1, 0.0, 0.0, 0.0, 0.0, None, 100.0, 10.0, "test"),
+        DetectionMatchInput(200, 1, 1.0, 0.0, 1.5 / 3600.0, 0.0, None, 100.0, 10.0, "test"),
+    ]
+    sources = [
+        CatalogMatchSource(10, "s10", 0.7 / 3600.0, 0.0, {"G": 12.0}),
+        CatalogMatchSource(20, "s20", -0.5 / 3600.0, 0.0, {"G": 13.0}),
+        CatalogMatchSource(30, "s30", 3.6 / 3600.0, 0.0, {"G": 14.0}),
+    ]
+    index = _CatalogSkyIndex(sources, radius_arcsec=2.0)
+    pairs = _candidate_pairs(
+        detections=detections,
+        catalog_rows=sources,
+        radius_arcsec=2.0,
+        spatial_index=index,
+    )
+    monkeypatch.setattr(module, "_project_catalog_sources_to_frame", lambda *_args: {})
+
+    rows = _match_frame(
+        frame=object(),
+        detections=detections,
+        candidate_pairs=pairs,
+        radius_arcsec=2.0,
+        mag_key="G",
+    )
+
+    assert {
+        (row["source_detection_id"], row["catalog_source_id"])
+        for row in rows
+    } == {(100, 20), (200, 10)}
+    assert len({row["source_detection_id"] for row in rows}) == len(rows)
+    assert len({row["catalog_source_id"] for row in rows}) == len(rows)
+    assert all(row["sep_arcsec"] <= 2.0 for row in rows)
+    assert 30 not in {row["catalog_source_id"] for row in rows}
+
+
+def test_spherical_spatial_hash_checks_local_cells_not_all_catalog_pairs():
+    sources = [
+        CatalogMatchSource(index, str(index), 20.0 + index * 0.3, 0.0, {})
+        for index in range(1000)
+    ]
+    sources.append(CatalogMatchSource(2000, "near", 0.0, 0.0, {}))
+    index = _CatalogSkyIndex(sources, radius_arcsec=2.0)
+    detection = DetectionMatchInput(1, 1, 0.0, 0.0, 0.0, 0.0, None, None, None, "test")
+
+    pairs = _candidate_pairs(
+        detections=[detection],
+        catalog_rows=sources,
+        radius_arcsec=2.0,
+        spatial_index=index,
+    )
+
+    assert pairs == [(detection, sources[-1])]
+    assert index.total_query_checks < len(sources) // 10
+
+
+def test_detection_catalog_candidate_scope_wraps_ra_zero_and_expands_match_radius():
+    from grandgousier.quality.detection_catalog_qc import _sky_query_boxes_for_positions
+
+    boxes = _sky_query_boxes_for_positions(
+        [(359.999, 20.0), (0.001, 20.0)],
+        radius_arcsec=2.0,
+    )
+
+    assert len(boxes) == 2
+    assert boxes[0].ra_min_deg > boxes[0].ra_max_deg or boxes[0].ra_max_deg == 360.0
+    assert all(box.dec_min_deg < 20.0 < box.dec_max_deg for box in boxes)
+
+
+def test_pipeline_quality_policy_exposes_selection_measurement_ensemble_and_science_counts():
+    from grandgousier.pipeline.runner import (
+        FieldPipelineConfig,
+        PipelineRunResult,
+        PipelineStepRecord,
+        _quality_policy_summary,
+    )
+
+    result = PipelineRunResult(
+        run_uid="telemetry-test",
+        pipeline_run_id=None,
+        status="DONE",
+        calibration_names={},
+        steps=[
+            PipelineStepRecord(
+                "match_detections_to_catalog",
+                "DONE",
+                {
+                    "selected_frames": 4,
+                    "prefetched_detection_rows": 15,
+                    "prefetched_catalog_rows": 20,
+                    "selected_catalog_sources": 20,
+                    "matched": 12,
+                    "spatial_index_sources": 20,
+                    "spatial_candidate_checks": 100,
+                    "candidate_pairs": 18,
+                    "frame_load_sec": 0.1,
+                    "detection_load_sec": 0.2,
+                    "catalog_load_sec": 0.3,
+                    "matching_sec": 0.4,
+                    "catalog_projection_sec": 0.05,
+                },
+            ),
+            PipelineStepRecord(
+                "aggregate_detection_support",
+                "DONE",
+                {"status": "DONE", "supported_catalog_sources": 4},
+            ),
+            PipelineStepRecord(
+                "match_catalog_to_frames",
+                "DONE",
+                {
+                    "selected_sources": 4,
+                    "linked": 3,
+                    "limited_links": 1,
+                    "source_load_sec": 0.11,
+                    "header_wcs_sec": 0.12,
+                    "wcs_projection_sec": 0.13,
+                    "row_build_sec": 0.14,
+                    "delete_existing_sec": 0.15,
+                    "staging_copy_sec": 0.16,
+                    "insert_select_sec": 0.17,
+                    "write_finalize_sec": 0.18,
+                },
+            ),
+            PipelineStepRecord(
+                "run_forced_photometry",
+                "DONE",
+                {
+                    "selected_links": 3,
+                    "eligible_links_before_cap": 5,
+                    "selected_links_after_cap": 3,
+                    "cap_dropped_links": 2,
+                    "measured": 3,
+                    "failed_measurements": 1,
+                },
+            ),
+            PipelineStepRecord(
+                "ensemble_calibrate",
+                "DONE",
+                {
+                    "selected_measurements": 30,
+                    "selected_objects": 10,
+                    "reference_candidates": 8,
+                    "usable_reference_objects": 7,
+                    "selected_frames": 4,
+                    "frames_with_offsets": 4,
+                    "calibrated": 28,
+                    "skipped_no_frame_offset": 2,
+                },
+            ),
+            PipelineStepRecord(
+                "field_qc_report",
+                "DONE",
+                {
+                    "candidate_triage": {
+                        "accepted": 2,
+                        "borderline": 1,
+                        "rejected": 3,
+                        "rejection_counts": {"HIGH_RMS": 3},
+                    }
+                },
+            ),
+            PipelineStepRecord(
+                "materialize_science_photometry",
+                "DONE",
+                {
+                    "science_acceptance_rejection": {
+                        "total_points": 40,
+                        "accepted_points": 35,
+                        "rejected_points": 5,
+                    }
+                },
+            ),
+        ],
+    )
+
+    diagnostics = _quality_policy_summary(
+        FieldPipelineConfig(catalog_name="cat", calibration_prefix="telemetry"),
+        result,
+    )
+
+    assert diagnostics["selection_diagnostics"]["detection_support"][
+        "supported_catalog_sources"
+    ] == 4
+    assert diagnostics["selection_diagnostics"]["catalog_projection"]["limited_links"] == 1
+    direct_match = diagnostics["selection_diagnostics"]["direct_detection_matching"]
+    assert direct_match["loaded_detections"] == 15
+    assert direct_match["loaded_catalog_sources"] == 20
+    assert direct_match["matches"] == 12
+    assert direct_match["spatial_candidate_checks"] == 100
+    assert direct_match["candidate_pairs"] == 18
+    assert direct_match["phase_timings_sec"]["catalog_projection"] == 0.05
+    projection_timings = diagnostics["selection_diagnostics"]["catalog_projection"][
+        "phase_timings_sec"
+    ]
+    assert projection_timings["source_load"] == 0.11
+    assert projection_timings["wcs_projection"] == 0.13
+    assert diagnostics["measurement_diagnostics"]["measured"] == 3
+    assert diagnostics["measurement_diagnostics"]["failed_measurements"] == 1
+    assert diagnostics["ensemble_diagnostics"]["calibrated"] == 28
+    assert diagnostics["candidate_acceptance_rejection"]["rejected"] == 3
+    assert diagnostics["candidate_acceptance_rejection"]["rejection_counts"] == {
+        "HIGH_RMS": 3
+    }
+    assert diagnostics["science_acceptance_rejection"]["accepted_points"] == 35
+    assert diagnostics["science_acceptance_rejection"]["rejected_points"] == 5
 
 
 
