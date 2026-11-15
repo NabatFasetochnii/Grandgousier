@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import pytest
 
+from grandgousier.astrometry.gaia_wcs_com import (
+    GAIA_WCS_COM_ALGORITHM,
+    GAIA_WCS_COM_POLICY,
+)
 from grandgousier.interseries.planning import (
     InterseriesSeriesCandidate,
     _build_pair_candidates,
@@ -416,7 +420,8 @@ def test_required_stage2_recipe_excludes_incompatible_series_from_ready_graph() 
                 return FakeResult([{"field_id": 7, "field_name": "TEST_FIELD"}])
             if "FROM field_series fs" in sql:
                 good = {
-                    "recipe_version": "field_pipeline_v9",
+                    "recipe_version": "field_pipeline_v10",
+                    "astrometric_centering_algorithm": GAIA_WCS_COM_ALGORITHM,
                     "photometry_estimator": "adaptive_ellipse",
                     "aperture_correction_plane_policy": "evidence",
                     "working_catalog_mag_limit": 19.0,
@@ -432,11 +437,20 @@ def test_required_stage2_recipe_excludes_incompatible_series_from_ready_graph() 
                     "enable_photometric_frame_qc": True,
                     "color_calibration_requested": True,
                     "enable_spatial_ensemble": False,
-                    "quality_policy": {"detection_branch_enabled": True},
+                    "quality_policy": {
+                        "detection_branch_enabled": True,
+                        "astrometric_centering": {
+                            **GAIA_WCS_COM_POLICY,
+                            "fwhm_header_unit": "arcsec",
+                            "neighbor_completeness_proven": False,
+                        },
+                    },
                 }
                 bad = dict(good)
                 bad["photometry_estimator"] = "circular"
-                bad["quality_policy"] = {"detection_branch_enabled": False}
+                bad["quality_policy"] = dict(
+                    good["quality_policy"], detection_branch_enabled=False
+                )
                 first = _science_head(1, 101)
                 first["recipe_json"] = good
                 second = _science_head(2, 102)

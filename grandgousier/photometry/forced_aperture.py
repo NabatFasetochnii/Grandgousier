@@ -4,19 +4,27 @@ import csv
 import json
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 from astropy.io import fits
 from sqlalchemy import func, select
+from sqlalchemy.orm import aliased
 from sqlalchemy.orm import Session
 from tqdm import tqdm
 
 from grandgousier.calibration.provenance import (
     IMMUTABLE_CALIBRATION_STATUSES,
     prepare_calibration_version_for_write,
+)
+from grandgousier.astrometry.gaia_wcs_com import (
+    GAIA_WCS_COM_ALGORITHM,
+    GAIA_WCS_COM_POLICY,
+    build_gaia_wcs_com_policy,
+    build_gaia_wcs_com_refinements,
+    compose_final_center,
 )
 from grandgousier.db.bulk import DEFAULT_BULK_INSERT_BATCH_SIZE
 from grandgousier.db.measurement_io import (
@@ -55,6 +63,10 @@ from grandgousier.db.models import (
     FrameStatus,
     InstrumentUnit,
     Measurement,
+    DetectionCatalogMatch,
+    DetectionRun,
+    DetectionRunFrame,
+    SourceDetection,
 )
 from grandgousier.identity.object import get_or_create_object_for_catalog_source
 
@@ -115,6 +127,9 @@ class ForcedPhotometryResult:
     empirical_psf_frames_fallback: int = 0
     empirical_psf_measurements: int = 0
     empirical_psf_measurement_fallbacks: int = 0
+    astrometric_centering_local_com: int = 0
+    astrometric_centering_frame_shift: int = 0
+    astrometric_centering_wcs_fallback: int = 0
     measurements_with_selected_error: int = 0
     measurements_with_physical_error: int = 0
     measurements_with_legacy_comparison: int = 0
@@ -311,6 +326,15 @@ def run_forced_aperture_photometry(
     diagnostics_out_dir: str | Path | None = None,
     diagnose_performance: bool = False,
     immutable_generation: bool = False,
+    astrometric_centering_algorithm: str = GAIA_WCS_COM_ALGORITHM,
+    source_detection_run_id: int | None = None,
+    catalog_match_run_id: int | None = None,
+    candidate_pair_evidence_by_frame: Mapping[int, Mapping[str, Any]] | None = None,
+    working_catalog: Any | None = None,
+    neighbor_completeness_proven: bool = False,
+    neighbor_query_margin_arcmin: float | None = None,
+    fwhm_header_unit: str = "arcsec",
+    astrometric_centering_policy: Mapping[str, Any] | None = None,
 ) -> ForcedPhotometryResult:
     """Run forced photometry for catalog-frame links.
 
@@ -329,6 +353,12 @@ def run_forced_aperture_photometry(
     photometry_estimator = str(photometry_estimator or "circular").strip().lower()
     if photometry_estimator not in {"circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"}:
         raise ValueError("photometry_estimator must be 'circular', 'adaptive_ellipse', 'spatial_psf', or 'empirical_psf'")
+    astrometric_centering_algorithm = str(astrometric_centering_algorithm).strip()
+    if astrometric_centering_algorithm != GAIA_WCS_COM_ALGORITHM:
+        raise ValueError(
+            "astrometric_centering_algorithm must be "
+            f"{GAIA_WCS_COM_ALGORITHM!r}"
+        )
     if adaptive_interpolation_neighbors < 3:
         raise ValueError("adaptive_interpolation_neighbors must be >= 3")
     if adaptive_min_psf_references < 6:
@@ -381,6 +411,10 @@ def run_forced_aperture_photometry(
     if annulus_outer_pix <= annulus_inner_pix:
         raise ValueError("annulus_outer_pix must be greater than annulus_inner_pix")
 
+    centering_policy = build_gaia_wcs_com_policy(
+        {"fwhm_header_unit": fwhm_header_unit, **dict(astrometric_centering_policy or {})}
+    )
+
     result = ForcedPhotometryResult(
         dry_run=dry_run,
         insert_batch_size=int(insert_batch_size),
@@ -430,7 +464,7 @@ def run_forced_aperture_photometry(
         calibration_name = (
             f"raw_{estimator_tag}_r{_fmt_float(aperture_radius_pix)}_"
             f"ann{_fmt_float(annulus_inner_pix)}_{_fmt_float(annulus_outer_pix)}_"
-            f"{_random_error_model_tag(random_error_model)}"
+            f"{_random_error_model_tag(random_error_model)}_gaiawcscomv1"
         )
     result.calibration_name = calibration_name
 
@@ -484,6 +518,8 @@ def run_forced_aperture_photometry(
             parameters={
                 "aperture_radius_pix": aperture_radius_pix,
                 "photometry_estimator": photometry_estimator,
+                "astrometric_centering_algorithm": astrometric_centering_algorithm,
+                "astrometric_centering_policy": centering_policy,
                 "adaptive_algorithm": (ADAPTIVE_APERTURE_ALGORITHM if photometry_estimator in {"adaptive_ellipse", "spatial_psf", "empirical_psf"} else None),
                 "adaptive_detection_algorithm": adaptive_detection_algorithm,
                 "adaptive_min_psf_snr": adaptive_min_psf_snr,
@@ -618,6 +654,54 @@ def run_forced_aperture_photometry(
             session,
             frame_ids=[int(frame.frame_id) for frame in frames],
             algorithm=adaptive_detection_algorithm,
+            detection_run_id=source_detection_run_id,
+        )
+
+    center_refinements = {}
+    if not fast_complete_reuse:
+        current_matches = _select_current_gaia_wcs_com_matches(
+            session,
+            frame_ids=[int(frame.frame_id) for frame in frames],
+            source_detection_run_id=source_detection_run_id,
+            catalog_match_run_id=catalog_match_run_id,
+        )
+        source_ids_by_catalog_source_id = {
+            int(source.catalog_source_id): str(source.source_id)
+            for frame_links in prefetched_links.values()
+            for _link, source in frame_links
+        }
+        nearest_neighbor_by_source_id: dict[str, float | None] = {}
+        if neighbor_completeness_proven and working_catalog is not None and current_matches:
+            matched_source_ids = sorted(
+                {
+                    str(row["source_id"])
+                    for frame_rows in current_matches.values()
+                    for row in frame_rows
+                    if row.get("source_id") is not None
+                }
+            )
+            try:
+                nearest_neighbor_by_source_id = (
+                    working_catalog.nearest_neighbor_separations(matched_source_ids)
+                )
+            except Exception:  # noqa: BLE001 - neighbor failures disable only local COM.
+                # A transient neighbor-index failure only disables local COM; exact
+                # accepted matches can still support the guarded frame translation.
+                nearest_neighbor_by_source_id = {}
+        center_refinements = build_gaia_wcs_com_refinements(
+            prefetched_links,
+            current_matches,
+            {int(frame.frame_id): frame for frame in frames},
+            candidate_pair_evidence_by_frame=candidate_pair_evidence_by_frame,
+            source_ids_by_catalog_source_id=source_ids_by_catalog_source_id,
+            nearest_neighbor_by_source_id=nearest_neighbor_by_source_id,
+            neighbor_completeness_proven=neighbor_completeness_proven,
+            neighbor_query_margin_arcmin=neighbor_query_margin_arcmin,
+            source_detection_run_id=source_detection_run_id,
+            catalog_match_run_id=catalog_match_run_id,
+            aperture_radius_pix=float(aperture_radius_pix),
+            fwhm_header_unit=fwhm_header_unit,
+            policy=centering_policy,
         )
 
     # PostgreSQL fresh immutable BASE generations can be streamed directly into
@@ -840,6 +924,29 @@ def run_forced_aperture_photometry(
         for link, source in links:
             failure_stage = "object_identity"
             try:
+                original_link_x = _finite_float(link.x)
+                original_link_y = _finite_float(link.y)
+                center_refinement = center_refinements.get(
+                    int(link.frame_catalog_link_id)
+                )
+                if (
+                    center_refinement is not None
+                    and center_refinement.x is not None
+                    and center_refinement.y is not None
+                ):
+                    link = replace(
+                        link,
+                        x=float(center_refinement.x),
+                        y=float(center_refinement.y),
+                    )
+                    if center_refinement.method == "local_com":
+                        result.astrometric_centering_local_com += 1
+                    elif center_refinement.method == "frame_shift":
+                        result.astrometric_centering_frame_shift += 1
+                    else:
+                        result.astrometric_centering_wcs_fallback += 1
+                else:
+                    result.astrometric_centering_wcs_fallback += 1
                 phase_started = _timing_start()
                 object_id = object_cache.get(source.catalog_source_id)
                 if object_id is None:
@@ -1088,6 +1195,7 @@ def run_forced_aperture_photometry(
                         timing_totals[key] = timing_totals.get(key, 0.0) + float(value)
 
                 phase_started = _timing_start()
+                failure_stage = "measurement_row_build"
                 result.measured += 1
                 # Persisted diagnostics historically weight detector parameters
                 # by measurement rows, not by frames. Keep the in-memory fresh-
@@ -1158,14 +1266,50 @@ def run_forced_aperture_photometry(
                 frame_scintillation_available.append(scintillation_available)
                 if dry_run or object_id is None:
                     continue
-                failure_stage = "measurement_row_build"
+                psf_residual_dx = _finite_float(
+                    measurement.flags.get("psf_fit_centroid_dx_pix")
+                )
+                psf_residual_dy = _finite_float(
+                    measurement.flags.get("psf_fit_centroid_dy_pix")
+                )
+                center_provenance = (
+                    dict(center_refinement.provenance)
+                    if center_refinement is not None
+                    else {
+                        "algorithm": GAIA_WCS_COM_ALGORITHM,
+                        "method": "wcs",
+                        "position_method": "wcs",
+                        "position_fallback_reason": "centering_refinement_unavailable",
+                        "source_detection_run_id": source_detection_run_id,
+                        "catalog_match_run_id": catalog_match_run_id,
+                        "neighbor_completeness_proven": bool(
+                            neighbor_completeness_proven
+                        ),
+                    }
+                )
+                (
+                    final_x,
+                    final_y,
+                    full_offset_dx,
+                    full_offset_dy,
+                    center_provenance,
+                ) = compose_final_center(
+                    original_x=float(original_link_x),
+                    original_y=float(original_link_y),
+                    base_x=float(link.x),
+                    base_y=float(link.y),
+                    psf_residual_dx_pix=psf_residual_dx,
+                    psf_residual_dy_pix=psf_residual_dy,
+                    provenance=center_provenance,
+                )
+                measurement.flags["astrometric_centering"] = center_provenance
                 rows.append(
                     {
                         "object_id": object_id,
                         "frame_id": frame.frame_id,
                         "calibration_version_id": result.calibration_version_id,
-                        "x": float(link.x),
-                        "y": float(link.y),
+                        "x": final_x,
+                        "y": final_y,
                         "flux": measurement.flux,
                         "flux_err": measurement.flux_err,
                         "mag_inst": measurement.mag_inst,
@@ -1176,8 +1320,8 @@ def run_forced_aperture_photometry(
                         "aperture_radius_pix": measurement.aperture_radius_pix,
                         "local_background": measurement.local_background,
                         "local_zp_correction": None,
-                        "centroid_dx_pix": _finite_float(measurement.flags.get("psf_fit_centroid_dx_pix")),
-                        "centroid_dy_pix": _finite_float(measurement.flags.get("psf_fit_centroid_dy_pix")),
+                        "centroid_dx_pix": full_offset_dx,
+                        "centroid_dy_pix": full_offset_dy,
                         "flags": {
                             **measurement.flags,
                             "catalog_name": source.catalog_name,
@@ -1755,6 +1899,86 @@ def _select_frame_links_bulk(
     return grouped
 
 
+def _select_current_gaia_wcs_com_matches(
+    session: Session,
+    *,
+    frame_ids: list[int],
+    source_detection_run_id: int | None,
+    catalog_match_run_id: int | None,
+) -> dict[int, list[dict[str, Any]]]:
+    """Load accepted matches joining exactly the current detector and match runs."""
+
+    if (
+        not frame_ids
+        or source_detection_run_id is None
+        or catalog_match_run_id is None
+    ):
+        return {}
+    match_run = aliased(DetectionRun)
+    source_run = aliased(DetectionRun)
+    match_run_frame = aliased(DetectionRunFrame)
+    source_run_frame = aliased(DetectionRunFrame)
+    stmt = (
+        select(
+            match_run_frame.frame_id.label("frame_id"),
+            DetectionCatalogMatch.source_detection_id.label("source_detection_id"),
+            DetectionCatalogMatch.catalog_source_id.label("catalog_source_id"),
+            DetectionCatalogMatch.match_status.label("match_status"),
+            SourceDetection.x.label("x"),
+            SourceDetection.y.label("y"),
+            SourceDetection.peak_adu.label("peak_adu"),
+            SourceDetection.flags.label("flags"),
+            CatalogSource.source_id.label("source_id"),
+            source_run.detection_run_id.label("source_detection_run_id"),
+            match_run.detection_run_id.label("catalog_match_run_id"),
+        )
+        .select_from(DetectionCatalogMatch)
+        .join(
+            match_run_frame,
+            match_run_frame.detection_run_frame_id
+            == DetectionCatalogMatch.detection_run_frame_id,
+        )
+        .join(match_run, match_run.detection_run_id == match_run_frame.detection_run_id)
+        .join(
+            SourceDetection,
+            SourceDetection.source_detection_id
+            == DetectionCatalogMatch.source_detection_id,
+        )
+        .join(
+            source_run_frame,
+            source_run_frame.detection_run_frame_id
+            == SourceDetection.detection_run_frame_id,
+        )
+        .join(source_run, source_run.detection_run_id == source_run_frame.detection_run_id)
+        .join(
+            CatalogSource,
+            CatalogSource.catalog_source_id == DetectionCatalogMatch.catalog_source_id,
+        )
+        .where(
+            match_run.detection_run_id == int(catalog_match_run_id),
+            source_run.detection_run_id == int(source_detection_run_id),
+            match_run.run_kind == "CATALOG_MATCH",
+            source_run.run_kind == "SOURCE_DETECTION",
+            match_run_frame.frame_id.in_([int(value) for value in frame_ids]),
+            match_run_frame.frame_id == source_run_frame.frame_id,
+            match_run_frame.status == "DONE",
+            source_run_frame.status == "DONE",
+            SourceDetection.detection_status == "DETECTED",
+            DetectionCatalogMatch.match_status == "MATCHED",
+        )
+        .order_by(
+            match_run_frame.frame_id,
+            DetectionCatalogMatch.catalog_source_id,
+            DetectionCatalogMatch.source_detection_id,
+        )
+    )
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for row in session.execute(stmt).mappings().all():
+        frame_id = int(row["frame_id"])
+        grouped.setdefault(frame_id, []).append(dict(row))
+    return grouped
+
+
 def _forced_measurement_scope_is_complete(
     session: Session,
     *,
@@ -1904,6 +2128,15 @@ def _get_or_create_calibration_version(
     reuse_completed_immutable: bool = False,
 ) -> CalibrationVersion:
     existing = session.scalar(select(CalibrationVersion).where(CalibrationVersion.name == name))
+    if existing is not None:
+        existing_parameters = existing.parameters if isinstance(existing.parameters, dict) else {}
+        for key in ("astrometric_centering_algorithm", "astrometric_centering_policy"):
+            if existing_parameters.get(key) != parameters.get(key):
+                raise ValueError(
+                    "Calibration name already exists with incompatible "
+                    f"astrometric centering provenance: name={name!r}, field={key!r}. "
+                    "Use a distinct calibration name."
+                )
     if existing is not None and str(getattr(existing, "lifecycle_status", "") or "") not in {
         "COMPLETE_IMMUTABLE",
         "SUPERSEDED_IMMUTABLE",

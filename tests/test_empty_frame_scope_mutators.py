@@ -735,6 +735,8 @@ def test_runner_passes_none_only_for_unscoped_mutator_calls(
     series_frame_ids,
     expected_frame_ids,
 ):
+    # This test isolates downstream scope forwarding; runner admission is tested separately.
+    monkeypatch.setattr(runner_module, "_check_open_series_admission", lambda *_args: None)
     observed_frame_ids: list[list[int] | None] = []
     if series_id is not None:
         monkeypatch.setattr(
@@ -758,17 +760,25 @@ def test_runner_passes_none_only_for_unscoped_mutator_calls(
             return frame_match.MatchCatalogResult()
         return {"selected_frames": 0}
 
-    run_detection = target == "detection"
+    run_detection = target in {"detection", "detection_catalog_match"}
     run_forced_photometry = target == "forced_photometry"
     if target == "wcs":
         monkeypatch.setattr(runner_module, "check_frames_wcs", capture_call)
     elif run_detection:
-        monkeypatch.setattr(runner_module, "detect_sources_in_frames", capture_call)
+        def capture_detection_call(_session, **kwargs):
+            if target == "detection":
+                value = kwargs["frame_ids"]
+                observed_frame_ids.append(None if value is None else list(value))
+            return SimpleNamespace(detection_run_id=101)
+
+        monkeypatch.setattr(
+            runner_module, "detect_sources_in_frames", capture_detection_call
+        )
     elif run_forced_photometry:
         monkeypatch.setattr(runner_module, "run_forced_aperture_photometry", capture_call)
     elif target == "catalog_match":
         monkeypatch.setattr(runner_module, "match_catalog_to_frames", capture_call)
-    else:
+    if target == "detection_catalog_match":
         monkeypatch.setattr(runner_module, "match_detections_to_catalog", capture_call)
 
     config = _runner_config(
@@ -791,6 +801,8 @@ def test_runner_passes_none_only_for_unscoped_mutator_calls(
 
 def test_runner_skips_both_mutators_when_pre_qc_eliminates_the_resolved_scope(monkeypatch):
     mutator_calls: list[str] = []
+    # Keep this runner-scope test independent of the separately tested DB admission guard.
+    monkeypatch.setattr(runner_module, "_check_open_series_admission", lambda *_args: None)
     monkeypatch.setattr(
         runner_module,
         "run_frame_pre_qc",

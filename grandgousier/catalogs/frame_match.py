@@ -61,6 +61,8 @@ def match_catalog_to_frames(
     session: Session,
     *,
     catalog_name: str,
+    catalog_source_ids: list[int] | None = None,
+    forced_catalog_source_ids: list[int] | None = None,
     frame_ids: list[int] | None = None,
     instrument: str | None = None,
     instrument_unit_id: int | None = None,
@@ -78,6 +80,21 @@ def match_catalog_to_frames(
 ) -> MatchCatalogResult:
     if frame_ids is not None and not frame_ids:
         raise ValueError("An explicit frame_ids selection must not be empty")
+    if catalog_source_ids is not None and not catalog_source_ids:
+        raise ValueError("An explicit catalog_source_ids selection must not be empty")
+    if forced_catalog_source_ids is not None:
+        if not forced_catalog_source_ids:
+            raise ValueError("An explicit forced_catalog_source_ids selection must not be empty")
+        if catalog_source_ids is not None and not set(forced_catalog_source_ids).issubset(
+            catalog_source_ids
+        ):
+            raise ValueError(
+                "forced_catalog_source_ids must be a subset of catalog_source_ids"
+            )
+
+    forced_source_ids = {
+        int(source_id) for source_id in (forced_catalog_source_ids or ())
+    }
 
     result = MatchCatalogResult(dry_run=dry_run, insert_batch_size=int(insert_batch_size))
     frames = _select_frames(
@@ -101,6 +118,10 @@ def match_catalog_to_frames(
         .where(CatalogSource.catalog_name == catalog_name)
         .order_by(CatalogSource.catalog_source_id)
     )
+    if catalog_source_ids is not None:
+        sources_stmt = sources_stmt.where(
+            CatalogSource.catalog_source_id.in_(catalog_source_ids)
+        )
     if limit_sources is not None:
         sources_stmt = sources_stmt.limit(limit_sources)
     sources = [dict(row._mapping) for row in session.execute(sources_stmt).all()]
@@ -116,7 +137,11 @@ def match_catalog_to_frames(
         sources = [
             source
             for source in sources
-            if source["_match_mag"] is not None and source["_match_mag"] <= limit_value
+            if int(source["catalog_source_id"]) in forced_source_ids
+            or (
+                source["_match_mag"] is not None
+                and source["_match_mag"] <= limit_value
+            )
         ]
     result.mag_limited_sources = len(sources)
     sources.sort(
@@ -132,6 +157,9 @@ def match_catalog_to_frames(
         return result
 
     source_ids = [int(source["catalog_source_id"]) for source in sources]
+    forced_mask = np.asarray(
+        [source_id in forced_source_ids for source_id in source_ids], dtype=bool
+    )
     source_mags = [source["_match_mag"] for source in sources]
     source_ra = np.asarray([float(source["ra_deg"]) for source in sources], dtype=float)
     source_dec = np.asarray([float(source["dec_deg"]) for source in sources], dtype=float)
@@ -201,12 +229,25 @@ def match_catalog_to_frames(
                     )
 
                 selected_indices = np.flatnonzero(valid)
-                if max_sources_per_frame is not None and len(selected_indices) > int(max_sources_per_frame):
-                    result.limited_links += len(selected_indices) - int(max_sources_per_frame)
-                    # ``sources`` is already ordered by the exact legacy
-                    # brightness/source-id key, so an in-footprint subsequence is
-                    # already in the order used by the old per-frame sort.
-                    selected_indices = selected_indices[: int(max_sources_per_frame)]
+                if max_sources_per_frame is not None:
+                    if forced_source_ids:
+                        forced_indices = selected_indices[forced_mask[selected_indices]]
+                        capped_indices = selected_indices[~forced_mask[selected_indices]]
+                    else:
+                        forced_indices = np.asarray([], dtype=np.intp)
+                        capped_indices = selected_indices
+                    if len(capped_indices) > int(max_sources_per_frame):
+                        result.limited_links += len(capped_indices) - int(max_sources_per_frame)
+                        # ``sources`` is already ordered by the exact legacy
+                        # brightness/source-id key, so an in-footprint subsequence is
+                        # already in the order used by the old per-frame sort.
+                        capped_indices = capped_indices[: int(max_sources_per_frame)]
+                    if forced_source_ids:
+                        selected_indices = np.sort(
+                            np.concatenate((forced_indices, capped_indices))
+                        )
+                    else:
+                        selected_indices = capped_indices
 
                 common_details = {
                     "naxis1": naxis1,
@@ -257,13 +298,16 @@ def match_catalog_to_frames(
 
             if replace_existing and successful_frame_ids:
                 delete_started = time.perf_counter()
+                catalog_source_query = select(CatalogSource.catalog_source_id).where(
+                    CatalogSource.catalog_name == catalog_name
+                )
+                if catalog_source_ids is not None:
+                    catalog_source_query = catalog_source_query.where(
+                        CatalogSource.catalog_source_id.in_(catalog_source_ids)
+                    )
                 del_stmt = delete(FrameCatalogLink).where(
                     FrameCatalogLink.frame_id.in_(successful_frame_ids),
-                    FrameCatalogLink.catalog_source_id.in_(
-                        select(CatalogSource.catalog_source_id).where(
-                            CatalogSource.catalog_name == catalog_name
-                        )
-                    ),
+                    FrameCatalogLink.catalog_source_id.in_(catalog_source_query),
                 )
                 result.deleted_existing += session.execute(del_stmt).rowcount or 0
                 result.delete_existing_sec = float(time.perf_counter() - delete_started)

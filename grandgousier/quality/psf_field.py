@@ -478,6 +478,7 @@ def _load_detection_rows(
     *,
     frame_ids: list[int],
     algorithm: str,
+    detection_run_id: int | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
     if not frame_ids:
         return {}
@@ -500,6 +501,8 @@ def _load_detection_rows(
         .where(DetectionRun.algorithm == algorithm)
         .order_by(DetectionRunFrame.frame_id, SourceDetection.snr.desc().nullslast())
     )
+    if detection_run_id is not None:
+        stmt = stmt.where(DetectionRun.detection_run_id == int(detection_run_id))
     grouped: dict[int, list[dict[str, Any]]] = {}
     for row in session.execute(stmt).mappings().all():
         grouped.setdefault(int(row["frame_id"]), []).append(dict(row))

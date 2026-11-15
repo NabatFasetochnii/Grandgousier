@@ -1,16 +1,18 @@
-from pathlib import Path
+import json
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("astropy")
 
-from astropy.io import fits
 import numpy as np
+from astropy.io import fits
 
 from grandgousier.archive import auto_process as auto_process_module
 from grandgousier.archive.auto_process import (
+    DetectedArchiveFile,
     _catalog_precondition_ok,
     _classify_science_status,
     _default_auto_catalog_name,
@@ -19,14 +21,12 @@ from grandgousier.archive.auto_process import (
     _format_calibration_prefix,
     _inspect_existing_catalog,
     _merge_current_series_ids,
-    _prepare_auto_catalog,
     discover_fits_files,
-    DetectedArchiveFile,
     process_archive_path,
     scan_archive_path,
 )
-from grandgousier.io.archive_indexer import index_archive_paths
 from grandgousier.instruments.base import InstrumentProfile
+from grandgousier.io.archive_indexer import index_archive_paths
 
 
 class FakeQuery:
@@ -66,6 +66,51 @@ class FakeSession:
 
     def flush(self):
         self.flushes += 1
+
+
+class _WorkingCatalogPersistenceSession(FakeSession):
+    def __init__(self):
+        super().__init__()
+        self.pipeline_runs = {}
+        self.update_statements = []
+
+    def register_pipeline_run(self, *, pipeline_run_id, field_id, series_id, provenance):
+        snapshot = json.loads(json.dumps(provenance))
+        self.pipeline_runs[pipeline_run_id] = {
+            "field_id": field_id,
+            "series_id": series_id,
+            "catalog_name": "gaia_dr3",
+            "recipe_json": {
+                "working_catalog_provenance": snapshot,
+                "quality_policy": {"working_catalog_provenance": snapshot},
+            },
+        }
+
+    def execute(self, statement, parameters):
+        sql = str(statement)
+        assert "UPDATE pipeline_runs" in sql
+        assert "pipeline_run_id = :pipeline_run_id" in sql
+        assert "field_id = :field_id" in sql
+        assert "series_id = :series_id" in sql
+        assert "catalog_name = 'gaia_dr3'" in sql
+        assert "jsonb_set" in sql
+        self.update_statements.append((sql, dict(parameters)))
+        run = self.pipeline_runs.get(parameters["pipeline_run_id"])
+        if (
+            run is None
+            or run["field_id"] != parameters["field_id"]
+            or run["series_id"] != parameters["series_id"]
+            or run["catalog_name"] != "gaia_dr3"
+        ):
+            return SimpleNamespace(rowcount=0)
+        provenance = json.loads(parameters["provenance_json"])
+        recipe = dict(run["recipe_json"])
+        recipe["working_catalog_provenance"] = provenance
+        quality_policy = dict(recipe["quality_policy"])
+        quality_policy["working_catalog_provenance"] = provenance
+        recipe["quality_policy"] = quality_policy
+        run["recipe_json"] = recipe
+        return SimpleNamespace(rowcount=1)
 
 
 def _write_master_fits(path: Path, *, filt="I", camera="204"):
@@ -245,7 +290,17 @@ def test_process_archive_path_cli_passes_coordinate_pair_before_db_open(monkeypa
 
     parser = cli.build_parser()
     args = parser.parse_args(["process-archive-path", "--path", "synthetic",
-                              "--target-ra-deg", "22.5", "--target-dec-deg", "67.25"])
+                              "--target-ra-deg", "22.5", "--target-dec-deg", "67.25",
+                              "--local-com-max-shift-pix", "1.25",
+                              "--frame-shift-min-matches", "24",
+                              "--frame-shift-max-robust-scatter-pix", "0.3",
+                              "--frame-shift-max-absolute-pix", "1.5",
+                              "--crowded-arcsec", "12", "--blended-arcsec", "6",
+                              "--disable-dynamic-separation",
+                              "--dynamic-seeing-factor", "1.7",
+                              "--dynamic-aperture-factor", "0.8",
+                              "--dynamic-crowding-factor", "1.3",
+                              "--fwhm-header-unit", "pix"])
     args.target_dec_deg = None
     monkeypatch.setattr(cli, "make_session_factory",
                         lambda *_a, **_kw: pytest.fail("invalid pair must not open DB"))
@@ -274,6 +329,17 @@ def test_process_archive_path_cli_passes_coordinate_pair_before_db_open(monkeypa
     assert observed["target_dec_deg"] == 67.25
     assert observed["execute"] is False
     assert observed["finalize_tail"] is False
+    assert observed["local_com_max_shift_pix"] == 1.25
+    assert observed["frame_shift_min_matches"] == 24
+    assert observed["frame_shift_max_robust_scatter_pix"] == 0.3
+    assert observed["frame_shift_max_absolute_pix"] == 1.5
+    assert observed["crowded_arcsec"] == 12.0
+    assert observed["blended_arcsec"] == 6.0
+    assert observed["dynamic_separation"] is False
+    assert observed["dynamic_seeing_factor"] == 1.7
+    assert observed["dynamic_aperture_factor"] == 0.8
+    assert observed["dynamic_crowding_factor"] == 1.3
+    assert observed["fwhm_header_unit"] == "pix"
 
 
 def test_discover_fits_files_is_suffix_based_and_sorted(tmp_path):
@@ -447,132 +513,884 @@ def test_classify_science_status_distinguishes_empty_science_products():
 
 
 
-def test_prepare_auto_catalog_reuses_populated_exact_name_without_gaia(monkeypatch):
-    calls = {"gaia": 0}
+def _install_auto_field_harness(
+    monkeypatch, tmp_path, series_rows, frame_ids_by_series, *, indexed_frame_ids=None
+):
+    from grandgousier.catalogs import gaia_query
 
-    monkeypatch.setattr(
-        "grandgousier.archive.auto_process._inspect_existing_catalog",
-        lambda _session, *, catalog_name: {
-            "mode": "explicit_existing",
-            "catalog_name": catalog_name,
-            "status": "DONE",
-            "inserted_or_updated": 123,
-            "n_sources": 123,
-        },
-    )
-
-    # Importing/querying Gaia must never be reached when the preserved catalog
-    # is already populated.  Patching the query symbol gives the test a clear
-    # failure mode if that contract regresses.
-    import grandgousier.catalogs.gaia_query as gaia_query
-
-    def _unexpected_gaia(*_args, **_kwargs):
-        calls["gaia"] += 1
-        raise AssertionError("Gaia query should not run for a populated preserved catalog")
-
-    monkeypatch.setattr(gaia_query, "query_gaia_for_frames", _unexpected_gaia)
-
-    row = _prepare_auto_catalog(
-        object(),
-        catalog_name="auto_catalog_master_20230916_TIC13533330_01_V",
-        frame_ids=[1, 2, 3],
-        enabled=True,
-        margin_arcmin=10.0,
-        mag_limit=None,
-        max_rows_per_frame=50000,
-        query_mode="frame_union",
-        max_radius_deg=1.0,
-        timeout_sec=120.0,
-        warnings=[],
-    )
-
-    assert calls["gaia"] == 0
-    assert row["mode"] == "auto_existing_reuse"
-    assert row["status"] == "DONE"
-    assert row["reused_existing"] is True
-    assert row["n_sources"] == 123
-    assert row["inserted_or_updated"] == 123
-    assert row["queried_frames"] == 0
-    assert row["queried_cones"] == 0
-    assert _catalog_precondition_ok(row, allow_empty_catalog=False)
-
-
-def test_process_archive_path_forwards_indexed_frame_ids_to_gaia(monkeypatch, tmp_path):
-    indexed_frame_ids = [17, 9]
-    source_path = tmp_path / "indexed.fits"
+    source_path = tmp_path / "auto_working_catalog.fits"
     detected = SimpleNamespace(path=str(source_path), profile_name="MASTER")
+    all_frame_ids = sorted(
+        {int(frame_id) for values in frame_ids_by_series.values() for frame_id in values}
+    )
+    selected_indexed_frame_ids = (
+        list(indexed_frame_ids) if indexed_frame_ids is not None else all_frame_ids
+    )
+    selected_frame_queries = []
+    exact_cone_calls = []
+    lifecycle_events = []
+    catalog_fields = {}
+
     monkeypatch.setattr(
         auto_process_module,
         "scan_archive_paths",
         lambda *_args, **_kwargs: ([detected], [], []),
     )
-    monkeypatch.setattr(auto_process_module, "load_auto_profiles", lambda **_kwargs: {"MASTER": object()})
+    monkeypatch.setattr(auto_process_module, "load_auto_profiles", lambda **_kwargs: {})
     monkeypatch.setattr(
         auto_process_module,
-        "index_archive_paths",
-        lambda **_kwargs: SimpleNamespace(discovered=1, inserted=1, skipped_existing=0, failed=0),
-    )
-    monkeypatch.setattr(
-        auto_process_module,
-        "_frame_ids_for_paths",
-        lambda *_args: list(indexed_frame_ids),
-    )
-    monkeypatch.setattr(auto_process_module, "_series_ids_for_paths", lambda *_args: [])
-    monkeypatch.setattr(
-        auto_process_module,
-        "select_persisted_science_frames",
+        "index_detected_archive_files",
         lambda *_args, **_kwargs: SimpleNamespace(
-            selected_frame_ids=list(indexed_frame_ids), summary={}, rows=[]
+            indexed_paths=[str(source_path)],
+            indexed_frame_ids=selected_indexed_frame_ids,
+            index_results=[],
+            failed_files=0,
         ),
     )
-    monkeypatch.setattr(auto_process_module, "_observation_selection_warning", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(auto_process_module, "_default_auto_catalog_name", lambda *_args, **_kwargs: "auto-test")
+    monkeypatch.setattr(
+        auto_process_module,
+        "_series_ids_for_paths",
+        lambda *_args, **_kwargs: [int(row["series_id"]) for row in series_rows],
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "_frame_ids_by_series_for_paths",
+        lambda *_args, **_kwargs: frame_ids_by_series,
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "_load_series_for_pipeline",
+        lambda *_args, **_kwargs: [dict(row) for row in series_rows],
+    )
+    monkeypatch.setattr(
+        auto_process_module, "_write_manifest_if_requested", lambda *_args, **_kwargs: None
+    )
+
+    def select_frames(_session, *, frame_ids, **kwargs):
+        assert kwargs["only_wcs_ok"] is False
+        selected_frame_queries.append(list(frame_ids))
+        return [
+            SimpleNamespace(
+                frame_id=frame_id,
+                raw_path=f"fake-frame-{frame_id}.fits",
+                instrument_unit_id=4,
+            )
+            for frame_id in frame_ids
+        ]
+
+    def exact_wcs_cone(path, *, margin_arcmin):
+        path = Path(path)
+        exact_cone_calls.append((path, margin_arcmin))
+        frame_id = int(path.stem.rsplit("-", 1)[1])
+        return frame_id / 10000.0, 0.0, 0.1 + margin_arcmin / 60.0
+
+    monkeypatch.setattr(gaia_query, "_select_frames", select_frames)
+    monkeypatch.setattr(
+        gaia_query,
+        "_frame_cone_for_frame_diagnostic",
+        lambda *_args, **_kwargs: pytest.fail(
+            "automatic transient Gaia must use exact WCS-corner cones"
+        ),
+    )
+    monkeypatch.setattr(gaia_query, "_frame_cone", exact_wcs_cone)
+    original_clear = gaia_query.GaiaWorkingCatalog.clear
+    original_close = gaia_query.GaiaWorkingCatalog.close
+
+    def track_clear(catalog):
+        lifecycle_events.append(("clear", catalog_fields.get(id(catalog))))
+        return original_clear(catalog)
+
+    def track_close(catalog):
+        lifecycle_events.append(("close", catalog_fields.get(id(catalog))))
+        return original_close(catalog)
+
+    monkeypatch.setattr(gaia_query.GaiaWorkingCatalog, "clear", track_clear)
+    monkeypatch.setattr(gaia_query.GaiaWorkingCatalog, "close", track_close)
+    monkeypatch.setattr(
+        gaia_query,
+        "query_gaia_for_frames",
+        lambda *_args, **_kwargs: pytest.fail("legacy full-catalog Gaia query must not run"),
+    )
+    monkeypatch.setattr(
+        gaia_query,
+        "_upsert_catalog_sources",
+        lambda *_args, **_kwargs: pytest.fail("transient Gaia rows must not be fully upserted"),
+    )
+    return (
+        source_path,
+        gaia_query,
+        selected_frame_queries,
+        lifecycle_events,
+        catalog_fields,
+        exact_cone_calls,
+    )
+
+
+def _auto_series(series_id, field_id):
+    return {
+        "series_id": series_id,
+        "field_id": field_id,
+        "field_name": f"field-{field_id}",
+        "instrument_unit_id": 4,
+        "instrument": "MASTER",
+        "site": "test",
+        "tube": "tube",
+        "camera": "camera",
+        "filter_name": "V",
+        "ra_center_deg": 10.0,
+        "dec_center_deg": 0.0,
+        "radius_arcmin": 10.0,
+        "time_start": None,
+        "time_end": None,
+        "mjd_start": None,
+        "mjd_end": None,
+        "n_frames": 1,
+        "status": "READY",
+    }
+
+
+def test_auto_working_catalog_hashes_are_deterministic_and_scope_sensitive():
+    from grandgousier.catalogs import gaia_query
+
+    frame_hash = auto_process_module._working_catalog_frame_scope_sha256
+    footprint_hash = auto_process_module._working_catalog_footprint_sha256
+    assert frame_hash([9, 3, 9]) == frame_hash([3, 9])
+    assert frame_hash([3, 9]) != frame_hash([3, 10])
+
+    first_cones = [(359.75, 12.0, 0.125), (10.0, -3.0, 0.25)]
+    reordered_cones = [(10.0, -3.0, 0.25), (359.75, 12.0, 0.125)]
+    assert footprint_hash(gaia_query, first_cones) == footprint_hash(
+        gaia_query, reordered_cones
+    )
+    assert footprint_hash(gaia_query, first_cones) == footprint_hash(
+        gaia_query, [*first_cones, first_cones[0]]
+    )
+    assert footprint_hash(gaia_query, first_cones) != footprint_hash(
+        gaia_query, [(*first_cones[0][:2], 0.126), first_cones[1]]
+    )
+
+
+def _fake_pipeline_result():
+    return SimpleNamespace(
+        pipeline_run_id=None,
+        status="DONE",
+        calibration_names={},
+        outputs={},
+        log_files={},
+        steps=[],
+        quality_policy={},
+    )
+
+
+def test_auto_gaia_field_union_uses_only_selected_frames_for_each_field(
+    monkeypatch, tmp_path
+):
+    series_rows = [_auto_series(3, 20), _auto_series(2, 10), _auto_series(1, 10)]
+    frame_ids_by_series = {1: [101], 2: [202, 999], 3: [303]}
+    source_path, gaia_query, _frame_queries, _lifecycle, _catalog_fields, _cone_calls = (
+        _install_auto_field_harness(
+            monkeypatch,
+            tmp_path,
+            series_rows,
+            frame_ids_by_series,
+            indexed_frame_ids=[101, 202, 303],
+        )
+    )
+
+    frame_field_ids = {101: 10, 202: 10, 999: 10, 303: 20}
+    selected_frames_by_field = []
+
+    def select_frames(_session, *, frame_ids, **_kwargs):
+        selected_frame_ids = [int(frame_id) for frame_id in frame_ids]
+        selected_fields = tuple(
+            sorted({frame_field_ids[frame_id] for frame_id in selected_frame_ids})
+        )
+        selected_frames_by_field.append((selected_fields, selected_frame_ids))
+        return [
+            SimpleNamespace(
+                frame_id=frame_id,
+                raw_path=f"fake-frame-{frame_id}.fits",
+                instrument_unit_id=4,
+            )
+            for frame_id in selected_frame_ids
+        ]
+
+    monkeypatch.setattr(gaia_query, "_select_frames", select_frames)
+    fetched_frame_ids_by_field = []
+
+    async def fake_fetch(cones, **_kwargs):
+        cones = list(cones)
+        fetched_frame_ids_by_field.append(
+            [round(float(ra) * 10000) for ra, _dec, _radius in cones]
+        )
+        return gaia_query.GaiaWorkingCatalog(
+            [
+                {
+                    "source_id": str(len(fetched_frame_ids_by_field)),
+                    "ra": cones[0][0],
+                    "dec": cones[0][1],
+                    "phot_g_mean_mag": 15.0,
+                }
+            ]
+        ), {"logical_queries": 1, "rows_received": 1}
+
+    monkeypatch.setattr(gaia_query, "fetch_gaia_working_catalog", fake_fetch)
+    monkeypatch.setattr(
+        auto_process_module,
+        "run_field_pipeline",
+        lambda *_args, **_kwargs: _fake_pipeline_result(),
+    )
+
+    process_archive_path(
+        FakeSession(),
+        root=tmp_path,
+        exact_paths=[source_path],
+        series_ids=[1, 2, 3],
+        execute=True,
+        make_light_curve_summary=False,
+    )
+
+    assert selected_frames_by_field == [((10,), [101, 202]), ((20,), [303])]
+    assert fetched_frame_ids_by_field == [[101, 202], [303]]
+
+
+def test_auto_gaia_fetches_once_per_field_and_processes_field_major_with_close(monkeypatch, tmp_path):
+    series_rows = [_auto_series(3, 20), _auto_series(2, 10), _auto_series(1, 10)]
+    frame_map = {1: [101], 2: [202, 999], 3: [303]}
+    source_path, gaia_query, frame_queries, lifecycle, catalog_fields, exact_cone_calls = (
+        _install_auto_field_harness(
+            monkeypatch,
+            tmp_path,
+            series_rows,
+            frame_map,
+            indexed_frame_ids=[101, 202, 303],
+        )
+    )
+    events = lifecycle
+    fetch_calls = []
+    provenance_calls = []
+    pipeline_configs = []
+    catalogs = {}
+    field_by_ra = {0.0101: 10, 0.0202: 10, 0.0303: 20}
+
+    async def fake_fetch(cones, **kwargs):
+        cones = list(cones)
+        field_id = field_by_ra[cones[0][0]]
+        fetch_calls.append((field_id, cones, kwargs))
+        events.append(("fetch", field_id))
+        source_ids = (
+            ("9007199254740993", "9007199254740995")
+            if field_id == 10
+            else ("9007199254740997",)
+        )
+        rows = [
+            {
+                "source_id": source_id,
+                "ra": cones[0][0],
+                "dec": cones[0][1],
+                "phot_g_mean_mag": 15.0,
+            }
+            for source_id in source_ids
+        ]
+        if field_id == 10:
+            rows.append(dict(rows[0]))
+        catalog = gaia_query.GaiaWorkingCatalog(rows)
+        catalogs[field_id] = catalog
+        catalog_fields[id(catalog)] = field_id
+        return catalog, {
+            "logical_queries": 1,
+            "physical_parts": 2 if field_id == 10 else 1,
+            "provider_attempts": 2 if field_id == 10 else 1,
+            "provider_failures": (
+                [{"provider": "gaia_ari_async", "error": "TimeoutError: timeout"}]
+                if field_id == 10
+                else []
+            ),
+            "providers_used": ["gaia_esac_async"],
+            "overflow_splits": 1 if field_id == 10 else 0,
+            "overflow_events": (
+                [{"part": 1, "provider": "gaia_aip_async", "query_status": "OVERFLOW"}]
+                if field_id == 10
+                else []
+            ),
+            "rows_received": len(rows),
+            "partial_rows_discarded": False,
+        }
+
+    monkeypatch.setattr(gaia_query, "fetch_gaia_working_catalog", fake_fetch)
+    series_fields = {int(row["series_id"]): int(row["field_id"]) for row in series_rows}
+
+    def fake_pipeline(
+        _session,
+        config,
+        *,
+        working_catalog,
+        working_catalog_provenance,
+        working_catalog_promoted_source_ids,
+        working_catalog_run_ids_by_series,
+    ):
+        field_id = series_fields[int(config.series_id)]
+        assert working_catalog is catalogs[field_id]
+        assert config.catalog_name == "gaia_dr3"
+        pipeline_configs.append(config)
+        provenance_calls.append((field_id, working_catalog_provenance))
+        events.append(("pipeline", int(config.series_id), field_id))
+        pipeline_run_id = 1000 + int(config.series_id)
+        working_catalog_run_ids_by_series[int(config.series_id)] = pipeline_run_id
+        session.register_pipeline_run(
+            pipeline_run_id=pipeline_run_id,
+            field_id=field_id,
+            series_id=int(config.series_id),
+            provenance=working_catalog_provenance,
+        )
+        selected_by_series = {
+            1: {"9007199254740993"},
+            2: {"9007199254740993"},
+            3: set(),
+        }
+        selected_ids = selected_by_series[int(config.series_id)]
+        working_catalog_promoted_source_ids.update(selected_ids)
+        pipeline_result = _fake_pipeline_result()
+        pipeline_result.steps = [
+            SimpleNamespace(
+                step_name="select_and_promote_working_gaia_sources",
+                status="DONE",
+                result={
+                    "selected_gaia_source_count": len(selected_ids),
+                    "canonical_catalog_source_count": len(selected_ids),
+                    "promotion_status": "PROMOTED" if selected_ids else "SKIPPED_NO_SELECTION",
+                },
+            )
+        ]
+        return pipeline_result
+
+    monkeypatch.setattr(auto_process_module, "run_field_pipeline", fake_pipeline)
+    session = _WorkingCatalogPersistenceSession()
+    result = process_archive_path(
+        session,
+        root=tmp_path,
+        exact_paths=[source_path],
+        series_ids=[1, 2, 3],
+        execute=True,
+        make_light_curve_summary=False,
+        local_com_max_shift_pix=1.25,
+        frame_shift_min_matches=24,
+        frame_shift_max_robust_scatter_pix=0.3,
+        frame_shift_max_absolute_pix=1.5,
+        crowded_arcsec=12.0,
+        blended_arcsec=6.0,
+        dynamic_separation=False,
+        dynamic_seeing_factor=1.7,
+        dynamic_aperture_factor=0.8,
+        dynamic_crowding_factor=1.3,
+        fwhm_header_unit="pix",
+    )
+
+    assert len(pipeline_configs) == 3
+    for config in pipeline_configs:
+        assert config.local_com_max_shift_pix == 1.25
+        assert config.frame_shift_min_matches == 24
+        assert config.frame_shift_max_robust_scatter_pix == 0.3
+        assert config.frame_shift_max_absolute_pix == 1.5
+        assert config.crowded_arcsec == 12.0
+        assert config.blended_arcsec == 6.0
+        assert config.dynamic_separation is False
+        assert config.dynamic_seeing_factor == 1.7
+        assert config.dynamic_aperture_factor == 0.8
+        assert config.dynamic_crowding_factor == 1.3
+        assert config.fwhm_header_unit == "pix"
+    assert [field_id for field_id, _cones, _kwargs in fetch_calls] == [10, 20]
+    assert [call[2]["max_radius_deg"] for call in fetch_calls] == [1.0, 1.0]
+    assert [call[2]["maxrec"] for call in fetch_calls] == [50000, 50000]
+    assert [call[1] for call in fetch_calls] == [
+        [(0.0101, 0.0, 0.13333333333333333), (0.0202, 0.0, 0.13333333333333333)],
+        [(0.0303, 0.0, 0.13333333333333333)],
+    ]
+    assert [field_id for field_id, _provenance in provenance_calls] == [10, 10, 20]
+    archive_provenance = [
+        row["working_catalog_provenance"] for row in result.catalog_results
+    ]
+    assert [provenance for _field_id, provenance in provenance_calls] == [
+        archive_provenance[0],
+        archive_provenance[0],
+        archive_provenance[1],
+    ]
+    first_provenance = archive_provenance[0]
+    assert first_provenance["field_id"] == 10
+    assert first_provenance["field_frame_count"] == 2
+    assert first_provenance["query_mode"] == "field_union"
+    assert first_provenance["frame_scope_sha256"] == (
+        auto_process_module._working_catalog_frame_scope_sha256([101, 202])
+    )
+    assert first_provenance["footprint_sha256"] == (
+        auto_process_module._working_catalog_footprint_sha256(
+            gaia_query, fetch_calls[0][1]
+        )
+    )
+    assert first_provenance["gaia_release"] == "DR3"
+    assert first_provenance["gaia_table"] == "gaiadr3.gaia_source"
+    assert first_provenance["requested_columns"] == list(
+        gaia_query.GAIA_WORKING_CATALOG_COLUMNS
+    )
+    assert first_provenance["requested_columns_sha256"] == (
+        auto_process_module._working_catalog_hash_json(
+            list(gaia_query.GAIA_WORKING_CATALOG_COLUMNS)
+        )
+    )
+    assert first_provenance["providers_used"] == ["gaia_esac_async"]
+    assert first_provenance["providers_attempted"] == [
+        "gaia_esac_async", "gaia_ari_async"
+    ]
+    assert first_provenance["elapsed_seconds"] >= 0.0
+    assert first_provenance["logical_acquisitions"] == 1
+    assert first_provenance["margin_arcmin"] == 2.0
+    assert first_provenance["magnitude_limit"] == 19.0
+    assert first_provenance["max_radius_deg"] == 1.0
+    assert first_provenance["maxrec"] == 50000
+    assert first_provenance["fetch_status"] == "SUCCEEDED_COMPLETE"
+    assert first_provenance["fetch_complete"] is True
+    assert first_provenance["logical_queries"] == 1
+    assert first_provenance["physical_parts"] == 2
+    assert first_provenance["provider_attempts"] == 2
+    assert first_provenance["provider_failures"] == 1
+    assert first_provenance["overflow_splits"] == 1
+    assert first_provenance["rows_received"] == 3
+    assert first_provenance["unique_rows"] == 2
+    assert first_provenance["unique_sources"] == 2
+    assert first_provenance["duplicate_rows"] == 1
+    assert first_provenance["field_acquisition_unique_identity_count"] == 2
+    assert first_provenance["working_catalog_sources"] == 2
+    assert first_provenance["overflow_occurred"] is True
+    assert first_provenance["overflow_splits"] == 1
+    assert first_provenance["overflow_statuses"] == ["OVERFLOW"]
+    assert first_provenance["position_policy"]["coordinate_frame"] == "ICRS"
+    assert first_provenance["position_policy"]["proper_motion_correction_applied"] is False
+    assert [
+        (
+            item["series_id"],
+            item["selected_identity_count"],
+            item["promoted_identity_count"],
+        )
+        for item in first_provenance["series_selection"]
+    ] == [(1, 1, 1), (2, 1, 1)]
+    assert first_provenance["series_selection"][0]["matching_policy"]["algorithm"] == (
+        "per_frame_greedy_one_to_one_haversine"
+    )
+    assert first_provenance["field_promoted_unique_identity_count"] == 1
+    assert first_provenance["field_discarded_transient_identity_count"] == 1
+    assert first_provenance["field_promotion_accounting_complete"] is True
+    assert first_provenance["partial_rows_discarded"] is False
+    second_provenance = archive_provenance[1]
+    assert second_provenance["unique_sources"] == 1
+    assert second_provenance["field_promoted_unique_identity_count"] == 0
+    assert second_provenance["field_discarded_transient_identity_count"] == 1
+    assert [
+        (
+            item["series_id"],
+            item["selected_identity_count"],
+            item["promoted_identity_count"],
+        )
+        for item in second_provenance["series_selection"]
+    ] == [(3, 0, 0)]
+    assert json.loads(json.dumps(first_provenance)) == first_provenance
+    assert "9007199254740993" not in json.dumps(first_provenance)
+    assert exact_cone_calls == [
+        (Path("fake-frame-101.fits"), 2.0),
+        (Path("fake-frame-202.fits"), 2.0),
+        (Path("fake-frame-303.fits"), 2.0),
+    ]
+    assert frame_queries == [[101, 202], [303]]
+    assert events == [
+        ("fetch", 10),
+        ("pipeline", 1, 10),
+        ("pipeline", 2, 10),
+        ("clear", 10),
+        ("close", 10),
+        ("fetch", 20),
+        ("pipeline", 3, 20),
+        ("clear", 20),
+        ("close", 20),
+    ]
+    assert result.catalog_name == "gaia_dr3"
+    assert len(result.catalog_results) == 2
+    assert [row["logical_queries"] for row in result.catalog_results] == [1, 1]
+    assert all("inserted_or_updated" not in row for row in result.catalog_results)
+    assert "9007199254740993" not in repr(result.to_dict())
+    assert [run_id for _sql, params in session.update_statements for run_id in [
+        params["pipeline_run_id"]
+    ]] == [1001, 1002, 1003]
+    for pipeline_run_id, catalog_index in ((1001, 0), (1002, 0), (1003, 1)):
+        recipe = session.pipeline_runs[pipeline_run_id]["recipe_json"]
+        persisted_provenance = recipe["working_catalog_provenance"]
+        assert persisted_provenance == archive_provenance[catalog_index]
+        assert recipe["quality_policy"]["working_catalog_provenance"] == (
+            persisted_provenance
+        )
+        assert "9007199254740993" not in json.dumps(recipe)
+    assert session.commits == 2
+    for catalog in catalogs.values():
+        with pytest.raises(RuntimeError, match="closed"):
+            _ = catalog.source_ids
+
+
+def test_auto_working_catalog_closes_after_pipeline_failure(monkeypatch, tmp_path):
+    series_rows = [_auto_series(1, 10)]
+    source_path, gaia_query, _frame_queries, lifecycle, catalog_fields, _cone_calls = (
+        _install_auto_field_harness(monkeypatch, tmp_path, series_rows, {1: [101]})
+    )
+    created = []
+
+    async def fake_fetch(_cones, **_kwargs):
+        catalog = gaia_query.GaiaWorkingCatalog(
+            [{"source_id": "42", "ra": 0.01, "dec": 0.0, "phot_g_mean_mag": 15.0}]
+        )
+        catalog_fields[id(catalog)] = 10
+        created.append(catalog)
+        return catalog, {"logical_queries": 1, "rows_received": 1}
+
+    monkeypatch.setattr(gaia_query, "fetch_gaia_working_catalog", fake_fetch)
+    session = _WorkingCatalogPersistenceSession()
+
+    def failing_pipeline(
+        _session,
+        config,
+        *,
+        working_catalog,
+        working_catalog_provenance,
+        working_catalog_promoted_source_ids,
+        working_catalog_run_ids_by_series,
+    ):
+        pipeline_run_id = 7001
+        working_catalog_run_ids_by_series[int(config.series_id)] = pipeline_run_id
+        session.register_pipeline_run(
+            pipeline_run_id=pipeline_run_id,
+            field_id=int(working_catalog_provenance["field_id"]),
+            series_id=int(config.series_id),
+            provenance=working_catalog_provenance,
+        )
+        raise RuntimeError("synthetic pipeline failure")
+
+    monkeypatch.setattr(auto_process_module, "run_field_pipeline", failing_pipeline)
+    result = process_archive_path(
+        session, root=tmp_path, exact_paths=[source_path], series_ids=[1],
+        execute=True, make_light_curve_summary=False,
+    )
+
+    assert result.status == "FAILED"
+    assert lifecycle == [("clear", 10), ("close", 10)]
+    assert [params["pipeline_run_id"] for _sql, params in session.update_statements] == [
+        7001
+    ]
+    persisted = session.pipeline_runs[7001]["recipe_json"][
+        "working_catalog_provenance"
+    ]
+    assert persisted["field_promotion_accounting_complete"] is False
+    assert persisted["field_promoted_unique_identity_count"] is None
+    assert persisted["field_discarded_transient_identity_count"] is None
+    assert persisted["field_acquisition_unique_identity_count"] == 1
+    selection = persisted["series_selection"][0]
+    assert selection["series_id"] == 1
+    assert selection["selection_step_status"] == "NOT_REPORTED"
+    assert selection["selected_identity_count"] is None
+    assert selection["promoted_identity_count"] is None
+    assert session.pipeline_runs[7001]["recipe_json"]["quality_policy"][
+        "working_catalog_provenance"
+    ] == persisted
+    assert len(created) == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = created[0].source_ids
+
+
+def test_auto_working_catalog_closes_when_fetch_result_processing_fails(monkeypatch, tmp_path):
+    series_rows = [_auto_series(1, 10)]
+    source_path, gaia_query, _frame_queries, lifecycle, catalog_fields, _cone_calls = (
+        _install_auto_field_harness(monkeypatch, tmp_path, series_rows, {1: [101]})
+    )
+    created = gaia_query.GaiaWorkingCatalog(
+        [{"source_id": "42", "ra": 0.01, "dec": 0.0, "phot_g_mean_mag": 15.0}]
+    )
+    catalog_fields[id(created)] = 10
+
+    async def malformed_fetch_result(_cones, **_kwargs):
+        return created, None
+
+    monkeypatch.setattr(gaia_query, "fetch_gaia_working_catalog", malformed_fetch_result)
+    monkeypatch.setattr(
+        auto_process_module,
+        "run_field_pipeline",
+        lambda *_args, **_kwargs: pytest.fail("pipeline must not run after acquisition failure"),
+    )
+    result = process_archive_path(
+        FakeSession(), root=tmp_path, exact_paths=[source_path], series_ids=[1],
+        execute=True, make_light_curve_summary=False,
+    )
+
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert result.catalog_results[0]["status"] == "FAILED"
+    assert lifecycle == [("clear", 10), ("close", 10)]
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = created.source_ids
+
+
+def test_auto_working_catalog_closes_on_catalog_precondition_early_return(monkeypatch, tmp_path):
+    series_rows = [_auto_series(1, 10)]
+    source_path, gaia_query, _frame_queries, lifecycle, catalog_fields, _cone_calls = (
+        _install_auto_field_harness(monkeypatch, tmp_path, series_rows, {1: [101]})
+    )
+    empty_catalog = gaia_query.GaiaWorkingCatalog()
+    catalog_fields[id(empty_catalog)] = 10
+
+    async def empty_fetch(_cones, **_kwargs):
+        return empty_catalog, {
+            "logical_queries": 1,
+            "physical_parts": 1,
+            "provider_attempts": 1,
+            "provider_failures": [],
+            "overflow_splits": 0,
+            "rows_received": 0,
+        }
+
+    monkeypatch.setattr(gaia_query, "fetch_gaia_working_catalog", empty_fetch)
+    monkeypatch.setattr(
+        auto_process_module,
+        "run_field_pipeline",
+        lambda *_args, **_kwargs: pytest.fail("empty catalog precondition must return early"),
+    )
+    result = process_archive_path(
+        FakeSession(), root=tmp_path, exact_paths=[source_path], series_ids=[1],
+        execute=True, make_light_curve_summary=False,
+    )
+
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert lifecycle == [("clear", 10), ("close", 10)]
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = empty_catalog.source_ids
+
+
+def test_auto_working_catalog_fetch_failure_stops_without_pipeline(monkeypatch, tmp_path):
+    series_rows = [_auto_series(1, 10)]
+    source_path, gaia_query, _frame_queries, _lifecycle, _catalog_fields, _cone_calls = (
+        _install_auto_field_harness(monkeypatch, tmp_path, series_rows, {1: [101]})
+    )
+    fetch_calls = []
+
+    async def failed_fetch(*_args, **_kwargs):
+        fetch_calls.append("called")
+        raise gaia_query.GaiaWorkingCatalogFetchError(
+            {"logical_queries": 1, "partial_rows_discarded": True, "failure_type": "ProviderError"}
+        )
+
+    monkeypatch.setattr(gaia_query, "fetch_gaia_working_catalog", failed_fetch)
+    monkeypatch.setattr(
+        auto_process_module,
+        "run_field_pipeline",
+        lambda *_args, **_kwargs: pytest.fail("pipeline must not run after fetch failure"),
+    )
+    result = process_archive_path(
+        FakeSession(), root=tmp_path, exact_paths=[source_path], series_ids=[1],
+        execute=True, make_light_curve_summary=False,
+    )
+
+    assert fetch_calls == ["called"]
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert result.catalog_results[0]["failure_type"] == "ProviderError"
+    assert result.catalog_results[0]["partial_rows_discarded"] is True
+
+
+def test_transient_gaia_reference_callback_waits_for_selected_persisted_identities(monkeypatch, tmp_path):
+    from grandgousier.calibration.photometric_policy import ColorCalibrationPolicy
+
+    series_rows = [_auto_series(1, 10)]
+    source_path, gaia_query, _frame_queries, _lifecycle, catalog_fields, _cone_calls = (
+        _install_auto_field_harness(monkeypatch, tmp_path, series_rows, {1: [101]})
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "load_auto_profiles",
+        lambda **_kwargs: {"MASTER": SimpleNamespace(raw_config={})},
+    )
+    policy = ColorCalibrationPolicy(
+        enabled=True,
+        reference_catalog_name="panstarrs_dr2",
+        reference_band="g",
+        color_index="g-r",
+        require_bands=("g", "r"),
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "resolve_color_calibration_policy",
+        lambda *_args, **_kwargs: policy,
+    )
+    events = []
+
+    def fake_ensure(_session, **kwargs):
+        events.append("reference_provider_and_import")
+        assert kwargs["selected_identity_source_ids"] == {"77"}
+        return {
+            "status": "MISSING_REFERENCE_PHOTOMETRY",
+            "ready": False,
+            "reason": "selected reference photometry unavailable",
+        }
+
+    monkeypatch.setattr(
+        auto_process_module, "_ensure_reference_photometry_for_series", fake_ensure
+    )
+
+    async def fake_fetch(cones, **_kwargs):
+        catalog = gaia_query.GaiaWorkingCatalog(
+            [{"source_id": "77", "ra": cones[0][0], "dec": 0.0, "phot_g_mean_mag": 15.0}]
+        )
+        catalog_fields[id(catalog)] = 10
+        return catalog, {
+            "logical_queries": 1,
+            "physical_parts": 1,
+            "provider_attempts": 1,
+            "provider_failures": [],
+            "overflow_splits": 0,
+            "rows_received": 1,
+        }
+
+    monkeypatch.setattr(gaia_query, "fetch_gaia_working_catalog", fake_fetch)
+    configs = []
+
+    def fake_pipeline(
+        _session,
+        config,
+        *,
+        working_catalog,
+        working_catalog_provenance,
+        working_catalog_promoted_source_ids,
+        working_catalog_run_ids_by_series,
+        reference_photometry_callback,
+    ):
+        configs.append(config)
+        assert isinstance(working_catalog_provenance, dict)
+        assert len(working_catalog) == 1
+        events.append("pipeline_started")
+        events.append("selected_identity_persisted")
+        reference_photometry_callback({"77"})
+        return _fake_pipeline_result()
+
+    monkeypatch.setattr(auto_process_module, "run_field_pipeline", fake_pipeline)
+    result = process_archive_path(
+        FakeSession(),
+        root=tmp_path,
+        exact_paths=[source_path],
+        series_ids=[1],
+        execute=True,
+        make_light_curve_summary=False,
+        enable_color_calibration=True,
+    )
+
+    assert len(configs) == 1
+    assert configs[0].color_calibration_requested is True
+    assert configs[0].enable_color_calibration is True
+    assert result.reference_photometry_results[0]["status"] == "MISSING_REFERENCE_PHOTOMETRY"
+    assert events == [
+        "pipeline_started",
+        "selected_identity_persisted",
+        "reference_provider_and_import",
+    ]
+
+
+def test_explicit_catalog_path_does_not_fetch_or_pass_working_catalog(monkeypatch, tmp_path):
+    series_rows = [_auto_series(1, 10)]
+    source_path, gaia_query, _frame_queries, _lifecycle, _catalog_fields, _cone_calls = (
+        _install_auto_field_harness(monkeypatch, tmp_path, series_rows, {1: [101]})
+    )
     monkeypatch.setattr(
         auto_process_module,
         "_inspect_existing_catalog",
-        lambda *_args, **_kwargs: {"n_sources": 0},
+        lambda _session, *, catalog_name: {
+            "mode": "explicit_existing",
+            "catalog_name": catalog_name,
+            "status": "DONE",
+            "inserted_or_updated": 5,
+            "n_sources": 5,
+        },
     )
-    monkeypatch.setattr(auto_process_module, "_frame_ids_by_instrument_unit", lambda *_args: {})
-    monkeypatch.setattr(auto_process_module, "_frame_ids_by_series_for_paths", lambda *_args: {})
-    monkeypatch.setattr(auto_process_module, "_load_series_for_pipeline", lambda *_args: [])
-    monkeypatch.setattr(auto_process_module, "_write_manifest_if_requested", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        gaia_query,
+        "fetch_gaia_working_catalog",
+        lambda *_args, **_kwargs: pytest.fail("explicit catalogs must not fetch transient Gaia"),
+    )
+    observed = []
 
-    import grandgousier.catalogs.gaia_query as gaia_query_module
+    def fake_pipeline(_session, config, **kwargs):
+        observed.append((config.catalog_name, kwargs))
+        return _fake_pipeline_result()
 
-    observed_frame_ids: list[list[int] | None] = []
-
-    def fake_gaia_query(_session, **kwargs):
-        observed_frame_ids.append(kwargs["frame_ids"])
-        return SimpleNamespace(
-            selected_frames=len(indexed_frame_ids),
-            queried_frames=len(indexed_frame_ids),
-            queried_cones=1,
-            row_limit_reached_cones=0,
-            read_rows=2,
-            inserted_or_updated=2,
-            failed_frames=0,
-            skipped_missing_file=0,
-            skipped_oversized_cones=0,
-            failed_footprint_reasons={},
-            sample_failed_footprints=[],
-            query_provider="test-fake",
-            query_provider_failures={},
-            query_mode="frame_union",
-            effective_query_mode="frame_union",
-        )
-
-    monkeypatch.setattr(gaia_query_module, "query_gaia_for_frames", fake_gaia_query)
-
-    process_archive_path(
-        object(),
+    monkeypatch.setattr(auto_process_module, "run_field_pipeline", fake_pipeline)
+    result = process_archive_path(
+        FakeSession(),
         root=tmp_path,
         exact_paths=[source_path],
+        series_ids=[1],
+        catalog_name="named-reference",
         execute=True,
-        auto_catalog_query=True,
-        auto_catalog_max_radius_deg=1.0,
+        make_light_curve_summary=False,
     )
 
-    assert observed_frame_ids == [indexed_frame_ids]
+    assert result.catalog_name == "named-reference"
+    assert observed == [("named-reference", {})]
+    assert result.catalog_results[0]["mode"] == "explicit_existing"
+
+
+def test_auto_working_catalog_wcs_footprint_failure_skips_fetch_and_pipeline(
+    monkeypatch, tmp_path
+):
+    series_rows = [_auto_series(1, 10)]
+    source_path, gaia_query, frame_queries, _lifecycle, _catalog_fields, exact_cone_calls = (
+        _install_auto_field_harness(monkeypatch, tmp_path, series_rows, {1: [101, 102]})
+    )
+
+    def missing_wcs_cone(path, *, margin_arcmin):
+        path = Path(path)
+        exact_cone_calls.append((path, margin_arcmin))
+        if path.name == "fake-frame-102.fits":
+            return None
+        frame_id = int(path.stem.rsplit("-", 1)[1])
+        return frame_id / 10000.0, 0.0, 0.1 + margin_arcmin / 60.0
+
+    monkeypatch.setattr(gaia_query, "_frame_cone", missing_wcs_cone)
+    fetch_calls = []
+    pipeline_calls = []
+
+    async def fake_fetch(cones, **kwargs):
+        fetch_calls.append((list(cones), kwargs))
+        return gaia_query.GaiaWorkingCatalog(), {"logical_queries": 1, "rows_received": 0}
+
+    monkeypatch.setattr(gaia_query, "fetch_gaia_working_catalog", fake_fetch)
+    monkeypatch.setattr(
+        auto_process_module,
+        "run_field_pipeline",
+        lambda *_args, **_kwargs: pipeline_calls.append("called"),
+    )
+
+    result = process_archive_path(
+        FakeSession(),
+        root=tmp_path,
+        exact_paths=[source_path],
+        series_ids=[1],
+        execute=True,
+        make_light_curve_summary=False,
+    )
+
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert result.pipeline_results == []
+    assert result.catalog_results[0]["status"] == "FAILED_FOOTPRINTS"
+    assert result.catalog_results[0]["cone_count"] == 1
+    assert result.catalog_results[0]["failed_footprints"] == 1
+    assert result.catalog_results[0]["failed_footprint_reasons"] == {
+        "invalid_wcs_footprint": 1
+    }
+    assert frame_queries == [[101, 102]]
+    assert exact_cone_calls == [
+        (Path("fake-frame-101.fits"), 2.0),
+        (Path("fake-frame-102.fits"), 2.0),
+    ]
+    assert fetch_calls == []
+    assert pipeline_calls == []
 
 
 @pytest.mark.parametrize("with_manifest", [False, True])
@@ -606,7 +1424,7 @@ def test_process_archive_path_stops_on_index_failure(monkeypatch, with_manifest)
 
     for name in (
         "_frame_ids_for_paths", "_series_ids_for_paths", "select_persisted_science_frames",
-        "_prepare_auto_catalog", "_inspect_existing_catalog", "build_field_series",
+        "_inspect_existing_catalog", "build_field_series",
         "run_field_pipeline",
     ):
         monkeypatch.setattr(auto_process_module, name, unexpected)
@@ -877,3 +1695,848 @@ def test_gaia_query_reports_all_provider_failures():
         )
 
     assert set(excinfo.value.failures) == {"first", "second"}
+
+
+class _OfflineEvidenceResult:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return list(self._rows)
+
+
+class _OfflineEvidenceSession(FakeSession):
+    def __init__(self, evidence):
+        super().__init__()
+        self.evidence = evidence
+        self.statements = []
+
+    def execute(self, statement, *_args, **_kwargs):
+        sql = str(statement)
+        self.statements.append((sql, statement))
+        if "FROM pipeline_runs" in sql:
+            rows = self.evidence["pipeline_runs"]
+        elif "FROM pipeline_run_steps" in sql:
+            rows = self.evidence["pipeline_steps"]
+        elif "FROM detection_runs" in sql:
+            rows = self.evidence["detection_runs"]
+        elif "FROM detection_run_frames" in sql:
+            rows = self.evidence["detection_run_frames"]
+        elif "FROM detection_catalog_matches" in sql:
+            rows = self.evidence["detection_catalog_matches"]
+        elif "FROM catalog_sources" in sql:
+            rows = (
+                self.evidence["target_catalog_sources"]
+                if "catalog_sources.source_id =" in sql
+                else self.evidence["matched_catalog_sources"]
+            )
+        elif "FROM frame_catalog_links" in sql:
+            rows = self.evidence["frame_catalog_links"]
+        else:
+            raise AssertionError(f"unexpected offline reuse query: {sql}")
+        return _OfflineEvidenceResult(rows)
+
+
+def _offline_reuse_evidence(monkeypatch, tmp_path, **overrides):
+    from grandgousier.catalogs import gaia_query
+    from grandgousier.db.detection_runs import (
+        CATALOG_MATCH_RUN,
+        SOURCE_DETECTION_RUN,
+        algorithm_version,
+        detection_run_fingerprint,
+    )
+    from grandgousier.photometry.source_detection import DEFAULT_ALGORITHM
+    from grandgousier.quality.detection_catalog_qc import MATCH_ALGORITHM
+
+    source_path, gaia_query, _frame_queries, _lifecycle, _catalog_fields, _cone_calls = (
+        _install_auto_field_harness(
+            monkeypatch, tmp_path, [_auto_series(1, 10)], {1: [101]}
+        )
+    )
+    cone = (0.0101, 0.0, 0.1 + 2.0 / 60.0)
+    provenance = {
+        "provenance_version": 1,
+        "field_id": 10,
+        "field_frame_count": 1,
+        "query_mode": "field_union",
+        "frame_scope_sha256": auto_process_module._working_catalog_frame_scope_sha256(
+            [101]
+        ),
+        "footprint_sha256": auto_process_module._working_catalog_footprint_sha256(
+            gaia_query, [cone]
+        ),
+        "catalog_name": "gaia_dr3",
+        "gaia_release": gaia_query.GAIA_DR3_RELEASE,
+        "gaia_table": gaia_query.GAIA_DR3_TABLE,
+        "requested_columns_sha256": auto_process_module._working_catalog_hash_json(
+            list(gaia_query.GAIA_WORKING_CATALOG_COLUMNS)
+        ),
+        "margin_arcmin": 2.0,
+        "magnitude_limit": 19.0,
+        "max_radius_deg": 1.0,
+        "maxrec": 50000,
+        "fetch_status": "SUCCEEDED_COMPLETE",
+        "fetch_complete": True,
+        "partial_rows_discarded": False,
+        "unique_sources": 1,
+        "working_catalog_sources": 1,
+    }
+    provenance.update(overrides.get("provenance", {}))
+
+    recipe = {
+        "catalog_name": "gaia_dr3",
+        "field_id": 10,
+        "series_id": 1,
+        "instrument_unit_id": 4,
+        "frame_ids": [101],
+        "dry_run": False,
+        "skip_detection": False,
+        "skip_detection_catalog_match": False,
+        "skip_catalog_frame_match": False,
+        "margin_pix": 2.0,
+        "mag_key": "G",
+        "working_catalog_mag_limit": 19.0,
+        "max_working_sources_per_frame": 2000,
+        "catalog_edge_margin_pix": 20.0,
+        "replace_frame_catalog_links": True,
+        "detection_threshold_sigma": 5.0,
+        "detection_max_sources_per_frame": 2000,
+        "detection_min_separation_pix": 5.0,
+        "detection_match_radius_arcsec": 2.0,
+        "aperture_radius_pix": 3.0,
+        "annulus_inner_pix": 8.0,
+        "annulus_outer_pix": 12.0,
+        "gaia_query_coverage_v1": {"coverage_complete": True},
+        "working_catalog_provenance": provenance,
+        "quality_policy": {"working_catalog_provenance": provenance},
+    }
+    recipe.update(overrides.get("recipe", {}))
+    pipeline_run = {
+        "pipeline_run_id": 100,
+        "field_id": 10,
+        "series_id": 1,
+        "instrument_unit_id": 4,
+        "catalog_name": "gaia_dr3",
+        "status": "DONE",
+        "recipe_json": recipe,
+    }
+    detector_parameters = {
+        "threshold_sigma": 5.0,
+        "max_sources_per_frame": 2000,
+        "min_separation_pix": 5.0,
+        "aperture_radius_pix": 3.0,
+        "annulus_inner_pix": 8.0,
+        "annulus_outer_pix": 12.0,
+        "centroid_box_radius_pix": 3,
+    }
+    matcher_parameters = {
+        "detection_algorithm": DEFAULT_ALGORITHM,
+        "radius_arcsec": 2.0,
+        "mag_key": "G",
+        "min_snr": None,
+    }
+    source_run = {
+        "detection_run_id": 11,
+        "pipeline_run_id": 100,
+        "run_kind": SOURCE_DETECTION_RUN,
+        "catalog_name": None,
+        "algorithm": DEFAULT_ALGORITHM,
+        "algorithm_version": algorithm_version(DEFAULT_ALGORITHM),
+        "parameters": detector_parameters,
+        "fingerprint": detection_run_fingerprint(
+            run_kind=SOURCE_DETECTION_RUN,
+            algorithm=DEFAULT_ALGORITHM,
+            parameters=detector_parameters,
+        ),
+    }
+    match_run = {
+        "detection_run_id": 12,
+        "pipeline_run_id": 100,
+        "run_kind": CATALOG_MATCH_RUN,
+        "catalog_name": "gaia_dr3",
+        "algorithm": MATCH_ALGORITHM,
+        "algorithm_version": algorithm_version(MATCH_ALGORITHM),
+        "parameters": matcher_parameters,
+        "fingerprint": detection_run_fingerprint(
+            run_kind=CATALOG_MATCH_RUN,
+            algorithm=MATCH_ALGORITHM,
+            parameters=matcher_parameters,
+            catalog_name="gaia_dr3",
+        ),
+    }
+    steps = [
+        {
+            "pipeline_run_id": 100,
+            "step_name": "detect_sources",
+            "status": "DONE",
+            "result_json": {
+                "detection_run_id": 11,
+                "selected_frames": 1,
+                "checked_frames": 1,
+                "failed_frames": 0,
+                "skipped_missing_file": 0,
+            },
+        },
+        {
+            "pipeline_run_id": 100,
+            "step_name": "select_and_promote_working_gaia_sources",
+            "status": "DONE",
+            "result_json": {
+                "selected_gaia_source_count": 1,
+                "canonical_catalog_source_count": 1,
+            },
+        },
+        {
+            "pipeline_run_id": 100,
+            "step_name": "project_selected_working_gaia_sources",
+            "status": "DONE",
+            "result_json": {
+                "selected_frames": 1,
+                "checked_frames": 1,
+                "failed_frames": 0,
+                "skipped_missing_file": 0,
+                "selected_sources": 1,
+                "linked": 1,
+            },
+        },
+        {
+            "pipeline_run_id": 100,
+            "step_name": "match_detections_to_catalog",
+            "status": "DONE",
+            "result_json": {
+                "detection_run_id": 12,
+                "selected_frames": 1,
+                "checked_frames": 1,
+                "failed_frames": 0,
+                "matched": 1,
+            },
+        },
+    ]
+    steps = overrides.get("pipeline_steps", steps)
+    match_frame_status = overrides.get("match_frame_status", "DONE")
+    run_frames = [
+        {
+            "detection_run_frame_id": 1101,
+            "detection_run_id": 11,
+            "frame_id": 101,
+            "status": "DONE",
+            "diagnostics": {},
+        },
+        {
+            "detection_run_frame_id": 1201,
+            "detection_run_id": 12,
+            "frame_id": 101,
+            "status": match_frame_status,
+            "diagnostics": {"n_matched": 1},
+        },
+    ]
+    if overrides.get("missing_match_frame"):
+        run_frames = run_frames[:1]
+    matched_catalog_source = {
+        "catalog_source_id": 501,
+        "catalog_name": "gaia_dr3",
+        "source_id": "77",
+        "ra_deg": 0.0101,
+        "dec_deg": 0.0,
+        "ref_mags": {"G": 15.0},
+    }
+    target_catalog_source = {
+        "catalog_source_id": 502,
+        "catalog_name": "gaia_dr3",
+        "source_id": "88",
+        "ra_deg": 0.011,
+        "dec_deg": 0.0,
+        "ref_mags": {"G": 16.0},
+    }
+    details = {
+        "mag_key": "G",
+        "working_mag_limit": 19.0,
+        "max_sources_per_frame": 2000,
+        "edge_margin_pix": 20.0,
+    }
+    link = {
+        "frame_id": 101,
+        "catalog_source_id": 501,
+        "in_footprint": True,
+        "margin_pix": 2.0,
+        "match_status": "IN_FOOTPRINT",
+        "details": details,
+    }
+    evidence = {
+        "pipeline_runs": [pipeline_run],
+        "pipeline_steps": steps,
+        "detection_runs": [source_run, match_run],
+        "detection_run_frames": run_frames,
+        "detection_catalog_matches": [
+            {
+                "frame_id": 101,
+                "detection_run_frame_id": 1201,
+                "source_detection_id": 6101,
+                "source_detection_run_frame_id": 1101,
+                "joined_source_detection_run_frame_id": 1101,
+                "source_detection_run_id": 11,
+                "source_frame_id": 101,
+                "catalog_source_id": 501,
+                "match_status": "MATCHED",
+            }
+        ],
+        "matched_catalog_sources": [matched_catalog_source],
+        "target_catalog_sources": [target_catalog_source],
+        "frame_catalog_links": [link],
+    }
+    evidence.update(overrides.get("evidence", {}))
+    return source_path, gaia_query, _OfflineEvidenceSession(evidence)
+
+
+def _append_completed_offline_run(
+    evidence,
+    *,
+    pipeline_run_id=200,
+    source_run_id=21,
+    match_run_id=22,
+    source_frame_id=2101,
+    match_frame_id=2201,
+    catalog_source_id=501,
+    source_id="77",
+    provenance_changes=None,
+):
+    from copy import deepcopy
+
+    original_run = evidence["pipeline_runs"][0]
+    original_pipeline_id = original_run["pipeline_run_id"]
+    recipe = deepcopy(original_run["recipe_json"])
+    provenance = deepcopy(recipe["working_catalog_provenance"])
+    provenance.update(
+        {
+            "reuse_mode": "completed_pipeline_catalog_match",
+            "new_source_search_performed": False,
+            "coverage_complete": False,
+            "per_frame_match_coverage_complete": True,
+            "reused_catalog_source_count": 1,
+            "explicit_target_included": False,
+        }
+    )
+    provenance.update(provenance_changes or {})
+    recipe["working_catalog_provenance"] = provenance
+    recipe["quality_policy"]["working_catalog_provenance"] = provenance
+    evidence["pipeline_runs"].append(
+        {
+            **deepcopy(original_run),
+            "pipeline_run_id": pipeline_run_id,
+            "recipe_json": recipe,
+        }
+    )
+
+    for step in list(evidence["pipeline_steps"]):
+        if step["pipeline_run_id"] != original_pipeline_id:
+            continue
+        copied_step = deepcopy(step)
+        copied_step["pipeline_run_id"] = pipeline_run_id
+        if copied_step["step_name"] == "detect_sources":
+            copied_step["result_json"]["detection_run_id"] = source_run_id
+        elif copied_step["step_name"] == "match_detections_to_catalog":
+            copied_step["result_json"]["detection_run_id"] = match_run_id
+        evidence["pipeline_steps"].append(copied_step)
+
+    for detection_run in evidence["detection_runs"][:2]:
+        copied_run = deepcopy(detection_run)
+        copied_run["pipeline_run_id"] = pipeline_run_id
+        copied_run["detection_run_id"] = (
+            source_run_id if detection_run["detection_run_id"] == 11 else match_run_id
+        )
+        evidence["detection_runs"].append(copied_run)
+
+    evidence["detection_run_frames"].extend(
+        [
+            {
+                "detection_run_frame_id": source_frame_id,
+                "detection_run_id": source_run_id,
+                "frame_id": 101,
+                "status": "DONE",
+                "diagnostics": {},
+            },
+            {
+                "detection_run_frame_id": match_frame_id,
+                "detection_run_id": match_run_id,
+                "frame_id": 101,
+                "status": "DONE",
+                "diagnostics": {"n_matched": 1},
+            },
+        ]
+    )
+    evidence["detection_catalog_matches"].append(
+        {
+            "frame_id": 101,
+            "detection_run_frame_id": match_frame_id,
+            "source_detection_id": source_frame_id + 5000,
+            "source_detection_run_frame_id": source_frame_id,
+            "joined_source_detection_run_frame_id": source_frame_id,
+            "source_detection_run_id": source_run_id,
+            "source_frame_id": 101,
+            "catalog_source_id": catalog_source_id,
+            "match_status": "MATCHED",
+        }
+    )
+    if catalog_source_id != 501:
+        evidence["matched_catalog_sources"].append(
+            {
+                "catalog_source_id": catalog_source_id,
+                "catalog_name": "gaia_dr3",
+                "source_id": source_id,
+                "ra_deg": 0.012,
+                "dec_deg": 0.0,
+                "ref_mags": {"G": 15.5},
+            }
+        )
+        link = deepcopy(evidence["frame_catalog_links"][0])
+        link["catalog_source_id"] = catalog_source_id
+        evidence["frame_catalog_links"].append(link)
+
+
+def _run_offline_reuse(
+    monkeypatch,
+    tmp_path,
+    *,
+    target_source_id=None,
+    evidence_overrides=None,
+    allow_empty_catalog=False,
+):
+    from grandgousier.catalogs import gaia_query
+
+    source_path, _gaia_query, session = _offline_reuse_evidence(
+        monkeypatch, tmp_path, **(evidence_overrides or {})
+    )
+    for prior_run in (evidence_overrides or {}).get("prior_offline_runs", []):
+        _append_completed_offline_run(session.evidence, **prior_run)
+    monkeypatch.setattr(
+        gaia_query,
+        "fetch_gaia_working_catalog",
+        lambda *_args, **_kwargs: pytest.fail("offline reuse must not issue Gaia TAP"),
+    )
+    observed = []
+
+    def fake_pipeline(
+        _session,
+        config,
+        *,
+        working_catalog,
+        working_catalog_provenance,
+        working_catalog_promoted_source_ids,
+        working_catalog_run_ids_by_series,
+    ):
+        observed.append(
+            {
+                "source_ids": [str(value) for value in working_catalog.source_ids],
+                "provenance": working_catalog_provenance,
+                "target_source_id": config.target_source_id,
+            }
+        )
+        return _fake_pipeline_result()
+
+    monkeypatch.setattr(auto_process_module, "run_field_pipeline", fake_pipeline)
+    result = process_archive_path(
+        session,
+        root=tmp_path,
+        exact_paths=[source_path],
+        series_ids=[1],
+        execute=True,
+        make_light_curve_summary=False,
+        auto_catalog_query=False,
+        allow_empty_catalog=allow_empty_catalog,
+        target_source_id=target_source_id,
+    )
+    return result, observed, session
+
+
+def test_offline_gaia_reuse_uses_only_completed_scoped_match_identities(
+    monkeypatch, tmp_path
+):
+    result, observed, session = _run_offline_reuse(monkeypatch, tmp_path)
+
+    assert result.status == "DONE_WITH_WARNINGS"
+    assert observed[0]["source_ids"] == ["77"]
+    assert observed[0]["provenance"]["new_source_search_performed"] is False
+    assert observed[0]["provenance"]["coverage_complete"] is False
+    assert result.catalog_results[0]["new_source_search_performed"] is False
+    assert result.catalog_results[0]["coverage_complete"] is False
+    assert result.catalog_results[0]["per_frame_match_coverage_complete"] is True
+    assert result.catalog_results[0]["working_catalog_provenance"][
+        "new_source_search_performed"
+    ] is False
+    assert result.catalog_results[0]["working_catalog_provenance"][
+        "coverage_complete"
+    ] is False
+    assert result.catalog_results[0]["working_catalog_provenance"][
+        "field_discarded_transient_identity_count"
+    ] is None
+    assert not any("gaiadr3.gaia_source" in sql for sql, _ in session.statements)
+    catalog_queries = [sql for sql, _ in session.statements if "FROM catalog_sources" in sql]
+    assert catalog_queries
+    assert all(
+        "catalog_source_id IN" in sql or "source_id =" in sql
+        for sql in catalog_queries
+    )
+
+
+def test_second_offline_gaia_reuse_accepts_matching_online_and_offline_history(
+    monkeypatch, tmp_path
+):
+    result, observed, session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        evidence_overrides={"prior_offline_runs": [{}]},
+    )
+
+    assert result.status == "DONE_WITH_WARNINGS"
+    assert observed[0]["source_ids"] == ["77"]
+    assert observed[0]["provenance"]["new_source_search_performed"] is False
+    assert observed[0]["provenance"]["coverage_complete"] is False
+    assert observed[0]["provenance"]["per_frame_match_coverage_complete"] is True
+    assert result.catalog_results[0]["new_source_search_performed"] is False
+    assert result.catalog_results[0]["coverage_complete"] is False
+    online_provenance = session.evidence["pipeline_runs"][0]["recipe_json"][
+        "working_catalog_provenance"
+    ]
+    reused_provenance = result.catalog_results[0]["working_catalog_provenance"]
+    assert reused_provenance["frame_scope_sha256"] == online_provenance["frame_scope_sha256"]
+    assert reused_provenance["footprint_sha256"] == online_provenance["footprint_sha256"]
+    assert reused_provenance["fetch_status"] == online_provenance["fetch_status"]
+    assert reused_provenance["fetch_complete"] is online_provenance["fetch_complete"]
+    assert result.catalog_results[0]["reused_pipeline_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("prior_run", "expected_reason"),
+    [
+        (
+            {"provenance_changes": {"provider_attempts": 2}},
+            "AMBIGUOUS_QUERY_PROVENANCE",
+        ),
+        (
+            {"catalog_source_id": 503, "source_id": "99"},
+            "AMBIGUOUS_COMPLETED_FRAME_EVIDENCE",
+        ),
+    ],
+)
+def test_offline_gaia_reuse_refuses_conflicting_completed_history(
+    monkeypatch, tmp_path, prior_run, expected_reason
+):
+    result, observed, _session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        evidence_overrides={"prior_offline_runs": [prior_run]},
+    )
+
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert observed == []
+    assert result.catalog_results[0]["refusal_reason"] == expected_reason
+    assert result.catalog_results[0]["new_source_search_performed"] is False
+    assert result.catalog_results[0]["coverage_complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("provenance_change", "expected_reason"),
+    [
+        ({"frame_scope_sha256": "f" * 64}, "FIELD_FRAME_SCOPE_MISMATCH"),
+        ({"footprint_sha256": "e" * 64}, "WCS_FOOTPRINT_MISMATCH"),
+    ],
+)
+def test_offline_gaia_reuse_refuses_scope_or_footprint_mismatch(
+    monkeypatch, tmp_path, provenance_change, expected_reason
+):
+    result, observed, _session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        evidence_overrides={"provenance": provenance_change},
+    )
+
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert observed == []
+    assert result.catalog_results[0]["refusal_reason"] == expected_reason
+    assert result.catalog_results[0]["new_source_search_performed"] is False
+    assert result.catalog_results[0]["coverage_complete"] is False
+
+
+def test_offline_gaia_reuse_refuses_incompatible_matcher_configuration(
+    monkeypatch, tmp_path
+):
+    result, observed, _session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        evidence_overrides={"recipe": {"detection_match_radius_arcsec": 3.0}},
+    )
+
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert observed == []
+    assert result.catalog_results[0]["refusal_reason"] == (
+        "PIPELINE_CONFIGURATION_MISMATCH"
+    )
+
+
+@pytest.mark.parametrize("allow_empty_catalog", [False, True])
+def test_offline_gaia_reuse_requires_explicit_empty_flag_without_compatible_evidence(
+    monkeypatch, tmp_path, allow_empty_catalog
+):
+    result, observed, _session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        allow_empty_catalog=allow_empty_catalog,
+        evidence_overrides={"evidence": {"pipeline_runs": []}},
+    )
+
+    row = result.catalog_results[0]
+    assert row["reuse_compatible"] is False
+    assert row["refusal_reason"] == "NO_COMPLETED_PIPELINE_EVIDENCE"
+    if allow_empty_catalog:
+        assert result.status == "DONE_WITH_WARNINGS"
+        assert len(observed) == 1
+        assert observed[0]["source_ids"] == []
+        assert row["empty_catalog_debug_fallback"] is True
+        assert row["new_source_search_performed"] is False
+        assert row["coverage_complete"] is False
+        assert row["per_frame_match_coverage_complete"] is False
+        assert observed[0]["provenance"]["new_source_search_performed"] is False
+        assert observed[0]["provenance"]["coverage_complete"] is False
+    else:
+        assert result.status == "FAILED_PRECONDITION_CATALOG"
+        assert observed == []
+        assert "empty_catalog_debug_fallback" not in row
+
+
+def test_legacy_query_coverage_diagnostic_cannot_replace_compact_fetch_proof(
+    monkeypatch, tmp_path
+):
+    result, observed, _session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        evidence_overrides={"provenance": {"fetch_complete": False}},
+    )
+
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert observed == []
+    assert result.catalog_results[0]["refusal_reason"] == "FETCH_PROVENANCE_INCOMPLETE"
+
+
+@pytest.mark.parametrize(
+    ("frame_overrides", "expected_reason"),
+    [
+        ({"missing_match_frame": True}, "INCOMPLETE_SUCCESSFUL_FRAME_COVERAGE"),
+        ({"match_frame_status": "FAILED"}, "INCOMPLETE_SUCCESSFUL_FRAME_COVERAGE"),
+    ],
+)
+def test_offline_gaia_reuse_refuses_incomplete_or_failed_frame_coverage(
+    monkeypatch, tmp_path, frame_overrides, expected_reason
+):
+    result, observed, _session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        evidence_overrides=frame_overrides,
+    )
+
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert observed == []
+    assert result.catalog_results[0]["refusal_reason"] == expected_reason
+
+
+def test_offline_gaia_reuse_refuses_missing_match_row_despite_positive_diagnostics(
+    monkeypatch, tmp_path
+):
+    result, observed, _session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        evidence_overrides={"evidence": {"detection_catalog_matches": []}},
+    )
+
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert observed == []
+    assert result.catalog_results[0]["refusal_reason"] == "MATCH_ROW_COUNT_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    "source_evidence_change",
+    [
+        {
+            "source_detection_run_frame_id": 2101,
+            "joined_source_detection_run_frame_id": 2101,
+            "source_detection_run_id": 21,
+            "source_frame_id": 101,
+        },
+        {
+            "source_detection_run_frame_id": 1102,
+            "joined_source_detection_run_frame_id": 1102,
+            "source_detection_run_id": 11,
+            "source_frame_id": 102,
+        },
+    ],
+)
+def test_offline_gaia_reuse_refuses_match_from_different_detection_run_or_frame(
+    monkeypatch, tmp_path, source_evidence_change
+):
+    result, observed, _session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        evidence_overrides={
+            "evidence": {
+                "detection_catalog_matches": [
+                    {
+                        "frame_id": 101,
+                        "detection_run_frame_id": 1201,
+                        "source_detection_id": 6101,
+                        "source_detection_run_frame_id": 1101,
+                        "joined_source_detection_run_frame_id": 1101,
+                        "source_detection_run_id": 11,
+                        "source_frame_id": 101,
+                        "catalog_source_id": 501,
+                        "match_status": "MATCHED",
+                        **source_evidence_change,
+                    }
+                ]
+            }
+        },
+    )
+
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert observed == []
+    assert (
+        result.catalog_results[0]["refusal_reason"]
+        == "MATCH_SOURCE_DETECTION_SCOPE_MISMATCH"
+    )
+
+
+@pytest.mark.parametrize(
+    ("evidence_change", "expected_reason"),
+    [
+        ({"matched_catalog_sources": []}, "MATCHED_GAIA_IDENTITY_MISSING"),
+        ({"frame_catalog_links": []}, "MATCHED_FRAME_LINK_MISSING_OR_INCOMPATIBLE"),
+    ],
+)
+def test_offline_gaia_reuse_refuses_missing_identity_or_corresponding_link(
+    monkeypatch, tmp_path, evidence_change, expected_reason
+):
+    result, observed, _session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        evidence_overrides={"evidence": evidence_change},
+    )
+
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert observed == []
+    assert result.catalog_results[0]["refusal_reason"] == expected_reason
+
+
+def test_offline_gaia_reuse_includes_target_only_with_canonical_row_and_scoped_link(
+    monkeypatch, tmp_path
+):
+    result, observed, _session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        target_source_id="88",
+        evidence_overrides={
+            "evidence": {
+                "frame_catalog_links": [
+                    {
+                        "frame_id": 101,
+                        "catalog_source_id": 501,
+                        "in_footprint": True,
+                        "margin_pix": 2.0,
+                        "match_status": "IN_FOOTPRINT",
+                        "details": {
+                            "mag_key": "G",
+                            "working_mag_limit": 19.0,
+                            "max_sources_per_frame": 2000,
+                            "edge_margin_pix": 20.0,
+                        },
+                    },
+                    {
+                        "frame_id": 101,
+                        "catalog_source_id": 502,
+                        "in_footprint": True,
+                        "margin_pix": 2.0,
+                        "match_status": "IN_FOOTPRINT",
+                        "details": {
+                            "mag_key": "G",
+                            "working_mag_limit": 19.0,
+                            "max_sources_per_frame": 2000,
+                            "edge_margin_pix": 20.0,
+                        },
+                    },
+                ]
+            }
+        },
+    )
+
+    assert result.status == "DONE_WITH_WARNINGS"
+    assert observed[0]["source_ids"] == ["77", "88"]
+    assert observed[0]["provenance"]["explicit_target_included"] is True
+
+
+def test_offline_gaia_reuse_refuses_unscoped_target_and_never_promotes_it(
+    monkeypatch, tmp_path
+):
+    result, observed, session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        target_source_id="88",
+    )
+
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert observed == []
+    assert result.catalog_results[0]["refusal_reason"] == (
+        "EXPLICIT_TARGET_HAS_NO_EXACT_SCOPE_LINK"
+    )
+    assert all(
+        "catalog_source_id IN" in sql or "source_id =" in sql
+        for sql, _ in session.statements
+        if "FROM catalog_sources" in sql
+    )
+
+
+def test_offline_gaia_reuse_refuses_target_without_canonical_identity(
+    monkeypatch, tmp_path
+):
+    result, observed, _session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        target_source_id="88",
+        evidence_overrides={"evidence": {"target_catalog_sources": []}},
+    )
+
+    assert result.status == "FAILED_PRECONDITION_CATALOG"
+    assert observed == []
+    assert result.catalog_results[0]["refusal_reason"] == (
+        "EXPLICIT_TARGET_NOT_CANONICAL"
+    )
+
+
+@pytest.mark.parametrize("allow_empty_catalog", [False, True])
+def test_explicit_empty_catalog_debugging_escape_does_not_reuse_incomplete_evidence(
+    monkeypatch, tmp_path, allow_empty_catalog
+):
+    result, observed, _session = _run_offline_reuse(
+        monkeypatch,
+        tmp_path,
+        allow_empty_catalog=allow_empty_catalog,
+        evidence_overrides={
+            "evidence": {
+                "detection_catalog_matches": [],
+                "matched_catalog_sources": [],
+                "frame_catalog_links": [],
+            }
+        },
+    )
+
+    row = result.catalog_results[0]
+    assert bool(observed) is allow_empty_catalog
+    assert row["reuse_compatible"] is False
+    assert row["refusal_reason"] == "MATCH_ROW_COUNT_MISMATCH"
+    if allow_empty_catalog:
+        assert result.status == "DONE_WITH_WARNINGS"
+        assert observed[0]["source_ids"] == []
+        assert row["empty_catalog_debug_fallback"] is True
+        assert row["new_source_search_performed"] is False
+        assert row["coverage_complete"] is False
+    else:
+        assert result.status == "FAILED_PRECONDITION_CATALOG"

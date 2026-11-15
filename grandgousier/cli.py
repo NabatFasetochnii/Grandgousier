@@ -10,6 +10,7 @@ import traceback
 from pathlib import Path
 
 from grandgousier import __version__
+from grandgousier.astrometry.gaia_wcs_com import GAIA_WCS_COM_POLICY
 from grandgousier.db.init_db import init_db, reset_db
 from grandgousier.db.session import make_session_factory
 from grandgousier.logging_config import configure_logging
@@ -1255,6 +1256,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_field_pipeline.add_argument("--out-dir", default=None, help="Optional directory for field QC JSON/CSV outputs")
     p_field_pipeline.add_argument("--margin-pix", type=float, default=2.0, help="Catalog-to-frame footprint margin")
     p_field_pipeline.add_argument("--aperture-radius-pix", type=float, default=3.0, help="Forced-photometry aperture radius")
+    p_field_pipeline.add_argument("--local-com-max-shift-pix", type=float, default=GAIA_WCS_COM_POLICY["local_com_max_shift_pix"], help="Maximum local center-of-mass offset from the accepted frame shift")
+    p_field_pipeline.add_argument("--frame-shift-min-matches", type=int, default=GAIA_WCS_COM_POLICY["frame_shift_min_matches"], help="Minimum exact current-run unsaturated matches for a frame translation")
+    p_field_pipeline.add_argument("--frame-shift-max-robust-scatter-pix", type=float, default=GAIA_WCS_COM_POLICY["frame_shift_max_robust_scatter_pix"], help="Maximum robust frame-shift scatter in pixels")
+    p_field_pipeline.add_argument("--frame-shift-max-absolute-pix", type=float, default=GAIA_WCS_COM_POLICY["frame_shift_max_absolute_pix"], help="Maximum absolute frame-shift magnitude in pixels")
     p_field_pipeline.add_argument("--photometry-estimator", choices=("circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"), default="adaptive_ellipse", help="Base science flux estimator; adaptive_ellipse uses a local PSF-aligned elliptical aperture and keeps circular as fallback")
     p_field_pipeline.add_argument("--adaptive-min-psf-snr", type=float, default=20.0, help="Minimum detection S/N for adaptive-aperture PSF references")
     p_field_pipeline.add_argument("--adaptive-max-psf-sources-per-frame", type=int, default=500, help="Maximum PSF reference detections used per frame by adaptive photometry")
@@ -1363,18 +1368,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_field_pipeline.add_argument("--color-min-bic-improvement", type=float, default=6.0, help="Minimum BIC improvement required to select the color model")
     p_field_pipeline.add_argument("--color-min-mad-improvement", type=float, default=0.0, help="Minimum residual-MAD improvement required to select the color model")
     p_field_pipeline.add_argument("--object-qc-min-measurements", type=int, default=10, help="Object-QC minimum measurements")
-    p_field_pipeline.add_argument("--crowded-arcsec", type=float, default=10.0, help="Object-QC crowded threshold")
-    p_field_pipeline.add_argument("--blended-arcsec", type=float, default=5.0, help="Object-QC blend threshold")
+    p_field_pipeline.add_argument("--crowded-arcsec", type=float, default=GAIA_WCS_COM_POLICY["crowded_arcsec"], help="Object-QC crowded threshold and local-centering veto")
+    p_field_pipeline.add_argument("--blended-arcsec", type=float, default=GAIA_WCS_COM_POLICY["blended_arcsec"], help="Object-QC blend threshold and local-centering veto")
     p_field_pipeline.add_argument("--edge-distance-pix", type=float, default=10.0, help="Object-QC edge threshold")
     p_field_pipeline.add_argument("--high-rms", type=float, default=0.10, help="Object-QC HIGH_RMS threshold")
     p_field_pipeline.add_argument("--high-mag-err", type=float, default=0.08, help="Object-QC FAINT_NOISY threshold")
     p_field_pipeline.add_argument("--min-detection-fraction", type=float, default=0.5, help="Object-QC weak detection-support threshold")
     p_field_pipeline.add_argument("--max-ref-mag-delta", type=float, default=2.0, help="Object-QC catalog residual threshold; use negative to disable")
     p_field_pipeline.add_argument("--disable-dynamic-separation", dest="dynamic_separation", action="store_false", help="Disable dynamic separation QC")
-    p_field_pipeline.set_defaults(dynamic_separation=True)
-    p_field_pipeline.add_argument("--dynamic-aperture-factor", type=float, default=1.0, help="Dynamic blend threshold aperture multiplier")
-    p_field_pipeline.add_argument("--dynamic-crowding-factor", type=float, default=1.5, help="Dynamic crowded threshold multiplier")
-    p_field_pipeline.add_argument("--fwhm-header-unit", choices=("arcsec", "pix", "auto"), default="arcsec", help="FWHM header unit for dynamic QC")
+    p_field_pipeline.set_defaults(dynamic_separation=GAIA_WCS_COM_POLICY["dynamic_separation"])
+    p_field_pipeline.add_argument("--dynamic-seeing-factor", type=float, default=GAIA_WCS_COM_POLICY["dynamic_seeing_factor"], help="Dynamic blend threshold seeing multiplier")
+    p_field_pipeline.add_argument("--dynamic-aperture-factor", type=float, default=GAIA_WCS_COM_POLICY["dynamic_aperture_factor"], help="Dynamic blend threshold aperture multiplier")
+    p_field_pipeline.add_argument("--dynamic-crowding-factor", type=float, default=GAIA_WCS_COM_POLICY["dynamic_crowding_factor"], help="Dynamic crowded threshold multiplier")
+    p_field_pipeline.add_argument("--fwhm-header-unit", choices=("arcsec", "pix", "auto"), default=GAIA_WCS_COM_POLICY["fwhm_header_unit"], help="FWHM header unit for dynamic QC")
     p_field_pipeline.add_argument("--field-report-min-excess", type=float, default=2.0, help="Field report candidate RMS excess threshold")
     p_field_pipeline.add_argument("--disable-intrinsic-variability-candidates", dest="enable_intrinsic_variability_candidates", action="store_false", help="Disable field-report intrinsic variability candidate channel")
     p_field_pipeline.set_defaults(enable_intrinsic_variability_candidates=True)
@@ -1484,6 +1490,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_archive_pipeline.add_argument("--log-dir", default="logs", help="Root directory for per-run logs")
     p_archive_pipeline.add_argument("--file-log-level", default=None, help="File log level: DEBUG, INFO, WARNING, ERROR")
     p_archive_pipeline.add_argument("--aperture-radius-pix", type=float, default=3.0, help="Forced-photometry aperture radius")
+    p_archive_pipeline.add_argument("--local-com-max-shift-pix", type=float, default=GAIA_WCS_COM_POLICY["local_com_max_shift_pix"])
+    p_archive_pipeline.add_argument("--frame-shift-min-matches", type=int, default=GAIA_WCS_COM_POLICY["frame_shift_min_matches"])
+    p_archive_pipeline.add_argument("--frame-shift-max-robust-scatter-pix", type=float, default=GAIA_WCS_COM_POLICY["frame_shift_max_robust_scatter_pix"])
+    p_archive_pipeline.add_argument("--frame-shift-max-absolute-pix", type=float, default=GAIA_WCS_COM_POLICY["frame_shift_max_absolute_pix"])
+    p_archive_pipeline.add_argument("--crowded-arcsec", type=float, default=GAIA_WCS_COM_POLICY["crowded_arcsec"])
+    p_archive_pipeline.add_argument("--blended-arcsec", type=float, default=GAIA_WCS_COM_POLICY["blended_arcsec"])
+    p_archive_pipeline.add_argument("--disable-dynamic-separation", dest="dynamic_separation", action="store_false")
+    p_archive_pipeline.set_defaults(dynamic_separation=GAIA_WCS_COM_POLICY["dynamic_separation"])
+    p_archive_pipeline.add_argument("--dynamic-seeing-factor", type=float, default=GAIA_WCS_COM_POLICY["dynamic_seeing_factor"])
+    p_archive_pipeline.add_argument("--dynamic-aperture-factor", type=float, default=GAIA_WCS_COM_POLICY["dynamic_aperture_factor"])
+    p_archive_pipeline.add_argument("--dynamic-crowding-factor", type=float, default=GAIA_WCS_COM_POLICY["dynamic_crowding_factor"])
+    p_archive_pipeline.add_argument("--fwhm-header-unit", choices=("arcsec", "pix", "auto"), default=GAIA_WCS_COM_POLICY["fwhm_header_unit"])
     p_archive_pipeline.add_argument("--annulus-inner-pix", type=float, default=8.0, help="Background annulus inner radius")
     p_archive_pipeline.add_argument("--annulus-outer-pix", type=float, default=12.0, help="Background annulus outer radius")
     p_archive_pipeline.add_argument("--dry-run", action="store_true", help="Run pipeline stages in dry-run mode")
@@ -1527,6 +1545,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_process_path.add_argument("--file-log-level", default="INFO", help="File log level")
     p_process_path.add_argument("--no-file-log", action="store_true", help="Do not write run.log/run.jsonl/errors.log")
     p_process_path.add_argument("--aperture-radius-pix", type=float, default=3.0, help="Forced-photometry aperture radius")
+    p_process_path.add_argument("--local-com-max-shift-pix", type=float, default=GAIA_WCS_COM_POLICY["local_com_max_shift_pix"], help="Maximum local center-of-mass offset from the accepted frame shift")
+    p_process_path.add_argument("--frame-shift-min-matches", type=int, default=GAIA_WCS_COM_POLICY["frame_shift_min_matches"], help="Minimum exact current-run unsaturated matches for a frame translation")
+    p_process_path.add_argument("--frame-shift-max-robust-scatter-pix", type=float, default=GAIA_WCS_COM_POLICY["frame_shift_max_robust_scatter_pix"], help="Maximum robust frame-shift scatter in pixels")
+    p_process_path.add_argument("--frame-shift-max-absolute-pix", type=float, default=GAIA_WCS_COM_POLICY["frame_shift_max_absolute_pix"], help="Maximum absolute frame-shift magnitude in pixels")
     p_process_path.add_argument("--photometry-estimator", choices=("circular", "adaptive_ellipse", "spatial_psf", "empirical_psf"), default="adaptive_ellipse", help="Base science flux estimator; adaptive_ellipse runs the complete Stage-2 chain from a local PSF-aligned elliptical aperture")
     p_process_path.add_argument("--adaptive-min-psf-snr", type=float, default=20.0, help="Minimum detection S/N for adaptive-aperture PSF references")
     p_process_path.add_argument("--adaptive-max-psf-sources-per-frame", type=int, default=500, help="Maximum PSF reference detections used per frame by adaptive photometry")
@@ -1624,6 +1646,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_process_path.add_argument("--candidate-ensemble-convergence-max-iterations", type=int, default=10, help="Safety cap for --candidate-ensemble-until-converged; counts the initial ensemble as iteration 1")
     p_process_path.add_argument("--candidate-ensemble-growth-policy", choices=("initial_only", "all"), default="initial_only", help="Whether later ensemble iterations may add newly appearing candidates; initial_only prevents exclusion cascades")
     p_process_path.add_argument("--ensemble-min-ref-stars-per-frame", type=int, default=30, help="Minimum conventional ensemble reference stars required per frame; default preserves prior process-archive-path behavior")
+    p_process_path.add_argument("--crowded-arcsec", type=float, default=GAIA_WCS_COM_POLICY["crowded_arcsec"], help="Object-QC crowded threshold and local-centering veto")
+    p_process_path.add_argument("--blended-arcsec", type=float, default=GAIA_WCS_COM_POLICY["blended_arcsec"], help="Object-QC blend threshold and local-centering veto")
+    p_process_path.add_argument("--disable-dynamic-separation", dest="dynamic_separation", action="store_false", help="Disable dynamic seeing/aperture separation QC and centering vetoes")
+    p_process_path.set_defaults(dynamic_separation=GAIA_WCS_COM_POLICY["dynamic_separation"])
+    p_process_path.add_argument("--dynamic-seeing-factor", type=float, default=GAIA_WCS_COM_POLICY["dynamic_seeing_factor"], help="Dynamic blend threshold seeing multiplier")
+    p_process_path.add_argument("--dynamic-aperture-factor", type=float, default=GAIA_WCS_COM_POLICY["dynamic_aperture_factor"], help="Dynamic blend threshold aperture multiplier")
+    p_process_path.add_argument("--dynamic-crowding-factor", type=float, default=GAIA_WCS_COM_POLICY["dynamic_crowding_factor"], help="Dynamic crowded threshold multiplier")
+    p_process_path.add_argument("--fwhm-header-unit", choices=("arcsec", "pix", "auto"), default=GAIA_WCS_COM_POLICY["fwhm_header_unit"], help="FWHM header unit for dynamic QC")
     p_process_path.add_argument("--enable-spatial-ensemble", action="store_true", help="Apply zero-mean per-frame spatial residual calibration after each conventional ensemble pass")
     p_process_path.add_argument("--enable-photometric-frame-qc", action="store_true", help="Enable conservative post-ensemble frame QC: relative/spatial anomalies become SUSPECT diagnostic flags without changing measurement errors; BAD is reserved for hard failures; accepted candidates are rechecked on GOOD epochs")
     p_process_path.add_argument("--spatial-ensemble-max-order", type=int, choices=(1, 2), default=2, help="Maximum spatial polynomial order: 1=plane, 2=quadratic")
@@ -5456,6 +5486,10 @@ def cmd_run_field_pipeline(args: argparse.Namespace) -> int:
         margin_pix=args.margin_pix,
         aperture_radius_pix=args.aperture_radius_pix,
         photometry_estimator=args.photometry_estimator,
+        local_com_max_shift_pix=args.local_com_max_shift_pix,
+        frame_shift_min_matches=args.frame_shift_min_matches,
+        frame_shift_max_robust_scatter_pix=args.frame_shift_max_robust_scatter_pix,
+        frame_shift_max_absolute_pix=args.frame_shift_max_absolute_pix,
         adaptive_min_psf_snr=args.adaptive_min_psf_snr,
         adaptive_max_psf_sources_per_frame=args.adaptive_max_psf_sources_per_frame,
         adaptive_psf_cutout_radius_pix=args.adaptive_psf_cutout_radius_pix,
@@ -5568,6 +5602,7 @@ def cmd_run_field_pipeline(args: argparse.Namespace) -> int:
         min_detection_fraction=args.min_detection_fraction,
         max_ref_mag_delta=_none_if_negative(args.max_ref_mag_delta),
         dynamic_separation=args.dynamic_separation,
+        dynamic_seeing_factor=args.dynamic_seeing_factor,
         dynamic_aperture_factor=args.dynamic_aperture_factor,
         dynamic_crowding_factor=args.dynamic_crowding_factor,
         fwhm_header_unit=args.fwhm_header_unit,
@@ -5754,6 +5789,17 @@ def cmd_run_archive_pipeline(args: argparse.Namespace) -> int:
             series_id=series_id,
             out_dir=out_dir,
             aperture_radius_pix=args.aperture_radius_pix,
+            local_com_max_shift_pix=args.local_com_max_shift_pix,
+            frame_shift_min_matches=args.frame_shift_min_matches,
+            frame_shift_max_robust_scatter_pix=args.frame_shift_max_robust_scatter_pix,
+            frame_shift_max_absolute_pix=args.frame_shift_max_absolute_pix,
+            crowded_arcsec=args.crowded_arcsec,
+            blended_arcsec=args.blended_arcsec,
+            dynamic_separation=args.dynamic_separation,
+            dynamic_seeing_factor=args.dynamic_seeing_factor,
+            dynamic_aperture_factor=args.dynamic_aperture_factor,
+            dynamic_crowding_factor=args.dynamic_crowding_factor,
+            fwhm_header_unit=args.fwhm_header_unit,
             annulus_inner_pix=args.annulus_inner_pix,
             annulus_outer_pix=args.annulus_outer_pix,
             dry_run=args.dry_run,
@@ -6226,6 +6272,10 @@ def cmd_process_archive_path(args: argparse.Namespace) -> int:
             no_file_log=args.no_file_log,
             aperture_radius_pix=args.aperture_radius_pix,
             photometry_estimator=args.photometry_estimator,
+            local_com_max_shift_pix=args.local_com_max_shift_pix,
+            frame_shift_min_matches=args.frame_shift_min_matches,
+            frame_shift_max_robust_scatter_pix=args.frame_shift_max_robust_scatter_pix,
+            frame_shift_max_absolute_pix=args.frame_shift_max_absolute_pix,
             adaptive_min_psf_snr=args.adaptive_min_psf_snr,
             adaptive_max_psf_sources_per_frame=args.adaptive_max_psf_sources_per_frame,
             adaptive_psf_cutout_radius_pix=args.adaptive_psf_cutout_radius_pix,
@@ -6299,6 +6349,13 @@ def cmd_process_archive_path(args: argparse.Namespace) -> int:
             candidate_ensemble_convergence_max_iterations=args.candidate_ensemble_convergence_max_iterations,
             candidate_ensemble_growth_policy=args.candidate_ensemble_growth_policy,
             ensemble_min_ref_stars_per_frame=args.ensemble_min_ref_stars_per_frame,
+            crowded_arcsec=args.crowded_arcsec,
+            blended_arcsec=args.blended_arcsec,
+            dynamic_separation=args.dynamic_separation,
+            dynamic_seeing_factor=args.dynamic_seeing_factor,
+            dynamic_aperture_factor=args.dynamic_aperture_factor,
+            dynamic_crowding_factor=args.dynamic_crowding_factor,
+            fwhm_header_unit=args.fwhm_header_unit,
             enable_spatial_ensemble=args.enable_spatial_ensemble,
             enable_photometric_frame_qc=args.enable_photometric_frame_qc,
             spatial_ensemble_max_order=args.spatial_ensemble_max_order,

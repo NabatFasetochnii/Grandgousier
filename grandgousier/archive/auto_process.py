@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import csv
+import hashlib
 import json
 import math
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -27,6 +30,7 @@ from grandgousier.identity.observation import (
     ObservationIdentityMissing,
     build_frame_observation_identity,
 )
+from grandgousier.astrometry.gaia_wcs_com import GAIA_WCS_COM_POLICY
 from grandgousier.instruments.base import InstrumentProfile
 from grandgousier.io.archive_indexer import IndexResult, index_archive_paths
 from grandgousier.io.fits_header import header_to_jsonable
@@ -57,6 +61,7 @@ from grandgousier.calibration.photometric_policy import (
 from grandgousier.catalogs.reference_photometry import (
     create_reference_photometry_csv,
     import_reference_photometry,
+    load_persisted_identity_sources,
 )
 
 
@@ -368,6 +373,14 @@ def process_archive_path(
     no_file_log: bool = False,
     aperture_radius_pix: float = 3.0,
     photometry_estimator: str = "adaptive_ellipse",
+    local_com_max_shift_pix: float = float(GAIA_WCS_COM_POLICY["local_com_max_shift_pix"]),
+    frame_shift_min_matches: int = int(GAIA_WCS_COM_POLICY["frame_shift_min_matches"]),
+    frame_shift_max_robust_scatter_pix: float = float(
+        GAIA_WCS_COM_POLICY["frame_shift_max_robust_scatter_pix"]
+    ),
+    frame_shift_max_absolute_pix: float = float(
+        GAIA_WCS_COM_POLICY["frame_shift_max_absolute_pix"]
+    ),
     adaptive_detection_algorithm: str = "numpy_localmax_v1",
     adaptive_min_psf_snr: float = 20.0,
     adaptive_max_psf_sources_per_frame: int = 500,
@@ -438,6 +451,13 @@ def process_archive_path(
     candidate_ensemble_convergence_max_iterations: int = 10,
     candidate_ensemble_growth_policy: str = "initial_only",
     ensemble_min_ref_stars_per_frame: int = 30,
+    crowded_arcsec: float = float(GAIA_WCS_COM_POLICY["crowded_arcsec"]),
+    blended_arcsec: float = float(GAIA_WCS_COM_POLICY["blended_arcsec"]),
+    dynamic_separation: bool = bool(GAIA_WCS_COM_POLICY["dynamic_separation"]),
+    dynamic_seeing_factor: float = float(GAIA_WCS_COM_POLICY["dynamic_seeing_factor"]),
+    dynamic_aperture_factor: float = float(GAIA_WCS_COM_POLICY["dynamic_aperture_factor"]),
+    dynamic_crowding_factor: float = float(GAIA_WCS_COM_POLICY["dynamic_crowding_factor"]),
+    fwhm_header_unit: str = str(GAIA_WCS_COM_POLICY["fwhm_header_unit"]),
     enable_spatial_ensemble: bool = False,
     spatial_ensemble_max_order: int = 2,
     spatial_ensemble_min_ref_stars_per_frame: int = 30,
@@ -523,7 +543,7 @@ def process_archive_path(
         )
         discovered_count = len(exact_path_list if limit is None else exact_path_list[: max(int(limit), 0)])
     profiles = load_auto_profiles(master_profile=master_profile, robophot_profile=robophot_profile)
-    effective_catalog_name = catalog_name or _default_auto_catalog_name(groups, root=root)
+    effective_catalog_name = catalog_name if catalog_name is not None else "gaia_dr3"
     result = ProcessArchiveResult(
         status="PLAN" if not execute else "RUNNING",
         path=str(root),
@@ -721,35 +741,7 @@ def process_archive_path(
             _write_manifest_if_requested(result, manifest_out, session=session)
             return result
 
-    if catalog_name is None:
-        effective_auto_catalog_mag_limit = _effective_auto_catalog_mag_limit(
-            explicit=auto_catalog_mag_limit, working=working_catalog_mag_limit
-        )
-        effective_auto_catalog_max_radius_deg = _effective_auto_catalog_max_radius_deg(
-            groups, explicit=auto_catalog_max_radius_deg
-        )
-        catalog_row = _prepare_auto_catalog(
-            session,
-            catalog_name=effective_catalog_name,
-            frame_ids=indexed_frame_ids,
-            enabled=auto_catalog_query,
-            margin_arcmin=auto_catalog_margin_arcmin,
-            mag_limit=effective_auto_catalog_mag_limit,
-            max_rows_per_frame=auto_catalog_max_rows_per_frame,
-            query_mode=auto_catalog_query_mode,
-            max_radius_deg=effective_auto_catalog_max_radius_deg,
-            timeout_sec=auto_catalog_timeout_sec,
-            warnings=result.warnings,
-        )
-        result.catalog_results.append(catalog_row)
-        if not _catalog_precondition_ok(catalog_row, allow_empty_catalog=allow_empty_catalog):
-            result.status = "FAILED_PRECONDITION_CATALOG"
-            result.warnings.append(
-                "auto catalog did not produce usable sources; install/fix astroquery, retry later, pass --catalog-name, or use --allow-empty-catalog for debugging"
-            )
-            _write_manifest_if_requested(result, manifest_out, session=session)
-            return result
-    else:
+    if catalog_name is not None:
         catalog_row = _inspect_existing_catalog(session, catalog_name=effective_catalog_name)
         result.catalog_results.append(catalog_row)
         if not _catalog_precondition_ok(catalog_row, allow_empty_catalog=allow_empty_catalog):
@@ -759,7 +751,6 @@ def process_archive_path(
             )
             _write_manifest_if_requested(result, manifest_out, session=session)
             return result
-
     created_series_ids: list[int] = []
     if not requested_series_ids:
         frame_ids_by_unit = _frame_ids_by_instrument_unit(session, science_input_frame_ids)
@@ -834,465 +825,792 @@ def process_archive_path(
             "OPEN field_series were not submitted to Stage 2; explicitly finalize eligible tails first: "
             + ", ".join(str(series_id) for series_id in open_ids)
         )
-    for series in finalized_series_rows:
-        prefix = _format_calibration_prefix(calibration_prefix_template, series)
-        series_out_dir = str(Path(out_root) / prefix) if out_root else None
-        profile = profiles.get(str(series.get("instrument") or ""))
-        error_policy = {}
-        if profile is not None and isinstance(profile.raw_config, dict):
-            configured = profile.raw_config.get("random_error_model")
-            if isinstance(configured, dict):
-                error_policy = configured
-        resolved_fractional_flux_floor = (
-            float(photometry_fractional_flux_floor)
-            if photometry_fractional_flux_floor is not None
-            else float(error_policy.get("fractional_flux_floor", 0.0) or 0.0)
-        )
-        resolved_scintillation_enabled = (
-            bool(photometry_scintillation_enabled)
-            if photometry_scintillation_enabled is not None
-            else bool(error_policy.get("scintillation_enabled", False))
-        )
-        resolved_scintillation_coefficient = (
-            float(photometry_scintillation_coefficient)
-            if photometry_scintillation_coefficient is not None
-            else float(error_policy.get("scintillation_coefficient", 0.09) or 0.09)
-        )
-        resolved_telescope_aperture_m = (
-            float(photometry_telescope_aperture_m)
-            if photometry_telescope_aperture_m is not None
-            else _optional_float(error_policy.get("telescope_aperture_m"))
-        )
-        resolved_site_altitude_m = (
-            float(photometry_site_altitude_m)
-            if photometry_site_altitude_m is not None
-            else _optional_float(error_policy.get("site_altitude_m"))
-        )
-        color_policy = None
-        reference_result: dict[str, Any] | None = None
-        if profile is not None:
-            color_policy = resolve_color_calibration_policy(
-                profile,
-                series.get("filter_name"),
-                enabled_override=True if enable_color_calibration else None,
-                reference_catalog_name=color_reference_catalog_name,
-                reference_band=color_reference_band,
-                color_index=color_index,
+    if catalog_name is None:
+        # The pipeline and Gaia acquisition must share exactly the selected input frames.
+        selected_frame_scope = {int(frame_id) for frame_id in science_input_frame_ids}
+        frame_ids_by_series_id = {
+            int(series_id): [
+                int(frame_id)
+                for frame_id in frame_ids
+                if int(frame_id) in selected_frame_scope
+            ]
+            for series_id, frame_ids in frame_ids_by_series_id.items()
+        }
+    field_frame_ids: dict[int, set[int]] = {}
+    if catalog_name is None:
+        finalized_series_rows.sort(
+            key=lambda row: (
+                row.get("field_id") is None,
+                int(row["field_id"]) if row.get("field_id") is not None else 0,
+                int(row["series_id"]),
             )
-        color_reference_ready = False
-        color_calibration_skip_reason: str | None = None
-        if enable_color_calibration and (color_policy is None or not color_policy.enabled):
-            reason = color_policy.skip_reason if color_policy is not None else "instrument profile was not resolved"
-            color_calibration_skip_reason = str(reason)
-            result.warnings.append(
-                f"series_id={series['series_id']}: color calibration skipped: {reason}"
+        )
+        for series in finalized_series_rows:
+            if series.get("field_id") is None:
+                continue
+            field_id = int(series["field_id"])
+            field_frame_ids.setdefault(field_id, set()).update(
+                frame_ids_by_series_id.get(int(series["series_id"]), [])
             )
-        elif enable_color_calibration and color_policy is not None:
-            reference_result = _ensure_reference_photometry_for_series(
-                session,
-                series=series,
-                policy=color_policy,
-                identity_catalog_name=effective_catalog_name,
-                out_dir=series_out_dir,
-                allow_remote_fetch=auto_reference_photometry,
+
+    if catalog_name is None:
+        effective_auto_catalog_mag_limit = _effective_auto_catalog_mag_limit(
+            explicit=auto_catalog_mag_limit, working=working_catalog_mag_limit
+        )
+        effective_auto_catalog_max_radius_deg = _effective_auto_catalog_max_radius_deg(
+            groups, explicit=auto_catalog_max_radius_deg
+        )
+    else:
+        effective_auto_catalog_mag_limit = None
+        effective_auto_catalog_max_radius_deg = None
+    active_field_id: int | None = None
+    working_catalog = None
+    working_catalog_provenance: dict[str, Any] | None = None
+    field_promoted_source_ids: set[str] = set()
+    field_series_selections: list[dict[str, Any]] = []
+    current_series_promoted_source_ids: set[str] = set()
+    field_pipeline_run_ids_by_series: dict[int, int] = {}
+    field_provenance_finalized = False
+
+    def finalize_active_working_catalog_field() -> None:
+        nonlocal field_provenance_finalized, working_catalog_provenance
+        if field_provenance_finalized:
+            return
+        field_provenance_finalized = True
+        provenance = working_catalog_provenance
+        try:
+            _finalize_auto_working_catalog_provenance(
+                catalog=working_catalog,
+                provenance=provenance,
+                promoted_source_ids=field_promoted_source_ids,
+                series_selections=field_series_selections,
             )
-            result.reference_photometry_results.append(reference_result)
-            color_reference_ready = bool(reference_result.get("ready"))
-            if not color_reference_ready:
-                color_calibration_skip_reason = str(
-                    reference_result.get("reason") or reference_result.get("status")
+            if provenance is not None:
+                _persist_finalized_auto_working_catalog_provenance(
+                    session,
+                    field_id=active_field_id,
+                    run_ids_by_series=field_pipeline_run_ids_by_series,
+                    provenance=provenance,
                 )
+        finally:
+            field_pipeline_run_ids_by_series.clear()
+            working_catalog_provenance = None
+
+    try:
+        for series in finalized_series_rows:
+            if catalog_name is None:
+                if series.get("field_id") is None:
+                    result.status = "FAILED_PRECONDITION_CATALOG"
+                    result.warnings.append(
+                        "automatic Gaia acquisition requires a persistent field_id"
+                    )
+                    finalize_active_working_catalog_field()
+                    _write_manifest_if_requested(result, manifest_out, session=session)
+                    return result
+                field_id = int(series["field_id"])
+                if field_id != active_field_id:
+                    try:
+                        finalize_active_working_catalog_field()
+                    finally:
+                        _close_working_catalog(working_catalog)
+                        working_catalog = None
+                    active_field_id = field_id
+                    field_provenance_finalized = False
+                    catalog_frame_ids = sorted(field_frame_ids.get(field_id, set()))
+                    if auto_catalog_query:
+                        working_catalog, catalog_row = _prepare_auto_working_catalog(
+                            session,
+                            field_id=field_id,
+                            frame_ids=catalog_frame_ids,
+                            enabled=True,
+                            margin_arcmin=auto_catalog_margin_arcmin,
+                            mag_limit=effective_auto_catalog_mag_limit,
+                            maxrec=auto_catalog_max_rows_per_frame,
+                            max_radius_deg=effective_auto_catalog_max_radius_deg,
+                            timeout_sec=auto_catalog_timeout_sec,
+                        )
+                    else:
+                        working_catalog, catalog_row = _reuse_auto_working_catalog(
+                            session,
+                            field_id=field_id,
+                            frame_ids=catalog_frame_ids,
+                            margin_arcmin=auto_catalog_margin_arcmin,
+                            mag_limit=effective_auto_catalog_mag_limit,
+                            maxrec=auto_catalog_max_rows_per_frame,
+                            max_radius_deg=effective_auto_catalog_max_radius_deg,
+                            target_source_id=target_source_id,
+                            working_catalog_mag_limit=working_catalog_mag_limit,
+                            max_working_sources_per_frame=max_working_sources_per_frame,
+                            catalog_edge_margin_pix=catalog_edge_margin_pix,
+                            aperture_radius_pix=aperture_radius_pix,
+                            annulus_inner_pix=annulus_inner_pix,
+                            annulus_outer_pix=annulus_outer_pix,
+                        )
+                    if (
+                        not catalog_row.get("reuse_compatible", True)
+                        and allow_empty_catalog
+                        and not auto_catalog_query
+                    ):
+                        from grandgousier.catalogs.gaia_query import GaiaWorkingCatalog
+
+                        refusal_reason = str(
+                            catalog_row.get("refusal_reason")
+                            or "OFFLINE_EVIDENCE_INCOMPATIBLE"
+                        )
+                        working_catalog = GaiaWorkingCatalog()
+                        working_catalog_provenance = {
+                            "provenance_version": 1,
+                            "field_id": field_id,
+                            "field_frame_count": len(set(catalog_frame_ids)),
+                            "reuse_mode": "empty_catalog_debug_fallback",
+                            "empty_catalog_debug_fallback": True,
+                            "empty_catalog_debug_fallback_reason": refusal_reason,
+                            "new_source_search_performed": False,
+                            "coverage_complete": False,
+                            "per_frame_match_coverage_complete": False,
+                            "fetch_status": "NOT_ATTEMPTED",
+                            "fetch_complete": False,
+                            "working_catalog_sources": 0,
+                        }
+                        catalog_row.update(
+                            {
+                                "offline_reuse_status": catalog_row.get("status"),
+                                "status": "DONE_WITH_WARNINGS",
+                                "empty_catalog_debug_fallback": True,
+                                "empty_catalog_debug_fallback_reason": refusal_reason,
+                                "effective_query_mode": "no_search_empty_debug_fallback",
+                                "working_catalog_sources": 0,
+                                "new_source_search_performed": False,
+                                "coverage_complete": False,
+                                "per_frame_match_coverage_complete": False,
+                                "working_catalog_provenance": working_catalog_provenance,
+                            }
+                        )
+                        result.warnings.append(
+                            "offline Gaia evidence was absent or incompatible; "
+                            "explicit empty-catalog debugging fallback used "
+                            f"(reason={refusal_reason})"
+                        )
+                    else:
+                        provenance = catalog_row.get("working_catalog_provenance")
+                        working_catalog_provenance = (
+                            provenance if isinstance(provenance, dict) else None
+                        )
+                    field_promoted_source_ids.clear()
+                    field_series_selections.clear()
+                    result.catalog_results.append(catalog_row)
+                    if catalog_row.get("status") not in {"DONE", "DONE_WITH_WARNINGS"}:
+                        result.warnings.append(
+                            f"auto Gaia working catalog field_id={field_id} "
+                            f"status={catalog_row.get('status')}"
+                        )
+                    elif catalog_row.get("status") == "DONE_WITH_WARNINGS":
+                        result.warnings.append(
+                            f"auto Gaia working catalog field_id={field_id} completed with warnings"
+                        )
+                    if not catalog_row.get("reuse_compatible", True) and not catalog_row.get(
+                        "empty_catalog_debug_fallback", False
+                    ):
+                        result.status = "FAILED_PRECONDITION_CATALOG"
+                        finalize_active_working_catalog_field()
+                        _write_manifest_if_requested(result, manifest_out, session=session)
+                        return result
+                    if not _working_catalog_precondition_ok(
+                        catalog_row, allow_empty_catalog=allow_empty_catalog
+                    ):
+                        result.status = "FAILED_PRECONDITION_CATALOG"
+                        finalize_active_working_catalog_field()
+                        _write_manifest_if_requested(result, manifest_out, session=session)
+                        return result
+                    if working_catalog is None:
+                        from grandgousier.catalogs.gaia_query import GaiaWorkingCatalog
+
+                        working_catalog = GaiaWorkingCatalog()
+            current_series_promoted_source_ids = set()
+            prefix = _format_calibration_prefix(calibration_prefix_template, series)
+            series_out_dir = str(Path(out_root) / prefix) if out_root else None
+            profile = profiles.get(str(series.get("instrument") or ""))
+            error_policy = {}
+            if profile is not None and isinstance(profile.raw_config, dict):
+                configured = profile.raw_config.get("random_error_model")
+                if isinstance(configured, dict):
+                    error_policy = configured
+            resolved_fractional_flux_floor = (
+                float(photometry_fractional_flux_floor)
+                if photometry_fractional_flux_floor is not None
+                else float(error_policy.get("fractional_flux_floor", 0.0) or 0.0)
+            )
+            resolved_scintillation_enabled = (
+                bool(photometry_scintillation_enabled)
+                if photometry_scintillation_enabled is not None
+                else bool(error_policy.get("scintillation_enabled", False))
+            )
+            resolved_scintillation_coefficient = (
+                float(photometry_scintillation_coefficient)
+                if photometry_scintillation_coefficient is not None
+                else float(error_policy.get("scintillation_coefficient", 0.09) or 0.09)
+            )
+            resolved_telescope_aperture_m = (
+                float(photometry_telescope_aperture_m)
+                if photometry_telescope_aperture_m is not None
+                else _optional_float(error_policy.get("telescope_aperture_m"))
+            )
+            resolved_site_altitude_m = (
+                float(photometry_site_altitude_m)
+                if photometry_site_altitude_m is not None
+                else _optional_float(error_policy.get("site_altitude_m"))
+            )
+            color_policy = None
+            reference_result: dict[str, Any] | None = None
+            if profile is not None:
+                color_policy = resolve_color_calibration_policy(
+                    profile,
+                    series.get("filter_name"),
+                    enabled_override=True if enable_color_calibration else None,
+                    reference_catalog_name=color_reference_catalog_name,
+                    reference_band=color_reference_band,
+                    color_index=color_index,
+                )
+            color_reference_ready = False
+            color_calibration_skip_reason: str | None = None
+            if enable_color_calibration and (color_policy is None or not color_policy.enabled):
+                reason = color_policy.skip_reason if color_policy is not None else "instrument profile was not resolved"
+                color_calibration_skip_reason = str(reason)
                 result.warnings.append(
-                    f"series_id={series['series_id']}: color calibration skipped: "
-                    f"{color_calibration_skip_reason}"
+                    f"series_id={series['series_id']}: color calibration skipped: {reason}"
                 )
-        config = FieldPipelineConfig(
-            catalog_name=effective_catalog_name,
-            calibration_prefix=prefix,
-            series_id=int(series["series_id"]),
-            frame_ids=frame_ids_by_series_id.get(int(series["series_id"]), []),
-            out_dir=series_out_dir,
-            aperture_radius_pix=aperture_radius_pix,
-            photometry_estimator=photometry_estimator,
-            adaptive_detection_algorithm=adaptive_detection_algorithm,
-            adaptive_min_psf_snr=adaptive_min_psf_snr,
-            adaptive_max_psf_sources_per_frame=adaptive_max_psf_sources_per_frame,
-            adaptive_psf_cutout_radius_pix=adaptive_psf_cutout_radius_pix,
-            adaptive_psf_min_isolation_pix=adaptive_psf_min_isolation_pix,
-            adaptive_interpolation_neighbors=adaptive_interpolation_neighbors,
-            adaptive_min_psf_references=adaptive_min_psf_references,
-            adaptive_aperture_fwhm_factor=adaptive_aperture_fwhm_factor,
-            adaptive_max_axis_ratio=adaptive_max_axis_ratio,
-            adaptive_max_radius_scale=adaptive_max_radius_scale,
-            adaptive_fallback_to_circular=adaptive_fallback_to_circular,
-            psf_profile=psf_profile,
-            psf_moffat_beta=psf_moffat_beta,
-            psf_fit_radius_fwhm=psf_fit_radius_fwhm,
-            psf_min_fit_radius_pix=psf_min_fit_radius_pix,
-            psf_max_fit_radius_pix=psf_max_fit_radius_pix,
-            psf_centroid_search_radius_pix=psf_centroid_search_radius_pix,
-            psf_centroid_grid_steps=psf_centroid_grid_steps,
-            psf_residual_clip_sigma=psf_residual_clip_sigma,
-            psf_residual_clip_iterations=psf_residual_clip_iterations,
-            psf_fallback_to_adaptive=psf_fallback_to_adaptive,
-            empirical_psf_grid_size=empirical_psf_grid_size,
-            empirical_psf_stamp_radius_pix=empirical_psf_stamp_radius_pix,
-            empirical_psf_reference_radius_pix=empirical_psf_reference_radius_pix,
-            empirical_psf_references_per_node=empirical_psf_references_per_node,
-            empirical_psf_min_references_per_node=empirical_psf_min_references_per_node,
-            empirical_psf_fallback_to_adaptive=empirical_psf_fallback_to_adaptive,
-            annulus_inner_pix=annulus_inner_pix,
-            annulus_outer_pix=annulus_outer_pix,
-            aperture_correction_reference_radius_pix=aperture_correction_reference_radius_pix,
-            aperture_correction_max_calibrator_mag_err=aperture_correction_max_calibrator_mag_err,
-            aperture_correction_min_calibrators_per_frame=aperture_correction_min_calibrators_per_frame,
-            aperture_correction_min_plane_calibrators=aperture_correction_min_plane_calibrators,
-            aperture_correction_min_plane_bic_improvement=aperture_correction_min_plane_bic_improvement,
-            aperture_correction_min_spatial_peak_to_peak=aperture_correction_min_spatial_peak_to_peak,
-            aperture_correction_plane_policy=aperture_correction_plane_policy,
-            aperture_correction_max_residual_mad=aperture_correction_max_residual_mad,
-            aperture_correction_max_abs_correction=aperture_correction_max_abs_correction,
-            aperture_correction_max_abs_spatial_deviation=(
-                aperture_correction_max_abs_spatial_deviation
-            ),
-            aperture_correction_max_abs_total_correction=(
-                aperture_correction_max_abs_total_correction
-            ),
-            aperture_correction_min_good_frame_fraction=aperture_correction_min_good_frame_fraction,
-            skip_aperture_correction=skip_aperture_correction,
-            bulk_insert_batch_size=bulk_insert_batch_size,
-            skip_detection=not (enable_detection_branch or enable_psf_field_diagnostics or photometry_estimator in {"adaptive_ellipse", "spatial_psf", "empirical_psf"}),
-            enable_psf_field_diagnostics=enable_psf_field_diagnostics,
-            psf_diagnostics_max_sources_per_frame=psf_diagnostics_max_sources_per_frame,
-            psf_diagnostics_min_snr=psf_diagnostics_min_snr,
-            psf_diagnostics_cutout_radius_pix=psf_diagnostics_cutout_radius_pix,
-            psf_diagnostics_min_isolation_pix=psf_diagnostics_min_isolation_pix,
-            psf_diagnostics_clip_sigma=psf_diagnostics_clip_sigma,
-            psf_diagnostics_n_iterations=psf_diagnostics_n_iterations,
-            psf_diagnostics_render_plots=psf_diagnostics_render_plots,
-            skip_detection_catalog_match=not enable_detection_branch,
-            require_detection_support=require_detection_support,
-            target_source_id=target_source_id,
-            target_object_id=target_object_id,
-            target_ra_deg=target_ra_deg,
-            target_dec_deg=target_dec_deg,
-            target_max_sep_arcsec=target_max_sep_arcsec,
-            export_target_light_curve=export_target_light_curve,
-            export_candidate_light_curves=export_candidate_light_curves,
-            export_candidate_plots=export_candidate_plots,
-            candidate_light_curve_limit=candidate_light_curve_limit,
-            exclude_candidates_from_ensemble=exclude_candidates_from_ensemble,
-            candidate_ensemble_max_iterations=candidate_ensemble_max_iterations,
-            candidate_ensemble_until_converged=candidate_ensemble_until_converged,
-            candidate_ensemble_convergence_max_iterations=candidate_ensemble_convergence_max_iterations,
-            candidate_ensemble_growth_policy=candidate_ensemble_growth_policy,
-            ensemble_min_ref_stars_per_frame=ensemble_min_ref_stars_per_frame,
-            enable_spatial_ensemble=enable_spatial_ensemble,
-            spatial_ensemble_max_order=spatial_ensemble_max_order,
-            spatial_ensemble_min_ref_stars_per_frame=spatial_ensemble_min_ref_stars_per_frame,
-            spatial_ensemble_clip_sigma=spatial_ensemble_clip_sigma,
-            spatial_ensemble_n_iterations=spatial_ensemble_n_iterations,
-            spatial_ensemble_min_bic_improvement=spatial_ensemble_min_bic_improvement,
-            spatial_ensemble_min_spatial_peak_to_peak=spatial_ensemble_min_spatial_peak_to_peak,
-            spatial_ensemble_max_residual_mad=spatial_ensemble_max_residual_mad,
-            spatial_ensemble_max_residual_mad_degradation=spatial_ensemble_max_residual_mad_degradation,
-            spatial_ensemble_max_abs_spatial_deviation=spatial_ensemble_max_abs_spatial_deviation,
-            spatial_ensemble_min_good_frame_fraction=spatial_ensemble_min_good_frame_fraction,
-            enable_photometric_frame_qc=enable_photometric_frame_qc,
-            enable_color_calibration=bool(
-                enable_color_calibration and color_policy and color_policy.enabled and color_reference_ready
-            ),
-            color_calibration_requested=bool(enable_color_calibration),
-            color_reference_ready=(bool(color_reference_ready) if enable_color_calibration else None),
-            color_calibration_skip_reason=color_calibration_skip_reason,
-            color_identity_catalog_name=effective_catalog_name,
-            color_reference_catalog_name=(
-                reference_result.get("effective_reference_catalog_name")
-                if reference_result is not None
-                else (color_policy.reference_catalog_name if color_policy else color_reference_catalog_name)
-            ),
-            color_reference_band=color_policy.reference_band if color_policy else color_reference_band,
-            color_index=color_policy.color_index if color_policy else color_index,
-            color_min_measurements_per_object=color_policy.min_measurements_per_object if color_policy else 5,
-            color_min_stars_per_frame=color_policy.min_stars_per_frame if color_policy else 20,
-            color_max_measurement_mag_err=color_policy.max_measurement_mag_err if color_policy else None,
-            color_max_reference_mag_err=color_policy.max_reference_mag_err if color_policy else None,
-            color_min_reference_mag=color_policy.min_reference_mag if color_policy else None,
-            color_max_reference_mag=color_policy.max_reference_mag if color_policy else None,
-            color_min_value=color_policy.min_color if color_policy else None,
-            color_max_value=color_policy.max_color if color_policy else None,
-            color_clip_sigma=color_policy.clip_sigma if color_policy else 4.0,
-            color_n_iterations=color_policy.n_iterations if color_policy else 5,
-            color_min_calibrator_objects=color_policy.min_calibrator_objects if color_policy else 20,
-            color_min_span=color_policy.min_color_span if color_policy else 0.3,
-            color_max_transform_residual_mad=color_policy.max_transform_residual_mad if color_policy else 0.10,
-            color_max_pivot_fraction=color_policy.max_pivot_color_fraction if color_policy else 0.25,
-            color_max_shape_metric_delta=color_policy.max_shape_metric_delta if color_policy else 1e-10,
-            color_min_term_significance=color_policy.min_color_term_significance if color_policy else 2.0,
-            color_min_bic_improvement=color_policy.min_color_model_bic_improvement if color_policy else 6.0,
-            color_min_mad_improvement=color_policy.min_color_model_mad_improvement if color_policy else 0.0,
-            enable_intrinsic_variability_candidates=enable_intrinsic_variability_candidates,
-            field_report_min_intrinsic_rms=field_report_min_intrinsic_rms,
-            field_report_min_rms_over_mag_err=field_report_min_rms_over_mag_err,
-            field_report_min_mad_over_mag_err=field_report_min_mad_over_mag_err,
-            field_report_intrinsic_mag_err_floor=field_report_intrinsic_mag_err_floor,
-            field_report_min_robust_peak_to_peak=field_report_min_robust_peak_to_peak,
-            enable_low_amplitude_intrinsic_candidates=enable_low_amplitude_intrinsic_candidates,
-            field_report_low_amplitude_min_measurements=field_report_low_amplitude_min_measurements,
-            field_report_low_amplitude_min_intrinsic_rms=field_report_low_amplitude_min_intrinsic_rms,
-            field_report_low_amplitude_min_rms_over_mag_err=field_report_low_amplitude_min_rms_over_mag_err,
-            field_report_low_amplitude_min_mad_over_mag_err=field_report_low_amplitude_min_mad_over_mag_err,
-            field_report_low_amplitude_min_robust_peak_to_peak=field_report_low_amplitude_min_robust_peak_to_peak,
-            skip_aperture_stability_qc=not enable_aperture_stability_qc,
-            exclude_bad_pre_qc_frames=exclude_bad_pre_qc_frames,
-            working_catalog_mag_limit=working_catalog_mag_limit,
-            max_working_sources_per_frame=max_working_sources_per_frame,
-            catalog_edge_margin_pix=catalog_edge_margin_pix,
-            force_recompute_photometry=force_recompute_photometry,
-            materialize_intermediate_calibrations=materialize_intermediate_calibrations,
-            science_materialization_diagnostics=science_materialization_diagnostics,
-            forced_photometry_diagnostics=forced_photometry_diagnostics,
-            calibration_performance_diagnostics=calibration_performance_diagnostics,
-            random_error_model=random_error_model,
-            photometry_gain_e_per_adu=photometry_gain_e_per_adu,
-            photometry_read_noise_e=photometry_read_noise_e,
-            background_estimator_variance_factor=(
-                background_estimator_variance_factor
-            ),
-            empirical_background_floor=empirical_background_floor,
-            photometry_fractional_flux_floor=resolved_fractional_flux_floor,
-            photometry_scintillation_enabled=resolved_scintillation_enabled,
-            photometry_scintillation_coefficient=resolved_scintillation_coefficient,
-            photometry_telescope_aperture_m=resolved_telescope_aperture_m,
-            photometry_site_altitude_m=resolved_site_altitude_m,
-            record_run=True,
-            log_dir=str(log_dir) if log_dir else None,
-            file_log_level=file_log_level,
-            no_file_log=no_file_log,
-            command_json={
-                "command": "process-archive-path",
-                "root": str(root),
-                "catalog_name": effective_catalog_name,
-                "working_catalog_mag_limit": working_catalog_mag_limit,
-                "max_working_sources_per_frame": max_working_sources_per_frame,
-                "catalog_edge_margin_pix": catalog_edge_margin_pix,
-                "enable_detection_branch": enable_detection_branch,
-                "enable_psf_field_diagnostics": enable_psf_field_diagnostics,
-                "psf_diagnostics_max_sources_per_frame": psf_diagnostics_max_sources_per_frame,
-                "psf_diagnostics_min_snr": psf_diagnostics_min_snr,
-                "psf_diagnostics_cutout_radius_pix": psf_diagnostics_cutout_radius_pix,
-                "psf_diagnostics_min_isolation_pix": psf_diagnostics_min_isolation_pix,
-                "enable_aperture_stability_qc": enable_aperture_stability_qc,
-                "skip_aperture_correction": skip_aperture_correction,
-                "calibration_performance_diagnostics": calibration_performance_diagnostics,
-                "aperture_correction_reference_radius_pix": aperture_correction_reference_radius_pix,
-                "aperture_correction_max_calibrator_mag_err": aperture_correction_max_calibrator_mag_err,
-                "aperture_correction_min_calibrators_per_frame": aperture_correction_min_calibrators_per_frame,
-                "aperture_correction_min_plane_calibrators": aperture_correction_min_plane_calibrators,
-                "aperture_correction_min_plane_bic_improvement": aperture_correction_min_plane_bic_improvement,
-                "aperture_correction_min_spatial_peak_to_peak": aperture_correction_min_spatial_peak_to_peak,
-                "aperture_correction_plane_policy": aperture_correction_plane_policy,
-                "aperture_correction_max_residual_mad": aperture_correction_max_residual_mad,
-                "aperture_correction_max_abs_correction": aperture_correction_max_abs_correction,
-                "aperture_correction_max_abs_spatial_deviation": (
+            elif enable_color_calibration and color_policy is not None:
+                if catalog_name is not None:
+                    color_calibration_skip_reason = (
+                        "exact selected identity sources are unavailable before this Stage-2 run"
+                    )
+                    reference_result = {
+                        "series_id": int(series["series_id"]),
+                        "field_id": int(series["field_id"]),
+                        "status": "SKIPPED_SELECTED_IDENTITY_SET_UNAVAILABLE",
+                        "ready": False,
+                        "reason": color_calibration_skip_reason,
+                    }
+                    result.warnings.append(
+                        f"series_id={series['series_id']}: color calibration skipped: "
+                        f"{color_calibration_skip_reason}"
+                    )
+                    result.reference_photometry_results.append(reference_result)
+            config = FieldPipelineConfig(
+                catalog_name=effective_catalog_name,
+                calibration_prefix=prefix,
+                series_id=int(series["series_id"]),
+                frame_ids=frame_ids_by_series_id.get(int(series["series_id"]), []),
+                out_dir=series_out_dir,
+                aperture_radius_pix=aperture_radius_pix,
+                photometry_estimator=photometry_estimator,
+                local_com_max_shift_pix=local_com_max_shift_pix,
+                frame_shift_min_matches=frame_shift_min_matches,
+                frame_shift_max_robust_scatter_pix=frame_shift_max_robust_scatter_pix,
+                frame_shift_max_absolute_pix=frame_shift_max_absolute_pix,
+                adaptive_detection_algorithm=adaptive_detection_algorithm,
+                adaptive_min_psf_snr=adaptive_min_psf_snr,
+                adaptive_max_psf_sources_per_frame=adaptive_max_psf_sources_per_frame,
+                adaptive_psf_cutout_radius_pix=adaptive_psf_cutout_radius_pix,
+                adaptive_psf_min_isolation_pix=adaptive_psf_min_isolation_pix,
+                adaptive_interpolation_neighbors=adaptive_interpolation_neighbors,
+                adaptive_min_psf_references=adaptive_min_psf_references,
+                adaptive_aperture_fwhm_factor=adaptive_aperture_fwhm_factor,
+                adaptive_max_axis_ratio=adaptive_max_axis_ratio,
+                adaptive_max_radius_scale=adaptive_max_radius_scale,
+                adaptive_fallback_to_circular=adaptive_fallback_to_circular,
+                psf_profile=psf_profile,
+                psf_moffat_beta=psf_moffat_beta,
+                psf_fit_radius_fwhm=psf_fit_radius_fwhm,
+                psf_min_fit_radius_pix=psf_min_fit_radius_pix,
+                psf_max_fit_radius_pix=psf_max_fit_radius_pix,
+                psf_centroid_search_radius_pix=psf_centroid_search_radius_pix,
+                psf_centroid_grid_steps=psf_centroid_grid_steps,
+                psf_residual_clip_sigma=psf_residual_clip_sigma,
+                psf_residual_clip_iterations=psf_residual_clip_iterations,
+                psf_fallback_to_adaptive=psf_fallback_to_adaptive,
+                empirical_psf_grid_size=empirical_psf_grid_size,
+                empirical_psf_stamp_radius_pix=empirical_psf_stamp_radius_pix,
+                empirical_psf_reference_radius_pix=empirical_psf_reference_radius_pix,
+                empirical_psf_references_per_node=empirical_psf_references_per_node,
+                empirical_psf_min_references_per_node=empirical_psf_min_references_per_node,
+                empirical_psf_fallback_to_adaptive=empirical_psf_fallback_to_adaptive,
+                annulus_inner_pix=annulus_inner_pix,
+                annulus_outer_pix=annulus_outer_pix,
+                aperture_correction_reference_radius_pix=aperture_correction_reference_radius_pix,
+                aperture_correction_max_calibrator_mag_err=aperture_correction_max_calibrator_mag_err,
+                aperture_correction_min_calibrators_per_frame=aperture_correction_min_calibrators_per_frame,
+                aperture_correction_min_plane_calibrators=aperture_correction_min_plane_calibrators,
+                aperture_correction_min_plane_bic_improvement=aperture_correction_min_plane_bic_improvement,
+                aperture_correction_min_spatial_peak_to_peak=aperture_correction_min_spatial_peak_to_peak,
+                aperture_correction_plane_policy=aperture_correction_plane_policy,
+                aperture_correction_max_residual_mad=aperture_correction_max_residual_mad,
+                aperture_correction_max_abs_correction=aperture_correction_max_abs_correction,
+                aperture_correction_max_abs_spatial_deviation=(
                     aperture_correction_max_abs_spatial_deviation
                 ),
-                "aperture_correction_max_abs_total_correction": (
+                aperture_correction_max_abs_total_correction=(
                     aperture_correction_max_abs_total_correction
                 ),
-                "aperture_correction_min_good_frame_fraction": aperture_correction_min_good_frame_fraction,
-                "require_detection_support": require_detection_support,
-                "target_source_id": target_source_id,
-                "target_object_id": target_object_id,
-                "target_ra_deg": target_ra_deg,
-                "target_dec_deg": target_dec_deg,
-                "target_max_sep_arcsec": target_max_sep_arcsec,
-                "export_target_light_curve": export_target_light_curve,
-                "export_candidate_light_curves": export_candidate_light_curves,
-                "export_candidate_plots": export_candidate_plots,
-                "candidate_light_curve_limit": candidate_light_curve_limit,
-                "exclude_candidates_from_ensemble": exclude_candidates_from_ensemble,
-                "candidate_ensemble_max_iterations": candidate_ensemble_max_iterations,
-                "candidate_ensemble_until_converged": candidate_ensemble_until_converged,
-                "candidate_ensemble_convergence_max_iterations": candidate_ensemble_convergence_max_iterations,
-                "candidate_ensemble_growth_policy": candidate_ensemble_growth_policy,
-                "ensemble_min_ref_stars_per_frame": int(ensemble_min_ref_stars_per_frame),
-                "selected_series_ids": requested_series_ids or None,
-                "enable_spatial_ensemble": bool(enable_spatial_ensemble),
-                "enable_photometric_frame_qc": bool(enable_photometric_frame_qc),
-                "enable_color_calibration": bool(enable_color_calibration),
-                "auto_reference_photometry": bool(auto_reference_photometry),
-                "color_reference_ready": bool(color_reference_ready),
-                "color_policy": color_policy.to_dict() if color_policy else None,
-                "enable_intrinsic_variability_candidates": enable_intrinsic_variability_candidates,
-                "field_report_min_intrinsic_rms": field_report_min_intrinsic_rms,
-                "field_report_min_rms_over_mag_err": field_report_min_rms_over_mag_err,
-                "field_report_min_mad_over_mag_err": field_report_min_mad_over_mag_err,
-                "field_report_intrinsic_mag_err_floor": field_report_intrinsic_mag_err_floor,
-                "field_report_min_robust_peak_to_peak": field_report_min_robust_peak_to_peak,
-                "enable_low_amplitude_intrinsic_candidates": enable_low_amplitude_intrinsic_candidates,
-                "field_report_low_amplitude_min_measurements": field_report_low_amplitude_min_measurements,
-                "field_report_low_amplitude_min_intrinsic_rms": field_report_low_amplitude_min_intrinsic_rms,
-                "field_report_low_amplitude_min_rms_over_mag_err": field_report_low_amplitude_min_rms_over_mag_err,
-                "field_report_low_amplitude_min_mad_over_mag_err": field_report_low_amplitude_min_mad_over_mag_err,
-                "field_report_low_amplitude_min_robust_peak_to_peak": field_report_low_amplitude_min_robust_peak_to_peak,
-            },
-            environment_json={"generated_by": "process-archive-path"},
-        )
-        try:
-            pipeline_result = run_field_pipeline(session, config)
-            pipe_row = _pipeline_row(series, prefix, pipeline_result)
-            result.processed_series_ids.append(int(series["series_id"]))
-            if pipeline_result.status == "DONE_WITH_WARNINGS":
-                warning_summary = pipeline_result.quality_policy.get(
-                    "pipeline_warning_summary"
-                )
-                result.warnings.append(
-                    _pipeline_warning_message(
-                        int(series["series_id"]), warning_summary
-                    )
-                )
-            if reference_result is not None and reference_result.get("csv_path") and series_out_dir:
-                try:
-                    _snapshot_post_pipeline_artifact(
-                        session,
-                        pipeline_result=pipeline_result,
-                        series_out_dir=series_out_dir,
-                        source_path=str(reference_result["csv_path"]),
-                        series_id=int(series["series_id"]),
-                        artifact_type="REFERENCE_PHOTOMETRY_CACHE",
-                        artifact_role="INPUT_CACHE",
-                    )
-                except Exception as artifact_exc:  # noqa: BLE001 - science run already completed.
-                    session.rollback()
-                    result.warnings.append(
-                        f"series_id={series['series_id']}: reference artifact registration failed: "
-                        f"{type(artifact_exc).__name__}: {artifact_exc}"
-                    )
-            if pipeline_result.status == "DONE_NO_SCIENCE_FRAMES":
-                pipe_row.update(
-                    {
-                        "science_status": "BAD_FRAME_QC",
-                        "total_points": 0,
-                        "accepted_points": 0,
-                        "rejected_points": 0,
-                        "n_objects": 0,
-                    }
-                )
-                result.warnings.append(
-                    f"series_id={series['series_id']} science_status=BAD_FRAME_QC all selected frames rejected by pre-QC"
-                )
-            elif make_light_curve_summary and (
-                pipeline_result.calibration_names.get("science") or pipeline_result.calibration_names.get("ensemble")
-            ):
-                summary_path = None
-                if series_out_dir:
-                    summary_path = str(Path(series_out_dir) / f"{prefix}_light_curve_summary.json")
-                require_detection_support_effective = bool(
-                    pipeline_result.quality_policy.get("require_detection_support_effective", enable_detection_branch)
-                )
-                science_calibration = (
-                    pipeline_result.calibration_names.get("science")
-                    or pipeline_result.calibration_names["ensemble"]
-                )
-                summary = build_light_curve_summary(
-                    session,
-                    calibration_names=[science_calibration],
-                    catalog_name=effective_catalog_name,
-                    series_id=int(series["series_id"]),
-                    reject_flags=light_curve_reject_flags(
-                        require_detection_support=require_detection_support_effective,
-                        extra_flags=("PHOTOMETRIC_FRAME_BAD" if enable_photometric_frame_qc else None),
+                aperture_correction_min_good_frame_fraction=aperture_correction_min_good_frame_fraction,
+                skip_aperture_correction=skip_aperture_correction,
+                bulk_insert_batch_size=bulk_insert_batch_size,
+                skip_detection=not (enable_detection_branch or enable_psf_field_diagnostics or photometry_estimator in {"adaptive_ellipse", "spatial_psf", "empirical_psf"}),
+                enable_psf_field_diagnostics=enable_psf_field_diagnostics,
+                psf_diagnostics_max_sources_per_frame=psf_diagnostics_max_sources_per_frame,
+                psf_diagnostics_min_snr=psf_diagnostics_min_snr,
+                psf_diagnostics_cutout_radius_pix=psf_diagnostics_cutout_radius_pix,
+                psf_diagnostics_min_isolation_pix=psf_diagnostics_min_isolation_pix,
+                psf_diagnostics_clip_sigma=psf_diagnostics_clip_sigma,
+                psf_diagnostics_n_iterations=psf_diagnostics_n_iterations,
+                psf_diagnostics_render_plots=psf_diagnostics_render_plots,
+                skip_detection_catalog_match=not enable_detection_branch,
+                require_detection_support=require_detection_support,
+                target_source_id=target_source_id,
+                target_object_id=target_object_id,
+                target_ra_deg=target_ra_deg,
+                target_dec_deg=target_dec_deg,
+                target_max_sep_arcsec=target_max_sep_arcsec,
+                export_target_light_curve=export_target_light_curve,
+                export_candidate_light_curves=export_candidate_light_curves,
+                export_candidate_plots=export_candidate_plots,
+                candidate_light_curve_limit=candidate_light_curve_limit,
+                exclude_candidates_from_ensemble=exclude_candidates_from_ensemble,
+                candidate_ensemble_max_iterations=candidate_ensemble_max_iterations,
+                candidate_ensemble_until_converged=candidate_ensemble_until_converged,
+                candidate_ensemble_convergence_max_iterations=candidate_ensemble_convergence_max_iterations,
+                candidate_ensemble_growth_policy=candidate_ensemble_growth_policy,
+                ensemble_min_ref_stars_per_frame=ensemble_min_ref_stars_per_frame,
+                crowded_arcsec=crowded_arcsec,
+                blended_arcsec=blended_arcsec,
+                dynamic_separation=dynamic_separation,
+                dynamic_seeing_factor=dynamic_seeing_factor,
+                dynamic_aperture_factor=dynamic_aperture_factor,
+                dynamic_crowding_factor=dynamic_crowding_factor,
+                fwhm_header_unit=fwhm_header_unit,
+                enable_spatial_ensemble=enable_spatial_ensemble,
+                spatial_ensemble_max_order=spatial_ensemble_max_order,
+                spatial_ensemble_min_ref_stars_per_frame=spatial_ensemble_min_ref_stars_per_frame,
+                spatial_ensemble_clip_sigma=spatial_ensemble_clip_sigma,
+                spatial_ensemble_n_iterations=spatial_ensemble_n_iterations,
+                spatial_ensemble_min_bic_improvement=spatial_ensemble_min_bic_improvement,
+                spatial_ensemble_min_spatial_peak_to_peak=spatial_ensemble_min_spatial_peak_to_peak,
+                spatial_ensemble_max_residual_mad=spatial_ensemble_max_residual_mad,
+                spatial_ensemble_max_residual_mad_degradation=spatial_ensemble_max_residual_mad_degradation,
+                spatial_ensemble_max_abs_spatial_deviation=spatial_ensemble_max_abs_spatial_deviation,
+                spatial_ensemble_min_good_frame_fraction=spatial_ensemble_min_good_frame_fraction,
+                enable_photometric_frame_qc=enable_photometric_frame_qc,
+                enable_color_calibration=bool(
+                    enable_color_calibration
+                    and color_policy
+                    and color_policy.enabled
+                    and catalog_name is None
+                ),
+                color_calibration_requested=bool(enable_color_calibration),
+                color_reference_ready=(
+                    None
+                    if catalog_name is None
+                    and enable_color_calibration
+                    and color_policy is not None
+                    and color_policy.enabled
+                    else (bool(color_reference_ready) if enable_color_calibration else None)
+                ),
+                color_calibration_skip_reason=color_calibration_skip_reason,
+                color_identity_catalog_name=effective_catalog_name,
+                color_reference_catalog_name=(
+                    reference_result.get("effective_reference_catalog_name")
+                    if reference_result is not None
+                    else (color_policy.reference_catalog_name if color_policy else color_reference_catalog_name)
+                ),
+                color_reference_band=color_policy.reference_band if color_policy else color_reference_band,
+                color_index=color_policy.color_index if color_policy else color_index,
+                color_min_measurements_per_object=color_policy.min_measurements_per_object if color_policy else 5,
+                color_min_stars_per_frame=color_policy.min_stars_per_frame if color_policy else 20,
+                color_max_measurement_mag_err=color_policy.max_measurement_mag_err if color_policy else None,
+                color_max_reference_mag_err=color_policy.max_reference_mag_err if color_policy else None,
+                color_min_reference_mag=color_policy.min_reference_mag if color_policy else None,
+                color_max_reference_mag=color_policy.max_reference_mag if color_policy else None,
+                color_min_value=color_policy.min_color if color_policy else None,
+                color_max_value=color_policy.max_color if color_policy else None,
+                color_clip_sigma=color_policy.clip_sigma if color_policy else 4.0,
+                color_n_iterations=color_policy.n_iterations if color_policy else 5,
+                color_min_calibrator_objects=color_policy.min_calibrator_objects if color_policy else 20,
+                color_min_span=color_policy.min_color_span if color_policy else 0.3,
+                color_max_transform_residual_mad=color_policy.max_transform_residual_mad if color_policy else 0.10,
+                color_max_pivot_fraction=color_policy.max_pivot_color_fraction if color_policy else 0.25,
+                color_max_shape_metric_delta=color_policy.max_shape_metric_delta if color_policy else 1e-10,
+                color_min_term_significance=color_policy.min_color_term_significance if color_policy else 2.0,
+                color_min_bic_improvement=color_policy.min_color_model_bic_improvement if color_policy else 6.0,
+                color_min_mad_improvement=color_policy.min_color_model_mad_improvement if color_policy else 0.0,
+                enable_intrinsic_variability_candidates=enable_intrinsic_variability_candidates,
+                field_report_min_intrinsic_rms=field_report_min_intrinsic_rms,
+                field_report_min_rms_over_mag_err=field_report_min_rms_over_mag_err,
+                field_report_min_mad_over_mag_err=field_report_min_mad_over_mag_err,
+                field_report_intrinsic_mag_err_floor=field_report_intrinsic_mag_err_floor,
+                field_report_min_robust_peak_to_peak=field_report_min_robust_peak_to_peak,
+                enable_low_amplitude_intrinsic_candidates=enable_low_amplitude_intrinsic_candidates,
+                field_report_low_amplitude_min_measurements=field_report_low_amplitude_min_measurements,
+                field_report_low_amplitude_min_intrinsic_rms=field_report_low_amplitude_min_intrinsic_rms,
+                field_report_low_amplitude_min_rms_over_mag_err=field_report_low_amplitude_min_rms_over_mag_err,
+                field_report_low_amplitude_min_mad_over_mag_err=field_report_low_amplitude_min_mad_over_mag_err,
+                field_report_low_amplitude_min_robust_peak_to_peak=field_report_low_amplitude_min_robust_peak_to_peak,
+                skip_aperture_stability_qc=not enable_aperture_stability_qc,
+                exclude_bad_pre_qc_frames=exclude_bad_pre_qc_frames,
+                working_catalog_mag_limit=working_catalog_mag_limit,
+                max_working_sources_per_frame=max_working_sources_per_frame,
+                catalog_edge_margin_pix=catalog_edge_margin_pix,
+                force_recompute_photometry=force_recompute_photometry,
+                materialize_intermediate_calibrations=materialize_intermediate_calibrations,
+                science_materialization_diagnostics=science_materialization_diagnostics,
+                forced_photometry_diagnostics=forced_photometry_diagnostics,
+                calibration_performance_diagnostics=calibration_performance_diagnostics,
+                random_error_model=random_error_model,
+                photometry_gain_e_per_adu=photometry_gain_e_per_adu,
+                photometry_read_noise_e=photometry_read_noise_e,
+                background_estimator_variance_factor=(
+                    background_estimator_variance_factor
+                ),
+                empirical_background_floor=empirical_background_floor,
+                photometry_fractional_flux_floor=resolved_fractional_flux_floor,
+                photometry_scintillation_enabled=resolved_scintillation_enabled,
+                photometry_scintillation_coefficient=resolved_scintillation_coefficient,
+                photometry_telescope_aperture_m=resolved_telescope_aperture_m,
+                photometry_site_altitude_m=resolved_site_altitude_m,
+                record_run=True,
+                log_dir=str(log_dir) if log_dir else None,
+                file_log_level=file_log_level,
+                no_file_log=no_file_log,
+                command_json={
+                    "command": "process-archive-path",
+                    "root": str(root),
+                    "catalog_name": effective_catalog_name,
+                    "working_catalog_mag_limit": working_catalog_mag_limit,
+                    "max_working_sources_per_frame": max_working_sources_per_frame,
+                    "catalog_edge_margin_pix": catalog_edge_margin_pix,
+                    "enable_detection_branch": enable_detection_branch,
+                    "enable_psf_field_diagnostics": enable_psf_field_diagnostics,
+                    "psf_diagnostics_max_sources_per_frame": psf_diagnostics_max_sources_per_frame,
+                    "psf_diagnostics_min_snr": psf_diagnostics_min_snr,
+                    "psf_diagnostics_cutout_radius_pix": psf_diagnostics_cutout_radius_pix,
+                    "psf_diagnostics_min_isolation_pix": psf_diagnostics_min_isolation_pix,
+                    "enable_aperture_stability_qc": enable_aperture_stability_qc,
+                    "skip_aperture_correction": skip_aperture_correction,
+                    "calibration_performance_diagnostics": calibration_performance_diagnostics,
+                    "aperture_correction_reference_radius_pix": aperture_correction_reference_radius_pix,
+                    "aperture_correction_max_calibrator_mag_err": aperture_correction_max_calibrator_mag_err,
+                    "aperture_correction_min_calibrators_per_frame": aperture_correction_min_calibrators_per_frame,
+                    "aperture_correction_min_plane_calibrators": aperture_correction_min_plane_calibrators,
+                    "aperture_correction_min_plane_bic_improvement": aperture_correction_min_plane_bic_improvement,
+                    "aperture_correction_min_spatial_peak_to_peak": aperture_correction_min_spatial_peak_to_peak,
+                    "aperture_correction_plane_policy": aperture_correction_plane_policy,
+                    "aperture_correction_max_residual_mad": aperture_correction_max_residual_mad,
+                    "aperture_correction_max_abs_correction": aperture_correction_max_abs_correction,
+                    "aperture_correction_max_abs_spatial_deviation": (
+                        aperture_correction_max_abs_spatial_deviation
                     ),
+                    "aperture_correction_max_abs_total_correction": (
+                        aperture_correction_max_abs_total_correction
+                    ),
+                    "aperture_correction_min_good_frame_fraction": aperture_correction_min_good_frame_fraction,
+                    "require_detection_support": require_detection_support,
+                    "target_source_id": target_source_id,
+                    "target_object_id": target_object_id,
+                    "target_ra_deg": target_ra_deg,
+                    "target_dec_deg": target_dec_deg,
+                    "target_max_sep_arcsec": target_max_sep_arcsec,
+                    "export_target_light_curve": export_target_light_curve,
+                    "export_candidate_light_curves": export_candidate_light_curves,
+                    "export_candidate_plots": export_candidate_plots,
+                    "candidate_light_curve_limit": candidate_light_curve_limit,
+                    "exclude_candidates_from_ensemble": exclude_candidates_from_ensemble,
+                    "candidate_ensemble_max_iterations": candidate_ensemble_max_iterations,
+                    "candidate_ensemble_until_converged": candidate_ensemble_until_converged,
+                    "candidate_ensemble_convergence_max_iterations": candidate_ensemble_convergence_max_iterations,
+                    "candidate_ensemble_growth_policy": candidate_ensemble_growth_policy,
+                    "ensemble_min_ref_stars_per_frame": int(ensemble_min_ref_stars_per_frame),
+                    "astrometric_centering": {
+                        "local_com_max_shift_pix": local_com_max_shift_pix,
+                        "frame_shift_min_matches": frame_shift_min_matches,
+                        "frame_shift_max_robust_scatter_pix": frame_shift_max_robust_scatter_pix,
+                        "frame_shift_max_absolute_pix": frame_shift_max_absolute_pix,
+                        "crowded_arcsec": crowded_arcsec,
+                        "blended_arcsec": blended_arcsec,
+                        "dynamic_separation": dynamic_separation,
+                        "dynamic_seeing_factor": dynamic_seeing_factor,
+                        "dynamic_aperture_factor": dynamic_aperture_factor,
+                        "dynamic_crowding_factor": dynamic_crowding_factor,
+                        "fwhm_header_unit": fwhm_header_unit,
+                    },
+                    "selected_series_ids": requested_series_ids or None,
+                    "enable_spatial_ensemble": bool(enable_spatial_ensemble),
+                    "enable_photometric_frame_qc": bool(enable_photometric_frame_qc),
+                    "enable_color_calibration": bool(enable_color_calibration),
+                    "auto_reference_photometry": bool(auto_reference_photometry),
+                    "color_reference_ready": bool(color_reference_ready),
+                    "color_policy": color_policy.to_dict() if color_policy else None,
+                    "enable_intrinsic_variability_candidates": enable_intrinsic_variability_candidates,
+                    "field_report_min_intrinsic_rms": field_report_min_intrinsic_rms,
+                    "field_report_min_rms_over_mag_err": field_report_min_rms_over_mag_err,
+                    "field_report_min_mad_over_mag_err": field_report_min_mad_over_mag_err,
+                    "field_report_intrinsic_mag_err_floor": field_report_intrinsic_mag_err_floor,
+                    "field_report_min_robust_peak_to_peak": field_report_min_robust_peak_to_peak,
+                    "enable_low_amplitude_intrinsic_candidates": enable_low_amplitude_intrinsic_candidates,
+                    "field_report_low_amplitude_min_measurements": field_report_low_amplitude_min_measurements,
+                    "field_report_low_amplitude_min_intrinsic_rms": field_report_low_amplitude_min_intrinsic_rms,
+                    "field_report_low_amplitude_min_rms_over_mag_err": field_report_low_amplitude_min_rms_over_mag_err,
+                    "field_report_low_amplitude_min_mad_over_mag_err": field_report_low_amplitude_min_mad_over_mag_err,
+                    "field_report_low_amplitude_min_robust_peak_to_peak": field_report_low_amplitude_min_robust_peak_to_peak,
+                },
+                environment_json={"generated_by": "process-archive-path"},
+            )
+            try:
+                if catalog_name is None:
+                    reference_callback = None
+                    if enable_color_calibration and color_policy is not None and color_policy.enabled:
+                        def _selected_reference_callback(
+                            selected_source_ids: set[str],
+                        ) -> dict[str, Any]:
+                            nonlocal reference_result
+                            nonlocal color_reference_ready
+                            nonlocal color_calibration_skip_reason
+                            try:
+                                reference_result = _ensure_reference_photometry_for_series(
+                                    session,
+                                    series=series,
+                                    policy=color_policy,
+                                    identity_catalog_name=effective_catalog_name,
+                                    selected_identity_source_ids=selected_source_ids,
+                                    out_dir=series_out_dir,
+                                    allow_remote_fetch=auto_reference_photometry,
+                                )
+                            except Exception as exc:  # noqa: BLE001 - preserve ensemble calibration fallback.
+                                session.rollback()
+                                reference_result = {
+                                    "series_id": int(series["series_id"]),
+                                    "field_id": int(series["field_id"]),
+                                    "status": "REFERENCE_ACQUISITION_FAILED",
+                                    "ready": False,
+                                    "reason": f"{type(exc).__name__}: optional reference acquisition failed",
+                                }
+                            result.reference_photometry_results.append(reference_result)
+                            color_reference_ready = bool(reference_result.get("ready"))
+                            if not color_reference_ready:
+                                color_calibration_skip_reason = str(
+                                    reference_result.get("reason") or reference_result.get("status")
+                                )
+                                result.warnings.append(
+                                    f"series_id={series['series_id']}: color calibration skipped: "
+                                    f"{color_calibration_skip_reason}"
+                                )
+                            return reference_result
+
+                        reference_callback = _selected_reference_callback
+                    pipeline_result = run_field_pipeline(
+                        session,
+                        config,
+                        working_catalog=working_catalog,
+                        working_catalog_provenance=working_catalog_provenance,
+                        working_catalog_promoted_source_ids=current_series_promoted_source_ids,
+                        working_catalog_run_ids_by_series=field_pipeline_run_ids_by_series,
+                        **(
+                            {"reference_photometry_callback": reference_callback}
+                            if reference_callback is not None
+                            else {}
+                        ),
+                    )
+                else:
+                    pipeline_result = run_field_pipeline(session, config)
+                pipeline_run_id = getattr(pipeline_result, "pipeline_run_id", None)
+                if pipeline_run_id is not None:
+                    field_pipeline_run_ids_by_series[int(series["series_id"])] = int(
+                        pipeline_run_id
+                    )
+                field_promoted_source_ids.update(current_series_promoted_source_ids)
+                selection_record = _auto_working_catalog_series_selection(
+                    series_id=int(series["series_id"]),
+                    pipeline_result=pipeline_result,
+                    promoted_source_ids=current_series_promoted_source_ids,
+                    config=config,
                 )
-                if summary_path:
-                    export_light_curve_summary_json(summary, summary_path)
+                if working_catalog_provenance is not None:
+                    field_series_selections.append(selection_record)
+                pipe_row = _pipeline_row(series, prefix, pipeline_result)
+                result.processed_series_ids.append(int(series["series_id"]))
+                if pipeline_result.status == "DONE_WITH_WARNINGS":
+                    warning_summary = pipeline_result.quality_policy.get(
+                        "pipeline_warning_summary"
+                    )
+                    result.warnings.append(
+                        _pipeline_warning_message(
+                            int(series["series_id"]), warning_summary
+                        )
+                    )
+                if reference_result is not None and reference_result.get("csv_path") and series_out_dir:
                     try:
                         _snapshot_post_pipeline_artifact(
                             session,
                             pipeline_result=pipeline_result,
                             series_out_dir=series_out_dir,
-                            source_path=summary_path,
+                            source_path=str(reference_result["csv_path"]),
                             series_id=int(series["series_id"]),
-                            artifact_type="LIGHT_CURVE_SUMMARY",
-                            artifact_role="SCIENCE",
+                            artifact_type="REFERENCE_PHOTOMETRY_CACHE",
+                            artifact_role="INPUT_CACHE",
                         )
-                    except Exception as artifact_exc:  # noqa: BLE001 - retain the science product and report provenance warning.
+                    except Exception as artifact_exc:  # noqa: BLE001 - science run already completed.
                         session.rollback()
                         result.warnings.append(
-                            f"series_id={series['series_id']}: light-curve summary artifact registration failed: "
+                            f"series_id={series['series_id']}: reference artifact registration failed: "
                             f"{type(artifact_exc).__name__}: {artifact_exc}"
                         )
-                science_status = _classify_science_status(
-                    summary.total_points,
-                    summary.accepted_points,
-                    summary.n_objects,
-                    pipeline_result=pipeline_result,
-                )
-                summary_row = {
-                    "series_id": int(series["series_id"]),
-                    "calibration_name": science_calibration,
-                    "path": summary_path,
-                    "total_points": summary.total_points,
-                    "accepted_points": summary.accepted_points,
-                    "rejected_points": summary.rejected_points,
-                    "n_objects": summary.n_objects,
-                    "science_status": science_status,
-                    "quality_policy": dict(pipeline_result.quality_policy),
-                }
-                result.light_curve_summaries.append(summary_row)
-                pipe_row.update(
-                    {
-                        "science_status": science_status,
-                        "quality_policy": dict(pipeline_result.quality_policy),
+                if pipeline_result.status == "DONE_NO_SCIENCE_FRAMES":
+                    pipe_row.update(
+                        {
+                            "science_status": "BAD_FRAME_QC",
+                            "total_points": 0,
+                            "accepted_points": 0,
+                            "rejected_points": 0,
+                            "n_objects": 0,
+                        }
+                    )
+                    result.warnings.append(
+                        f"series_id={series['series_id']} science_status=BAD_FRAME_QC all selected frames rejected by pre-QC"
+                    )
+                elif make_light_curve_summary and (
+                    pipeline_result.calibration_names.get("science") or pipeline_result.calibration_names.get("ensemble")
+                ):
+                    summary_path = None
+                    if series_out_dir:
+                        summary_path = str(Path(series_out_dir) / f"{prefix}_light_curve_summary.json")
+                    require_detection_support_effective = bool(
+                        pipeline_result.quality_policy.get("require_detection_support_effective", enable_detection_branch)
+                    )
+                    science_calibration = (
+                        pipeline_result.calibration_names.get("science")
+                        or pipeline_result.calibration_names["ensemble"]
+                    )
+                    summary = build_light_curve_summary(
+                        session,
+                        calibration_names=[science_calibration],
+                        catalog_name=effective_catalog_name,
+                        series_id=int(series["series_id"]),
+                        reject_flags=light_curve_reject_flags(
+                            require_detection_support=require_detection_support_effective,
+                            extra_flags=("PHOTOMETRIC_FRAME_BAD" if enable_photometric_frame_qc else None),
+                        ),
+                    )
+                    if summary_path:
+                        export_light_curve_summary_json(summary, summary_path)
+                        try:
+                            _snapshot_post_pipeline_artifact(
+                                session,
+                                pipeline_result=pipeline_result,
+                                series_out_dir=series_out_dir,
+                                source_path=summary_path,
+                                series_id=int(series["series_id"]),
+                                artifact_type="LIGHT_CURVE_SUMMARY",
+                                artifact_role="SCIENCE",
+                            )
+                        except Exception as artifact_exc:  # noqa: BLE001 - retain the science product and report provenance warning.
+                            session.rollback()
+                            result.warnings.append(
+                                f"series_id={series['series_id']}: light-curve summary artifact registration failed: "
+                                f"{type(artifact_exc).__name__}: {artifact_exc}"
+                            )
+                    science_status = _classify_science_status(
+                        summary.total_points,
+                        summary.accepted_points,
+                        summary.n_objects,
+                        pipeline_result=pipeline_result,
+                    )
+                    summary_row = {
+                        "series_id": int(series["series_id"]),
+                        "calibration_name": science_calibration,
+                        "path": summary_path,
                         "total_points": summary.total_points,
                         "accepted_points": summary.accepted_points,
                         "rejected_points": summary.rejected_points,
                         "n_objects": summary.n_objects,
-                        "light_curve_summary_json": summary_path,
-                        "target_light_curve_csv": pipeline_result.outputs.get("target_light_curve_csv"),
-                        "target_light_curve_json": pipeline_result.outputs.get("target_light_curve_json"),
-                        "accepted_candidate_light_curves_dir": pipeline_result.outputs.get("accepted_candidate_light_curves_dir"),
-                        "accepted_candidates_summary_csv": pipeline_result.outputs.get("accepted_candidates_summary_csv"),
-                        "accepted_candidates_summary_json": pipeline_result.outputs.get("accepted_candidates_summary_json"),
-                        "accepted_candidates_index_html": pipeline_result.outputs.get("accepted_candidates_index_html"),
-                        "accepted_candidate_count": _step_metric(pipeline_result, "export_candidate_light_curves", "accepted_candidates"),
-                        "exported_candidate_light_curves": _step_metric(pipeline_result, "export_candidate_light_curves", "exported_light_curves"),
-                        "candidate_plot_count": _step_metric(pipeline_result, "export_candidate_light_curves", "candidate_plot_count"),
-                        "candidate_plot_warnings_count": _step_metric(pipeline_result, "export_candidate_light_curves", "candidate_plot_warnings_count"),
-                        "candidate_plot_backend": _step_metric(pipeline_result, "export_candidate_light_curves", "plot_backend"),
-                        "ensemble_initial_calibration": pipeline_result.outputs.get("ensemble_initial_calibration"),
-                        "ensemble_candidate_excluded_calibration": pipeline_result.outputs.get("ensemble_candidate_excluded_calibration"),
+                        "science_status": science_status,
+                        "quality_policy": dict(pipeline_result.quality_policy),
+                    }
+                    result.light_curve_summaries.append(summary_row)
+                    pipe_row.update(
+                        {
+                            "science_status": science_status,
+                            "quality_policy": dict(pipeline_result.quality_policy),
+                            "total_points": summary.total_points,
+                            "accepted_points": summary.accepted_points,
+                            "rejected_points": summary.rejected_points,
+                            "n_objects": summary.n_objects,
+                            "light_curve_summary_json": summary_path,
+                            "target_light_curve_csv": pipeline_result.outputs.get("target_light_curve_csv"),
+                            "target_light_curve_json": pipeline_result.outputs.get("target_light_curve_json"),
+                            "accepted_candidate_light_curves_dir": pipeline_result.outputs.get("accepted_candidate_light_curves_dir"),
+                            "accepted_candidates_summary_csv": pipeline_result.outputs.get("accepted_candidates_summary_csv"),
+                            "accepted_candidates_summary_json": pipeline_result.outputs.get("accepted_candidates_summary_json"),
+                            "accepted_candidates_index_html": pipeline_result.outputs.get("accepted_candidates_index_html"),
+                            "accepted_candidate_count": _step_metric(pipeline_result, "export_candidate_light_curves", "accepted_candidates"),
+                            "exported_candidate_light_curves": _step_metric(pipeline_result, "export_candidate_light_curves", "exported_light_curves"),
+                            "candidate_plot_count": _step_metric(pipeline_result, "export_candidate_light_curves", "candidate_plot_count"),
+                            "candidate_plot_warnings_count": _step_metric(pipeline_result, "export_candidate_light_curves", "candidate_plot_warnings_count"),
+                            "candidate_plot_backend": _step_metric(pipeline_result, "export_candidate_light_curves", "plot_backend"),
+                            "ensemble_initial_calibration": pipeline_result.outputs.get("ensemble_initial_calibration"),
+                            "ensemble_candidate_excluded_calibration": pipeline_result.outputs.get("ensemble_candidate_excluded_calibration"),
+                        }
+                    )
+                    if science_status != "OK":
+                        result.warnings.append(
+                            f"series_id={series['series_id']} science_status={science_status} total_points={summary.total_points} accepted_points={summary.accepted_points}"
+                        )
+                elif pipeline_result.status in {"DONE", "DONE_WITH_WARNINGS"}:
+                    pipe_row["science_status"] = "NO_LIGHT_CURVE_SUMMARY"
+                    result.warnings.append(f"series_id={series['series_id']} science_status=NO_LIGHT_CURVE_SUMMARY")
+                result.pipeline_results.append(pipe_row)
+            except Exception as exc:  # noqa: BLE001 - batch command reports per-series failures.
+                field_promoted_source_ids.update(current_series_promoted_source_ids)
+                if working_catalog_provenance is not None and not any(
+                    int(item["series_id"]) == int(series["series_id"])
+                    for item in field_series_selections
+                ):
+                    field_series_selections.append(
+                        _auto_working_catalog_series_selection(
+                            series_id=int(series["series_id"]),
+                            pipeline_result=None,
+                            promoted_source_ids=current_series_promoted_source_ids,
+                            config=config,
+                        )
+                    )
+                # A failed SQL statement leaves PostgreSQL transactions aborted until
+                # rollback.  Isolate series failures so the next series can still run.
+                session.rollback()
+                failure_status = (
+                    FAILED_PRECONDITION_ENSEMBLE_STATUS
+                    if isinstance(exc, EnsemblePreconditionError)
+                    else "FAILED"
+                )
+                if catalog_name is None:
+                    error_message = f"{type(exc).__name__}: automatic field pipeline failed"
+                    failure_diagnostics = {}
+                else:
+                    error_message = f"{type(exc).__name__}: {exc}"
+                    diagnostics = getattr(exc, "diagnostics", None)
+                    failure_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+                result.pipeline_results.append(
+                    {
+                        "series_id": int(series["series_id"]),
+                        "field_name": series.get("field_name"),
+                        "calibration_prefix": prefix,
+                        "status": failure_status,
+                        "error_message": error_message,
+                        **failure_diagnostics,
                     }
                 )
-                if science_status != "OK":
-                    result.warnings.append(
-                        f"series_id={series['series_id']} science_status={science_status} total_points={summary.total_points} accepted_points={summary.accepted_points}"
-                    )
-            elif pipeline_result.status in {"DONE", "DONE_WITH_WARNINGS"}:
-                pipe_row["science_status"] = "NO_LIGHT_CURVE_SUMMARY"
-                result.warnings.append(f"series_id={series['series_id']} science_status=NO_LIGHT_CURVE_SUMMARY")
-            result.pipeline_results.append(pipe_row)
-        except Exception as exc:  # noqa: BLE001 - batch command reports per-series failures.
-            # A failed SQL statement leaves PostgreSQL transactions aborted until
-            # rollback.  Isolate series failures so the next series can still run.
-            session.rollback()
-            failure_status = (
-                FAILED_PRECONDITION_ENSEMBLE_STATUS
-                if isinstance(exc, EnsemblePreconditionError)
-                else "FAILED"
-            )
-            result.pipeline_results.append(
-                {
-                    "series_id": int(series["series_id"]),
-                    "field_name": series.get("field_name"),
-                    "calibration_prefix": prefix,
-                    "status": failure_status,
-                    "error_message": f"{type(exc).__name__}: {exc}",
-                    **(getattr(exc, "diagnostics", {}) if isinstance(getattr(exc, "diagnostics", None), dict) else {}),
-                }
-            )
 
+    finally:
+        try:
+            finalize_active_working_catalog_field()
+        finally:
+            _close_working_catalog(working_catalog)
     failed_rows = [
         row for row in result.pipeline_results
         if row.get("status") not in (
@@ -1363,6 +1681,10 @@ def process_archive_summary_rows(result: ProcessArchiveResult) -> list[dict[str,
                 {"section": "catalog", "metric": "queried_cones", "value": item.get("queried_cones")},
                 {"section": "catalog", "metric": "row_limit_reached_cones", "value": item.get("row_limit_reached_cones")},
                 {"section": "catalog", "metric": "read_rows", "value": item.get("read_rows")},
+                {"section": "catalog", "metric": "logical_queries", "value": item.get("logical_queries")},
+                {"section": "catalog", "metric": "physical_parts", "value": item.get("physical_parts")},
+                {"section": "catalog", "metric": "working_catalog_sources", "value": item.get("working_catalog_sources")},
+                {"section": "catalog", "metric": "provider_failures", "value": item.get("provider_failures")},
                 {"section": "catalog", "metric": "inserted_or_updated", "value": item.get("inserted_or_updated")},
                 {"section": "catalog", "metric": "n_sources", "value": item.get("n_sources")},
                 {"section": "catalog", "metric": "failed_frames", "value": item.get("failed_frames")},
@@ -1669,6 +1991,7 @@ def _ensure_reference_photometry_for_series(
     series: dict[str, Any],
     policy: ColorCalibrationPolicy,
     identity_catalog_name: str,
+    selected_identity_source_ids: Iterable[str] | None,
     out_dir: str | Path | None,
     allow_remote_fetch: bool,
 ) -> dict[str, Any]:
@@ -1704,12 +2027,40 @@ def _ensure_reference_photometry_for_series(
         "ready": False,
     }
 
+    if selected_identity_source_ids is None:
+        return {
+            **base,
+            "status": "SKIPPED_SELECTED_IDENTITY_SET_UNAVAILABLE",
+            "reason": "reference acquisition requires identities selected and persisted by this Stage-2 run",
+        }
+    selected_ids = sorted({str(source_id).strip() for source_id in selected_identity_source_ids if str(source_id).strip()})
+    base["selected_identity_count"] = len(selected_ids)
+    if not selected_ids:
+        return {
+            **base,
+            "status": "SKIPPED_NO_SELECTED_IDENTITIES",
+            "reason": "Stage-2 selected no persisted identity sources for reference acquisition",
+        }
+    try:
+        load_persisted_identity_sources(
+            session,
+            identity_catalog_name=identity_catalog_name,
+            source_ids=selected_ids,
+        )
+    except Exception as exc:  # noqa: BLE001 - optional reference refinement fails closed.
+        session.rollback()
+        return {
+            **base,
+            "status": "SKIPPED_SELECTED_IDENTITIES_NOT_PERSISTED",
+            "reason": f"{type(exc).__name__}: selected identities are not fully persisted",
+        }
+
     try:
         before_counts = _reference_band_counts_for_series(
             session,
-            series=series,
             identity_catalog_name=identity_catalog_name,
             reference_catalog_name=provider_catalog_name,
+            selected_identity_source_ids=selected_ids,
         )
     except Exception as exc:  # noqa: BLE001 - optional reference layer must not destroy ensemble output.
         session.rollback()
@@ -1731,9 +2082,9 @@ def _ensure_reference_photometry_for_series(
     try:
         scoped_counts = _reference_band_counts_for_series(
             session,
-            series=series,
             identity_catalog_name=identity_catalog_name,
             reference_catalog_name=scoped_catalog_name,
+            selected_identity_source_ids=selected_ids,
         )
     except Exception as exc:  # noqa: BLE001
         session.rollback()
@@ -1778,12 +2129,14 @@ def _ensure_reference_photometry_for_series(
             session,
             out_path=csv_path,
             provider=provider_catalog_name,
-            series_id=series_id,
-            overwrite=True,
+            overwrite=False,
             require_bands=required_bands,
             min_mag=min_mag,
             max_mag=max_mag,
             max_mag_err=max_mag_err,
+            selected_identity_catalog_name=identity_catalog_name,
+            selected_identity_source_ids=selected_ids,
+            selected_identity_match_radius_arcsec=1.0,
         )
         imported = import_reference_photometry(
             session,
@@ -1822,6 +2175,8 @@ def _ensure_reference_photometry_for_series(
             },
             match_to_catalog=identity_catalog_name,
             max_match_arcsec=1.0,
+            selected_identity_source_ids=selected_ids,
+            requested_identity_source_id_col="selected_identity_source_id",
         )
     except Exception as exc:  # noqa: BLE001 - reference acquisition is an optional science refinement.
         session.rollback()
@@ -1835,9 +2190,9 @@ def _ensure_reference_photometry_for_series(
     try:
         after_counts = _reference_band_counts_for_series(
             session,
-            series=series,
             identity_catalog_name=identity_catalog_name,
             reference_catalog_name=scoped_catalog_name,
+            selected_identity_source_ids=selected_ids,
         )
     except Exception as exc:  # noqa: BLE001
         session.rollback()
@@ -1889,45 +2244,36 @@ def _required_reference_bands(policy: ColorCalibrationPolicy) -> list[str]:
 def _reference_band_counts_for_series(
     session: Session,
     *,
-    series: dict[str, Any],
     identity_catalog_name: str,
     reference_catalog_name: str,
+    selected_identity_source_ids: Iterable[str],
 ) -> dict[str, int]:
-    """Count matched reference bands inside the series field before frame links exist."""
+    """Count reference bands only for the exact Stage-2 selected identity set."""
 
-    ra = series.get("ra_center_deg")
-    dec = series.get("dec_center_deg")
-    radius_arcmin = series.get("radius_arcmin") or 30.0
-    if ra is None or dec is None:
+    selected_ids = sorted({str(source_id).strip() for source_id in selected_identity_source_ids if str(source_id).strip()})
+    if not selected_ids:
         return {}
-    radius_deg = max(float(radius_arcmin) / 60.0, 1.0 / 3600.0)
-    cos_dec = max(abs(math.cos(math.radians(float(dec)))), 0.01)
-    ra_half_width = min(180.0, radius_deg / cos_dec)
+    stmt = text(
+        """
+        SELECT
+            pb.canonical_name AS band,
+            COUNT(DISTINCT rps.refphot_source_id) AS n_sources
+        FROM reference_photometry_sources rps
+        JOIN reference_photometry_catalogs rpc ON rpc.refcat_id = rps.refcat_id
+        JOIN reference_photometry_points rpp ON rpp.refphot_source_id = rps.refphot_source_id
+        JOIN photometric_bands pb ON pb.band_id = rpp.band_id
+        WHERE rpc.catalog_name = :reference_catalog_name
+          AND rps.identity_catalog_name = :identity_catalog_name
+          AND rps.identity_source_id IN :selected_identity_source_ids
+        GROUP BY pb.canonical_name
+        """
+    ).bindparams(bindparam("selected_identity_source_ids", expanding=True))
     rows = session.execute(
-        text(
-            """
-            SELECT
-                pb.canonical_name AS band,
-                COUNT(DISTINCT rps.refphot_source_id) AS n_sources
-            FROM reference_photometry_sources rps
-            JOIN reference_photometry_catalogs rpc ON rpc.refcat_id = rps.refcat_id
-            JOIN reference_photometry_points rpp ON rpp.refphot_source_id = rps.refphot_source_id
-            JOIN photometric_bands pb ON pb.band_id = rpp.band_id
-            WHERE rpc.catalog_name = :reference_catalog_name
-              AND rps.identity_catalog_name = :identity_catalog_name
-              AND rps.identity_source_id IS NOT NULL
-              AND rps.dec_deg BETWEEN :dec_min AND :dec_max
-              AND ABS(DEGREES(ATAN2(SIN(RADIANS(rps.ra_deg - :ra_center)), COS(RADIANS(rps.ra_deg - :ra_center))))) <= :ra_half_width
-            GROUP BY pb.canonical_name
-            """
-        ),
+        stmt,
         {
             "reference_catalog_name": reference_catalog_name,
             "identity_catalog_name": identity_catalog_name,
-            "dec_min": max(-90.0, float(dec) - radius_deg),
-            "dec_max": min(90.0, float(dec) + radius_deg),
-            "ra_center": float(ra),
-            "ra_half_width": ra_half_width,
+            "selected_identity_source_ids": selected_ids,
         },
     ).mappings().all()
     return {str(row["band"]): int(row["n_sources"] or 0) for row in rows}
@@ -1991,130 +2337,1585 @@ def _inspect_existing_catalog(session: Session, *, catalog_name: str) -> dict[st
         "n_sources": n_sources,
     }
 
-def _prepare_auto_catalog(
+
+def _working_catalog_hash_json(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _working_catalog_frame_scope_sha256(frame_ids: Iterable[int]) -> str:
+    return _working_catalog_hash_json(sorted({int(frame_id) for frame_id in frame_ids}))
+
+
+def _working_catalog_footprint_sha256(gaia_query: Any, cones: Iterable[Any]) -> str:
+    """Hash the exact normalized WCS-cone union sent to the transient Gaia fetch."""
+
+    normalized_cones = gaia_query._normalise_working_cones(cones)
+    exact_float_payload = [
+        [float(value).hex() for value in cone]
+        for cone in normalized_cones
+    ]
+    return _working_catalog_hash_json(exact_float_payload)
+
+
+def _auto_working_catalog_fetch_provenance(
+    *,
+    gaia_query: Any,
+    field_id: int,
+    frame_ids: list[int],
+    cones: list[tuple[float, float, float]],
+    margin_arcmin: float,
+    mag_limit: float | None,
+    max_radius_deg: float,
+    maxrec: int,
+    diagnostics: dict[str, Any],
+    fetch_status: str,
+    fetch_complete: bool,
+    unique_rows: int | None,
+    elapsed_seconds: float | None,
+) -> dict[str, Any]:
+    provider_failures = diagnostics.get("provider_failures") or []
+    providers_used = []
+    providers_attempted = []
+    for provider in diagnostics.get("providers_used") or []:
+        if isinstance(provider, str) and provider and provider not in providers_used:
+            providers_used.append(provider)
+            if provider not in providers_attempted:
+                providers_attempted.append(provider)
+    for failure in provider_failures:
+        if not isinstance(failure, dict):
+            continue
+        provider = failure.get("provider")
+        if isinstance(provider, str) and provider and provider not in providers_attempted:
+            providers_attempted.append(provider)
+    overflow_events = diagnostics.get("overflow_events") or []
+    overflow_statuses = sorted(
+        {
+            str(event["query_status"]).strip().upper()
+            for event in overflow_events
+            if isinstance(event, dict) and event.get("query_status")
+        }
+    )
+    rows_received = int(diagnostics.get("rows_received") or 0)
+    duplicate_rows = None
+    if unique_rows is not None:
+        unique_rows = int(unique_rows)
+        if unique_rows > rows_received:
+            raise ValueError("Gaia fetch unique rows exceed rows received")
+        duplicate_rows = rows_received - unique_rows
+    partial_rows_discarded = bool(diagnostics.get("partial_rows_discarded", False))
+    complete = bool(fetch_complete and not partial_rows_discarded)
+    return {
+        "provenance_version": 1,
+        "field_id": int(field_id),
+        "field_frame_count": len(set(int(value) for value in frame_ids)),
+        "query_mode": "field_union",
+        "new_source_search_performed": True,
+        "coverage_complete": complete,
+        "frame_scope_sha256": _working_catalog_frame_scope_sha256(frame_ids),
+        "footprint_sha256": _working_catalog_footprint_sha256(gaia_query, cones),
+        "catalog_name": "gaia_dr3",
+        "gaia_release": gaia_query.GAIA_DR3_RELEASE,
+        "gaia_table": gaia_query.GAIA_DR3_TABLE,
+        "requested_columns": list(gaia_query.GAIA_WORKING_CATALOG_COLUMNS),
+        "requested_columns_sha256": _working_catalog_hash_json(
+            list(gaia_query.GAIA_WORKING_CATALOG_COLUMNS)
+        ),
+        "margin_arcmin": float(margin_arcmin),
+        "magnitude_limit": float(mag_limit) if mag_limit is not None else None,
+        "max_radius_deg": float(max_radius_deg),
+        "maxrec": int(maxrec),
+        "fetch_status": str(fetch_status),
+        "fetch_complete": complete,
+        "elapsed_seconds": (
+            float(elapsed_seconds) if elapsed_seconds is not None else None
+        ),
+        "logical_acquisitions": 1,
+        "cone_count": int(diagnostics.get("cone_count", len(cones))),
+        "logical_queries": int(diagnostics.get("logical_queries") or 0),
+        "physical_parts": int(diagnostics.get("physical_parts") or 0),
+        "provider_attempts": int(diagnostics.get("provider_attempts") or 0),
+        "providers_used": providers_used,
+        "providers_attempted": providers_attempted,
+        "provider_failures": len(provider_failures),
+        "rows_received": rows_received,
+        "unique_rows": unique_rows,
+        "unique_sources": unique_rows,
+        "field_acquisition_unique_identity_count": unique_rows,
+        "working_catalog_sources": unique_rows,
+        "duplicate_rows": duplicate_rows,
+        "overflow_splits": int(diagnostics.get("overflow_splits") or 0),
+        "overflow_occurred": bool(overflow_events or diagnostics.get("overflow_splits")),
+        "overflow_event_count": len(overflow_events),
+        "overflow_statuses": overflow_statuses,
+        "partial_rows_discarded": partial_rows_discarded,
+        "position_policy": {
+            "coordinate_frame": "ICRS",
+            "catalog_position_columns": ["ra", "dec"],
+            "catalog_position_epoch_year": 2016.0,
+            "proper_motion_correction_applied": False,
+            "query_footprints": "union_of_frame_wcs_corner_cones",
+            "query_margin_arcmin": float(margin_arcmin),
+        },
+    }
+
+
+def _auto_working_catalog_matching_policy(
+    config: FieldPipelineConfig,
+) -> dict[str, Any]:
+    return {
+        "algorithm": "per_frame_greedy_one_to_one_haversine",
+        "detection_positions": "source_detection_ra_dec_from_frame_wcs",
+        "radius_arcsec": float(config.detection_match_radius_arcsec),
+        "working_catalog_mag_limit": (
+            float(config.working_catalog_mag_limit)
+            if config.working_catalog_mag_limit is not None
+            else None
+        ),
+        "max_sources_per_frame": (
+            int(config.max_working_sources_per_frame)
+            if config.max_working_sources_per_frame is not None
+            else None
+        ),
+        "catalog_edge_margin_pix": float(config.catalog_edge_margin_pix),
+        "include_exact_requested_target": bool(config.target_source_id is not None),
+    }
+
+
+def _auto_working_catalog_series_selection(
+    *,
+    series_id: int,
+    pipeline_result: Any,
+    promoted_source_ids: set[str],
+    config: FieldPipelineConfig,
+) -> dict[str, Any]:
+    step = next(
+        (
+            item
+            for item in getattr(pipeline_result, "steps", ())
+            if getattr(item, "step_name", None) == "select_and_promote_working_gaia_sources"
+        ),
+        None,
+    )
+    payload = getattr(step, "result", None) if step is not None else None
+    payload = payload if isinstance(payload, dict) else {}
+    selected_count = payload.get("selected_gaia_source_count")
+    promoted_count = payload.get("canonical_catalog_source_count")
+    selection_status = getattr(step, "status", None) if step is not None else None
+    promotion_status = payload.get("promotion_status")
+    if step is not None and selection_status != "FAILED":
+        if (
+            isinstance(selected_count, bool)
+            or not isinstance(selected_count, int)
+            or isinstance(promoted_count, bool)
+            or not isinstance(promoted_count, int)
+            or selected_count != len(promoted_source_ids)
+            or promoted_count != len(promoted_source_ids)
+        ):
+            raise RuntimeError(
+                "working Gaia selection counts disagree with the non-serialized identity capture"
+            )
+    elif promoted_source_ids:
+        selected_count = len(promoted_source_ids)
+        promoted_count = len(promoted_source_ids)
+        selection_status = "COMPLETED_BEFORE_PIPELINE_FAILURE"
+        promotion_status = "PROMOTED"
+    else:
+        selected_count = None
+        promoted_count = None
+        selection_status = str(selection_status or "NOT_REPORTED")
+    return {
+        "series_id": int(series_id),
+        "selection_step_status": str(selection_status),
+        "promotion_status": (
+            str(promotion_status) if promotion_status is not None else None
+        ),
+        "selected_identity_count": selected_count,
+        "promoted_identity_count": promoted_count,
+        "matching_policy": _auto_working_catalog_matching_policy(config),
+    }
+
+
+def _finalize_auto_working_catalog_provenance(
+    *,
+    catalog: Any | None,
+    provenance: dict[str, Any] | None,
+    promoted_source_ids: set[str],
+    series_selections: list[dict[str, Any]],
+) -> None:
+    if not isinstance(provenance, dict):
+        promoted_source_ids.clear()
+        series_selections.clear()
+        return
+    provenance["series_selection"] = [dict(item) for item in series_selections]
+    provenance["series_selection_count"] = len(series_selections)
+    series_accounting_complete = bool(series_selections) and all(
+        type(item.get("selected_identity_count")) is int
+        and item["selected_identity_count"] >= 0
+        and type(item.get("promoted_identity_count")) is int
+        and item["promoted_identity_count"] >= 0
+        for item in series_selections
+    )
+    provenance["field_promoted_unique_identity_count"] = None
+    provenance["field_promotion_accounting_scope"] = "unique_source_id_union_across_series"
+    provenance["field_promotion_accounting_complete"] = False
+    provenance["field_discarded_transient_identity_count"] = None
+    provenance["field_acquisition_unique_identity_count"] = None
+    if catalog is not None:
+        catalog_ids = {str(value) for value in catalog.source_ids}
+        if not promoted_source_ids.issubset(catalog_ids):
+            raise RuntimeError(
+                "working Gaia promotion identity capture exceeds its field catalog scope"
+            )
+        if provenance.get("new_source_search_performed") is True:
+            if provenance.get("fetch_complete") is not True:
+                raise RuntimeError(
+                    "working Gaia field promotion accounting requires a complete acquisition"
+                )
+            provenance["field_acquisition_unique_identity_count"] = len(catalog_ids)
+            if series_accounting_complete:
+                provenance["field_promoted_unique_identity_count"] = len(
+                    promoted_source_ids
+                )
+                provenance["field_discarded_transient_identity_count"] = len(
+                    catalog_ids.difference(promoted_source_ids)
+                )
+                provenance["field_promotion_accounting_complete"] = True
+        elif provenance.get("new_source_search_performed") is False:
+            provenance["field_reused_catalog_unique_identity_count"] = len(catalog_ids)
+            if series_accounting_complete:
+                provenance["field_promoted_unique_identity_count"] = len(
+                    promoted_source_ids
+                )
+                provenance["field_promotion_accounting_complete"] = True
+    promoted_source_ids.clear()
+    series_selections.clear()
+
+
+def _persist_finalized_auto_working_catalog_provenance(
     session: Session,
     *,
-    catalog_name: str,
+    field_id: int | None,
+    run_ids_by_series: dict[int, int],
+    provenance: dict[str, Any],
+) -> None:
+    """Replace the acquisition snapshot on each exact field pipeline run."""
+
+    if not run_ids_by_series:
+        return
+    if field_id is None or isinstance(field_id, bool) or not isinstance(field_id, int):
+        raise RuntimeError("finalized working Gaia provenance requires an exact field_id")
+    if not isinstance(provenance, dict) or provenance.get("field_id") != field_id:
+        raise RuntimeError("finalized working Gaia provenance does not match its field scope")
+
+    try:
+        provenance_json = json.dumps(
+            provenance,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        safe_provenance = json.loads(provenance_json)
+    except (TypeError, ValueError):
+        raise RuntimeError("finalized working Gaia provenance must contain JSON values only") from None
+
+    def validate_compact_payload(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if not isinstance(key, str):
+                    raise RuntimeError("working Gaia provenance keys must be strings")
+                if key.casefold() in {
+                    "source_id",
+                    "source_ids",
+                    "catalog_source_id",
+                    "catalog_source_ids",
+                    "catalog_row",
+                    "catalog_rows",
+                }:
+                    raise RuntimeError("working Gaia provenance must not contain source identities")
+                validate_compact_payload(child)
+        elif isinstance(value, list):
+            for child in value:
+                validate_compact_payload(child)
+        elif value is not None and not isinstance(value, (str, bool, int, float)):
+            raise RuntimeError("working Gaia provenance must contain scalar/list JSON values")
+
+    validate_compact_payload(safe_provenance)
+    update_statement = text(
+        """
+        UPDATE pipeline_runs
+        SET recipe_json = jsonb_set(
+                jsonb_set(
+                    recipe_json,
+                    '{working_catalog_provenance}',
+                    CAST(:provenance_json AS JSONB),
+                    true
+                ),
+                '{quality_policy}',
+                jsonb_set(
+                    recipe_json->'quality_policy',
+                    '{working_catalog_provenance}',
+                    CAST(:provenance_json AS JSONB),
+                    true
+                ),
+                true
+            ),
+            updated_at = now()
+        WHERE pipeline_run_id = :pipeline_run_id
+          AND field_id = :field_id
+          AND series_id = :series_id
+          AND catalog_name = 'gaia_dr3'
+          AND jsonb_typeof(recipe_json) = 'object'
+          AND jsonb_typeof(recipe_json->'quality_policy') = 'object'
+        """
+    )
+    normalized_run_ids: list[tuple[int, int]] = []
+    for series_id, pipeline_run_id in run_ids_by_series.items():
+        if (
+            isinstance(series_id, bool)
+            or not isinstance(series_id, int)
+            or isinstance(pipeline_run_id, bool)
+            or not isinstance(pipeline_run_id, int)
+        ):
+            raise RuntimeError("working Gaia run scope requires integer series/run IDs")
+        normalized_run_ids.append((series_id, pipeline_run_id))
+    if len({run_id for _series_id, run_id in normalized_run_ids}) != len(
+        normalized_run_ids
+    ):
+        raise RuntimeError("working Gaia run scope contains a duplicate pipeline_run_id")
+
+    try:
+        for series_id, pipeline_run_id in sorted(normalized_run_ids):
+            update = session.execute(
+                update_statement,
+                {
+                    "provenance_json": provenance_json,
+                    "pipeline_run_id": pipeline_run_id,
+                    "field_id": field_id,
+                    "series_id": series_id,
+                },
+            )
+            if getattr(update, "rowcount", None) != 1:
+                raise RuntimeError(
+                    "finalized working Gaia provenance did not match one exact pipeline run"
+                )
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+
+
+def _prepare_auto_working_catalog(
+    session: Session,
+    *,
+    field_id: int,
     frame_ids: list[int],
     enabled: bool,
     margin_arcmin: float,
     mag_limit: float | None,
-    max_rows_per_frame: int,
-    query_mode: str,
-    max_radius_deg: float | None,
+    maxrec: int,
+    max_radius_deg: float,
     timeout_sec: float | None,
-    warnings: list[str],
-) -> dict[str, Any]:
+) -> tuple[Any | None, dict[str, Any]]:
+    """Acquire one bounded, transient Gaia DR3 catalog for a persistent field."""
+
+    from grandgousier.catalogs import gaia_query
+
+    selected_frame_ids = sorted({int(frame_id) for frame_id in frame_ids})
     row: dict[str, Any] = {
-        "mode": "auto_gaia_dr3",
-        "catalog_name": catalog_name,
+        "mode": "auto_gaia_dr3_working",
+        "catalog_name": "gaia_dr3",
+        "field_id": int(field_id),
         "enabled": bool(enabled),
-        "frame_ids_count": len(frame_ids),
-        "query_mode": query_mode,
+        "frame_ids_count": len(selected_frame_ids),
+        "query_mode": "field_union",
         "max_radius_deg": max_radius_deg,
         "mag_limit": mag_limit,
+        "maxrec": maxrec,
         "timeout_sec": timeout_sec,
-        "status": "SKIPPED_DISABLED" if not enabled else "RUNNING",
+        "status": "RUNNING",
     }
-
-    # Auto-generated catalog names are deterministic for the same archive group.
-    # A clean Stage-2 rebuild deliberately preserves CatalogSource identity, so
-    # querying Gaia again here would be both unnecessary and harmful: it makes
-    # a rebuild depend on network availability and can replace a previously
-    # established catalog namespace.  Reuse a populated exact-name catalog
-    # before considering any remote query.
-    existing = _inspect_existing_catalog(session, catalog_name=catalog_name)
-    existing_sources = int(existing.get("n_sources") or 0)
-    if existing_sources > 0:
-        row.update(
-            {
-                "mode": "auto_existing_reuse",
-                "status": "DONE",
-                "reused_existing": True,
-                "n_sources": existing_sources,
-                "inserted_or_updated": existing_sources,
-                "selected_frames": 0,
-                "queried_frames": 0,
-                "queried_cones": 0,
-                "effective_query_mode": "local_reuse",
-                "row_limit_reached_cones": 0,
-                "query_provider": "local_preserved_catalog",
-                "query_provider_failures": {},
-                "read_rows": 0,
-                "failed_frames": 0,
-                "failed_footprint_reasons": {},
-                "sample_failed_footprints": [],
-                "skipped_missing_file": 0,
-                "skipped_oversized_cones": 0,
-            }
-        )
-        return row
-
     if not enabled:
-        warnings.append(f"auto catalog name generated but Gaia query disabled: {catalog_name}")
-        return row
-    if not frame_ids:
+        row["status"] = "SKIPPED_DISABLED"
+        return None, row
+    if not selected_frame_ids:
         row["status"] = "SKIPPED_NO_FRAMES"
-        warnings.append(f"auto catalog query skipped because no indexed frames were found: {catalog_name}")
-        return row
-    try:
-        from grandgousier.catalogs.gaia_query import query_gaia_for_frames
+        return None, row
 
-        res = query_gaia_for_frames(
+    catalog = None
+    fetch_elapsed_seconds: float | None = None
+    try:
+        margin_arcmin = float(margin_arcmin)
+        if not math.isfinite(margin_arcmin) or margin_arcmin < 0.0:
+            raise ValueError("margin_arcmin must be finite and non-negative")
+        frames = gaia_query._select_frames(
             session,
-            catalog_name=catalog_name,
-            frame_ids=frame_ids,
+            frame_ids=selected_frame_ids,
+            instrument=None,
+            instrument_unit_id=None,
             only_wcs_ok=False,
+            limit=None,
+        )
+        frames_by_id = {int(frame.frame_id): frame for frame in frames}
+        missing_frame_count = len(set(selected_frame_ids) - set(frames_by_id))
+        row["selected_frames"] = len(frames_by_id)
+        row["missing_frame_count"] = missing_frame_count
+        if missing_frame_count:
+            row["status"] = "FAILED_FRAME_SELECTION"
+            return None, row
+
+        cones: list[tuple[float, float, float]] = []
+        failed_footprint_reasons: Counter[str] = Counter()
+        for frame_id in selected_frame_ids:
+            frame = frames_by_id[frame_id]
+            try:
+                cone = gaia_query._frame_cone(
+                    Path(frame.raw_path), margin_arcmin=margin_arcmin
+                )
+            except Exception as exc:  # noqa: BLE001 - report footprint failure without response data.
+                failed_footprint_reasons[
+                    f"wcs_footprint_failed:{type(exc).__name__}"
+                ] += 1
+            else:
+                if cone is None:
+                    failed_footprint_reasons["invalid_wcs_footprint"] += 1
+                    continue
+                cones.append(cone)
+        row["cone_count"] = len(cones)
+        row["failed_footprints"] = sum(failed_footprint_reasons.values())
+        row["failed_footprint_reasons"] = dict(sorted(failed_footprint_reasons.items()))
+        if failed_footprint_reasons:
+            row["status"] = "FAILED_FOOTPRINTS"
+            return None, row
+
+        timeout = 120.0 if timeout_sec is None else float(timeout_sec)
+        fetch_started = time.perf_counter()
+        try:
+            catalog, diagnostics = asyncio.run(
+                gaia_query.fetch_gaia_working_catalog(
+                    cones,
+                    max_radius_deg=max_radius_deg,
+                    mag_limit=mag_limit,
+                    maxrec=maxrec,
+                    gaia_timeout_sec=timeout,
+                )
+            )
+        finally:
+            fetch_elapsed_seconds = float(time.perf_counter() - fetch_started)
+        provider_failures = diagnostics.get("provider_failures") or []
+        overflow_splits = int(diagnostics.get("overflow_splits") or 0)
+        unique_rows = len(catalog)
+        rows_received = int(diagnostics.get("rows_received") or 0)
+        fetch_diagnostics = {
+            "cone_count": int(diagnostics.get("cone_count", len(cones))),
+            "logical_queries": int(diagnostics.get("logical_queries") or 0),
+            "physical_parts": int(diagnostics.get("physical_parts") or 0),
+            "provider_attempts": int(diagnostics.get("provider_attempts") or 0),
+            "provider_failures": len(provider_failures),
+            "providers_used": list(diagnostics.get("providers_used") or []),
+            "overflow_splits": overflow_splits,
+            "rows_received": rows_received,
+            "unique_sources": unique_rows,
+            "duplicate_rows": rows_received - unique_rows,
+            "working_catalog_sources": unique_rows,
+            "partial_rows_discarded": bool(
+                diagnostics.get("partial_rows_discarded", False)
+            ),
+        }
+        row["working_catalog_provenance"] = _auto_working_catalog_fetch_provenance(
+            gaia_query=gaia_query,
+            field_id=field_id,
+            frame_ids=selected_frame_ids,
+            cones=cones,
             margin_arcmin=margin_arcmin,
             mag_limit=mag_limit,
-            max_rows_per_frame=max_rows_per_frame,
-            query_mode=query_mode,
             max_radius_deg=max_radius_deg,
-            gaia_timeout_sec=timeout_sec,
-            match=False,
-            dry_run=False,
+            maxrec=maxrec,
+            diagnostics=diagnostics,
+            fetch_status="SUCCEEDED_COMPLETE",
+            fetch_complete=True,
+            unique_rows=unique_rows,
+            elapsed_seconds=fetch_elapsed_seconds,
         )
-        row_limit_reached_cones = int(getattr(res, "row_limit_reached_cones", 0) or 0)
-        if res.failed_frames > 0:
-            status = "DONE_WITH_FAILED_FRAMES"
-        elif row_limit_reached_cones > 0:
-            status = "DONE_WITH_WARNINGS"
-        else:
-            status = "DONE"
         row.update(
             {
-                "status": status,
-                "selected_frames": res.selected_frames,
-                "queried_frames": res.queried_frames,
-                "queried_cones": getattr(res, "queried_cones", None),
-                "query_mode": getattr(res, "query_mode", query_mode),
-                "effective_query_mode": getattr(res, "effective_query_mode", query_mode),
-                "row_limit_reached_cones": row_limit_reached_cones,
-                "query_provider": getattr(res, "query_provider", None),
-                "query_provider_failures": getattr(res, "query_provider_failures", {}),
-                "read_rows": res.read_rows,
-                "inserted_or_updated": res.inserted_or_updated,
-                "failed_frames": res.failed_frames,
-                "failed_footprint_reasons": getattr(res, "failed_footprint_reasons", {}),
-                "sample_failed_footprints": getattr(res, "sample_failed_footprints", []),
-                "skipped_missing_file": res.skipped_missing_file,
-                "skipped_oversized_cones": getattr(res, "skipped_oversized_cones", 0),
+                "status": "DONE_WITH_WARNINGS" if provider_failures else "DONE",
+                "logical_queries": fetch_diagnostics["logical_queries"],
+                "physical_parts": fetch_diagnostics["physical_parts"],
+                "provider_attempts": fetch_diagnostics["provider_attempts"],
+                "provider_failures": fetch_diagnostics["provider_failures"],
+                "overflow_splits": fetch_diagnostics["overflow_splits"],
+                "rows_received": fetch_diagnostics["rows_received"],
+                "duplicate_rows": fetch_diagnostics["duplicate_rows"],
+                "providers_used": fetch_diagnostics["providers_used"],
+                "elapsed_seconds": fetch_elapsed_seconds,
+                "working_catalog_sources": unique_rows,
+                "partial_rows_discarded": fetch_diagnostics["partial_rows_discarded"],
             }
         )
-        if res.inserted_or_updated == 0:
-            warnings.append(f"auto catalog query inserted zero sources: {catalog_name}")
-        if row_limit_reached_cones > 0:
-            warnings.append(
-                f"auto Gaia query reached MAXREC={max_rows_per_frame} in {row_limit_reached_cones} cone(s); "
-                "catalog may be truncated; use a brighter --auto-catalog-mag-limit or raise --auto-catalog-max-rows-per-frame"
+        return catalog, row
+    except Exception as exc:  # noqa: BLE001 - acquisition failures are reported without response data.
+        if catalog is not None:
+            _close_working_catalog(catalog)
+        diagnostics = getattr(exc, "diagnostics", {})
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        row.update(
+            {
+                "status": "FAILED",
+                "failure_type": str(diagnostics.get("failure_type") or type(exc).__name__),
+                "logical_queries": int(diagnostics.get("logical_queries") or 0),
+                "physical_parts": int(diagnostics.get("physical_parts") or 0),
+                "provider_attempts": int(diagnostics.get("provider_attempts") or 0),
+                "provider_failures": len(diagnostics.get("provider_failures") or []),
+                "overflow_splits": int(diagnostics.get("overflow_splits") or 0),
+                "rows_received": int(diagnostics.get("rows_received") or 0),
+                "providers_used": list(diagnostics.get("providers_used") or []),
+                "elapsed_seconds": fetch_elapsed_seconds,
+                "partial_rows_discarded": bool(
+                    diagnostics.get("partial_rows_discarded", False)
+                ),
+            }
+        )
+        if fetch_elapsed_seconds is not None:
+            row["working_catalog_provenance"] = _auto_working_catalog_fetch_provenance(
+                gaia_query=gaia_query,
+                field_id=field_id,
+                frame_ids=selected_frame_ids,
+                cones=cones,
+                margin_arcmin=margin_arcmin,
+                mag_limit=mag_limit,
+                max_radius_deg=max_radius_deg,
+                maxrec=maxrec,
+                diagnostics=diagnostics,
+                fetch_status="FAILED",
+                fetch_complete=False,
+                unique_rows=None,
+                elapsed_seconds=fetch_elapsed_seconds,
             )
-        return row
-    except Exception as exc:  # noqa: BLE001 - one-command processing should continue and report the catalog failure.
-        session.rollback()
-        row.update({"status": "FAILED", "error_message": f"{type(exc).__name__}: {exc}"})
-        warnings.append(f"auto catalog query failed for {catalog_name}: {type(exc).__name__}: {exc}")
-        return row
+        return None, row
 
+
+class _OfflineWorkingCatalogReuseRejected(RuntimeError):
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _reuse_auto_working_catalog(
+    session: Session,
+    *,
+    field_id: int,
+    frame_ids: list[int],
+    margin_arcmin: float,
+    mag_limit: float | None,
+    maxrec: int,
+    max_radius_deg: float,
+    target_source_id: str | None,
+    working_catalog_mag_limit: float | None,
+    max_working_sources_per_frame: int | None,
+    catalog_edge_margin_pix: float,
+    aperture_radius_pix: float,
+    annulus_inner_pix: float,
+    annulus_outer_pix: float,
+) -> tuple[Any | None, dict[str, Any]]:
+    """Reuse exact-scope Gaia identities backed by completed match evidence.
+
+    Identity and link reads are restricted to IDs from successful detection matches
+    (plus one explicitly requested target). This path never scans ``gaia_dr3``.
+    """
+
+    row: dict[str, Any] = {
+        "mode": "offline_gaia_dr3_reuse",
+        "catalog_name": "gaia_dr3",
+        "field_id": int(field_id),
+        "frame_ids_count": len(set(int(value) for value in frame_ids)),
+        "query_mode": "field_union",
+        "new_source_search_performed": False,
+        "coverage_complete": False,
+        "reuse_compatible": False,
+        "status": "FAILED_OFFLINE_REUSE_PRECONDITION",
+    }
+    try:
+        catalog, provenance, diagnostics = _load_offline_working_catalog_reuse(
+            session,
+            field_id=field_id,
+            frame_ids=frame_ids,
+            margin_arcmin=margin_arcmin,
+            mag_limit=mag_limit,
+            maxrec=maxrec,
+            max_radius_deg=max_radius_deg,
+            target_source_id=target_source_id,
+            working_catalog_mag_limit=working_catalog_mag_limit,
+            max_working_sources_per_frame=max_working_sources_per_frame,
+            catalog_edge_margin_pix=catalog_edge_margin_pix,
+            aperture_radius_pix=aperture_radius_pix,
+            annulus_inner_pix=annulus_inner_pix,
+            annulus_outer_pix=annulus_outer_pix,
+        )
+    except _OfflineWorkingCatalogReuseRejected as exc:
+        row["refusal_reason"] = exc.reason
+        return None, row
+    except Exception:  # noqa: BLE001 - proof failures must not reach the pipeline.
+        row["refusal_reason"] = "OFFLINE_EVIDENCE_READ_FAILED"
+        return None, row
+
+    offline_provenance = dict(provenance)
+    offline_provenance.update(
+        {
+            "reuse_mode": "completed_pipeline_catalog_match",
+            "new_source_search_performed": False,
+            "coverage_complete": False,
+            "per_frame_match_coverage_complete": True,
+            "reused_catalog_source_count": len(catalog),
+            "explicit_target_included": bool(diagnostics["target_source_included"]),
+        }
+    )
+    row.update(diagnostics)
+    row.update(
+        {
+            "status": "DONE",
+            "reuse_compatible": True,
+            "working_catalog_sources": len(catalog),
+            "working_catalog_provenance": offline_provenance,
+        }
+    )
+    return catalog, row
+
+
+def _load_offline_working_catalog_reuse(
+    session: Session,
+    *,
+    field_id: int,
+    frame_ids: list[int],
+    margin_arcmin: float,
+    mag_limit: float | None,
+    maxrec: int,
+    max_radius_deg: float,
+    target_source_id: str | None,
+    working_catalog_mag_limit: float | None,
+    max_working_sources_per_frame: int | None,
+    catalog_edge_margin_pix: float,
+    aperture_radius_pix: float,
+    annulus_inner_pix: float,
+    annulus_outer_pix: float,
+) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    from sqlalchemy import select
+    from sqlalchemy.orm import aliased
+
+    from grandgousier.catalogs import gaia_query
+    from grandgousier.db.detection_runs import (
+        CATALOG_MATCH_RUN,
+        SOURCE_DETECTION_RUN,
+        algorithm_version,
+        detection_run_fingerprint,
+    )
+    from grandgousier.db.models import (
+        CatalogSource,
+        DetectionCatalogMatch,
+        DetectionRun,
+        DetectionRunFrame,
+        FrameCatalogLink,
+        PipelineRun,
+        PipelineRunStep,
+        SourceDetection,
+    )
+    from grandgousier.photometry.source_detection import DEFAULT_ALGORITHM
+    from grandgousier.quality.detection_catalog_qc import MATCH_ALGORITHM
+
+    selected_frame_ids = sorted({int(value) for value in frame_ids})
+    if not selected_frame_ids:
+        raise _OfflineWorkingCatalogReuseRejected("NO_SELECTED_FRAMES")
+    if len(selected_frame_ids) != len(frame_ids):
+        raise _OfflineWorkingCatalogReuseRejected("AMBIGUOUS_FRAME_SCOPE")
+    if target_source_id is not None and not isinstance(target_source_id, str):
+        raise _OfflineWorkingCatalogReuseRejected("INVALID_EXPLICIT_TARGET_ID")
+
+    try:
+        if isinstance(maxrec, bool):
+            raise ValueError
+        margin_arcmin = float(margin_arcmin)
+        max_radius_deg = float(max_radius_deg)
+        maxrec = int(maxrec)
+        if (
+            not math.isfinite(margin_arcmin)
+            or margin_arcmin < 0.0
+            or not math.isfinite(max_radius_deg)
+            or max_radius_deg <= 0.0
+            or maxrec <= 0
+        ):
+            raise ValueError
+        if mag_limit is not None:
+            mag_limit = float(mag_limit)
+            if not math.isfinite(mag_limit):
+                raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        raise _OfflineWorkingCatalogReuseRejected("INVALID_CURRENT_QUERY_CONFIGURATION") from None
+
+    frames = gaia_query._select_frames(
+        session,
+        frame_ids=selected_frame_ids,
+        instrument=None,
+        instrument_unit_id=None,
+        only_wcs_ok=False,
+        limit=None,
+    )
+    frames_by_id = {int(frame.frame_id): frame for frame in frames}
+    if len(frames_by_id) != len(selected_frame_ids) or set(frames_by_id) != set(
+        selected_frame_ids
+    ):
+        raise _OfflineWorkingCatalogReuseRejected("CURRENT_FRAME_SELECTION_INCOMPLETE")
+
+    cones: list[tuple[float, float, float]] = []
+    for frame_id in selected_frame_ids:
+        try:
+            cone = gaia_query._frame_cone(
+                Path(frames_by_id[frame_id].raw_path), margin_arcmin=margin_arcmin
+            )
+        except Exception:
+            raise _OfflineWorkingCatalogReuseRejected("CURRENT_WCS_FOOTPRINT_UNAVAILABLE") from None
+        if cone is None:
+            raise _OfflineWorkingCatalogReuseRejected("CURRENT_WCS_FOOTPRINT_UNAVAILABLE")
+        cones.append(cone)
+
+    defaults = FieldPipelineConfig(catalog_name="gaia_dr3", calibration_prefix="offline-reuse")
+    expected_provenance = {
+        "provenance_version": 1,
+        "field_id": int(field_id),
+        "field_frame_count": len(selected_frame_ids),
+        "query_mode": "field_union",
+        "frame_scope_sha256": _working_catalog_frame_scope_sha256(selected_frame_ids),
+        "footprint_sha256": _working_catalog_footprint_sha256(gaia_query, cones),
+        "catalog_name": "gaia_dr3",
+        "gaia_release": gaia_query.GAIA_DR3_RELEASE,
+        "gaia_table": gaia_query.GAIA_DR3_TABLE,
+        "requested_columns_sha256": _working_catalog_hash_json(
+            list(gaia_query.GAIA_WORKING_CATALOG_COLUMNS)
+        ),
+        "margin_arcmin": margin_arcmin,
+        "magnitude_limit": mag_limit,
+        "max_radius_deg": max_radius_deg,
+        "maxrec": maxrec,
+    }
+
+    pipeline_rows = session.execute(
+        select(
+            PipelineRun.pipeline_run_id.label("pipeline_run_id"),
+            PipelineRun.field_id.label("field_id"),
+            PipelineRun.series_id.label("series_id"),
+            PipelineRun.instrument_unit_id.label("instrument_unit_id"),
+            PipelineRun.catalog_name.label("catalog_name"),
+            PipelineRun.status.label("status"),
+            PipelineRun.recipe_json.label("recipe_json"),
+        ).where(
+            PipelineRun.field_id == int(field_id),
+            PipelineRun.catalog_name == "gaia_dr3",
+            PipelineRun.status.in_(("DONE", "DONE_WITH_WARNINGS")),
+        ).order_by(PipelineRun.pipeline_run_id.desc()).limit(1001)
+    ).mappings().all()
+    if not pipeline_rows:
+        raise _OfflineWorkingCatalogReuseRejected("NO_COMPLETED_PIPELINE_EVIDENCE")
+    if len(pipeline_rows) > 1000:
+        raise _OfflineWorkingCatalogReuseRejected("TOO_MANY_PIPELINE_EVIDENCE_ROWS")
+
+    scope_rows: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    for run in pipeline_rows:
+        recipe = run.get("recipe_json")
+        recipe = recipe if isinstance(recipe, dict) else {}
+        provenance = recipe.get("working_catalog_provenance")
+        provenance = provenance if isinstance(provenance, dict) else {}
+        if (
+            provenance.get("field_id") == expected_provenance["field_id"]
+            and provenance.get("field_frame_count") == expected_provenance["field_frame_count"]
+            and provenance.get("frame_scope_sha256")
+            == expected_provenance["frame_scope_sha256"]
+        ):
+            scope_rows.append((dict(run), recipe, provenance))
+    if not scope_rows:
+        raise _OfflineWorkingCatalogReuseRejected("FIELD_FRAME_SCOPE_MISMATCH")
+
+    footprint_rows = [
+        candidate
+        for candidate in scope_rows
+        if candidate[2].get("footprint_sha256") == expected_provenance["footprint_sha256"]
+    ]
+    if not footprint_rows:
+        raise _OfflineWorkingCatalogReuseRejected("WCS_FOOTPRINT_MISMATCH")
+
+    query_rows = [
+        candidate
+        for candidate in footprint_rows
+        if all(
+            _offline_json_value_matches(candidate[2].get(key), value)
+            for key, value in expected_provenance.items()
+        )
+    ]
+    if not query_rows:
+        raise _OfflineWorkingCatalogReuseRejected("QUERY_PROVENANCE_MISMATCH")
+
+    complete_query_rows = [
+        candidate
+        for candidate in query_rows
+        if candidate[2].get("fetch_status") == "SUCCEEDED_COMPLETE"
+        and candidate[2].get("fetch_complete") is True
+        and candidate[2].get("partial_rows_discarded") is False
+        and _offline_nonnegative_int(candidate[2].get("unique_sources"))
+        == _offline_nonnegative_int(candidate[2].get("working_catalog_sources"))
+    ]
+    if not complete_query_rows:
+        raise _OfflineWorkingCatalogReuseRejected("FETCH_PROVENANCE_INCOMPLETE")
+
+    expected_detector_parameters = {
+        "threshold_sigma": defaults.detection_threshold_sigma,
+        "max_sources_per_frame": defaults.detection_max_sources_per_frame,
+        "min_separation_pix": defaults.detection_min_separation_pix,
+        "aperture_radius_pix": aperture_radius_pix,
+        "annulus_inner_pix": annulus_inner_pix,
+        "annulus_outer_pix": annulus_outer_pix,
+        "centroid_box_radius_pix": 3,
+    }
+    expected_match_parameters = {
+        "detection_algorithm": DEFAULT_ALGORITHM,
+        "radius_arcsec": defaults.detection_match_radius_arcsec,
+        "mag_key": defaults.mag_key,
+        "min_snr": None,
+    }
+    expected_detector_recipe = {
+        "detection_threshold_sigma": defaults.detection_threshold_sigma,
+        "detection_max_sources_per_frame": defaults.detection_max_sources_per_frame,
+        "detection_min_separation_pix": defaults.detection_min_separation_pix,
+        "aperture_radius_pix": aperture_radius_pix,
+        "annulus_inner_pix": annulus_inner_pix,
+        "annulus_outer_pix": annulus_outer_pix,
+    }
+    expected_projection_recipe = {
+        "margin_pix": defaults.margin_pix,
+        "mag_key": defaults.mag_key,
+        "working_catalog_mag_limit": working_catalog_mag_limit,
+        "max_working_sources_per_frame": max_working_sources_per_frame,
+        "catalog_edge_margin_pix": catalog_edge_margin_pix,
+        "replace_frame_catalog_links": True,
+    }
+
+    def pipeline_recipe_compatible(
+        run: dict[str, Any], recipe: dict[str, Any], provenance: dict[str, Any]
+    ) -> bool:
+        if run.get("field_id") != int(field_id):
+            return False
+        if run.get("status") not in {"DONE", "DONE_WITH_WARNINGS"}:
+            return False
+        if recipe.get("field_id") != int(field_id):
+            return False
+        if recipe.get("series_id") != run.get("series_id") or run.get("series_id") is None:
+            return False
+        if recipe.get("instrument_unit_id") != run.get("instrument_unit_id"):
+            return False
+        if recipe.get("catalog_name") != "gaia_dr3":
+            return False
+        if recipe.get("dry_run") is not False:
+            return False
+        if recipe.get("skip_detection") is not False:
+            return False
+        if recipe.get("skip_detection_catalog_match") is not False:
+            return False
+        if recipe.get("skip_catalog_frame_match") is not False:
+            return False
+        if recipe.get("working_catalog_provenance") != provenance:
+            return False
+        quality_policy = recipe.get("quality_policy")
+        if not isinstance(quality_policy, dict) or quality_policy.get(
+            "working_catalog_provenance"
+        ) != provenance:
+            return False
+        if not all(
+            _offline_json_value_matches(recipe.get(key), value)
+            for key, value in expected_projection_recipe.items()
+        ):
+            return False
+        if not all(
+            _offline_json_value_matches(recipe.get(key), value)
+            for key, value in expected_detector_recipe.items()
+        ):
+            return False
+        return _offline_json_value_matches(
+            recipe.get("detection_match_radius_arcsec"),
+            defaults.detection_match_radius_arcsec,
+        )
+
+    compatible_pipeline_rows = [
+        candidate
+        for candidate in complete_query_rows
+        if pipeline_recipe_compatible(*candidate)
+    ]
+    if not compatible_pipeline_rows:
+        raise _OfflineWorkingCatalogReuseRejected("PIPELINE_CONFIGURATION_MISMATCH")
+
+    pipeline_ids = sorted(
+        {int(candidate[0]["pipeline_run_id"]) for candidate in compatible_pipeline_rows}
+    )
+    step_names = (
+        "detect_sources",
+        "select_and_promote_working_gaia_sources",
+        "project_selected_working_gaia_sources",
+        "match_detections_to_catalog",
+    )
+    steps = session.execute(
+        select(
+            PipelineRunStep.pipeline_run_id.label("pipeline_run_id"),
+            PipelineRunStep.step_name.label("step_name"),
+            PipelineRunStep.status.label("status"),
+            PipelineRunStep.result_json.label("result_json"),
+        ).where(
+            PipelineRunStep.pipeline_run_id.in_(pipeline_ids),
+            PipelineRunStep.step_name.in_(step_names),
+        )
+    ).mappings().all()
+    steps_by_pipeline: dict[int, dict[str, list[dict[str, Any]]]] = {}
+    for step in steps:
+        steps_by_pipeline.setdefault(int(step["pipeline_run_id"]), {}).setdefault(
+            str(step["step_name"]), []
+        ).append(dict(step))
+
+    detection_runs = session.execute(
+        select(
+            DetectionRun.detection_run_id.label("detection_run_id"),
+            DetectionRun.pipeline_run_id.label("pipeline_run_id"),
+            DetectionRun.run_kind.label("run_kind"),
+            DetectionRun.catalog_name.label("catalog_name"),
+            DetectionRun.algorithm.label("algorithm"),
+            DetectionRun.algorithm_version.label("algorithm_version"),
+            DetectionRun.parameters.label("parameters"),
+            DetectionRun.fingerprint.label("fingerprint"),
+        ).where(
+            DetectionRun.pipeline_run_id.in_(pipeline_ids),
+            DetectionRun.run_kind.in_((SOURCE_DETECTION_RUN, CATALOG_MATCH_RUN)),
+        )
+    ).mappings().all()
+    runs_by_pipeline: dict[int, dict[str, list[dict[str, Any]]]] = {}
+    for detection_run in detection_runs:
+        runs_by_pipeline.setdefault(int(detection_run["pipeline_run_id"]), {}).setdefault(
+            str(detection_run["run_kind"]), []
+        ).append(dict(detection_run))
+
+    candidate_records: list[dict[str, Any]] = []
+    for run, recipe, provenance in compatible_pipeline_rows:
+        pipeline_run_id = int(run["pipeline_run_id"])
+        raw_frame_ids = recipe.get("frame_ids")
+        if not isinstance(raw_frame_ids, list) or not raw_frame_ids:
+            continue
+        try:
+            pipeline_frame_ids = [int(value) for value in raw_frame_ids]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if len(set(pipeline_frame_ids)) != len(pipeline_frame_ids):
+            continue
+        pipeline_frame_set = set(pipeline_frame_ids)
+        if not pipeline_frame_set.issubset(set(selected_frame_ids)):
+            continue
+        if any(
+            getattr(frames_by_id[frame_id], "instrument_unit_id", None)
+            != run.get("instrument_unit_id")
+            for frame_id in pipeline_frame_set
+        ):
+            continue
+
+        pipeline_steps = steps_by_pipeline.get(pipeline_run_id, {})
+        required_steps: dict[str, dict[str, Any]] = {}
+        for step_name in step_names:
+            rows_for_step = pipeline_steps.get(step_name, [])
+            if len(rows_for_step) != 1 or rows_for_step[0].get("status") != "DONE":
+                break
+            result_json = rows_for_step[0].get("result_json")
+            if not isinstance(result_json, dict):
+                break
+            required_steps[step_name] = result_json
+        if len(required_steps) != len(step_names):
+            continue
+
+        source_runs = runs_by_pipeline.get(pipeline_run_id, {}).get(SOURCE_DETECTION_RUN, [])
+        match_runs = runs_by_pipeline.get(pipeline_run_id, {}).get(CATALOG_MATCH_RUN, [])
+        if len(source_runs) != 1 or len(match_runs) != 1:
+            continue
+        source_run, match_run = source_runs[0], match_runs[0]
+        source_parameters = source_run.get("parameters")
+        match_parameters = match_run.get("parameters")
+        if not isinstance(source_parameters, dict) or not isinstance(match_parameters, dict):
+            continue
+        if (
+            source_run.get("algorithm") != DEFAULT_ALGORITHM
+            or source_run.get("algorithm_version") != algorithm_version(DEFAULT_ALGORITHM)
+            or source_parameters != expected_detector_parameters
+            or source_run.get("fingerprint")
+            != detection_run_fingerprint(
+                run_kind=SOURCE_DETECTION_RUN,
+                algorithm=DEFAULT_ALGORITHM,
+                parameters=expected_detector_parameters,
+            )
+        ):
+            continue
+        if (
+            match_run.get("catalog_name") != "gaia_dr3"
+            or match_run.get("algorithm") != MATCH_ALGORITHM
+            or match_run.get("algorithm_version") != algorithm_version(MATCH_ALGORITHM)
+            or match_parameters != expected_match_parameters
+            or match_run.get("fingerprint")
+            != detection_run_fingerprint(
+                run_kind=CATALOG_MATCH_RUN,
+                algorithm=MATCH_ALGORITHM,
+                parameters=expected_match_parameters,
+                catalog_name="gaia_dr3",
+            )
+        ):
+            continue
+
+        source_step = required_steps["detect_sources"]
+        select_step = required_steps["select_and_promote_working_gaia_sources"]
+        projection_step = required_steps["project_selected_working_gaia_sources"]
+        match_step = required_steps["match_detections_to_catalog"]
+        if not _offline_step_covers_frames(source_step, len(pipeline_frame_set), skipped=True):
+            continue
+        selected_source_count = _offline_nonnegative_int(
+            select_step.get("selected_gaia_source_count")
+        )
+        canonical_source_count = _offline_nonnegative_int(
+            select_step.get("canonical_catalog_source_count")
+        )
+        if (
+            source_step.get("detection_run_id") != int(source_run["detection_run_id"])
+            or selected_source_count is None
+            or selected_source_count <= 0
+            or canonical_source_count != selected_source_count
+        ):
+            continue
+        if not _offline_step_covers_frames(
+            projection_step, len(pipeline_frame_set), skipped=True
+        ):
+            continue
+        if not _offline_step_covers_frames(match_step, len(pipeline_frame_set), skipped=False):
+            continue
+        if match_step.get("detection_run_id") != int(match_run["detection_run_id"]):
+            continue
+        candidate_records.append(
+            {
+                "pipeline_run_id": pipeline_run_id,
+                "frame_ids": pipeline_frame_set,
+                "provenance": provenance,
+                "source_run_id": int(source_run["detection_run_id"]),
+                "match_run_id": int(match_run["detection_run_id"]),
+            }
+        )
+
+    if not candidate_records:
+        raise _OfflineWorkingCatalogReuseRejected("NO_COMPATIBLE_COMPLETED_MATCH_RUN")
+
+    detection_run_ids = sorted(
+        {
+            run_id
+            for candidate in candidate_records
+            for run_id in (candidate["source_run_id"], candidate["match_run_id"])
+        }
+    )
+    run_frames = session.execute(
+        select(
+            DetectionRunFrame.detection_run_frame_id.label("detection_run_frame_id"),
+            DetectionRunFrame.detection_run_id.label("detection_run_id"),
+            DetectionRunFrame.frame_id.label("frame_id"),
+            DetectionRunFrame.status.label("status"),
+            DetectionRunFrame.diagnostics.label("diagnostics"),
+        ).where(
+            DetectionRunFrame.detection_run_id.in_(detection_run_ids),
+            DetectionRunFrame.frame_id.in_(selected_frame_ids),
+        )
+    ).mappings().all()
+    run_frames_by_run: dict[int, list[dict[str, Any]]] = {}
+    for run_frame in run_frames:
+        run_frames_by_run.setdefault(int(run_frame["detection_run_id"]), []).append(
+            dict(run_frame)
+        )
+
+    frame_evidence: dict[int, list[dict[str, Any]]] = {}
+    matched_run_frame_ids: set[int] = set()
+    valid_candidate_records: list[dict[str, Any]] = []
+    for candidate in candidate_records:
+        expected_frames = set(candidate["frame_ids"])
+        per_run_frames: dict[int, dict[int, dict[str, Any]]] = {}
+        valid = True
+        for run_id in (candidate["source_run_id"], candidate["match_run_id"]):
+            selected_rows = run_frames_by_run.get(run_id, [])
+            row_by_frame = {int(item["frame_id"]): item for item in selected_rows}
+            if (
+                len(row_by_frame) != len(selected_rows)
+                or set(row_by_frame) != expected_frames
+                or any(item.get("status") != "DONE" for item in selected_rows)
+            ):
+                valid = False
+                break
+            per_run_frames[run_id] = row_by_frame
+        if not valid:
+            continue
+        match_frames = per_run_frames[candidate["match_run_id"]]
+        source_frames = per_run_frames[candidate["source_run_id"]]
+        candidate["match_frame_by_id"] = match_frames
+        candidate["source_frame_by_id"] = source_frames
+        valid_candidate_records.append(candidate)
+        matched_run_frame_ids.update(
+            int(item["detection_run_frame_id"]) for item in match_frames.values()
+        )
+        for frame_id in expected_frames:
+            frame_evidence.setdefault(frame_id, []).append(candidate)
+
+    if set(frame_evidence) != set(selected_frame_ids):
+        raise _OfflineWorkingCatalogReuseRejected("INCOMPLETE_SUCCESSFUL_FRAME_COVERAGE")
+
+    reuse_only_provenance_keys = {
+        "reuse_mode",
+        "new_source_search_performed",
+        "coverage_complete",
+        "per_frame_match_coverage_complete",
+        "reused_catalog_source_count",
+        "explicit_target_included",
+    }
+    expected_reuse_provenance = {
+        "reuse_mode": "completed_pipeline_catalog_match",
+        "new_source_search_performed": False,
+        "coverage_complete": False,
+        "per_frame_match_coverage_complete": True,
+    }
+    for candidate in valid_candidate_records:
+        candidate_provenance = candidate["provenance"]
+        if any(
+            key in candidate_provenance
+            and not _offline_json_value_matches(candidate_provenance[key], value)
+            for key, value in expected_reuse_provenance.items()
+        ):
+            raise _OfflineWorkingCatalogReuseRejected("AMBIGUOUS_QUERY_PROVENANCE")
+        if (
+            "reused_catalog_source_count" in candidate_provenance
+            and _offline_nonnegative_int(
+                candidate_provenance["reused_catalog_source_count"]
+            )
+            is None
+        ):
+            raise _OfflineWorkingCatalogReuseRejected("AMBIGUOUS_QUERY_PROVENANCE")
+        if (
+            "explicit_target_included" in candidate_provenance
+            and not isinstance(candidate_provenance["explicit_target_included"], bool)
+        ):
+            raise _OfflineWorkingCatalogReuseRejected("AMBIGUOUS_QUERY_PROVENANCE")
+    provenance_values = [
+        {
+            key: value
+            for key, value in candidate["provenance"].items()
+            if key not in reuse_only_provenance_keys
+        }
+        for candidate in valid_candidate_records
+    ]
+    if not provenance_values or any(value != provenance_values[0] for value in provenance_values[1:]):
+        raise _OfflineWorkingCatalogReuseRejected("AMBIGUOUS_QUERY_PROVENANCE")
+
+    expected_match_frames: dict[int, dict[str, Any]] = {}
+    for candidate in valid_candidate_records:
+        for frame_id in candidate["frame_ids"]:
+            match_frame = candidate["match_frame_by_id"][frame_id]
+            source_frame = candidate["source_frame_by_id"][frame_id]
+            diagnostics = match_frame.get("diagnostics")
+            expected_match_frames[int(match_frame["detection_run_frame_id"])] = {
+                "frame_id": int(frame_id),
+                "n_matched": (
+                    _offline_nonnegative_int(diagnostics.get("n_matched"))
+                    if isinstance(diagnostics, dict)
+                    else None
+                ),
+                "source_detection_run_id": int(candidate["source_run_id"]),
+                "source_detection_run_frame_id": int(
+                    source_frame["detection_run_frame_id"]
+                ),
+                "pipeline_run_id": int(candidate["pipeline_run_id"]),
+            }
+
+    source_run_frame = aliased(DetectionRunFrame)
+    match_rows = session.execute(
+        select(
+            DetectionRunFrame.frame_id.label("frame_id"),
+            DetectionCatalogMatch.detection_run_frame_id.label("detection_run_frame_id"),
+            DetectionCatalogMatch.source_detection_id.label("source_detection_id"),
+            DetectionCatalogMatch.catalog_source_id.label("catalog_source_id"),
+            DetectionCatalogMatch.match_status.label("match_status"),
+            SourceDetection.detection_run_frame_id.label(
+                "source_detection_run_frame_id"
+            ),
+            source_run_frame.detection_run_frame_id.label(
+                "joined_source_detection_run_frame_id"
+            ),
+            source_run_frame.detection_run_id.label("source_detection_run_id"),
+            source_run_frame.frame_id.label("source_frame_id"),
+        )
+        .join(
+            DetectionRunFrame,
+            DetectionRunFrame.detection_run_frame_id
+            == DetectionCatalogMatch.detection_run_frame_id,
+        )
+        .outerjoin(
+            SourceDetection,
+            SourceDetection.source_detection_id
+            == DetectionCatalogMatch.source_detection_id,
+        )
+        .outerjoin(
+            source_run_frame,
+            source_run_frame.detection_run_frame_id
+            == SourceDetection.detection_run_frame_id,
+        )
+        .where(
+            DetectionCatalogMatch.detection_run_frame_id.in_(
+                sorted(matched_run_frame_ids)
+            )
+        )
+    ).mappings().all()
+    actual_match_counts = {run_frame_id: 0 for run_frame_id in expected_match_frames}
+    match_source_ids_by_pipeline: dict[int, dict[int, set[int]]] = {
+        candidate["pipeline_run_id"]: {
+            frame_id: set() for frame_id in candidate["frame_ids"]
+        }
+        for candidate in valid_candidate_records
+    }
+    matched_pairs: set[tuple[int, int]] = set()
+    matched_catalog_source_ids: set[int] = set()
+    for match in match_rows:
+        match_run_frame_id = _offline_nonnegative_int(
+            match.get("detection_run_frame_id")
+        )
+        expected_frame = expected_match_frames.get(match_run_frame_id)
+        if expected_frame is None:
+            raise _OfflineWorkingCatalogReuseRejected(
+                "MATCH_ROW_OUTSIDE_CURRENT_FRAME_SCOPE"
+            )
+        actual_match_counts[match_run_frame_id] += 1
+        if (
+            match.get("frame_id") != expected_frame["frame_id"]
+            or _offline_nonnegative_int(match.get("source_detection_run_frame_id"))
+            != expected_frame["source_detection_run_frame_id"]
+            or _offline_nonnegative_int(
+                match.get("joined_source_detection_run_frame_id")
+            )
+            != expected_frame["source_detection_run_frame_id"]
+            or _offline_nonnegative_int(match.get("source_detection_run_id"))
+            != expected_frame["source_detection_run_id"]
+            or match.get("source_frame_id") != expected_frame["frame_id"]
+        ):
+            raise _OfflineWorkingCatalogReuseRejected(
+                "MATCH_SOURCE_DETECTION_SCOPE_MISMATCH"
+            )
+        if match.get("match_status") != "MATCHED":
+            raise _OfflineWorkingCatalogReuseRejected("NONMATCHED_ROW_IN_COMPLETED_MATCH_RUN")
+        frame_id = int(match["frame_id"])
+        source_id = int(match["catalog_source_id"])
+        if frame_id not in frame_evidence:
+            raise _OfflineWorkingCatalogReuseRejected("MATCH_ROW_OUTSIDE_CURRENT_FRAME_SCOPE")
+        match_source_ids_by_pipeline[expected_frame["pipeline_run_id"]][frame_id].add(
+            source_id
+        )
+    for run_frame_id, expected in expected_match_frames.items():
+        if (
+            expected["n_matched"] is None
+            or actual_match_counts[run_frame_id] != expected["n_matched"]
+        ):
+            raise _OfflineWorkingCatalogReuseRejected("MATCH_ROW_COUNT_MISMATCH")
+
+    selected_pipeline_ids: set[int] = set()
+    for frame_id, evidence in frame_evidence.items():
+        ordered_evidence = sorted(
+            evidence, key=lambda item: int(item["pipeline_run_id"]), reverse=True
+        )
+        identity_sets = [
+            match_source_ids_by_pipeline[int(candidate["pipeline_run_id"])][frame_id]
+            for candidate in ordered_evidence
+        ]
+        if any(identities != identity_sets[0] for identities in identity_sets[1:]):
+            raise _OfflineWorkingCatalogReuseRejected("AMBIGUOUS_COMPLETED_FRAME_EVIDENCE")
+        selected_candidate = ordered_evidence[0]
+        selected_pipeline_ids.add(int(selected_candidate["pipeline_run_id"]))
+        for source_id in identity_sets[0]:
+            matched_pairs.add((frame_id, source_id))
+            matched_catalog_source_ids.add(source_id)
+
+    catalog_rows: list[dict[str, Any]] = []
+    if matched_catalog_source_ids:
+        identity_rows = session.execute(
+            select(
+                CatalogSource.catalog_source_id.label("catalog_source_id"),
+                CatalogSource.catalog_name.label("catalog_name"),
+                CatalogSource.source_id.label("source_id"),
+                CatalogSource.ra_deg.label("ra_deg"),
+                CatalogSource.dec_deg.label("dec_deg"),
+                CatalogSource.ref_mags.label("ref_mags"),
+            ).where(
+                CatalogSource.catalog_name == "gaia_dr3",
+                CatalogSource.catalog_source_id.in_(sorted(matched_catalog_source_ids)),
+            )
+        ).mappings().all()
+        if len(identity_rows) != len(matched_catalog_source_ids):
+            raise _OfflineWorkingCatalogReuseRejected("MATCHED_GAIA_IDENTITY_MISSING")
+        seen_source_ids: dict[str, int] = {}
+        for identity in identity_rows:
+            canonical_id = int(identity["catalog_source_id"])
+            if canonical_id not in matched_catalog_source_ids or identity.get(
+                "catalog_name"
+            ) != "gaia_dr3":
+                raise _OfflineWorkingCatalogReuseRejected("MATCHED_GAIA_IDENTITY_AMBIGUOUS")
+            source_id = str(identity.get("source_id") or "")
+            previous_id = seen_source_ids.get(source_id)
+            if previous_id is not None and previous_id != canonical_id:
+                raise _OfflineWorkingCatalogReuseRejected("MATCHED_GAIA_IDENTITY_AMBIGUOUS")
+            seen_source_ids[source_id] = canonical_id
+            try:
+                ra_deg = float(identity["ra_deg"])
+                dec_deg = float(identity["dec_deg"])
+            except (TypeError, ValueError, OverflowError):
+                raise _OfflineWorkingCatalogReuseRejected("MATCHED_GAIA_IDENTITY_INVALID") from None
+            if (
+                not source_id.isdigit()
+                or not math.isfinite(ra_deg)
+                or not math.isfinite(dec_deg)
+                or not 0.0 <= ra_deg < 360.0
+                or not -90.0 <= dec_deg <= 90.0
+            ):
+                raise _OfflineWorkingCatalogReuseRejected("MATCHED_GAIA_IDENTITY_INVALID")
+            ref_mags = identity.get("ref_mags")
+            ref_mags = ref_mags if isinstance(ref_mags, dict) else {}
+            try:
+                g_mag = float(ref_mags["G"]) if ref_mags.get("G") is not None else math.nan
+            except (TypeError, ValueError, OverflowError):
+                g_mag = math.nan
+            if not math.isfinite(g_mag):
+                g_mag = math.nan
+            catalog_rows.append(
+                {
+                    "catalog_source_id": canonical_id,
+                    "source_id": source_id,
+                    "ra": ra_deg,
+                    "dec": dec_deg,
+                    "phot_g_mean_mag": g_mag,
+                }
+            )
+
+    target_catalog_source_id: int | None = None
+    target_source_row: dict[str, Any] | None = None
+    if target_source_id is not None:
+        target_rows = session.execute(
+            select(
+                CatalogSource.catalog_source_id.label("catalog_source_id"),
+                CatalogSource.catalog_name.label("catalog_name"),
+                CatalogSource.source_id.label("source_id"),
+                CatalogSource.ra_deg.label("ra_deg"),
+                CatalogSource.dec_deg.label("dec_deg"),
+                CatalogSource.ref_mags.label("ref_mags"),
+            ).where(
+                CatalogSource.catalog_name == "gaia_dr3",
+                CatalogSource.source_id == target_source_id,
+            )
+        ).mappings().all()
+        if len(target_rows) != 1:
+            raise _OfflineWorkingCatalogReuseRejected("EXPLICIT_TARGET_NOT_CANONICAL")
+        target_source_row = dict(target_rows[0])
+        target_catalog_source_id = int(target_source_row["catalog_source_id"])
+        if target_source_row.get("source_id") != target_source_id:
+            raise _OfflineWorkingCatalogReuseRejected("EXPLICIT_TARGET_IDENTITY_MISMATCH")
+        target_link_source_ids = sorted(
+            matched_catalog_source_ids | {target_catalog_source_id}
+        )
+    else:
+        target_link_source_ids = sorted(matched_catalog_source_ids)
+
+    if target_link_source_ids:
+        link_rows = session.execute(
+            select(
+                FrameCatalogLink.frame_id.label("frame_id"),
+                FrameCatalogLink.catalog_source_id.label("catalog_source_id"),
+                FrameCatalogLink.in_footprint.label("in_footprint"),
+                FrameCatalogLink.margin_pix.label("margin_pix"),
+                FrameCatalogLink.match_status.label("match_status"),
+                FrameCatalogLink.details.label("details"),
+            ).where(
+                FrameCatalogLink.frame_id.in_(selected_frame_ids),
+                FrameCatalogLink.catalog_source_id.in_(target_link_source_ids),
+            )
+        ).mappings().all()
+    else:
+        link_rows = []
+
+    expected_link_details = {
+        "mag_key": defaults.mag_key,
+        "working_mag_limit": working_catalog_mag_limit,
+        "max_sources_per_frame": max_working_sources_per_frame,
+        "edge_margin_pix": catalog_edge_margin_pix,
+    }
+    scoped_frame_set = set(selected_frame_ids)
+    scoped_source_set = set(target_link_source_ids)
+    links_by_pair: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for link in link_rows:
+        pair = (int(link["frame_id"]), int(link["catalog_source_id"]))
+        if pair[0] not in scoped_frame_set or pair[1] not in scoped_source_set:
+            raise _OfflineWorkingCatalogReuseRejected("FRAME_LINK_OUTSIDE_CURRENT_SCOPE")
+        links_by_pair.setdefault(pair, []).append(dict(link))
+
+    def link_is_compatible(link: dict[str, Any]) -> bool:
+        details = link.get("details")
+        return (
+            link.get("in_footprint") is True
+            and link.get("match_status") == "IN_FOOTPRINT"
+            and _offline_json_value_matches(link.get("margin_pix"), defaults.margin_pix)
+            and isinstance(details, dict)
+            and all(
+                _offline_json_value_matches(details.get(key), value)
+                for key, value in expected_link_details.items()
+            )
+        )
+
+    for pair in matched_pairs:
+        candidate_links = links_by_pair.get(pair, [])
+        if len(candidate_links) != 1 or not link_is_compatible(candidate_links[0]):
+            raise _OfflineWorkingCatalogReuseRejected(
+                "MATCHED_FRAME_LINK_MISSING_OR_INCOMPATIBLE"
+            )
+
+    target_source_included = False
+    if target_catalog_source_id is not None:
+        target_links = [
+            link
+            for (frame_id, source_id), values in links_by_pair.items()
+            if source_id == target_catalog_source_id and frame_id in scoped_frame_set
+            for link in values
+            if link_is_compatible(link)
+        ]
+        if not target_links:
+            raise _OfflineWorkingCatalogReuseRejected(
+                "EXPLICIT_TARGET_HAS_NO_EXACT_SCOPE_LINK"
+            )
+        if not any(
+            identity["catalog_source_id"] == target_catalog_source_id
+            for identity in catalog_rows
+        ):
+            try:
+                ra_deg = float(target_source_row["ra_deg"])
+                dec_deg = float(target_source_row["dec_deg"])
+            except (TypeError, ValueError, OverflowError):
+                raise _OfflineWorkingCatalogReuseRejected(
+                    "EXPLICIT_TARGET_IDENTITY_INVALID"
+                ) from None
+            if (
+                not target_source_id.isdigit()
+                or not math.isfinite(ra_deg)
+                or not math.isfinite(dec_deg)
+                or not 0.0 <= ra_deg < 360.0
+                or not -90.0 <= dec_deg <= 90.0
+            ):
+                raise _OfflineWorkingCatalogReuseRejected(
+                    "EXPLICIT_TARGET_IDENTITY_INVALID"
+                )
+            ref_mags = target_source_row.get("ref_mags")
+            ref_mags = ref_mags if isinstance(ref_mags, dict) else {}
+            try:
+                g_mag = float(ref_mags["G"]) if ref_mags.get("G") is not None else math.nan
+            except (TypeError, ValueError, OverflowError):
+                g_mag = math.nan
+            catalog_rows.append(
+                {
+                    "catalog_source_id": target_catalog_source_id,
+                    "source_id": target_source_id,
+                    "ra": ra_deg,
+                    "dec": dec_deg,
+                    "phot_g_mean_mag": g_mag if math.isfinite(g_mag) else math.nan,
+                }
+            )
+        target_source_included = True
+
+    source_id_to_canonical: dict[str, int] = {}
+    unique_rows: dict[str, tuple[float, float, float]] = {}
+    for identity in catalog_rows:
+        source_id = str(identity["source_id"])
+        canonical_id = int(identity["catalog_source_id"])
+        previous_canonical_id = source_id_to_canonical.get(source_id)
+        if previous_canonical_id is not None and previous_canonical_id != canonical_id:
+            raise _OfflineWorkingCatalogReuseRejected("GAIA_SOURCE_ID_AMBIGUOUS")
+        source_id_to_canonical[source_id] = canonical_id
+        unique_rows[source_id] = (
+            float(identity["ra"]),
+            float(identity["dec"]),
+            float(identity["phot_g_mean_mag"]),
+        )
+
+    expected_canonical_ids = matched_catalog_source_ids | (
+        {target_catalog_source_id} if target_source_included else set()
+    )
+    if set(source_id_to_canonical.values()) != expected_canonical_ids:
+        raise _OfflineWorkingCatalogReuseRejected("GAIA_IDENTITY_SET_INCOMPLETE")
+
+    provenance = dict(provenance_values[0])
+    catalog = gaia_query.GaiaWorkingCatalog._from_unique_rows(unique_rows)
+    return catalog, provenance, {
+        "reused_pipeline_count": len(selected_pipeline_ids),
+        "per_frame_match_coverage_complete": True,
+        "matched_catalog_source_count": len(matched_catalog_source_ids),
+        "target_source_included": target_source_included,
+    }
+
+
+def _offline_json_value_matches(actual: Any, expected: Any) -> bool:
+    if expected is None:
+        return actual is None
+    if isinstance(expected, bool):
+        return isinstance(actual, bool) and actual is expected
+    if isinstance(expected, (int, float)):
+        if isinstance(actual, bool) or not isinstance(actual, (int, float)):
+            return False
+        try:
+            return math.isfinite(float(actual)) and float(actual) == float(expected)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    return type(actual) is type(expected) and actual == expected
+
+
+def _offline_nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return int(value)
+
+
+def _offline_step_covers_frames(
+    result: dict[str, Any], frame_count: int, *, skipped: bool
+) -> bool:
+    for key in ("selected_frames", "checked_frames"):
+        if _offline_nonnegative_int(result.get(key)) != int(frame_count):
+            return False
+    if _offline_nonnegative_int(result.get("failed_frames")) != 0:
+        return False
+    if skipped and _offline_nonnegative_int(result.get("skipped_missing_file")) != 0:
+        return False
+    return True
+
+
+def _close_working_catalog(catalog: Any | None) -> None:
+    if catalog is None:
+        return
+    try:
+        catalog.clear()
+    finally:
+        catalog.close()
+
+
+def _working_catalog_precondition_ok(
+    row: dict[str, Any], *, allow_empty_catalog: bool
+) -> bool:
+    if allow_empty_catalog:
+        return True
+    return (
+        row.get("status") in {"DONE", "DONE_WITH_WARNINGS"}
+        and int(row.get("working_catalog_sources") or 0) > 0
+    )
 
 
 def _catalog_precondition_ok(row: dict[str, Any], *, allow_empty_catalog: bool) -> bool:

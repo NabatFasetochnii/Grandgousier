@@ -3,8 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from grandgousier.astrometry.gaia_wcs_com import (
+    GAIA_WCS_COM_ALGORITHM,
+    GAIA_WCS_COM_POLICY,
+)
+
 
 STAGE2_RECIPE_STAGE3_SCALE_V1 = "stage3_scale_v1"
+CURRENT_PIPELINE_RECIPE_VERSION = "field_pipeline_v10"
 SUPPORTED_STAGE2_RECIPES = (STAGE2_RECIPE_STAGE3_SCALE_V1,)
 
 READY_STAGE3_RECIPE = "READY_STAGE3_RECIPE"
@@ -14,6 +20,22 @@ MISSING_PROVENANCE = "MISSING_PROVENANCE"
 
 _STAGE3_SCALE_V1_PROCESS_KWARGS: dict[str, Any] = {
     "photometry_estimator": "adaptive_ellipse",
+    "astrometric_centering_algorithm": GAIA_WCS_COM_ALGORITHM,
+    "local_com_max_shift_pix": GAIA_WCS_COM_POLICY["local_com_max_shift_pix"],
+    "frame_shift_min_matches": GAIA_WCS_COM_POLICY["frame_shift_min_matches"],
+    "frame_shift_max_robust_scatter_pix": GAIA_WCS_COM_POLICY[
+        "frame_shift_max_robust_scatter_pix"
+    ],
+    "frame_shift_max_absolute_pix": GAIA_WCS_COM_POLICY[
+        "frame_shift_max_absolute_pix"
+    ],
+    "crowded_arcsec": GAIA_WCS_COM_POLICY["crowded_arcsec"],
+    "blended_arcsec": GAIA_WCS_COM_POLICY["blended_arcsec"],
+    "dynamic_separation": GAIA_WCS_COM_POLICY["dynamic_separation"],
+    "dynamic_seeing_factor": GAIA_WCS_COM_POLICY["dynamic_seeing_factor"],
+    "dynamic_aperture_factor": GAIA_WCS_COM_POLICY["dynamic_aperture_factor"],
+    "dynamic_crowding_factor": GAIA_WCS_COM_POLICY["dynamic_crowding_factor"],
+    "fwhm_header_unit": GAIA_WCS_COM_POLICY["fwhm_header_unit"],
     "aperture_correction_plane_policy": "evidence",
     "working_catalog_mag_limit": 19.0,
     "max_working_sources_per_frame": 2000,
@@ -191,8 +213,39 @@ def assess_stage2_recipe_json(
                 )
 
     recipe_version = recipe_json.get("recipe_version")
-    if recipe_version is not None and str(recipe_version) != "field_pipeline_v9":
-        notes.append(f"recipe_version:current=field_pipeline_v9,actual={recipe_version}")
+    if recipe_version is None:
+        missing.append("missing:recipe_version")
+    elif str(recipe_version) != CURRENT_PIPELINE_RECIPE_VERSION:
+        mismatch.append(
+            f"recipe_version:expected={CURRENT_PIPELINE_RECIPE_VERSION},actual={recipe_version}"
+        )
+
+    centering_algorithm = recipe_json.get("astrometric_centering_algorithm")
+    if centering_algorithm is None:
+        missing.append("missing:astrometric_centering_algorithm")
+    elif str(centering_algorithm) != GAIA_WCS_COM_ALGORITHM:
+        mismatch.append(
+            "astrometric_centering_algorithm:expected="
+            f"{GAIA_WCS_COM_ALGORITHM},actual={_fmt(centering_algorithm)}"
+        )
+
+    centering_policy = quality_policy.get("astrometric_centering")
+    if not isinstance(centering_policy, Mapping):
+        missing.append("missing:quality_policy.astrometric_centering")
+    else:
+        expected_centering_policy = {
+            **GAIA_WCS_COM_POLICY,
+            "fwhm_header_unit": "arcsec",
+        }
+        for key, expected in expected_centering_policy.items():
+            actual = centering_policy.get(key)
+            field_name = f"quality_policy.astrometric_centering.{key}"
+            if actual is None:
+                missing.append(f"missing:{field_name}")
+            elif not _semantic_equal(actual, expected):
+                mismatch.append(
+                    f"{field_name}:expected={_fmt(expected)},actual={_fmt(actual)}"
+                )
 
     if missing:
         return Stage2RecipeCompatibility(

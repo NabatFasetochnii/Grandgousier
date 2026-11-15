@@ -70,6 +70,7 @@ class ImportReferencePhotometryResult:
     unmatched_to_gaia: int = 0
     skipped_bad_coordinates: int = 0
     skipped_duplicate_source_ids: int = 0
+    skipped_ambiguous_identity_matches: int = 0
     dry_run: bool = False
 
 
@@ -125,6 +126,9 @@ def create_reference_photometry_csv(
     max_mag_err: dict[str, float] | None = None,
     min_detections: int | None = None,
     use_remote_filters: bool = True,
+    selected_identity_catalog_name: str | None = None,
+    selected_identity_source_ids: Iterable[str] | None = None,
+    selected_identity_match_radius_arcsec: float = 1.0,
 ) -> ReferencePhotometryCsvResult:
     """Create a local reference-photometry CSV for a field/series/cone.
 
@@ -138,33 +142,89 @@ def create_reference_photometry_csv(
     if provider_key != "panstarrs_dr2":
         raise ValueError(f"Unsupported reference CSV provider: {provider!r}. Supported: panstarrs_dr2")
 
-    cone = _resolve_reference_photometry_cone(
-        session,
-        field_id=field_id,
-        series_id=series_id,
-        ra_deg=ra_deg,
-        dec_deg=dec_deg,
-        radius_arcmin=radius_arcmin,
-    )
+    selected_sources: list[dict] | None = None
+    if selected_identity_source_ids is not None:
+        if field_id is not None or series_id is not None or ra_deg is not None or dec_deg is not None or radius_arcmin is not None:
+            raise ValueError("Selected-identity acquisition cannot be combined with a field or cone scope")
+        if not selected_identity_catalog_name:
+            raise ValueError("Selected-identity acquisition requires identity_catalog_name")
+        if not math.isfinite(float(selected_identity_match_radius_arcsec)) or selected_identity_match_radius_arcsec <= 0:
+            raise ValueError("selected_identity_match_radius_arcsec must be positive and finite")
+        selected_ids = sorted(
+            {str(source_id).strip() for source_id in selected_identity_source_ids if str(source_id).strip()}
+        )
+        selected_sources = load_persisted_identity_sources(
+            session,
+            identity_catalog_name=selected_identity_catalog_name,
+            source_ids=selected_ids,
+        )
+        if not selected_sources:
+            raise ValueError("Selected-identity acquisition requires a non-empty persisted identity set")
+        cone = {
+            "field_id": None,
+            "series_id": None,
+            "ra_deg": None,
+            "dec_deg": None,
+            "radius_arcmin": None,
+        }
+    elif selected_identity_catalog_name is not None:
+        raise ValueError("identity_catalog_name requires selected_identity_source_ids")
+    else:
+        cone = _resolve_reference_photometry_cone(
+            session,
+            field_id=field_id,
+            series_id=series_id,
+            ra_deg=ra_deg,
+            dec_deg=dec_deg,
+            radius_arcmin=radius_arcmin,
+        )
     out = Path(out_path)
     if out.exists() and not overwrite:
         raise FileExistsError(f"Output file already exists: {out}. Use --overwrite to replace it.")
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    df, url, remote_filter_params, tls_info = _fetch_panstarrs_dr2_mean_csv(
-        cone["ra_deg"],
-        cone["dec_deg"],
-        cone["radius_arcmin"] / 60.0,
-        require_bands=require_bands,
-        min_mag=min_mag,
-        max_mag=max_mag,
-        max_mag_err=max_mag_err,
-        min_detections=min_detections,
-        use_remote_filters=use_remote_filters,
-    )
-    raw_rows = len(df)
-
-    export = _standardize_panstarrs_reference_dataframe(df)
+    if selected_sources is None:
+        df, url, remote_filter_params, tls_info = _fetch_panstarrs_dr2_mean_csv(
+            cone["ra_deg"],
+            cone["dec_deg"],
+            cone["radius_arcmin"] / 60.0,
+            require_bands=require_bands,
+            min_mag=min_mag,
+            max_mag=max_mag,
+            max_mag_err=max_mag_err,
+            min_detections=min_detections,
+            use_remote_filters=use_remote_filters,
+        )
+        raw_rows = len(df)
+        export = _standardize_panstarrs_reference_dataframe(df)
+    else:
+        exports = []
+        raw_rows = 0
+        url = None
+        remote_filter_params = {}
+        tls_info = {"source": None, "path": None}
+        radius_deg = float(selected_identity_match_radius_arcsec) / 3600.0
+        for identity in selected_sources:
+            df, request_url, filters, request_tls_info = _fetch_panstarrs_dr2_mean_csv(
+                identity["ra_deg"],
+                identity["dec_deg"],
+                radius_deg,
+                require_bands=require_bands,
+                min_mag=min_mag,
+                max_mag=max_mag,
+                max_mag_err=max_mag_err,
+                min_detections=min_detections,
+                use_remote_filters=use_remote_filters,
+            )
+            raw_rows += len(df)
+            standardized = _standardize_panstarrs_reference_dataframe(df)
+            standardized["selected_identity_source_id"] = identity["source_id"]
+            exports.append(standardized)
+            if url is None:
+                url = request_url
+                remote_filter_params = dict(filters)
+                tls_info = dict(request_tls_info)
+        export = pd.concat(exports, ignore_index=True) if exports else pd.DataFrame()
     skipped = raw_rows - len(export)
     filtered, filter_summary = _filter_reference_export_dataframe(
         export,
@@ -178,6 +238,12 @@ def create_reference_photometry_csv(
     filter_summary["remote_filters_enabled"] = bool(use_remote_filters)
     filter_summary["remote_filter_params"] = dict(remote_filter_params)
     filter_summary["remote_query_rows"] = int(raw_rows)
+    if selected_sources is not None:
+        filter_summary["scope"] = "selected_identity_sources"
+        filter_summary["selected_identity_count"] = len(selected_sources)
+        filter_summary["selected_identity_match_radius_arcsec"] = float(
+            selected_identity_match_radius_arcsec
+        )
     if limit is not None:
         filtered = filtered.head(limit)
         filter_summary["limit"] = int(limit)
@@ -202,7 +268,7 @@ def create_reference_photometry_csv(
         remote_filters_enabled=bool(use_remote_filters),
         tls_ca_source=tls_info.get("source"),
         tls_ca_path=tls_info.get("path"),
-        url=url,
+        url=url if selected_sources is None else None,
         import_command=import_command,
     )
 
@@ -227,6 +293,8 @@ def import_reference_photometry(
     max_match_arcsec: float = 1.0,
     limit: int | None = None,
     dry_run: bool = False,
+    selected_identity_source_ids: Iterable[str] | None = None,
+    requested_identity_source_id_col: str | None = None,
 ) -> ImportReferencePhotometryResult:
     """Import external reference photometry into normalized source/band/point rows.
 
@@ -250,11 +318,28 @@ def import_reference_photometry(
         _require_columns(df, [source_id_col])
     if epoch_col:
         _require_columns(df, [epoch_col])
+    if requested_identity_source_id_col:
+        _require_columns(df, [requested_identity_source_id_col])
     for mapping in [mag_cols or {}, mag_err_cols or {}, color_cols or {}, quality_cols or {}]:
         _require_columns(df, list(mapping.values()))
 
     normalized_mag_cols = _normalize_band_column_mapping(mag_cols or {})
     normalized_mag_err_cols = _normalize_band_column_mapping(mag_err_cols or {})
+
+    strict_identity_scope = selected_identity_source_ids is not None
+    selected_identity_ids = (
+        sorted({str(value).strip() for value in selected_identity_source_ids if str(value).strip()})
+        if strict_identity_scope
+        else None
+    )
+    if strict_identity_scope:
+        if not selected_identity_ids:
+            result.unmatched_to_gaia = len(df)
+            return result
+        if not match_to_catalog or not source_id_col:
+            raise ValueError(
+                "Selected-identity imports require match_to_catalog and source_id_col"
+            )
 
     refcat_id = None
     if not dry_run:
@@ -275,15 +360,45 @@ def import_reference_photometry(
             df,
             ra_col=ra_col,
             dec_col=dec_col,
+            source_ids=selected_identity_ids,
         )
+    if strict_identity_scope:
+        loaded_ids = {str(source["source_id"]) for source in identity_sources}
+        if loaded_ids != set(selected_identity_ids or ()):
+            missing_ids = sorted(set(selected_identity_ids or ()).difference(loaded_ids))
+            raise ValueError(
+                "Selected reference identity set is not fully persisted in "
+                f"{match_to_catalog!r}; missing {len(missing_ids)} selected source(s)"
+            )
+        selected_matches, ambiguous_match_count = _unambiguous_selected_identity_matches(
+            df,
+            identity_sources,
+            source_id_col=str(source_id_col),
+            ra_col=ra_col,
+            dec_col=dec_col,
+            max_match_arcsec=max_match_arcsec,
+            requested_identity_source_id_col=requested_identity_source_id_col,
+        )
+        result.skipped_ambiguous_identity_matches += ambiguous_match_count
+    else:
+        selected_matches = None
 
     rows: list[dict] = []
-    for _, row in df.iterrows():
+    for row_index, row in df.iterrows():
         ra = _to_float(row.get(ra_col))
         dec = _to_float(row.get(dec_col))
         if ra is None or dec is None or not (0.0 <= ra < 360.0) or not (-90.0 <= dec <= 90.0):
             result.skipped_bad_coordinates += 1
             continue
+
+        if strict_identity_scope:
+            match = (selected_matches or {}).get(int(row_index))
+            if match is None:
+                result.unmatched_to_gaia += 1
+                continue
+            result.matched_to_gaia += 1
+        else:
+            match = None
 
         if source_id_col:
             source_id = _to_text(row.get(source_id_col))
@@ -296,17 +411,16 @@ def import_reference_photometry(
         quality_flags = _extract_named_value_dict(row, quality_cols or {})
         raw_json = {str(k): _jsonable(v) for k, v in row.to_dict().items()}
 
-        match = None
-        if identity_sources:
+        if not strict_identity_scope and identity_sources:
             match = _nearest_catalog_source(
                 ra,
                 dec,
                 identity_sources,
                 max_match_arcsec=max_match_arcsec,
             )
-        if match is not None:
+        if not strict_identity_scope and match is not None:
             result.matched_to_gaia += 1
-        elif match_to_catalog:
+        elif not strict_identity_scope and match_to_catalog:
             result.unmatched_to_gaia += 1
 
         points: list[dict] = []
@@ -1474,7 +1588,91 @@ def _upsert_reference_catalog(
     return int(session.scalar(stmt))
 
 
-def _load_match_catalog_sources(session: Session, catalog_name: str, df: pd.DataFrame, *, ra_col: str, dec_col: str) -> list[dict]:
+def _unambiguous_selected_identity_matches(
+    df: pd.DataFrame,
+    identity_sources: list[dict],
+    *,
+    source_id_col: str,
+    ra_col: str,
+    dec_col: str,
+    max_match_arcsec: float,
+    requested_identity_source_id_col: str | None,
+) -> tuple[dict[int, dict], int]:
+    """Match provider rows only when both sides resolve uniquely in the selected set."""
+
+    candidates_by_row: dict[int, dict] = {}
+    ambiguous_rows = 0
+    for row_index, row in df.iterrows():
+        ra = _to_float(row.get(ra_col))
+        dec = _to_float(row.get(dec_col))
+        external_id = _to_text(row.get(source_id_col))
+        if ra is None or dec is None or not external_id:
+            continue
+        candidates = []
+        for source in identity_sources:
+            separation = angular_sep_arcsec(
+                ra,
+                dec,
+                float(source["ra_deg"]),
+                float(source["dec_deg"]),
+            )
+            if separation <= max_match_arcsec:
+                candidate = dict(source)
+                candidate["sep_arcsec"] = separation
+                candidates.append(candidate)
+        if len(candidates) != 1:
+            if candidates:
+                ambiguous_rows += 1
+            continue
+        match = candidates[0]
+        if requested_identity_source_id_col:
+            requested_id = _to_text(row.get(requested_identity_source_id_col))
+            if requested_id != str(match["source_id"]):
+                ambiguous_rows += 1
+                continue
+        candidates_by_row[int(row_index)] = {
+            **match,
+            "external_source_id": external_id,
+        }
+
+    external_to_identity: dict[str, set[str]] = {}
+    identity_to_external: dict[str, set[str]] = {}
+    for match in candidates_by_row.values():
+        external_id = str(match["external_source_id"])
+        identity_id = str(match["source_id"])
+        external_to_identity.setdefault(external_id, set()).add(identity_id)
+        identity_to_external.setdefault(identity_id, set()).add(external_id)
+
+    ambiguous_external_ids = {
+        external_id
+        for external_id, identity_ids in external_to_identity.items()
+        if len(identity_ids) != 1
+    }
+    ambiguous_identity_ids = {
+        identity_id
+        for identity_id, external_ids in identity_to_external.items()
+        if len(external_ids) != 1
+    }
+    selected_matches = {}
+    for row_index, match in candidates_by_row.items():
+        external_id = str(match["external_source_id"])
+        identity_id = str(match["source_id"])
+        if external_id in ambiguous_external_ids or identity_id in ambiguous_identity_ids:
+            ambiguous_rows += 1
+            continue
+        selected_matches[row_index] = match
+    return selected_matches, ambiguous_rows
+
+
+def _load_match_catalog_sources(
+    session: Session,
+    catalog_name: str,
+    df: pd.DataFrame,
+    *,
+    ra_col: str,
+    dec_col: str,
+    source_ids: Iterable[str] | None = None,
+) -> list[dict]:
     ras = [_to_float(v) for v in df[ra_col].head(100000).tolist()] if ra_col in df else []
     decs = [_to_float(v) for v in df[dec_col].head(100000).tolist()] if dec_col in df else []
     ras = [v for v in ras if v is not None]
@@ -1486,13 +1684,64 @@ def _load_match_catalog_sources(session: Session, catalog_name: str, df: pd.Data
         CatalogSource.ra_deg,
         CatalogSource.dec_deg,
     ).where(CatalogSource.catalog_name == catalog_name)
-    if ras and decs and (max(ras) - min(ras)) < 20.0:
+    if source_ids is not None:
+        exact_source_ids = sorted({str(source_id) for source_id in source_ids})
+        if not exact_source_ids:
+            return []
+        stmt = stmt.where(CatalogSource.source_id.in_(exact_source_ids))
+    elif ras and decs and (max(ras) - min(ras)) < 20.0:
         margin = 0.2
         stmt = stmt.where(CatalogSource.ra_deg >= min(ras) - margin, CatalogSource.ra_deg <= max(ras) + margin)
-    if decs:
+    if source_ids is None and decs:
         margin = 0.2
         stmt = stmt.where(CatalogSource.dec_deg >= min(decs) - margin, CatalogSource.dec_deg <= max(decs) + margin)
     return [dict(row._mapping) for row in session.execute(stmt).all()]
+
+
+def load_persisted_identity_sources(
+    session: Session,
+    *,
+    identity_catalog_name: str,
+    source_ids: Iterable[str],
+) -> list[dict]:
+    """Load coordinates for an exact, already-persisted identity selection."""
+
+    selected_ids = sorted({str(source_id).strip() for source_id in source_ids if str(source_id).strip()})
+    if not selected_ids:
+        return []
+    rows = session.execute(
+        select(
+            CatalogSource.source_id,
+            CatalogSource.ra_deg,
+            CatalogSource.dec_deg,
+        ).where(
+            CatalogSource.catalog_name == identity_catalog_name,
+            CatalogSource.source_id.in_(selected_ids),
+        )
+    ).all()
+    sources = [
+        {
+            "source_id": str(row[0]),
+            "ra_deg": float(row[1]),
+            "dec_deg": float(row[2]),
+        }
+        for row in rows
+        if row[1] is not None and row[2] is not None
+    ]
+    found_ids = {source["source_id"] for source in sources}
+    if found_ids != set(selected_ids):
+        raise ValueError(
+            "Selected reference identities are not all persisted with usable coordinates"
+        )
+    if any(
+        not math.isfinite(source["ra_deg"])
+        or not math.isfinite(source["dec_deg"])
+        or not (0.0 <= source["ra_deg"] < 360.0)
+        or not (-90.0 <= source["dec_deg"] <= 90.0)
+        for source in sources
+    ):
+        raise ValueError("Selected persisted reference identity coordinates are invalid")
+    return sorted(sources, key=lambda source: source["source_id"])
 
 
 def _nearest_catalog_source(ra: float, dec: float, sources: list[dict], *, max_match_arcsec: float) -> dict | None:

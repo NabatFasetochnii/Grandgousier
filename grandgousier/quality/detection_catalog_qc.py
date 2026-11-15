@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 from sqlalchemy import delete, func, select
@@ -52,6 +54,8 @@ class DetectionCatalogQcResult:
     catalog_name: str = ""
     read_strategy: str = "BULK_SCALAR_2QUERY_V1"
     write_strategy: str = "SQLALCHEMY_PER_FRAME_UPSERT"
+    # Same-invocation, transient evidence for centering; never written to DB.
+    candidate_pair_evidence_by_frame: dict[int, dict[str, Any]] = field(default_factory=dict)
     prefetched_detection_rows: int = 0
     prefetched_catalog_rows: int = 0
     staging_rows: int = 0
@@ -113,6 +117,7 @@ def match_detections_to_catalog(
     radius_arcsec: float = 2.0,
     mag_key: str = "G",
     min_snr: float | None = None,
+    source_detection_run_id: int | None = None,
     limit_frames: int | None = None,
     replace_existing: bool = False,
     dry_run: bool = False,
@@ -158,6 +163,7 @@ def match_detections_to_catalog(
         frame_ids=selected_frame_ids,
         algorithm=detection_algorithm,
         min_snr=min_snr,
+        detection_run_id=source_detection_run_id,
     )
     result.detection_load_sec = float(time.perf_counter() - started)
     result.prefetched_detection_rows = int(sum(len(rows) for rows in detections_by_frame.values()))
@@ -180,6 +186,11 @@ def match_detections_to_catalog(
             catalog_name=catalog_name,
             parameters={
                 "detection_algorithm": detection_algorithm,
+                "source_detection_run_id": (
+                    int(source_detection_run_id)
+                    if source_detection_run_id is not None
+                    else None
+                ),
                 "radius_arcsec": radius_arcsec,
                 "mag_key": mag_key,
                 "min_snr": min_snr,
@@ -211,15 +222,46 @@ def match_detections_to_catalog(
                 result.selected_catalog_sources += len(catalog_rows)
 
                 started = time.perf_counter()
+                accepted_pair_evidence: list[dict[str, int]] = []
                 rows = _match_frame(
                     frame=frame,
                     detections=detections,
                     catalog_rows=catalog_rows,
                     radius_arcsec=radius_arcsec,
                     mag_key=mag_key,
+                    accepted_pair_evidence=accepted_pair_evidence,
                 )
                 result.matching_sec += float(time.perf_counter() - started)
                 result.matched += len(rows)
+                if match_run is not None and source_detection_run_id is not None:
+                    stored_parameters = (
+                        match_run.parameters if isinstance(match_run.parameters, dict) else {}
+                    )
+                    stored_source_run_id = stored_parameters.get(
+                        "source_detection_run_id"
+                    )
+                    stored_radius_arcsec = stored_parameters.get("radius_arcsec")
+                    try:
+                        valid_radius = (
+                            not isinstance(stored_radius_arcsec, bool)
+                            and math.isfinite(float(stored_radius_arcsec))
+                            and float(stored_radius_arcsec) > 0
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        valid_radius = False
+                    result.candidate_pair_evidence_by_frame[int(frame.frame_id)] = {
+                        "frame_id": int(frame.frame_id),
+                        "source_detection_run_id": stored_source_run_id,
+                        "catalog_match_run_id": int(match_run.detection_run_id),
+                        "radius_arcsec": stored_radius_arcsec,
+                        "complete": (
+                            valid_radius
+                            and isinstance(stored_source_run_id, int)
+                            and not isinstance(stored_source_run_id, bool)
+                            and stored_source_run_id == int(source_detection_run_id)
+                        ),
+                        "accepted_pairs": accepted_pair_evidence,
+                    }
 
                 started = time.perf_counter()
                 qc_row = _build_frame_qc_row(
@@ -452,6 +494,7 @@ def _select_detections_bulk(
     frame_ids: list[int],
     algorithm: str,
     min_snr: float | None,
+    detection_run_id: int | None = None,
 ) -> dict[int, list[DetectionMatchInput]]:
     if not frame_ids:
         return {}
@@ -492,6 +535,8 @@ def _select_detections_bulk(
     )
     if min_snr is not None:
         stmt = stmt.where(SourceDetection.snr >= float(min_snr))
+    if detection_run_id is not None:
+        stmt = stmt.where(DetectionRun.detection_run_id == int(detection_run_id))
 
     grouped: dict[int, list[DetectionMatchInput]] = {}
     for row in session.execute(stmt).mappings().all():
@@ -609,6 +654,7 @@ def _match_frame(
     catalog_rows: list[tuple[CatalogMatchSource, CatalogMatchLink]],
     radius_arcsec: float,
     mag_key: str,
+    accepted_pair_evidence: list[dict[str, int]] | None = None,
 ) -> list[dict]:
     if not detections or not catalog_rows:
         return []
@@ -621,6 +667,12 @@ def _match_frame(
         if sep is not None and sep <= radius_arcsec:
             candidates.append((sep, det, source, link))
     candidates.sort(key=lambda item: item[0])
+    candidate_detection_counts = Counter(
+        int(det.source_detection_id) for _sep, det, _source, _link in candidates
+    )
+    candidate_catalog_counts = Counter(
+        int(source.catalog_source_id) for _sep, _det, source, _link in candidates
+    )
 
     used_detections: set[int] = set()
     used_sources: set[int] = set()
@@ -653,6 +705,19 @@ def _match_frame(
                 "zero_point": zp,
             }
         )
+        if accepted_pair_evidence is not None:
+            accepted_pair_evidence.append(
+                {
+                    "source_detection_id": int(det.source_detection_id),
+                    "catalog_source_id": int(source.catalog_source_id),
+                    "detection_candidate_count": int(
+                        candidate_detection_counts[det.source_detection_id]
+                    ),
+                    "catalog_candidate_count": int(
+                        candidate_catalog_counts[source.catalog_source_id]
+                    ),
+                }
+            )
     return rows
 
 

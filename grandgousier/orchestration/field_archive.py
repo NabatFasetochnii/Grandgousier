@@ -390,7 +390,7 @@ def run_field_archive_workflow(
                 archive_result = process_archive_path(
                     session,
                     root=batch.path,
-                    catalog_name=str(catalog_name),
+                    catalog_name=None if str(catalog_name) == "gaia_dr3" else str(catalog_name),
                     execute=True,
                     instrument_profile=instrument_profile,
                     recursive=False,

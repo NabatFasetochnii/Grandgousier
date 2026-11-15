@@ -742,3 +742,87 @@ def test_batch_db_state_blocks_recipe_mismatch_without_resume_rerun():
     assert state["status"] == "RECIPE_MISMATCH"
     assert "photometry_estimator" in state["reason"]
     assert _batch_action(state["status"], resume=True) == "STOP_CONFLICT"
+
+
+def test_gaia_catalog_uses_scoped_archive_handoff(monkeypatch, tmp_path: Path):
+    from grandgousier.archive import auto_process
+    from grandgousier.db import session as db_session
+    from grandgousier.interseries import planning
+    from grandgousier.orchestration import field_archive as field_archive_module
+
+    root = tmp_path / "processed"
+    root.mkdir()
+    batch_root = root
+    detected = [
+        SimpleNamespace(
+            path=str(batch_root / f"frame-{index:02}.fits"),
+            date_obs=datetime(2024, 1, 2, 12, tzinfo=timezone.utc),
+            site="KAO",
+            object_name="TEST_FIELD",
+            filter_name="V",
+        )
+        for index in range(10)
+    ]
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        auto_process,
+        "scan_archive_path",
+        lambda *_args, **_kwargs: (detected, [], []),
+    )
+    monkeypatch.setattr(
+        db_session, "make_session_factory", lambda *_args, **_kwargs: FakeSession
+    )
+    monkeypatch.setattr(
+        planning,
+        "build_interseries_plan",
+        lambda *_args, **_kwargs: SimpleNamespace(series=[]),
+    )
+    monkeypatch.setattr(
+        field_archive_module,
+        "_inspect_batch_db_state",
+        lambda *_args, **_kwargs: {
+            "status": "NEW",
+            "indexed_files": 0,
+            "series_ids": [41],
+            "resume_series_ids": [],
+            "reason": None,
+        },
+    )
+    process_calls = []
+
+    def fake_process_archive_path(_session, **kwargs):
+        process_calls.append(kwargs)
+        return SimpleNamespace(
+            status="FAILED_PRECONDITION_CATALOG",
+            failed_files=0,
+            processed_series_ids=[],
+            to_dict=lambda: {"status": "FAILED_PRECONDITION_CATALOG"},
+        )
+
+    monkeypatch.setattr(auto_process, "process_archive_path", fake_process_archive_path)
+
+    result = field_archive_module.run_field_archive_workflow(
+        database_url=None,
+        processed_root=root,
+        field_id=7,
+        catalog_name="gaia_dr3",
+        policies=[parse_stage3_policy("V:15:76")],
+        execute=True,
+        out_root=tmp_path / "reports",
+    )
+
+    assert result.status == "FAILED_STAGE2"
+    assert result.catalog_name == "gaia_dr3"
+    assert len(process_calls) == 1
+    handoff = process_calls[0]
+    assert handoff["catalog_name"] is None
+    assert Path(handoff["root"]) == root
+    assert handoff["recursive"] is False
+    assert handoff["series_ids"] is None
