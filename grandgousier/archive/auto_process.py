@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 import time
 from collections import Counter
@@ -2047,7 +2048,7 @@ def _frame_ids_by_instrument_unit(session: Session, frame_ids: list[int]) -> dic
 
 
 
-_REFERENCE_PHOTOMETRY_CACHE_SCHEMA_VERSION = 3
+_REFERENCE_PHOTOMETRY_CACHE_SCHEMA_VERSION = 4
 _REFERENCE_PHOTOMETRY_PROVIDER_RELEASE = "dr2"
 _REFERENCE_PHOTOMETRY_MATCH_RADIUS_ARCSEC = 1.0
 _REFERENCE_PROVIDER_DIAGNOSTIC_KEYS = (
@@ -2069,6 +2070,7 @@ _REFERENCE_PROVIDER_DIAGNOSTIC_KEYS = (
 
 @dataclass(frozen=True)
 class _ValidatedReferenceCacheEntry:
+    generation_dir: Path
     csv_path: Path
     manifest_path: Path
     manifest: dict[str, Any]
@@ -2188,16 +2190,30 @@ def _reference_cache_csv_row_count(path: Path) -> int:
         return sum(1 for _ in rows)
 
 
+def _reference_cache_path_is_reparse_point(path: Path) -> bool:
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return False
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(path_stat.st_mode) or bool(
+        getattr(path_stat, "st_file_attributes", 0) & reparse_attribute
+    )
+
+
 def _validate_selected_reference_cache(
     *,
-    csv_path: Path,
-    manifest_path: Path,
+    generation_dir: Path,
     fingerprint: str,
     expected_provenance: dict[str, Any],
 ) -> dict[str, Any]:
-    if not csv_path.is_file() or csv_path.is_symlink():
+    if _reference_cache_path_is_reparse_point(generation_dir) or not generation_dir.is_dir():
+        raise ValueError("cached reference generation is not a regular directory")
+    csv_path = generation_dir / "data.csv"
+    manifest_path = generation_dir / "manifest.json"
+    if _reference_cache_path_is_reparse_point(csv_path) or not csv_path.is_file():
         raise ValueError("cached reference CSV is not a regular file")
-    if not manifest_path.is_file() or manifest_path.is_symlink():
+    if _reference_cache_path_is_reparse_point(manifest_path) or not manifest_path.is_file():
         raise ValueError("cached reference manifest is not a regular file")
     with manifest_path.open("r", encoding="utf-8") as stream:
         manifest = json.load(stream)
@@ -2266,29 +2282,70 @@ def _validate_selected_reference_cache(
     return manifest
 
 
-def _new_reference_cache_temp_path(cache_dir: Path, *, fingerprint: str, suffix: str) -> Path:
-    descriptor, name = tempfile.mkstemp(
-        prefix=f".panstarrs_dr2_{fingerprint}.",
-        suffix=suffix,
-        dir=cache_dir,
+def _new_reference_cache_temp_generation_dir(cache_dir: Path, *, fingerprint: str) -> Path:
+    return Path(
+        tempfile.mkdtemp(
+            prefix=f".panstarrs_dr2_{fingerprint}.",
+            suffix=".tmp",
+            dir=cache_dir,
+        )
     )
-    os.close(descriptor)
-    return Path(name)
 
 
 def _fsync_reference_cache_file(path: Path) -> None:
+    if _reference_cache_path_is_reparse_point(path) or not path.is_file():
+        raise ValueError("reference cache file is not a regular file")
     with path.open("r+b") as stream:
         stream.flush()
         os.fsync(stream.fileno())
 
 
-def _publish_reference_cache_file_no_overwrite(source: Path, destination: Path) -> None:
-    if os.path.lexists(destination):
-        raise FileExistsError(f"Reference cache artifact already exists: {destination}")
-    # On Windows os.rename is an atomic same-volume move and fails if dst exists.
-    # That no-replace behavior prevents concurrent runs from overwriting a cache.
-    os.rename(source, destination)
+def _fsync_reference_cache_directory(path: Path) -> None:
+    """Best-effort directory metadata sync where the platform supports it."""
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+        os.fsync(descriptor)
+    except (OSError, NotImplementedError):
+        # Windows does not provide a portable directory-fsync operation through os.
+        pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
+
+def _publish_reference_cache_generation_no_overwrite(source: Path, destination: Path) -> None:
+    if os.path.lexists(destination):
+        raise FileExistsError(f"Reference cache generation already exists: {destination}")
+    # Keep the temporary generation on the same filesystem. On the supported
+    # Windows runtime, os.rename fails rather than replacing an existing target.
+    try:
+        os.rename(source, destination)
+    except OSError as exc:
+        if os.path.lexists(destination):
+            raise FileExistsError(
+                f"Reference cache generation appeared during publication: {destination}"
+            ) from exc
+        raise
+
+
+def _cleanup_reference_cache_temp_generation(path: Path) -> None:
+    """Remove only known files in this call's temporary directory; never recurse."""
+    try:
+        if _reference_cache_path_is_reparse_point(path) or not path.is_dir():
+            return
+        for name in ("data.csv", "manifest.json"):
+            child = path / name
+            if not os.path.lexists(child):
+                continue
+            if _reference_cache_path_is_reparse_point(child):
+                continue
+            if child.is_file():
+                child.unlink()
+        path.rmdir()
+    except OSError:
+        # Incomplete private temp generations are harmless and do not block retries.
+        pass
 
 def _ensure_reference_photometry_for_series(
     session: Session,
@@ -2384,56 +2441,13 @@ def _ensure_reference_photometry_for_series(
         }
 
     try:
-        before_counts = _reference_band_counts_for_series(
-            session,
-            identity_catalog_name=identity_catalog_name,
-            reference_catalog_name=provider_catalog_name,
-            selected_identity_source_ids=selected_ids,
-        )
-    except Exception as exc:  # noqa: BLE001 - optional reference layer must not destroy ensemble output.
-        session.rollback()
-        return {
-            **base,
-            "status": "REFERENCE_COVERAGE_CHECK_FAILED",
-            "reason": f"{type(exc).__name__}: {exc}",
-        }
-    base["band_counts_before"] = before_counts
-    base["band_counts_after"] = before_counts
-    if _reference_band_coverage_ready(before_counts, required_bands, minimum_sources):
-        try:
-            global_coverage_by_identity = _reference_band_coverage_by_identity(
-                session,
-                identity_catalog_name=identity_catalog_name,
-                reference_catalog_name=provider_catalog_name,
-                selected_identity_source_ids=selected_ids,
-                required_bands=required_bands,
-            )
-        except Exception as exc:  # noqa: BLE001 - preserve the existing global-readiness gate.
-            session.rollback()
-            return {
-                **base,
-                "status": "REFERENCE_COVERAGE_CHECK_FAILED",
-                "reason": f"{type(exc).__name__}: {exc}",
-            }
-        _set_reference_identity_coverage_telemetry(
-            base, global_coverage_by_identity, selected_ids, required_bands
-        )
-        return {
-            **base,
-            "status": "READY_EXISTING",
-            "ready": True,
-            "effective_reference_catalog_name": provider_catalog_name,
-            "reference_namespace_mode": "existing_global",
-        }
-
-    try:
         scoped_counts = _reference_band_counts_for_series(
             session,
             identity_catalog_name=identity_catalog_name,
             reference_catalog_name=scoped_catalog_name,
             selected_identity_source_ids=selected_ids,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - optional reference layer must not destroy ensemble output.
         session.rollback()
         return {
             **base,
@@ -2460,7 +2474,10 @@ def _ensure_reference_photometry_for_series(
     missing_identity_source_ids = _set_reference_identity_coverage_telemetry(
         base, scoped_coverage_by_identity, selected_ids, required_bands
     )
-    if _reference_band_coverage_ready(scoped_counts, required_bands, minimum_sources):
+    if (
+        _reference_band_coverage_ready(scoped_counts, required_bands, minimum_sources)
+        and not missing_identity_source_ids
+    ):
         return {
             **base,
             "status": "READY_EXISTING_SCOPED",
@@ -2513,6 +2530,13 @@ def _ensure_reference_photometry_for_series(
         "limit": None,
     }
     target_dir.mkdir(parents=True, exist_ok=True)
+    if _reference_cache_path_is_reparse_point(target_dir) or not target_dir.is_dir():
+        base["cache_invalid"] = True
+        return {
+            **base,
+            "status": "REFERENCE_CACHE_INVALID",
+            "reason": "reference cache parent is not a regular directory",
+        }
     missing_identity_ids = set(missing_identity_source_ids)
     fingerprint, cache_provenance = _selected_reference_cache_fingerprint(
         provider=provider_catalog_name,
@@ -2529,8 +2553,9 @@ def _ensure_reference_photometry_for_series(
         filters=filters,
         match_radius_arcsec=match_radius_arcsec,
     )
-    csv_path = target_dir / f"panstarrs_dr2_{fingerprint}.csv"
-    manifest_path = target_dir / f"panstarrs_dr2_{fingerprint}.json"
+    generation_dir = target_dir / f"panstarrs_dr2_{fingerprint}"
+    csv_path = generation_dir / "data.csv"
+    manifest_path = generation_dir / "manifest.json"
     cache_manifest: dict[str, Any] | None = None
     cache_hit = False
     local_cache_entry_reused = False
@@ -2539,38 +2564,49 @@ def _ensure_reference_photometry_for_series(
         if process_local_cache is not None
         else None
     )
-    if (
+    cache_entry_matches = (
         isinstance(local_entry, _ValidatedReferenceCacheEntry)
+        and local_entry.generation_dir == generation_dir
         and local_entry.csv_path == csv_path
         and local_entry.manifest_path == manifest_path
-    ):
-        cache_manifest = json.loads(json.dumps(local_entry.manifest))
-        cache_hit = True
-        local_cache_entry_reused = True
-    else:
-        cache_exists = (os.path.lexists(csv_path), os.path.lexists(manifest_path))
-    if not cache_hit:
-        if any(cache_exists):
-            try:
-                if not all(cache_exists):
-                    raise ValueError("fingerprinted CSV/manifest pair is incomplete")
-                cache_manifest = _validate_selected_reference_cache(
-                    csv_path=csv_path,
-                    manifest_path=manifest_path,
-                    fingerprint=fingerprint,
-                    expected_provenance=cache_provenance,
-                )
-                cache_hit = True
-            except Exception as exc:  # noqa: BLE001 - invalid deterministic artifacts must fail closed.
-                base["cache_invalid"] = True
-                return {
-                    **base,
-                    "status": "REFERENCE_CACHE_INVALID",
-                    "reason": f"invalid existing reference cache: {type(exc).__name__}: {exc}",
-                    "csv_path": str(csv_path),
-                    "manifest_path": str(manifest_path),
-                    "cache_fingerprint": fingerprint,
-                }
+    )
+    if cache_entry_matches:
+        try:
+            cache_manifest = _validate_selected_reference_cache(
+                generation_dir=generation_dir,
+                fingerprint=fingerprint,
+                expected_provenance=cache_provenance,
+            )
+            cache_hit = True
+            local_cache_entry_reused = True
+        except Exception as exc:  # noqa: BLE001 - a process-local entry never overrides physical state.
+            base["cache_invalid"] = True
+            return {
+                **base,
+                "status": "REFERENCE_CACHE_INVALID",
+                "reason": f"invalid existing reference cache: {type(exc).__name__}: {exc}",
+                "csv_path": str(csv_path),
+                "manifest_path": str(manifest_path),
+                "cache_fingerprint": fingerprint,
+            }
+    elif os.path.lexists(generation_dir):
+        try:
+            cache_manifest = _validate_selected_reference_cache(
+                generation_dir=generation_dir,
+                fingerprint=fingerprint,
+                expected_provenance=cache_provenance,
+            )
+            cache_hit = True
+        except Exception as exc:  # noqa: BLE001 - invalid deterministic artifacts fail closed.
+            base["cache_invalid"] = True
+            return {
+                **base,
+                "status": "REFERENCE_CACHE_INVALID",
+                "reason": f"invalid existing reference cache: {type(exc).__name__}: {exc}",
+                "csv_path": str(csv_path),
+                "manifest_path": str(manifest_path),
+                "cache_fingerprint": fingerprint,
+            }
 
     base["cache_hit"] = cache_hit
     base["cache_miss"] = not cache_hit
@@ -2583,24 +2619,23 @@ def _ensure_reference_photometry_for_series(
         base.update(cache_manifest["selected_reference_diagnostics"])
         if process_local_cache is not None and not local_cache_entry_reused:
             process_local_cache[fingerprint] = _ValidatedReferenceCacheEntry(
+                generation_dir=generation_dir,
                 csv_path=csv_path,
                 manifest_path=manifest_path,
                 manifest=json.loads(json.dumps(cache_manifest)),
             )
-
+    temp_generation_dir: Path | None = None
     try:
         if not cache_hit:
-            csv_temp_path = _new_reference_cache_temp_path(
+            temp_generation_dir = _new_reference_cache_temp_generation_dir(
                 target_dir,
                 fingerprint=fingerprint,
-                suffix=".csv.tmp",
             )
+            csv_temp_path = temp_generation_dir / "data.csv"
             fetched = create_reference_photometry_csv(
                 session,
                 out_path=csv_temp_path,
                 provider=provider_catalog_name,
-                # The exclusively-created temporary file is ours; published cache paths
-                # are always moved with no-replace semantics below.
                 overwrite=True,
                 require_bands=required_bands,
                 min_mag=min_mag,
@@ -2612,8 +2647,11 @@ def _ensure_reference_photometry_for_series(
                 selected_identity_source_ids=missing_identity_source_ids,
                 selected_identity_match_radius_arcsec=match_radius_arcsec,
             )
-            if not csv_temp_path.is_file() or csv_temp_path.is_symlink():
-                raise RuntimeError("reference provider did not finish its temporary CSV")
+            if (
+                _reference_cache_path_is_reparse_point(csv_temp_path)
+                or not csv_temp_path.is_file()
+            ):
+                raise RuntimeError("reference provider did not finish a regular temporary CSV")
             provider_diagnostics = (getattr(fetched, "filter_summary", None) or {}).get(
                 "selected_reference_diagnostics"
             )
@@ -2657,11 +2695,7 @@ def _ensure_reference_photometry_for_series(
                 "csv_sha256": _file_sha256(csv_temp_path),
                 "complete": True,
             }
-            manifest_temp_path = _new_reference_cache_temp_path(
-                target_dir,
-                fingerprint=fingerprint,
-                suffix=".json.tmp",
-            )
+            manifest_temp_path = temp_generation_dir / "manifest.json"
             manifest_payload = json.dumps(
                 cache_manifest,
                 ensure_ascii=False,
@@ -2669,21 +2703,61 @@ def _ensure_reference_photometry_for_series(
                 indent=2,
                 allow_nan=False,
             ) + "\n"
-            with manifest_temp_path.open("w", encoding="utf-8", newline="\n") as stream:
+            with manifest_temp_path.open("x", encoding="utf-8", newline="\n") as stream:
                 stream.write(manifest_payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            _publish_reference_cache_file_no_overwrite(csv_temp_path, csv_path)
-            _publish_reference_cache_file_no_overwrite(manifest_temp_path, manifest_path)
-            cache_manifest = _validate_selected_reference_cache(
-                csv_path=csv_path,
-                manifest_path=manifest_path,
-                fingerprint=fingerprint,
-                expected_provenance=cache_provenance,
-            )
+            _fsync_reference_cache_directory(temp_generation_dir)
+            try:
+                _publish_reference_cache_generation_no_overwrite(
+                    temp_generation_dir,
+                    generation_dir,
+                )
+            except OSError:
+                if not os.path.lexists(generation_dir):
+                    raise
+                try:
+                    cache_manifest = _validate_selected_reference_cache(
+                        generation_dir=generation_dir,
+                        fingerprint=fingerprint,
+                        expected_provenance=cache_provenance,
+                    )
+                except Exception as validation_exc:  # noqa: BLE001 - never replace a corrupt winner.
+                    base["cache_invalid"] = True
+                    return {
+                        **base,
+                        "status": "REFERENCE_CACHE_INVALID",
+                        "reason": (
+                            "invalid concurrent reference cache: "
+                            f"{type(validation_exc).__name__}: {validation_exc}"
+                        ),
+                        **cache_details,
+                    }
+                cache_hit = True
+                base["cache_hit"] = True
+                base["cache_miss"] = False
+            else:
+                _fsync_reference_cache_directory(target_dir)
+                try:
+                    cache_manifest = _validate_selected_reference_cache(
+                        generation_dir=generation_dir,
+                        fingerprint=fingerprint,
+                        expected_provenance=cache_provenance,
+                    )
+                except Exception as exc:  # noqa: BLE001 - published canonical state fails closed.
+                    base["cache_invalid"] = True
+                    return {
+                        **base,
+                        "status": "REFERENCE_CACHE_INVALID",
+                        "reason": f"invalid published reference cache: {type(exc).__name__}: {exc}",
+                        **cache_details,
+                    }
+            if cache_manifest is None:
+                raise RuntimeError("reference cache manifest was not available after publication")
             base.update(cache_manifest["selected_reference_diagnostics"])
             if process_local_cache is not None:
                 process_local_cache[fingerprint] = _ValidatedReferenceCacheEntry(
+                    generation_dir=generation_dir,
                     csv_path=csv_path,
                     manifest_path=manifest_path,
                     manifest=json.loads(json.dumps(cache_manifest)),
@@ -2742,6 +2816,9 @@ def _ensure_reference_photometry_for_series(
             "status": "REFERENCE_ACQUISITION_FAILED",
             "reason": f"{type(exc).__name__}: {exc}",
         }
+    finally:
+        if temp_generation_dir is not None:
+            _cleanup_reference_cache_temp_generation(temp_generation_dir)
 
     try:
         after_counts = _reference_band_counts_for_series(

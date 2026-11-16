@@ -234,7 +234,7 @@ def test_post_import_coverage_error_rolls_back_reference_writes(
     def coverage_check(*_args, **_kwargs):
         nonlocal coverage_calls
         coverage_calls += 1
-        if coverage_calls == 3:
+        if coverage_calls == 2:
             raise RuntimeError("synthetic post-import coverage failure")
         return {}
 

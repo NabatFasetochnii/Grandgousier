@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -210,7 +211,10 @@ def test_compatible_cache_is_reused_without_a_second_provider_request(monkeypatc
     assert second["cache_provenance"]["csv_sha256"] == hashlib.sha256(
         Path(second["csv_path"]).read_bytes()
     ).hexdigest()
-    assert second["cache_provenance"]["schema_version"] == 3
+    assert second["cache_provenance"]["schema_version"] == 4
+    assert Path(second["csv_path"]).name == "data.csv"
+    assert Path(second["manifest_path"]).name == "manifest.json"
+    assert Path(second["csv_path"]).parent.name == f"panstarrs_dr2_{second['cache_fingerprint']}"
     manifest = second["cache_provenance"]
     diagnostics = manifest["selected_reference_diagnostics"]
     assert manifest["logical_query_groups"] == diagnostics["logical_query_groups"] == 1
@@ -262,14 +266,14 @@ def test_process_local_cache_scope_and_disk_recovery(monkeypatch, tmp_path):
 
     assert first["cache_miss"] is True
     assert local_hit["cache_hit"] is True
-    assert len(validation_calls) == 1  # The second call reuses the validated process-local entry.
+    assert len(validation_calls) == 2  # Process-local reuse revalidates the physical generation.
 
     second_invocation_cache = {}
     disk_hit = _ensure(tmp_path, process_local_cache=second_invocation_cache)
 
     assert second_invocation_cache is not first_invocation_cache
     assert disk_hit["cache_hit"] is True
-    assert len(validation_calls) == 2  # A new invocation recovers through validated disk cache.
+    assert len(validation_calls) == 3  # A new invocation recovers through validated disk cache.
     assert len(provider_calls) == 1
     assert len(import_calls) == 3
     assert second_invocation_cache[first["cache_fingerprint"]]
@@ -329,6 +333,9 @@ def test_import_rollback_retry_reuses_completed_provider_cache(monkeypatch, tmp_
     "corruption",
     [
         "incomplete_manifest",
+        "missing_csv",
+        "missing_manifest",
+        "fingerprint",
         "csv_hash",
         *[
             (kind, key)
@@ -364,6 +371,14 @@ def test_invalid_cache_fails_closed_without_provider_or_import(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["complete"] = False
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif corruption == "missing_csv":
+        csv_path.unlink()
+    elif corruption == "missing_manifest":
+        manifest_path.unlink()
+    elif corruption == "fingerprint":
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["fingerprint"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     elif corruption == "csv_hash":
         csv_path.write_bytes(csv_path.read_bytes() + b"corruption\n")
     else:
@@ -380,11 +395,11 @@ def test_invalid_cache_fails_closed_without_provider_or_import(
     assert len(import_calls) == 1
 
 
-def test_concurrent_existing_cache_artifact_is_never_overwritten(monkeypatch, tmp_path):
+def test_concurrent_invalid_generation_is_never_overwritten(monkeypatch, tmp_path):
     fingerprint, _provenance = _fingerprint()
-    cache_dir = tmp_path / "reference_photometry"
-    cache_dir.mkdir()
-    csv_path = cache_dir / f"panstarrs_dr2_{fingerprint}.csv"
+    generation_dir = (
+        tmp_path / "reference_photometry" / f"panstarrs_dr2_{fingerprint}"
+    )
     existing_bytes = b"user-owned concurrent artifact\n"
     provider_calls = []
     import_calls = []
@@ -392,7 +407,8 @@ def test_concurrent_existing_cache_artifact_is_never_overwritten(monkeypatch, tm
     def provider(_session, **kwargs):
         provider_calls.append(kwargs["out_path"])
         result = _provider_result(kwargs["out_path"])
-        csv_path.write_bytes(existing_bytes)
+        generation_dir.mkdir()
+        (generation_dir / "data.csv").write_bytes(existing_bytes)
         return result
 
     def importer(session, **kwargs):
@@ -402,8 +418,106 @@ def test_concurrent_existing_cache_artifact_is_never_overwritten(monkeypatch, tm
     _configure(monkeypatch, provider=provider, importer=importer)
     result = _ensure(tmp_path)
 
-    assert result["status"] == "REFERENCE_ACQUISITION_FAILED"
-    assert "FileExistsError" in result["reason"]
-    assert csv_path.read_bytes() == existing_bytes
+    assert result["status"] == "REFERENCE_CACHE_INVALID"
+    assert result["cache_invalid"] is True
+    assert "manifest" in result["reason"]
+    assert (generation_dir / "data.csv").read_bytes() == existing_bytes
     assert len(provider_calls) == 1
     assert import_calls == []
+    assert not Path(provider_calls[0]).parent.exists()
+
+
+def test_concurrent_valid_generation_winner_is_reused(monkeypatch, tmp_path):
+    provider_calls = []
+    import_calls = []
+    publisher = auto_process._publish_reference_cache_generation_no_overwrite
+
+    def provider(_session, **kwargs):
+        provider_calls.append(kwargs["out_path"])
+        return _provider_result(kwargs["out_path"])
+
+    def importer(session, **kwargs):
+        import_calls.append(Path(kwargs["path"]))
+        return _successful_import(session, **kwargs)
+
+    def publish_with_winner(source, destination):
+        shutil.copytree(source, destination)
+        winner_manifest_path = destination / "manifest.json"
+        winner_manifest = json.loads(winner_manifest_path.read_text(encoding="utf-8"))
+        winner_manifest["race_winner"] = "first-publisher"
+        winner_manifest_path.write_text(json.dumps(winner_manifest), encoding="utf-8")
+        publisher(source, destination)
+
+    _configure(monkeypatch, provider=provider, importer=importer)
+    monkeypatch.setattr(
+        auto_process,
+        "_publish_reference_cache_generation_no_overwrite",
+        publish_with_winner,
+    )
+
+    result = _ensure(tmp_path)
+
+    assert result["cache_hit"] is True
+    assert result["cache_miss"] is False
+    assert result["cache_provenance"]["race_winner"] == "first-publisher"
+    assert Path(result["csv_path"]).is_file()
+    assert import_calls == [Path(result["csv_path"])]
+    assert len(provider_calls) == 1
+    assert not Path(provider_calls[0]).parent.exists()
+
+
+def test_orphan_temporary_generation_does_not_block_retry(monkeypatch, tmp_path):
+    fingerprint, _provenance = _fingerprint()
+    cache_dir = tmp_path / "reference_photometry"
+    cache_dir.mkdir()
+    orphan = cache_dir / f".panstarrs_dr2_{fingerprint}.orphan.tmp"
+    orphan.mkdir()
+    (orphan / "partial.csv").write_text("partial", encoding="utf-8")
+    provider_calls = []
+    import_calls = []
+
+    def provider(_session, **kwargs):
+        provider_calls.append(Path(kwargs["out_path"]))
+        return _provider_result(kwargs["out_path"])
+
+    def importer(session, **kwargs):
+        import_calls.append(Path(kwargs["path"]))
+        return _successful_import(session, **kwargs)
+
+    _configure(monkeypatch, provider=provider, importer=importer)
+    result = _ensure(tmp_path)
+
+    assert result["status"] == "INSUFFICIENT_REFERENCE_COVERAGE"
+    assert Path(result["csv_path"]).is_file()
+    assert len(provider_calls) == 1
+    assert len(import_calls) == 1
+    assert orphan.is_dir()
+    assert (orphan / "partial.csv").read_text(encoding="utf-8") == "partial"
+    assert provider_calls[0].parent != orphan
+
+
+def test_process_local_cache_revalidates_physical_generation(monkeypatch, tmp_path):
+    provider_calls = []
+    import_calls = []
+
+    def provider(_session, **kwargs):
+        provider_calls.append(kwargs["out_path"])
+        return _provider_result(kwargs["out_path"])
+
+    def importer(session, **kwargs):
+        import_calls.append(Path(kwargs["path"]))
+        return _successful_import(session, **kwargs)
+
+    _configure(monkeypatch, provider=provider, importer=importer)
+    process_local_cache = {}
+    first = _ensure(tmp_path, process_local_cache=process_local_cache)
+    csv_path = Path(first["csv_path"])
+    csv_path.write_bytes(csv_path.read_bytes() + b"changed after cache validation\n")
+
+    second = _ensure(tmp_path, process_local_cache=process_local_cache)
+
+    assert second["status"] == "REFERENCE_CACHE_INVALID"
+    assert second["cache_invalid"] is True
+    assert "SHA-256 mismatch" in second["reason"]
+    assert len(provider_calls) == 1
+    assert len(import_calls) == 1

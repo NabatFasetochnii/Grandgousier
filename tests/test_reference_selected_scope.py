@@ -728,7 +728,7 @@ def test_reference_ensure_counts_and_imports_only_the_exact_selected_set(
 
     def count_selected(_session, *, identity_catalog_name, reference_catalog_name, selected_identity_source_ids):
         count_calls.append(set(selected_identity_source_ids))
-        if len(count_calls) < 3:
+        if len(count_calls) < 2:
             return {}
         return {"g": 2, "r": 2}
 
@@ -789,7 +789,7 @@ def test_reference_ensure_counts_and_imports_only_the_exact_selected_set(
         "provider_selected_scope",
         "import_selected_scope",
     ]
-    assert count_calls == [{"42", "84"}] * 3
+    assert count_calls == [{"42", "84"}] * 2
     assert result["status"] == "FETCHED_IMPORTED"
     assert result["selected_identity_count"] == 2
     assert result["ready"] is True
@@ -842,13 +842,14 @@ def test_fingerprinted_csv_without_manifest_is_rejected_before_provider(
         },
         match_radius_arcsec=1.0,
     )
-    csv_path = (
+    generation_dir = (
         tmp_path
         / "reference_photometry"
-        / f"panstarrs_dr2_{fingerprint}.csv"
+        / f"panstarrs_dr2_{fingerprint}"
     )
-    csv_path.parent.mkdir(parents=True)
-    original_contents = b"existing broader-scope reference artifact\n"
+    generation_dir.mkdir(parents=True)
+    csv_path = generation_dir / "data.csv"
+    original_contents = b"existing incomplete reference generation\n"
     csv_path.write_bytes(original_contents)
     session = SimpleNamespace(rollback=lambda: None)
 
@@ -863,7 +864,7 @@ def test_fingerprinted_csv_without_manifest_is_rejected_before_provider(
     )
 
     assert result["status"] == "REFERENCE_CACHE_INVALID"
-    assert "incomplete" in result["reason"]
+    assert "manifest" in result["reason"]
     assert csv_path.read_bytes() == original_contents
     assert load_events == ["load"]
 
@@ -942,27 +943,13 @@ def test_reference_band_coverage_query_returns_exact_per_identity_bands_in_bound
     assert all(call[1]["reference_catalog_name"] == "panstarrs_dr2__gaia_dr3" for call in session.calls)
 
 
-@pytest.mark.parametrize(
-    ("ready_catalog", "expected_status", "expected_namespace"),
-    [
-        ("panstarrs_dr2", "READY_EXISTING", "existing_global"),
-        (
-            "identity_scoped",
-            "READY_EXISTING_SCOPED",
-            "identity_scoped",
-        ),
-    ],
-)
-def test_reference_ensure_ready_coverage_does_not_fetch(
-    monkeypatch, ready_catalog, expected_status, expected_namespace
-):
+def test_reference_ensure_ready_scoped_coverage_does_not_fetch(monkeypatch):
     selected_ids = ["42", "84"]
-    ready_catalog = (
-        auto_process.identity_scoped_reference_catalog_name("panstarrs_dr2", "gaia_dr3")
-        if ready_catalog == "identity_scoped"
-        else ready_catalog
+    scoped_name = auto_process.identity_scoped_reference_catalog_name(
+        "panstarrs_dr2", "gaia_dr3"
     )
     coverage_targets = []
+    count_targets = []
 
     monkeypatch.setattr(
         auto_process,
@@ -971,7 +958,8 @@ def test_reference_ensure_ready_coverage_does_not_fetch(
     )
 
     def count_coverage(_session, *, reference_catalog_name, **_kwargs):
-        return {"g": 2, "r": 2} if reference_catalog_name == ready_catalog else {}
+        count_targets.append(reference_catalog_name)
+        return {"g": 2, "r": 2} if reference_catalog_name == scoped_name else {}
 
     def per_identity_coverage(
         _session,
@@ -1008,14 +996,76 @@ def test_reference_ensure_ready_coverage_does_not_fetch(
         allow_remote_fetch=True,
     )
 
-    assert result["status"] == expected_status
+    assert result["status"] == "READY_EXISTING_SCOPED"
     assert result["ready"] is True
-    assert result["reference_namespace_mode"] == expected_namespace
+    assert result["reference_namespace_mode"] == "identity_scoped"
+    assert result["effective_reference_catalog_name"] == scoped_name
     assert result["selected_identity_count"] == 2
     assert result["already_complete_identity_count"] == 2
     assert result["missing_identity_count"] == 0
-    assert coverage_targets == [(ready_catalog, selected_ids)]
+    assert count_targets == [scoped_name]
+    assert coverage_targets == [(scoped_name, selected_ids)]
 
+
+def test_global_full_scoped_empty_is_missing_when_remote_disabled(monkeypatch):
+    selected_ids = ["42", "84"]
+    scoped_name = auto_process.identity_scoped_reference_catalog_name(
+        "panstarrs_dr2", "gaia_dr3"
+    )
+    count_targets = []
+    coverage_targets = []
+
+    monkeypatch.setattr(
+        auto_process,
+        "load_persisted_identity_sources",
+        lambda *_args, **_kwargs: [],
+    )
+
+    def count_coverage(_session, *, reference_catalog_name, **_kwargs):
+        count_targets.append(reference_catalog_name)
+        return {"g": 2, "r": 2} if reference_catalog_name == "panstarrs_dr2" else {}
+
+    def per_identity_coverage(
+        _session,
+        *,
+        reference_catalog_name,
+        selected_identity_source_ids,
+        **_kwargs,
+    ):
+        coverage_targets.append((reference_catalog_name, list(selected_identity_source_ids)))
+        return {source_id: set() for source_id in selected_identity_source_ids}
+
+    monkeypatch.setattr(auto_process, "_reference_band_counts_for_series", count_coverage)
+    monkeypatch.setattr(
+        auto_process, "_reference_band_coverage_by_identity", per_identity_coverage
+    )
+    monkeypatch.setattr(
+        auto_process,
+        "create_reference_photometry_csv",
+        lambda *_args, **_kwargs: pytest.fail("remote fetch is disabled"),
+    )
+    monkeypatch.setattr(
+        auto_process,
+        "import_reference_photometry",
+        lambda *_args, **_kwargs: pytest.fail("missing scoped rows cannot be imported"),
+    )
+
+    result = auto_process._ensure_reference_photometry_for_series(
+        object(),
+        series={"series_id": 5, "field_id": 8},
+        policy=_coverage_policy(),
+        identity_catalog_name="gaia_dr3",
+        selected_identity_source_ids=set(selected_ids),
+        out_dir=None,
+        allow_remote_fetch=False,
+    )
+
+    assert result["status"] == "MISSING_REFERENCE_PHOTOMETRY"
+    assert result["ready"] is False
+    assert result["missing_identity_count"] == 2
+    assert result["already_complete_identity_count"] == 0
+    assert count_targets == [scoped_name]
+    assert coverage_targets == [(scoped_name, selected_ids)]
 
 def test_reference_ensure_fetches_only_incomplete_identities_and_postchecks_full_selection(
     monkeypatch, tmp_path
@@ -1026,6 +1076,7 @@ def test_reference_ensure_fetches_only_incomplete_identities_and_postchecks_full
     )
     count_calls = []
     coverage_calls = []
+    coverage_results = []
     provider_ids = []
     importer_ids = []
 
@@ -1048,9 +1099,9 @@ def test_reference_ensure_fetches_only_incomplete_identities_and_postchecks_full
         ids = list(selected_identity_source_ids)
         count_calls.append((reference_catalog_name, ids))
         if reference_catalog_name == "panstarrs_dr2":
-            return {}
-        if len(count_calls) == 2:
-            return {"g": 2, "r": 3}
+            return {"g": 3, "r": 3}
+        if len(count_calls) == 1:
+            return {"g": 2, "r": 2}
         return {"g": 3, "r": 3}
 
     def per_identity_coverage(
@@ -1061,11 +1112,13 @@ def test_reference_ensure_fetches_only_incomplete_identities_and_postchecks_full
         **_kwargs,
     ):
         coverage_calls.append((reference_catalog_name, list(selected_identity_source_ids)))
-        return {
+        coverage = {
             "42": {"g", "r"},
             "84": {"g"},
             "99": {"r"},
         }
+        coverage_results.append(coverage)
+        return coverage
 
     def fetch(_session, **kwargs):
         provider_ids.append(kwargs["selected_identity_source_ids"])
@@ -1115,10 +1168,14 @@ def test_reference_ensure_fetches_only_incomplete_identities_and_postchecks_full
     assert provider_ids == importer_ids == [["84", "99"]]
     assert coverage_calls == [(scoped_name, selected_ids)]
     assert count_calls == [
-        ("panstarrs_dr2", selected_ids),
         (scoped_name, selected_ids),
         (scoped_name, selected_ids),
     ]
+    missing_bands_by_identity = {
+        source_id: {"g", "r"} - bands
+        for source_id, bands in coverage_results[0].items()
+    }
+    assert missing_bands_by_identity == {"42": set(), "84": {"r"}, "99": {"g"}}
     assert result["status"] == "FETCHED_IMPORTED"
     assert result["ready"] is True
     assert result["selected_identity_count"] == 3
@@ -1179,7 +1236,6 @@ def test_reference_ensure_with_no_missing_identities_but_short_minimum_is_nonfat
     assert result["already_complete_identity_count"] == 2
     assert result["missing_identity_count"] == 0
     assert count_calls == [
-        "panstarrs_dr2",
         auto_process.identity_scoped_reference_catalog_name("panstarrs_dr2", "gaia_dr3"),
     ]
     assert provider_calls == []
