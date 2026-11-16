@@ -1222,18 +1222,34 @@ def test_transient_gaia_reference_callback_waits_for_selected_persisted_identiti
         lambda *_args, **_kwargs: policy,
     )
     events = []
+    process_local_caches = []
 
     def fake_ensure(_session, **kwargs):
         events.append("reference_provider_and_import")
+        process_local_cache = kwargs["process_local_cache"]
+        assert isinstance(process_local_cache, dict)
+        process_local_caches.append(process_local_cache)
         assert kwargs["selected_identity_source_ids"] == {"77"}
+        assert Path(kwargs["out_dir"]) == tmp_path / "out_root"
         return {
             "status": "MISSING_REFERENCE_PHOTOMETRY",
             "ready": False,
             "reason": "selected reference photometry unavailable",
+            "csv_path": str(tmp_path / "cache.csv"),
+            "manifest_path": str(tmp_path / "cache.json"),
+            "cache_provenance": {"fingerprint": "test"},
         }
 
     monkeypatch.setattr(
         auto_process_module, "_ensure_reference_photometry_for_series", fake_ensure
+    )
+    registered_reference_artifacts = []
+    monkeypatch.setattr(
+        auto_process_module,
+        "_snapshot_post_pipeline_artifact",
+        lambda _session, **kwargs: registered_reference_artifacts.append(
+            (kwargs["source_path"], kwargs["artifact_role"])
+        ),
     )
 
     async def fake_fetch(cones, **_kwargs):
@@ -1272,25 +1288,196 @@ def test_transient_gaia_reference_callback_waits_for_selected_persisted_identiti
         return _fake_pipeline_result()
 
     monkeypatch.setattr(auto_process_module, "run_field_pipeline", fake_pipeline)
-    result = process_archive_path(
-        FakeSession(),
-        root=tmp_path,
-        exact_paths=[source_path],
-        series_ids=[1],
-        execute=True,
-        make_light_curve_summary=False,
-        enable_color_calibration=True,
-    )
+    def run_archive():
+        return process_archive_path(
+            FakeSession(),
+            root=tmp_path,
+            exact_paths=[source_path],
+            series_ids=[1],
+            out_root=tmp_path / "out_root",
+            execute=True,
+            make_light_curve_summary=False,
+            enable_color_calibration=True,
+        )
 
-    assert len(configs) == 1
-    assert configs[0].color_calibration_requested is True
-    assert configs[0].enable_color_calibration is True
+    run_archive()
+    result = run_archive()
+
+    assert len(configs) == 2
+    assert all(config.color_calibration_requested for config in configs)
+    assert all(config.enable_color_calibration for config in configs)
+    assert len(process_local_caches) == 2
+    assert process_local_caches[0] is not process_local_caches[1]
+    assert process_local_caches == [{}, {}]
     assert result.reference_photometry_results[0]["status"] == "MISSING_REFERENCE_PHOTOMETRY"
+    assert registered_reference_artifacts == [
+        (str(tmp_path / "cache.csv"), "INPUT_CACHE"),
+        (str(tmp_path / "cache.json"), "INPUT_CACHE"),
+        (str(tmp_path / "cache.csv"), "INPUT_CACHE"),
+        (str(tmp_path / "cache.json"), "INPUT_CACHE"),
+    ]
     assert events == [
         "pipeline_started",
         "selected_identity_persisted",
         "reference_provider_and_import",
+        "pipeline_started",
+        "selected_identity_persisted",
+        "reference_provider_and_import",
     ]
+
+
+def test_selected_reference_diagnostics_are_in_archive_pipeline_summary():
+    diagnostics = {
+        "selected_identity_count": 5,
+        "already_complete_identity_count": 2,
+        "missing_identity_count": 3,
+        "cache_hit": True,
+        "cache_miss": False,
+        "cache_invalid": False,
+        "logical_query_groups": 2,
+        "provider_requests": 2,
+        "provider_response_bytes_received": 1234,
+        "provider_rows_received": 12,
+        "provider_rows_retained": 3,
+        "provider_exact_duplicates_collapsed": 1,
+        "provider_conflicting_source_ids": 1,
+        "provider_conflicting_rows": 2,
+        "matched_rows": 5,
+        "ambiguous_rows": 1,
+        "ambiguous_identities": 1,
+        "unmatched_rows": 3,
+        "unmatched_identities": 2,
+        "imported_or_updated": 3,
+        "band_counts_before": {"g": 2, "r": 2},
+        "band_counts_after": {"g": 5, "r": 5},
+    }
+    result = auto_process_module.ProcessArchiveResult(
+        status="DONE",
+        path="archive",
+        catalog_name="gaia_dr3",
+        execute=True,
+        discovered_files=0,
+        detected_files=0,
+        failed_files=0,
+        reference_photometry_results=[
+            {
+                "series_id": 1,
+                "reference_catalog_name": "panstarrs_dr2",
+                "status": "FETCHED_IMPORTED",
+                "ready": True,
+                **diagnostics,
+            }
+        ],
+    )
+
+    summary_values = {
+        (row["section"], row["metric"]): row["value"]
+        for row in auto_process_module.process_archive_summary_rows(result)
+    }
+
+    for metric, value in diagnostics.items():
+        assert summary_values[("reference:1", metric)] == value
+    assert result.to_dict()["reference_photometry_results"][0][
+        "selected_identity_count"
+    ] == 5
+
+
+def test_gaia_acquisition_diagnostics_are_in_archive_summary_without_alias_rows():
+    acquisition_metrics = {
+        "selected_frames": 7,
+        "raw_cones": 7,
+        "unique_footprints": 5,
+        "cone_count": 5,
+        "logical_queries": 2,
+        "physical_parts": 4,
+        "provider_attempts": 6,
+        "rows_received": 23,
+        "unique_sources": 19,
+        "working_catalog_sources": 19,
+        "n_sources": 19,
+        "queried_frames": 7,
+        "queried_cones": 5,
+        "read_rows": 23,
+    }
+    result = auto_process_module.ProcessArchiveResult(
+        status="DONE",
+        path="archive",
+        catalog_name="gaia_dr3",
+        execute=True,
+        discovered_files=0,
+        detected_files=0,
+        failed_files=0,
+        catalog_results=[{"mode": "auto_gaia_dr3_working", **acquisition_metrics}],
+    )
+
+    catalog_rows = [
+        row
+        for row in auto_process_module.process_archive_summary_rows(result)
+        if row["section"] == "catalog"
+    ]
+    summary_values = {row["metric"]: row["value"] for row in catalog_rows}
+
+    for metric in (
+        "selected_frames",
+        "raw_cones",
+        "unique_footprints",
+        "logical_queries",
+        "physical_parts",
+        "provider_attempts",
+        "rows_received",
+        "unique_sources",
+    ):
+        assert summary_values[metric] == acquisition_metrics[metric]
+    for metric in (
+        "queried_frames",
+        "queried_cones",
+        "read_rows",
+        "working_catalog_sources",
+        "n_sources",
+    ):
+        assert metric not in summary_values
+    assert all(
+        not isinstance(summary_values[metric], (list, tuple, set, dict))
+        for metric in (
+            "selected_frames",
+            "raw_cones",
+            "unique_footprints",
+            "logical_queries",
+            "physical_parts",
+            "provider_attempts",
+            "rows_received",
+            "unique_sources",
+        )
+    )
+
+
+def test_working_catalog_provenance_keeps_legacy_cone_count_as_unique_footprints():
+    from grandgousier.catalogs import gaia_query
+
+    duplicate_cones = [(10.0, 20.0, 0.5), (10.0, 20.0, 0.5)]
+    provenance = auto_process_module._auto_working_catalog_fetch_provenance(
+        gaia_query=gaia_query,
+        field_id=7,
+        frame_ids=[101, 202],
+        cones=duplicate_cones,
+        margin_arcmin=2.0,
+        mag_limit=19.0,
+        max_radius_deg=1.0,
+        maxrec=50000,
+        diagnostics={
+            "raw_cones": 2,
+            "unique_footprints": 1,
+            "logical_queries": 1,
+        },
+        fetch_status="SUCCEEDED_COMPLETE",
+        fetch_complete=True,
+        unique_rows=0,
+        elapsed_seconds=0.1,
+    )
+
+    assert provenance["raw_cones"] == 2
+    assert provenance["unique_footprints"] == 1
+    assert provenance["cone_count"] == 1
 
 
 def test_explicit_catalog_path_does_not_fetch_or_pass_working_catalog(monkeypatch, tmp_path):
@@ -1379,7 +1566,8 @@ def test_auto_working_catalog_wcs_footprint_failure_skips_fetch_and_pipeline(
     assert result.status == "FAILED_PRECONDITION_CATALOG"
     assert result.pipeline_results == []
     assert result.catalog_results[0]["status"] == "FAILED_FOOTPRINTS"
-    assert result.catalog_results[0]["cone_count"] == 1
+    assert result.catalog_results[0]["raw_cones"] == 1
+    assert result.catalog_results[0]["unique_footprints"] == 1
     assert result.catalog_results[0]["failed_footprints"] == 1
     assert result.catalog_results[0]["failed_footprint_reasons"] == {
         "invalid_wcs_footprint": 1

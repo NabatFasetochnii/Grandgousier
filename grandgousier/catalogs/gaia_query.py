@@ -21,8 +21,8 @@ from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.wcs import WCS, FITSFixedWarning
-from sqlalchemy import or_, select
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import case, func, literal, or_, select
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.orm import Session, selectinload
 from tqdm import tqdm
 
@@ -337,15 +337,108 @@ class GaiaWorkingCatalog:
         max_positions: int = 100_000,
         max_pair_comparisons: int = 100_000_000,
     ) -> list[tuple[int, str, float]]:
-        """Greedily match current-frame detections to unique Gaia sources.
+        """Return the legacy deterministic nearest assignment for diagnostics only.
 
-        Every candidate within ``radius_arcsec`` is considered, ordered by
-        separation. Exact separation ties retain the input detection order and
-        the catalog's source-ID order, matching the stable candidate ordering
-        used by ``quality.detection_catalog_qc._match_frame``. The spherical
-        neighbor grid limits pair work without constructing a detection-by-source
-        matrix.
+        Promotion authority uses :meth:`select_unique_detection_matches` instead:
+        greedy nearest assignment is useful to inspect, but must not resolve a
+        candidate graph with ambiguity or source competition.
         """
+
+        normalized_detection_ids, candidates = self._detection_candidate_edges(
+            detection_ids,
+            ra_deg,
+            dec_deg,
+            radius_arcsec=radius_arcsec,
+            max_positions=max_positions,
+            max_pair_comparisons=max_pair_comparisons,
+        )
+        used_detections: set[int] = set()
+        used_sources: set[int] = set()
+        accepted: list[tuple[int, str, float]] = []
+        for separation, query_index, source_index in candidates:
+            detection_id = normalized_detection_ids[query_index]
+            if detection_id in used_detections or source_index in used_sources:
+                continue
+            used_detections.add(detection_id)
+            used_sources.add(source_index)
+            accepted.append(
+                (detection_id, str(self._source_ids[source_index]), float(separation))
+            )
+        return accepted
+
+    def select_unique_detection_matches(
+        self,
+        detection_ids: Sequence[int],
+        ra_deg: Any,
+        dec_deg: Any,
+        *,
+        radius_arcsec: float,
+        max_positions: int = 100_000,
+        max_pair_comparisons: int = 100_000_000,
+    ) -> tuple[list[tuple[int, str, float]], dict[str, int]]:
+        """Select only reciprocal degree-one pairs from this frame's radius graph.
+
+        ``reciprocal_unique_matches`` counts pairs whose detection and Gaia candidate
+        degrees are both one. ``ambiguous_detections`` counts detections with multiple
+        Gaia candidates, while ``conflicting_gaia_sources`` counts Gaia sources that
+        candidate-match multiple detections. Ambiguities are never resolved by distance
+        or stable ordering. The diagnostics contain bounded counts only.
+        """
+
+        normalized_detection_ids, candidates = self._detection_candidate_edges(
+            detection_ids,
+            ra_deg,
+            dec_deg,
+            radius_arcsec=radius_arcsec,
+            max_positions=max_positions,
+            max_pair_comparisons=max_pair_comparisons,
+        )
+        detection_candidate_counts = [0] * len(normalized_detection_ids)
+        source_candidate_counts: dict[int, int] = {}
+        for _separation, detection_index, source_index in candidates:
+            detection_candidate_counts[detection_index] += 1
+            source_candidate_counts[source_index] = (
+                source_candidate_counts.get(source_index, 0) + 1
+            )
+
+        selected_candidates = [
+            (separation, detection_index, source_index)
+            for separation, detection_index, source_index in candidates
+            if detection_candidate_counts[detection_index] == 1
+            and source_candidate_counts[source_index] == 1
+        ]
+        selected_candidates.sort(key=lambda candidate: (candidate[1], candidate[2]))
+        matches = [
+            (
+                normalized_detection_ids[detection_index],
+                str(self._source_ids[source_index]),
+                float(separation),
+            )
+            for separation, detection_index, source_index in selected_candidates
+        ]
+        diagnostics = {
+            "detections_considered": len(normalized_detection_ids),
+            "reciprocal_unique_matches": len(matches),
+            "ambiguous_detections": sum(
+                count > 1 for count in detection_candidate_counts
+            ),
+            "conflicting_gaia_sources": sum(
+                count > 1 for count in source_candidate_counts.values()
+            ),
+        }
+        return matches, diagnostics
+
+    def _detection_candidate_edges(
+        self,
+        detection_ids: Sequence[int],
+        ra_deg: Any,
+        dec_deg: Any,
+        *,
+        radius_arcsec: float,
+        max_positions: int,
+        max_pair_comparisons: int,
+    ) -> tuple[list[int], list[tuple[float, int, int]]]:
+        """Build the bounded in-radius candidate graph for one frame."""
 
         self._ensure_open()
         try:
@@ -390,7 +483,7 @@ class GaiaWorkingCatalog:
         if len(set(normalized_detection_ids)) != len(normalized_detection_ids):
             raise ValueError("detection IDs must be unique within the frame")
         if not len(query_ra) or not len(self._source_ids):
-            return []
+            return normalized_detection_ids, []
 
         max_chord = 2.0 * math.sin(math.radians(radius / 3600.0) / 2.0)
         search_chord = max_chord + 1e-15
@@ -450,21 +543,10 @@ class GaiaWorkingCatalog:
                 if separation <= radius:
                     candidates.append((separation, query_index, source_index))
 
-        # The secondary keys make equal-separation behavior explicit and repeatable.
+        # Keep diagnostic nearest assignment ties stable without letting this
+        # ordering influence reciprocal-unique promotion selection.
         candidates.sort(key=lambda candidate: (candidate[0], candidate[1], candidate[2]))
-        used_detections: set[int] = set()
-        used_sources: set[int] = set()
-        accepted: list[tuple[int, str, float]] = []
-        for separation, query_index, source_index in candidates:
-            detection_id = normalized_detection_ids[query_index]
-            if detection_id in used_detections or source_index in used_sources:
-                continue
-            used_detections.add(detection_id)
-            used_sources.add(source_index)
-            accepted.append(
-                (detection_id, str(self._source_ids[source_index]), float(separation))
-            )
-        return accepted
+        return normalized_detection_ids, candidates
 
     def nearest_neighbor_separations(
         self, source_ids: Iterable[str]
@@ -1036,7 +1118,11 @@ async def fetch_gaia_working_catalog(
     if not math.isfinite(max_radius_deg) or max_radius_deg <= 0.0:
         raise ValueError("max_radius_deg must be finite and positive")
 
-    selected_cones = _normalise_working_cones(cones)
+    try:
+        raw_cones = list(cones)
+    except TypeError:
+        raise ValueError("cones must be an iterable of (ra_deg, dec_deg, radius_deg)") from None
+    selected_cones = _normalise_working_cones(raw_cones)
     if not selected_cones:
         raise ValueError("at least one selected Gaia cone is required")
     if any(radius > max_radius_deg for _ra, _dec, radius in selected_cones):
@@ -1102,7 +1188,8 @@ async def fetch_gaia_working_catalog(
         "rows_received": 0,
         "unique_sources": 0,
         "maxrec": int(maxrec),
-        "cone_count": len(selected_cones),
+        "raw_cones": len(raw_cones),
+        "unique_footprints": len(selected_cones),
         "providers_used": [],
         "provider_failures": [],
         "provider_failures_omitted": 0,
@@ -2392,6 +2479,8 @@ def promote_selected_gaia_sources(
     session: Session,
     working_catalog: GaiaWorkingCatalog,
     source_ids: Iterable[str | int],
+    *,
+    diagnostics_out: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """Persist only selected working-catalog rows in the canonical Gaia namespace.
 
@@ -2405,6 +2494,8 @@ def promote_selected_gaia_sources(
         raise TypeError("working_catalog must be a GaiaWorkingCatalog")
     catalog_source_ids = working_catalog.source_ids  # Also rejects a closed catalog.
     selected_ids = _normalise_selected_gaia_source_ids(source_ids)
+    if diagnostics_out is not None:
+        diagnostics_out.update({"promoted_new": 0, "promoted_existing": 0})
     if not selected_ids:
         return {}
 
@@ -2457,15 +2548,18 @@ def promote_selected_gaia_sources(
     with session.no_autoflush:
         existing_rows = session.execute(existing_stmt).all()
 
+    canonical_source_ids: set[str] = set()
     canonical_objects: dict[str, set[int]] = {}
     legacy_objects: dict[str, set[int]] = {}
     legacy_names: dict[str, set[str]] = {}
     for catalog_name_value, source_id_value, _catalog_source_id, object_id_value in existing_rows:
         source_id = str(source_id_value)
+        catalog_name = str(catalog_name_value)
+        if catalog_name == "gaia_dr3":
+            canonical_source_ids.add(source_id)
         if object_id_value is None:
             continue
         object_id = int(object_id_value)
-        catalog_name = str(catalog_name_value)
         if catalog_name == "gaia_dr3":
             canonical_objects.setdefault(source_id, set()).add(object_id)
         elif catalog_name.startswith("auto_catalog_field_"):
@@ -2482,6 +2576,14 @@ def promote_selected_gaia_sources(
         raise RuntimeError(
             "conflicting canonical/legacy Gaia object links for source IDs: "
             + ", ".join(conflicts)
+        )
+
+    if diagnostics_out is not None:
+        diagnostics_out.update(
+            {
+                "promoted_new": len(selected_set.difference(canonical_source_ids)),
+                "promoted_existing": len(selected_set.intersection(canonical_source_ids)),
+            }
         )
 
     source_id_map = _upsert_selected_gaia_catalog_sources(session, rows)
@@ -2540,6 +2642,13 @@ def _normalise_selected_gaia_source_ids(source_ids: Iterable[str | int]) -> list
 def _upsert_selected_gaia_catalog_sources(
     session: Session, rows: list[dict]
 ) -> dict[str, int]:
+    """Insert selected Gaia rows and minimally refresh known DR3 fields.
+
+    Conflicts update only G photometry and epoch-2016 positions. In particular,
+    proper motion, other photometry/colors, source metadata, and object links are
+    not replaced by the deliberately compact working-catalog payload.
+    """
+
     table = CatalogSource.__table__
     source_id_map: dict[str, int] = {}
     for start in range(0, len(rows), 1000):
@@ -2548,16 +2657,17 @@ def _upsert_selected_gaia_catalog_sources(
         stmt = stmt.on_conflict_do_update(
             constraint="uq_catalog_sources_catalog_source",
             set_={
-                "source_uid": stmt.excluded.source_uid,
-                "ra_deg": stmt.excluded.ra_deg,
-                "dec_deg": stmt.excluded.dec_deg,
-                "epoch": stmt.excluded.epoch,
-                "pmra_masyr": stmt.excluded.pmra_masyr,
-                "pmdec_masyr": stmt.excluded.pmdec_masyr,
-                "ref_mags": stmt.excluded.ref_mags,
-                "colors": stmt.excluded.colors,
-                "source_flags": stmt.excluded.source_flags,
-                "raw_json": stmt.excluded.raw_json,
+                "ra_deg": case(
+                    (table.c.epoch == 2016.0, stmt.excluded.ra_deg),
+                    else_=table.c.ra_deg,
+                ),
+                "dec_deg": case(
+                    (table.c.epoch == 2016.0, stmt.excluded.dec_deg),
+                    else_=table.c.dec_deg,
+                ),
+                "ref_mags": func.coalesce(
+                    table.c.ref_mags, literal({}, type_=JSONB)
+                ).op("||")(stmt.excluded.ref_mags),
             },
         ).returning(table.c.source_id, table.c.catalog_source_id)
         for returned_row in session.execute(stmt).all():

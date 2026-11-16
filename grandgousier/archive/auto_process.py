@@ -5,7 +5,9 @@ import csv
 import hashlib
 import json
 import math
+import os
 import re
+import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -58,6 +60,7 @@ from grandgousier.calibration.photometric_policy import (
     identity_scoped_reference_catalog_name,
     resolve_color_calibration_policy,
 )
+from grandgousier.catalogs import reference_photometry as reference_photometry_module
 from grandgousier.catalogs.reference_photometry import (
     create_reference_photometry_csv,
     import_reference_photometry,
@@ -871,6 +874,7 @@ def process_archive_path(
     current_series_promoted_source_ids: set[str] = set()
     field_pipeline_run_ids_by_series: dict[int, int] = {}
     field_provenance_finalized = False
+    reference_cache_by_fingerprint: dict[str, _ValidatedReferenceCacheEntry] = {}
 
     def finalize_active_working_catalog_field() -> None:
         nonlocal field_provenance_finalized, working_catalog_provenance
@@ -1380,8 +1384,9 @@ def process_archive_path(
                                     policy=color_policy,
                                     identity_catalog_name=effective_catalog_name,
                                     selected_identity_source_ids=selected_source_ids,
-                                    out_dir=series_out_dir,
+                                    out_dir=out_root,
                                     allow_remote_fetch=auto_reference_photometry,
+                                    process_local_cache=reference_cache_by_fingerprint,
                                 )
                             except Exception as exc:  # noqa: BLE001 - preserve ensemble calibration fallback.
                                 session.rollback()
@@ -1445,23 +1450,33 @@ def process_archive_path(
                             int(series["series_id"]), warning_summary
                         )
                     )
-                if reference_result is not None and reference_result.get("csv_path") and series_out_dir:
-                    try:
-                        _snapshot_post_pipeline_artifact(
-                            session,
-                            pipeline_result=pipeline_result,
-                            series_out_dir=series_out_dir,
-                            source_path=str(reference_result["csv_path"]),
-                            series_id=int(series["series_id"]),
-                            artifact_type="REFERENCE_PHOTOMETRY_CACHE",
-                            artifact_role="INPUT_CACHE",
-                        )
-                    except Exception as artifact_exc:  # noqa: BLE001 - science run already completed.
-                        session.rollback()
-                        result.warnings.append(
-                            f"series_id={series['series_id']}: reference artifact registration failed: "
-                            f"{type(artifact_exc).__name__}: {artifact_exc}"
-                        )
+                if (
+                    reference_result is not None
+                    and reference_result.get("cache_provenance")
+                    and series_out_dir
+                ):
+                    for reference_artifact_path in (
+                        reference_result.get("csv_path"),
+                        reference_result.get("manifest_path"),
+                    ):
+                        if not reference_artifact_path:
+                            continue
+                        try:
+                            _snapshot_post_pipeline_artifact(
+                                session,
+                                pipeline_result=pipeline_result,
+                                series_out_dir=series_out_dir,
+                                source_path=str(reference_artifact_path),
+                                series_id=int(series["series_id"]),
+                                artifact_type="REFERENCE_PHOTOMETRY_CACHE",
+                                artifact_role="INPUT_CACHE",
+                            )
+                        except Exception as artifact_exc:  # noqa: BLE001 - science run already completed.
+                            session.rollback()
+                            result.warnings.append(
+                                f"series_id={series['series_id']}: reference artifact registration failed: "
+                                f"{type(artifact_exc).__name__}: {artifact_exc}"
+                            )
                 if pipeline_result.status == "DONE_NO_SCIENCE_FRAMES":
                     pipe_row.update(
                         {
@@ -1677,16 +1692,32 @@ def process_archive_summary_rows(result: ProcessArchiveResult) -> list[dict[str,
                 {"section": "catalog", "metric": "effective_query_mode", "value": item.get("effective_query_mode")},
                 {"section": "catalog", "metric": "mag_limit", "value": item.get("mag_limit")},
                 {"section": "catalog", "metric": "max_radius_deg", "value": item.get("max_radius_deg")},
-                {"section": "catalog", "metric": "queried_frames", "value": item.get("queried_frames")},
-                {"section": "catalog", "metric": "queried_cones", "value": item.get("queried_cones")},
+                {"section": "catalog", "metric": "selected_frames", "value": item.get("selected_frames")},
+                {"section": "catalog", "metric": "raw_cones", "value": item.get("raw_cones")},
+                {
+                    "section": "catalog",
+                    "metric": "unique_footprints",
+                    "value": item.get("unique_footprints", item.get("cone_count")),
+                },
                 {"section": "catalog", "metric": "row_limit_reached_cones", "value": item.get("row_limit_reached_cones")},
-                {"section": "catalog", "metric": "read_rows", "value": item.get("read_rows")},
                 {"section": "catalog", "metric": "logical_queries", "value": item.get("logical_queries")},
                 {"section": "catalog", "metric": "physical_parts", "value": item.get("physical_parts")},
-                {"section": "catalog", "metric": "working_catalog_sources", "value": item.get("working_catalog_sources")},
+                {"section": "catalog", "metric": "provider_attempts", "value": item.get("provider_attempts")},
+                {
+                    "section": "catalog",
+                    "metric": "rows_received",
+                    "value": item.get("rows_received", item.get("read_rows")),
+                },
+                {
+                    "section": "catalog",
+                    "metric": "unique_sources",
+                    "value": item.get(
+                        "unique_sources",
+                        item.get("working_catalog_sources", item.get("n_sources")),
+                    ),
+                },
                 {"section": "catalog", "metric": "provider_failures", "value": item.get("provider_failures")},
                 {"section": "catalog", "metric": "inserted_or_updated", "value": item.get("inserted_or_updated")},
-                {"section": "catalog", "metric": "n_sources", "value": item.get("n_sources")},
                 {"section": "catalog", "metric": "failed_frames", "value": item.get("failed_frames")},
                 {"section": "catalog", "metric": "failed_footprint_reasons", "value": item.get("failed_footprint_reasons")},
                 {"section": "catalog", "metric": "skipped_missing_file", "value": item.get("skipped_missing_file")},
@@ -1705,6 +1736,37 @@ def process_archive_summary_rows(result: ProcessArchiveResult) -> list[dict[str,
                 {"section": f"reference:{i}", "metric": "matched_to_identity", "value": item.get("matched_to_identity")},
             ]
         )
+        for metric in (
+            "selected_identity_count",
+            "already_complete_identity_count",
+            "missing_identity_count",
+            "cache_hit",
+            "cache_miss",
+            "cache_invalid",
+            "logical_query_groups",
+            "provider_requests",
+            "provider_response_bytes_received",
+            "provider_rows_received",
+            "provider_rows_retained",
+            "provider_exact_duplicates_collapsed",
+            "provider_conflicting_source_ids",
+            "provider_conflicting_rows",
+            "matched_rows",
+            "ambiguous_rows",
+            "ambiguous_identities",
+            "unmatched_rows",
+            "unmatched_identities",
+            "imported_or_updated",
+            "band_counts_before",
+            "band_counts_after",
+        ):
+            rows.append(
+                {
+                    "section": f"reference:{i}",
+                    "metric": metric,
+                    "value": item.get(metric),
+                }
+            )
     for i, pipe in enumerate(result.pipeline_results, start=1):
         rows.extend(
             [
@@ -1985,6 +2047,249 @@ def _frame_ids_by_instrument_unit(session: Session, frame_ids: list[int]) -> dic
 
 
 
+_REFERENCE_PHOTOMETRY_CACHE_SCHEMA_VERSION = 3
+_REFERENCE_PHOTOMETRY_PROVIDER_RELEASE = "dr2"
+_REFERENCE_PHOTOMETRY_MATCH_RADIUS_ARCSEC = 1.0
+_REFERENCE_PROVIDER_DIAGNOSTIC_KEYS = (
+    "logical_query_groups",
+    "provider_requests",
+    "provider_response_bytes_received",
+    "provider_rows_received",
+    "provider_rows_retained",
+    "provider_exact_duplicates_collapsed",
+    "provider_conflicting_source_ids",
+    "provider_conflicting_rows",
+    "matched_rows",
+    "ambiguous_rows",
+    "ambiguous_identities",
+    "unmatched_rows",
+    "unmatched_identities",
+)
+
+
+@dataclass(frozen=True)
+class _ValidatedReferenceCacheEntry:
+    csv_path: Path
+    manifest_path: Path
+    manifest: dict[str, Any]
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _selected_reference_grouping_algorithm() -> dict[str, Any]:
+    provider_module = reference_photometry_module
+    return {
+        "name": "greedy_capped_spherical_cones",
+        "version": 1,
+        "limits": {
+            "max_selected_identities": int(provider_module._MAX_SELECTED_IDENTITIES),
+            "max_selected_groups": int(provider_module._MAX_SELECTED_GROUPS),
+            "max_request_radius_deg": float(provider_module._MAX_SELECTED_REQUEST_RADIUS_DEG),
+            "max_response_bytes_per_request": int(
+                provider_module._MAX_SELECTED_RESPONSE_BYTES_PER_REQUEST
+            ),
+            "max_response_bytes_total": int(
+                provider_module._MAX_SELECTED_RESPONSE_BYTES_TOTAL
+            ),
+            "max_response_rows": int(provider_module._MAX_SELECTED_RESPONSE_ROWS),
+            "max_candidate_comparisons": int(
+                provider_module._MAX_SELECTED_CANDIDATE_COMPARISONS
+            ),
+            "radius_decimal_places": int(provider_module._PANSTARRS_RADIUS_DECIMAL_PLACES),
+        },
+    }
+
+
+def _selected_reference_cache_fingerprint(
+    *,
+    provider: str,
+    provider_release: str,
+    identity_catalog_name: str,
+    missing_identity_source_ids: Iterable[str],
+    persisted_identity_sources: Iterable[dict[str, Any]],
+    required_bands: Iterable[str],
+    filters: dict[str, Any],
+    match_radius_arcsec: float,
+    grouping_algorithm: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    identity_ids = sorted(
+        {str(source_id).strip() for source_id in missing_identity_source_ids if str(source_id).strip()}
+    )
+    position_by_id: dict[str, dict[str, Any]] = {}
+    for source in persisted_identity_sources:
+        source_id = str(source.get("source_id", "")).strip()
+        if not source_id:
+            continue
+        ra_deg = float(source["ra_deg"])
+        dec_deg = float(source["dec_deg"])
+        if (
+            not math.isfinite(ra_deg)
+            or not math.isfinite(dec_deg)
+            or not (0.0 <= ra_deg < 360.0)
+            or not (-90.0 <= dec_deg <= 90.0)
+        ):
+            raise ValueError("Persisted selected reference identity positions are invalid")
+        if source_id in position_by_id:
+            raise ValueError("Persisted selected reference identity positions are not unique")
+        position_by_id[source_id] = {
+            "source_id": source_id,
+            "ra_deg": ra_deg,
+            "dec_deg": dec_deg,
+        }
+    if set(position_by_id) != set(identity_ids):
+        raise ValueError("Persisted positions do not match the selected missing reference identities")
+
+    identity_positions = [position_by_id[source_id] for source_id in identity_ids]
+    identity_set_sha256 = _canonical_json_sha256(identity_ids)
+    identity_positions_sha256 = _canonical_json_sha256(identity_positions)
+    provenance = {
+        "schema_version": _REFERENCE_PHOTOMETRY_CACHE_SCHEMA_VERSION,
+        "cache_schema_version": _REFERENCE_PHOTOMETRY_CACHE_SCHEMA_VERSION,
+        "provider": str(provider),
+        "provider_release": str(provider_release),
+        "identity_catalog_name": str(identity_catalog_name),
+        "identity_count": len(identity_ids),
+        "identity_set_sha256": identity_set_sha256,
+        "identity_positions_sha256": identity_positions_sha256,
+        "required_bands": sorted(
+            {str(band).strip().lower() for band in required_bands if str(band).strip()}
+        ),
+        "filters": filters,
+        "match_radius_arcsec": float(match_radius_arcsec),
+        "grouping_algorithm": grouping_algorithm or _selected_reference_grouping_algorithm(),
+    }
+    return _canonical_json_sha256(provenance), provenance
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _reference_cache_csv_row_count(path: Path) -> int:
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        rows = csv.reader(stream)
+        try:
+            next(rows)
+        except StopIteration as exc:
+            raise ValueError("cached reference CSV is empty") from exc
+        return sum(1 for _ in rows)
+
+
+def _validate_selected_reference_cache(
+    *,
+    csv_path: Path,
+    manifest_path: Path,
+    fingerprint: str,
+    expected_provenance: dict[str, Any],
+) -> dict[str, Any]:
+    if not csv_path.is_file() or csv_path.is_symlink():
+        raise ValueError("cached reference CSV is not a regular file")
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise ValueError("cached reference manifest is not a regular file")
+    with manifest_path.open("r", encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    if not isinstance(manifest, dict):
+        raise ValueError("cached reference manifest is not a JSON object")
+    if (
+        type(manifest.get("schema_version")) is not int
+        or manifest.get("schema_version") != _REFERENCE_PHOTOMETRY_CACHE_SCHEMA_VERSION
+    ):
+        raise ValueError("cached reference manifest schema version mismatch")
+    if manifest.get("fingerprint") != fingerprint:
+        raise ValueError("cached reference manifest fingerprint mismatch")
+    if manifest.get("complete") is not True:
+        raise ValueError("cached reference manifest is incomplete")
+    for key, expected_value in expected_provenance.items():
+        if key == "identity_count" and type(manifest.get(key)) is not int:
+            raise ValueError("cached reference manifest has invalid identity_count")
+        if manifest.get(key) != expected_value:
+            raise ValueError(f"cached reference manifest provenance mismatch for {key}")
+    provider_diagnostics = manifest.get("selected_reference_diagnostics")
+    if (
+        not isinstance(provider_diagnostics, dict)
+        or set(provider_diagnostics) != set(_REFERENCE_PROVIDER_DIAGNOSTIC_KEYS)
+    ):
+        raise ValueError("cached reference manifest has an invalid selected-reference diagnostic contract")
+    for key in _REFERENCE_PROVIDER_DIAGNOSTIC_KEYS:
+        value = provider_diagnostics.get(key)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"cached reference manifest has invalid {key}")
+    for manifest_key, diagnostic_key in (
+        ("logical_query_groups", "logical_query_groups"),
+        ("provider_requests", "provider_requests"),
+        ("rows_received", "provider_rows_received"),
+        ("retained_rows", "provider_rows_retained"),
+    ):
+        value = manifest.get(manifest_key)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"cached reference manifest has invalid {manifest_key}")
+        if value != provider_diagnostics[diagnostic_key]:
+            raise ValueError(
+                f"cached reference manifest {manifest_key} does not match selected-reference diagnostics"
+            )
+    if provider_diagnostics["provider_requests"] != provider_diagnostics["logical_query_groups"]:
+        raise ValueError("cached reference manifest provider/group counts do not match")
+    if provider_diagnostics["provider_rows_retained"] > provider_diagnostics["provider_rows_received"]:
+        raise ValueError("cached reference manifest retained-row count exceeds rows received")
+    if provider_diagnostics["provider_rows_retained"] > provider_diagnostics["matched_rows"]:
+        raise ValueError("cached reference manifest retained-row count exceeds matched rows")
+    if provider_diagnostics["matched_rows"] > provider_diagnostics["provider_rows_received"]:
+        raise ValueError("cached reference manifest matched-row count exceeds rows received")
+    if provider_diagnostics["provider_exact_duplicates_collapsed"] > provider_diagnostics[
+        "provider_rows_received"
+    ]:
+        raise ValueError("cached reference manifest duplicate-row count exceeds rows received")
+    if provider_diagnostics["provider_conflicting_rows"] > provider_diagnostics[
+        "provider_rows_received"
+    ]:
+        raise ValueError("cached reference manifest conflicting-row count exceeds rows received")
+    manifest_csv_sha256 = manifest.get("csv_sha256")
+    if not isinstance(manifest_csv_sha256, str) or len(manifest_csv_sha256) != 64:
+        raise ValueError("cached reference manifest has invalid CSV SHA-256")
+    if _file_sha256(csv_path) != manifest_csv_sha256:
+        raise ValueError("cached reference CSV SHA-256 mismatch")
+    if _reference_cache_csv_row_count(csv_path) != provider_diagnostics["provider_rows_retained"]:
+        raise ValueError("cached reference CSV row count mismatch")
+    return manifest
+
+
+def _new_reference_cache_temp_path(cache_dir: Path, *, fingerprint: str, suffix: str) -> Path:
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".panstarrs_dr2_{fingerprint}.",
+        suffix=suffix,
+        dir=cache_dir,
+    )
+    os.close(descriptor)
+    return Path(name)
+
+
+def _fsync_reference_cache_file(path: Path) -> None:
+    with path.open("r+b") as stream:
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _publish_reference_cache_file_no_overwrite(source: Path, destination: Path) -> None:
+    if os.path.lexists(destination):
+        raise FileExistsError(f"Reference cache artifact already exists: {destination}")
+    # On Windows os.rename is an atomic same-volume move and fails if dst exists.
+    # That no-replace behavior prevents concurrent runs from overwriting a cache.
+    os.rename(source, destination)
+
+
 def _ensure_reference_photometry_for_series(
     session: Session,
     *,
@@ -1994,6 +2299,7 @@ def _ensure_reference_photometry_for_series(
     selected_identity_source_ids: Iterable[str] | None,
     out_dir: str | Path | None,
     allow_remote_fetch: bool,
+    process_local_cache: dict[str, _ValidatedReferenceCacheEntry] | None = None,
 ) -> dict[str, Any]:
     """Ensure that a series has enough matched reference-band photometry.
 
@@ -2025,6 +2331,28 @@ def _ensure_reference_photometry_for_series(
         "minimum_sources_per_band": minimum_sources,
         "allow_remote_fetch": bool(allow_remote_fetch),
         "ready": False,
+        "selected_identity_count": 0,
+        "already_complete_identity_count": 0,
+        "missing_identity_count": 0,
+        "cache_hit": False,
+        "cache_miss": False,
+        "cache_invalid": False,
+        "logical_query_groups": None,
+        "provider_requests": None,
+        "provider_response_bytes_received": None,
+        "provider_rows_received": None,
+        "provider_rows_retained": None,
+        "provider_exact_duplicates_collapsed": None,
+        "provider_conflicting_source_ids": None,
+        "provider_conflicting_rows": None,
+        "matched_rows": None,
+        "ambiguous_rows": None,
+        "ambiguous_identities": None,
+        "unmatched_rows": None,
+        "unmatched_identities": None,
+        "imported_or_updated": None,
+        "band_counts_before": {},
+        "band_counts_after": {},
     }
 
     if selected_identity_source_ids is None:
@@ -2042,7 +2370,7 @@ def _ensure_reference_photometry_for_series(
             "reason": "Stage-2 selected no persisted identity sources for reference acquisition",
         }
     try:
-        load_persisted_identity_sources(
+        persisted_identity_sources = load_persisted_identity_sources(
             session,
             identity_catalog_name=identity_catalog_name,
             source_ids=selected_ids,
@@ -2070,7 +2398,26 @@ def _ensure_reference_photometry_for_series(
             "reason": f"{type(exc).__name__}: {exc}",
         }
     base["band_counts_before"] = before_counts
+    base["band_counts_after"] = before_counts
     if _reference_band_coverage_ready(before_counts, required_bands, minimum_sources):
+        try:
+            global_coverage_by_identity = _reference_band_coverage_by_identity(
+                session,
+                identity_catalog_name=identity_catalog_name,
+                reference_catalog_name=provider_catalog_name,
+                selected_identity_source_ids=selected_ids,
+                required_bands=required_bands,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve the existing global-readiness gate.
+            session.rollback()
+            return {
+                **base,
+                "status": "REFERENCE_COVERAGE_CHECK_FAILED",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        _set_reference_identity_coverage_telemetry(
+            base, global_coverage_by_identity, selected_ids, required_bands
+        )
         return {
             **base,
             "status": "READY_EXISTING",
@@ -2093,7 +2440,26 @@ def _ensure_reference_photometry_for_series(
             "status": "SCOPED_REFERENCE_COVERAGE_CHECK_FAILED",
             "reason": f"{type(exc).__name__}: {exc}",
         }
-    base["scoped_band_counts_before"] = scoped_counts
+    base["band_counts_before"] = scoped_counts
+    base["band_counts_after"] = scoped_counts
+    try:
+        scoped_coverage_by_identity = _reference_band_coverage_by_identity(
+            session,
+            identity_catalog_name=identity_catalog_name,
+            reference_catalog_name=scoped_catalog_name,
+            selected_identity_source_ids=selected_ids,
+            required_bands=required_bands,
+        )
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        return {
+            **base,
+            "status": "SCOPED_REFERENCE_COVERAGE_CHECK_FAILED",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    missing_identity_source_ids = _set_reference_identity_coverage_telemetry(
+        base, scoped_coverage_by_identity, selected_ids, required_bands
+    )
     if _reference_band_coverage_ready(scoped_counts, required_bands, minimum_sources):
         return {
             **base,
@@ -2101,6 +2467,16 @@ def _ensure_reference_photometry_for_series(
             "ready": True,
             "effective_reference_catalog_name": scoped_catalog_name,
             "reference_namespace_mode": "identity_scoped",
+        }
+
+    if not missing_identity_source_ids:
+        return {
+            **base,
+            "status": "INSUFFICIENT_REFERENCE_COVERAGE",
+            "reason": (
+                "all selected identities have the required bands, but the scoped catalog "
+                "still has fewer sources than the configured minimum"
+            ),
         }
 
     if not allow_remote_fetch:
@@ -2116,33 +2492,211 @@ def _ensure_reference_photometry_for_series(
             "reason": f"automatic acquisition is not implemented for {provider_catalog_name!r}",
         }
 
-    target_dir = Path(out_dir) / "reference_photometry" if out_dir else Path("exports") / "reference_photometry"
-    csv_path = target_dir / f"series_{series_id}_{provider_catalog_name}.csv"
+    target_dir = (
+        Path(out_dir) / "reference_photometry"
+        if out_dir
+        else Path("exports") / "reference_photometry"
+    )
     max_mag_err = None
     if policy.max_reference_mag_err is not None:
         max_mag_err = {band: float(policy.max_reference_mag_err) for band in required_bands}
     min_mag = {str(policy.reference_band): float(policy.min_reference_mag)} if policy.min_reference_mag is not None else None
     max_mag = {str(policy.reference_band): float(policy.max_reference_mag)} if policy.max_reference_mag is not None else None
+    match_radius_arcsec = _REFERENCE_PHOTOMETRY_MATCH_RADIUS_ARCSEC
+    filters = {
+        "require_bands": sorted(set(required_bands)),
+        "min_mag": min_mag,
+        "max_mag": max_mag,
+        "max_mag_err": max_mag_err,
+        "min_detections": None,
+        "use_remote_filters": True,
+        "limit": None,
+    }
+    target_dir.mkdir(parents=True, exist_ok=True)
+    missing_identity_ids = set(missing_identity_source_ids)
+    fingerprint, cache_provenance = _selected_reference_cache_fingerprint(
+        provider=provider_catalog_name,
+        provider_release=_REFERENCE_PHOTOMETRY_PROVIDER_RELEASE,
+        identity_catalog_name=identity_catalog_name,
+        missing_identity_source_ids=missing_identity_source_ids,
+        persisted_identity_sources=(
+            source
+            for source in persisted_identity_sources
+            if str(source.get("source_id", "")).strip()
+            in missing_identity_ids
+        ),
+        required_bands=required_bands,
+        filters=filters,
+        match_radius_arcsec=match_radius_arcsec,
+    )
+    csv_path = target_dir / f"panstarrs_dr2_{fingerprint}.csv"
+    manifest_path = target_dir / f"panstarrs_dr2_{fingerprint}.json"
+    cache_manifest: dict[str, Any] | None = None
+    cache_hit = False
+    local_cache_entry_reused = False
+    local_entry = (
+        process_local_cache.get(fingerprint)
+        if process_local_cache is not None
+        else None
+    )
+    if (
+        isinstance(local_entry, _ValidatedReferenceCacheEntry)
+        and local_entry.csv_path == csv_path
+        and local_entry.manifest_path == manifest_path
+    ):
+        cache_manifest = json.loads(json.dumps(local_entry.manifest))
+        cache_hit = True
+        local_cache_entry_reused = True
+    else:
+        cache_exists = (os.path.lexists(csv_path), os.path.lexists(manifest_path))
+    if not cache_hit:
+        if any(cache_exists):
+            try:
+                if not all(cache_exists):
+                    raise ValueError("fingerprinted CSV/manifest pair is incomplete")
+                cache_manifest = _validate_selected_reference_cache(
+                    csv_path=csv_path,
+                    manifest_path=manifest_path,
+                    fingerprint=fingerprint,
+                    expected_provenance=cache_provenance,
+                )
+                cache_hit = True
+            except Exception as exc:  # noqa: BLE001 - invalid deterministic artifacts must fail closed.
+                base["cache_invalid"] = True
+                return {
+                    **base,
+                    "status": "REFERENCE_CACHE_INVALID",
+                    "reason": f"invalid existing reference cache: {type(exc).__name__}: {exc}",
+                    "csv_path": str(csv_path),
+                    "manifest_path": str(manifest_path),
+                    "cache_fingerprint": fingerprint,
+                }
+
+    base["cache_hit"] = cache_hit
+    base["cache_miss"] = not cache_hit
+    cache_details: dict[str, Any] = {
+        "csv_path": str(csv_path),
+        "manifest_path": str(manifest_path),
+        "cache_fingerprint": fingerprint,
+    }
+    if cache_manifest is not None:
+        base.update(cache_manifest["selected_reference_diagnostics"])
+        if process_local_cache is not None and not local_cache_entry_reused:
+            process_local_cache[fingerprint] = _ValidatedReferenceCacheEntry(
+                csv_path=csv_path,
+                manifest_path=manifest_path,
+                manifest=json.loads(json.dumps(cache_manifest)),
+            )
 
     try:
-        fetched = create_reference_photometry_csv(
-            session,
-            out_path=csv_path,
-            provider=provider_catalog_name,
-            overwrite=False,
-            require_bands=required_bands,
-            min_mag=min_mag,
-            max_mag=max_mag,
-            max_mag_err=max_mag_err,
-            selected_identity_catalog_name=identity_catalog_name,
-            selected_identity_source_ids=selected_ids,
-            selected_identity_match_radius_arcsec=1.0,
-        )
+        if not cache_hit:
+            csv_temp_path = _new_reference_cache_temp_path(
+                target_dir,
+                fingerprint=fingerprint,
+                suffix=".csv.tmp",
+            )
+            fetched = create_reference_photometry_csv(
+                session,
+                out_path=csv_temp_path,
+                provider=provider_catalog_name,
+                # The exclusively-created temporary file is ours; published cache paths
+                # are always moved with no-replace semantics below.
+                overwrite=True,
+                require_bands=required_bands,
+                min_mag=min_mag,
+                max_mag=max_mag,
+                max_mag_err=max_mag_err,
+                min_detections=None,
+                use_remote_filters=True,
+                selected_identity_catalog_name=identity_catalog_name,
+                selected_identity_source_ids=missing_identity_source_ids,
+                selected_identity_match_radius_arcsec=match_radius_arcsec,
+            )
+            if not csv_temp_path.is_file() or csv_temp_path.is_symlink():
+                raise RuntimeError("reference provider did not finish its temporary CSV")
+            provider_diagnostics = (getattr(fetched, "filter_summary", None) or {}).get(
+                "selected_reference_diagnostics"
+            )
+            if (
+                not isinstance(provider_diagnostics, dict)
+                or set(provider_diagnostics) != set(_REFERENCE_PROVIDER_DIAGNOSTIC_KEYS)
+            ):
+                raise RuntimeError("reference provider omitted selected-acquisition diagnostics")
+            if any(
+                type(value) is not int or value < 0
+                for value in provider_diagnostics.values()
+            ):
+                raise RuntimeError("reference provider returned invalid selected-reference counters")
+            if provider_diagnostics["provider_requests"] != provider_diagnostics[
+                "logical_query_groups"
+            ]:
+                raise RuntimeError("reference provider request/group counts do not match")
+            provider_raw_rows = getattr(fetched, "raw_rows", None)
+            if (
+                type(provider_raw_rows) is not int
+                or provider_raw_rows != provider_diagnostics["provider_rows_received"]
+            ):
+                raise RuntimeError("reference provider row diagnostics do not match rows received")
+            provider_rows_retained = getattr(fetched, "written_rows", None)
+            if (
+                type(provider_rows_retained) is not int
+                or provider_rows_retained != provider_diagnostics["provider_rows_retained"]
+            ):
+                raise RuntimeError("reference provider returned an invalid retained-row count")
+            if _reference_cache_csv_row_count(csv_temp_path) != provider_rows_retained:
+                raise RuntimeError("completed reference CSV row count does not match provider diagnostics")
+            _fsync_reference_cache_file(csv_temp_path)
+            cache_manifest = {
+                **cache_provenance,
+                "fingerprint": fingerprint,
+                "logical_query_groups": provider_diagnostics["logical_query_groups"],
+                "provider_requests": provider_diagnostics["provider_requests"],
+                "rows_received": provider_diagnostics["provider_rows_received"],
+                "retained_rows": provider_diagnostics["provider_rows_retained"],
+                "selected_reference_diagnostics": dict(provider_diagnostics),
+                "csv_sha256": _file_sha256(csv_temp_path),
+                "complete": True,
+            }
+            manifest_temp_path = _new_reference_cache_temp_path(
+                target_dir,
+                fingerprint=fingerprint,
+                suffix=".json.tmp",
+            )
+            manifest_payload = json.dumps(
+                cache_manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            ) + "\n"
+            with manifest_temp_path.open("w", encoding="utf-8", newline="\n") as stream:
+                stream.write(manifest_payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            _publish_reference_cache_file_no_overwrite(csv_temp_path, csv_path)
+            _publish_reference_cache_file_no_overwrite(manifest_temp_path, manifest_path)
+            cache_manifest = _validate_selected_reference_cache(
+                csv_path=csv_path,
+                manifest_path=manifest_path,
+                fingerprint=fingerprint,
+                expected_provenance=cache_provenance,
+            )
+            base.update(cache_manifest["selected_reference_diagnostics"])
+            if process_local_cache is not None:
+                process_local_cache[fingerprint] = _ValidatedReferenceCacheEntry(
+                    csv_path=csv_path,
+                    manifest_path=manifest_path,
+                    manifest=json.loads(json.dumps(cache_manifest)),
+                )
+
+        if cache_manifest is None:
+            raise RuntimeError("reference cache manifest was not available after acquisition")
+        cache_details["cache_provenance"] = cache_manifest
         imported = import_reference_photometry(
             session,
             path=csv_path,
             catalog_name=scoped_catalog_name,
-            catalog_version="dr2",
+            catalog_version=_REFERENCE_PHOTOMETRY_PROVIDER_RELEASE,
             photometric_system=policy.photometric_system or "ps1_ab",
             source_priority=10,
             ra_col="ra",
@@ -2174,17 +2728,19 @@ def _ensure_reference_photometry_for_series(
                 "synthetic_bv_transform": "synthetic_bv_transform",
             },
             match_to_catalog=identity_catalog_name,
-            max_match_arcsec=1.0,
-            selected_identity_source_ids=selected_ids,
+            max_match_arcsec=match_radius_arcsec,
+            selected_identity_source_ids=missing_identity_source_ids,
             requested_identity_source_id_col="selected_identity_source_id",
+            commit=False,
         )
+        base["imported_or_updated"] = int(imported.inserted_or_updated)
     except Exception as exc:  # noqa: BLE001 - reference acquisition is an optional science refinement.
         session.rollback()
         return {
             **base,
+            **cache_details,
             "status": "REFERENCE_ACQUISITION_FAILED",
             "reason": f"{type(exc).__name__}: {exc}",
-            "csv_path": str(csv_path),
         }
 
     try:
@@ -2198,27 +2754,21 @@ def _ensure_reference_photometry_for_series(
         session.rollback()
         return {
             **base,
+            **cache_details,
             "status": "REFERENCE_POST_IMPORT_CHECK_FAILED",
             "reason": f"{type(exc).__name__}: {exc}",
-            "csv_path": str(csv_path),
-            "remote_rows": fetched.raw_rows,
-            "written_rows": fetched.written_rows,
-            "imported_or_updated": imported.inserted_or_updated,
             "matched_to_identity": imported.matched_to_gaia,
         }
     ready = _reference_band_coverage_ready(after_counts, required_bands, minimum_sources)
+    base["band_counts_after"] = after_counts
     return {
         **base,
+        **cache_details,
         "status": "FETCHED_IMPORTED" if ready else "INSUFFICIENT_REFERENCE_COVERAGE",
         "ready": ready,
         "reason": None if ready else "reference import completed but too few matched sources remain",
-        "csv_path": str(csv_path),
-        "remote_rows": fetched.raw_rows,
-        "written_rows": fetched.written_rows,
-        "imported_or_updated": imported.inserted_or_updated,
         "matched_to_identity": imported.matched_to_gaia,
         "unmatched_to_identity": imported.unmatched_to_gaia,
-        "band_counts_after": after_counts,
         "effective_reference_catalog_name": scoped_catalog_name,
         "reference_namespace_mode": "identity_scoped",
     }
@@ -2277,6 +2827,98 @@ def _reference_band_counts_for_series(
         },
     ).mappings().all()
     return {str(row["band"]): int(row["n_sources"] or 0) for row in rows}
+
+
+_REFERENCE_COVERAGE_QUERY_CHUNK_SIZE = 500
+
+
+def _reference_band_coverage_by_identity(
+    session: Session,
+    *,
+    identity_catalog_name: str,
+    reference_catalog_name: str,
+    selected_identity_source_ids: Iterable[str],
+    required_bands: list[str],
+) -> dict[str, set[str]]:
+    """Return normalized required-band coverage for each selected identity.
+
+    The selected identity set is queried in bounded chunks. Identities without
+    any matching reference points remain present with an empty band set.
+    """
+
+    selected_ids = sorted(
+        {str(source_id).strip() for source_id in selected_identity_source_ids if str(source_id).strip()}
+    )
+    required = sorted({str(band).strip().lower() for band in required_bands if str(band).strip()})
+    coverage = {source_id: set() for source_id in selected_ids}
+    if not selected_ids or not required:
+        return coverage
+
+    stmt = text(
+        """
+        SELECT DISTINCT
+            rps.identity_source_id AS identity_source_id,
+            pb.canonical_name AS band
+        FROM reference_photometry_sources rps
+        JOIN reference_photometry_catalogs rpc ON rpc.refcat_id = rps.refcat_id
+        JOIN reference_photometry_points rpp ON rpp.refphot_source_id = rps.refphot_source_id
+        JOIN photometric_bands pb ON pb.band_id = rpp.band_id
+        WHERE rpc.catalog_name = :reference_catalog_name
+          AND rps.identity_catalog_name = :identity_catalog_name
+          AND rps.identity_source_id IN :selected_identity_source_ids
+          AND pb.canonical_name IN :required_bands
+        """
+    ).bindparams(
+        bindparam("selected_identity_source_ids", expanding=True),
+        bindparam("required_bands", expanding=True),
+    )
+    chunk_size = max(1, int(_REFERENCE_COVERAGE_QUERY_CHUNK_SIZE))
+    for offset in range(0, len(selected_ids), chunk_size):
+        chunk = selected_ids[offset : offset + chunk_size]
+        result = session.execute(
+            stmt,
+            {
+                "reference_catalog_name": reference_catalog_name,
+                "identity_catalog_name": identity_catalog_name,
+                "selected_identity_source_ids": chunk,
+                "required_bands": required,
+            },
+        )
+        rows = result.mappings().all() if hasattr(result, "mappings") else result.all()
+        for row in rows:
+            if hasattr(row, "_mapping"):
+                row = row._mapping
+            if hasattr(row, "keys"):
+                source_id = str(row["identity_source_id"])
+                band = str(row["band"]).strip().lower()
+            else:
+                source_id = str(row[0])
+                band = str(row[1]).strip().lower()
+            if source_id in coverage and band in required:
+                coverage[source_id].add(band)
+    return coverage
+
+
+def _set_reference_identity_coverage_telemetry(
+    result: dict[str, Any],
+    coverage_by_identity: dict[str, set[str]],
+    selected_identity_source_ids: list[str],
+    required_bands: list[str],
+) -> list[str]:
+    """Record bounded selected-identity completeness counts and return missing IDs."""
+
+    required = set(required_bands)
+    if required:
+        missing_ids = [
+            source_id
+            for source_id in selected_identity_source_ids
+            if not required.issubset(coverage_by_identity.get(source_id, set()))
+        ]
+    else:
+        missing_ids = list(selected_identity_source_ids)
+    result["already_complete_identity_count"] = len(selected_identity_source_ids) - len(missing_ids)
+    result["missing_identity_count"] = len(missing_ids)
+    return missing_ids
 
 
 def _reference_band_coverage_ready(counts: dict[str, int], required_bands: list[str], minimum_sources: int) -> bool:
@@ -2411,6 +3053,13 @@ def _auto_working_catalog_fetch_provenance(
         duplicate_rows = rows_received - unique_rows
     partial_rows_discarded = bool(diagnostics.get("partial_rows_discarded", False))
     complete = bool(fetch_complete and not partial_rows_discarded)
+    raw_cones = int(diagnostics.get("raw_cones", len(cones)))
+    unique_footprints = diagnostics.get("unique_footprints")
+    if unique_footprints is None:
+        unique_footprints = diagnostics.get("cone_count")
+    if unique_footprints is None:
+        unique_footprints = len(gaia_query._normalise_working_cones(cones))
+    unique_footprints = int(unique_footprints)
     return {
         "provenance_version": 1,
         "field_id": int(field_id),
@@ -2437,7 +3086,9 @@ def _auto_working_catalog_fetch_provenance(
             float(elapsed_seconds) if elapsed_seconds is not None else None
         ),
         "logical_acquisitions": 1,
-        "cone_count": int(diagnostics.get("cone_count", len(cones))),
+        "raw_cones": raw_cones,
+        "cone_count": unique_footprints,
+        "unique_footprints": unique_footprints,
         "logical_queries": int(diagnostics.get("logical_queries") or 0),
         "physical_parts": int(diagnostics.get("physical_parts") or 0),
         "provider_attempts": int(diagnostics.get("provider_attempts") or 0),
@@ -2733,6 +3384,8 @@ def _prepare_auto_working_catalog(
         "field_id": int(field_id),
         "enabled": bool(enabled),
         "frame_ids_count": len(selected_frame_ids),
+        "raw_cones": 0,
+        "unique_footprints": 0,
         "query_mode": "field_union",
         "max_radius_deg": max_radius_deg,
         "mag_limit": mag_limit,
@@ -2786,7 +3439,8 @@ def _prepare_auto_working_catalog(
                     failed_footprint_reasons["invalid_wcs_footprint"] += 1
                     continue
                 cones.append(cone)
-        row["cone_count"] = len(cones)
+        row["raw_cones"] = len(cones)
+        row["unique_footprints"] = len(gaia_query._normalise_working_cones(cones))
         row["failed_footprints"] = sum(failed_footprint_reasons.values())
         row["failed_footprint_reasons"] = dict(sorted(failed_footprint_reasons.items()))
         if failed_footprint_reasons:
@@ -2812,7 +3466,10 @@ def _prepare_auto_working_catalog(
         unique_rows = len(catalog)
         rows_received = int(diagnostics.get("rows_received") or 0)
         fetch_diagnostics = {
-            "cone_count": int(diagnostics.get("cone_count", len(cones))),
+            "raw_cones": int(diagnostics.get("raw_cones", len(cones))),
+            "unique_footprints": int(
+                diagnostics.get("unique_footprints", row["unique_footprints"])
+            ),
             "logical_queries": int(diagnostics.get("logical_queries") or 0),
             "physical_parts": int(diagnostics.get("physical_parts") or 0),
             "provider_attempts": int(diagnostics.get("provider_attempts") or 0),
@@ -2845,6 +3502,8 @@ def _prepare_auto_working_catalog(
         row.update(
             {
                 "status": "DONE_WITH_WARNINGS" if provider_failures else "DONE",
+                "raw_cones": fetch_diagnostics["raw_cones"],
+                "unique_footprints": fetch_diagnostics["unique_footprints"],
                 "logical_queries": fetch_diagnostics["logical_queries"],
                 "physical_parts": fetch_diagnostics["physical_parts"],
                 "provider_attempts": fetch_diagnostics["provider_attempts"],

@@ -500,6 +500,26 @@ def test_fetch_gaia_working_catalog_is_read_only_json_safe_and_uses_async_tap(mo
     assert json.loads(json.dumps(diagnostics))["unique_sources"] == 1
 
 
+def test_fetch_reports_raw_and_exact_unique_footprints():
+    client = _ScriptedAsyncTapClient(
+        [_AsyncTapJob([_working_row("1", 12.0, -3.0, 15.0)])]
+    )
+    catalog, diagnostics = asyncio.run(
+        gq.fetch_gaia_working_catalog(
+            [(12.0, -3.0, 0.5), (12.0, -3.0, 0.5)],
+            max_radius_deg=1.0,
+            providers=[_working_provider(client)],
+        )
+    )
+
+    assert len(catalog) == 1
+    assert diagnostics["raw_cones"] == 2
+    assert diagnostics["unique_footprints"] == 1
+    assert diagnostics["logical_queries"] == 1
+    assert diagnostics["physical_parts"] == 1
+    assert len(client.calls) == 1
+
+
 def _spy_on_default_working_provider(monkeypatch, client):
     build_calls = []
 

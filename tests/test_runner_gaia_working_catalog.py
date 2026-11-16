@@ -54,6 +54,13 @@ def _config(**overrides) -> runner.FieldPipelineConfig:
     return runner.FieldPipelineConfig(**values)
 
 
+def _set_new_promotion_diagnostics(diagnostics_out, source_ids):
+    if diagnostics_out is not None:
+        diagnostics_out.update(
+            promoted_new=len(source_ids), promoted_existing=0
+        )
+
+
 def _install_fake_runner(monkeypatch, detections_by_frame, events=None):
     events = events if events is not None else []
     monkeypatch.setattr(runner, "_check_open_series_admission", lambda *_args: None)
@@ -100,20 +107,23 @@ def test_working_gaia_selection_is_ordered_per_frame_and_projects_only_promoted_
     }
     events = _install_fake_runner(monkeypatch, detections)
     per_frame_matches = []
-    original_match = GaiaWorkingCatalog.match_detections
+    original_match = GaiaWorkingCatalog.select_unique_detection_matches
 
     def record_frame_match(self, *args, **kwargs):
-        matches = original_match(self, *args, **kwargs)
+        matches, diagnostics = original_match(self, *args, **kwargs)
         per_frame_matches.append(matches)
-        return matches
+        return matches, diagnostics
 
-    monkeypatch.setattr(GaiaWorkingCatalog, "match_detections", record_frame_match)
+    monkeypatch.setattr(
+        GaiaWorkingCatalog, "select_unique_detection_matches", record_frame_match
+    )
     promoted_inputs = []
 
-    def promote(_session, actual_catalog, source_ids):
+    def promote(_session, actual_catalog, source_ids, *, diagnostics_out=None):
         events.append("promote")
         assert actual_catalog is catalog
         promoted_inputs.append(list(source_ids))
+        _set_new_promotion_diagnostics(diagnostics_out, source_ids)
         return {source_id: 701}
 
     monkeypatch.setattr(runner, "promote_selected_gaia_sources", promote)
@@ -160,8 +170,9 @@ def test_only_matched_working_sources_are_promoted_and_projected(monkeypatch):
     _install_fake_runner(monkeypatch, {11: [_Detection(101, 10.0)], 12: []})
     promoted_inputs = []
 
-    def promote(_session, _catalog, source_ids):
+    def promote(_session, _catalog, source_ids, *, diagnostics_out=None):
         promoted_inputs.append(list(source_ids))
+        _set_new_promotion_diagnostics(diagnostics_out, source_ids)
         return {"101": 501}
 
     monkeypatch.setattr(runner, "promote_selected_gaia_sources", promote)
@@ -183,12 +194,12 @@ def test_selected_reference_callback_runs_after_promotion_and_preserves_ensemble
 ):
     catalog = GaiaWorkingCatalog([_gaia_row("101", 10.0)])
     events = _install_fake_runner(monkeypatch, {11: [_Detection(101, 10.0)]})
-    monkeypatch.setattr(
-        runner,
-        "promote_selected_gaia_sources",
-        lambda _session, _catalog, source_ids: events.append("persist_selected")
-        or {source_id: 501 for source_id in source_ids},
-    )
+    def promote(_session, _catalog, source_ids, *, diagnostics_out=None):
+        events.append("persist_selected")
+        _set_new_promotion_diagnostics(diagnostics_out, source_ids)
+        return {source_id: 501 for source_id in source_ids}
+
+    monkeypatch.setattr(runner, "promote_selected_gaia_sources", promote)
     monkeypatch.setattr(runner, "match_catalog_to_frames", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
         runner,
@@ -314,8 +325,9 @@ def test_detection_matches_over_working_magnitude_limit_are_not_promoted(monkeyp
     )
     promoted_inputs = []
 
-    def promote(_session, _catalog, source_ids):
+    def promote(_session, _catalog, source_ids, *, diagnostics_out=None):
         promoted_inputs.append(list(source_ids))
+        _set_new_promotion_diagnostics(diagnostics_out, source_ids)
         return {"101": 501}
 
     monkeypatch.setattr(runner, "promote_selected_gaia_sources", promote)
@@ -346,8 +358,9 @@ def test_exact_requested_target_is_added_to_selection_even_without_a_detection_m
     _install_fake_runner(monkeypatch, {11: [_Detection(101, 10.0)], 12: []})
     promoted_inputs = []
 
-    def promote(_session, _catalog, source_ids):
+    def promote(_session, _catalog, source_ids, *, diagnostics_out=None):
         promoted_inputs.append(list(source_ids))
+        _set_new_promotion_diagnostics(diagnostics_out, source_ids)
         return {"101": 501, "202": 502}
 
     monkeypatch.setattr(runner, "promote_selected_gaia_sources", promote)
@@ -372,9 +385,71 @@ def test_exact_requested_target_is_added_to_selection_even_without_a_detection_m
         for step in result.steps
         if step.step_name == "select_and_promote_working_gaia_sources"
     )
-    assert selection["target_source_included"] is True
+    assert selection["explicit_target_included"] is True
     assert selection["selected_gaia_source_count"] == 2
+    assert selection["matching_diagnostics"] == {
+        "detections_considered": 1,
+        "reciprocal_unique_matches": 1,
+        "ambiguous_detections": 0,
+        "conflicting_gaia_sources": 0,
+    }
+    assert selection["automatic_unique_sources"] == 1
+    assert "target_source_included" not in selection
+    assert "automatic_selected_unique_sources" not in selection
+    assert selection["promoted_new"] == 2
+    assert selection["promoted_existing"] == 0
+    assert json.loads(json.dumps(selection)) == selection
     assert "202" not in json.dumps(selection)
+
+
+def test_forced_target_survives_automatic_candidate_ambiguity_and_is_reported(monkeypatch):
+    target_source_id = "202"
+    catalog = GaiaWorkingCatalog(
+        [
+            _gaia_row("101", 10.0),
+            _gaia_row(target_source_id, 10.0 + 0.25 / 3600.0),
+        ]
+    )
+    _install_fake_runner(monkeypatch, {11: [_Detection(101, 10.0)], 12: []})
+    promoted_inputs = []
+
+    def promote(_session, _catalog, source_ids, *, diagnostics_out=None):
+        promoted_inputs.append(list(source_ids))
+        _set_new_promotion_diagnostics(diagnostics_out, source_ids)
+        return {target_source_id: 502}
+
+    monkeypatch.setattr(runner, "promote_selected_gaia_sources", promote)
+    projected = []
+    monkeypatch.setattr(
+        runner,
+        "match_catalog_to_frames",
+        lambda _session, **kwargs: projected.append(kwargs) or {"linked": 1},
+    )
+
+    result = runner.run_field_pipeline(
+        object(),
+        _config(target_source_id=target_source_id),
+        working_catalog=catalog,
+    )
+
+    selection = next(
+        step.result
+        for step in result.steps
+        if step.step_name == "select_and_promote_working_gaia_sources"
+    )
+    assert promoted_inputs == [[target_source_id]]
+    assert projected[0]["catalog_source_ids"] == [502]
+    assert projected[0]["forced_catalog_source_ids"] == [502]
+    assert selection["matching_diagnostics"] == {
+        "detections_considered": 1,
+        "reciprocal_unique_matches": 0,
+        "ambiguous_detections": 1,
+        "conflicting_gaia_sources": 0,
+    }
+    assert selection["automatic_unique_sources"] == 0
+    assert selection["explicit_target_included"] is True
+    assert selection["selected_gaia_source_count"] == 1
+    assert target_source_id not in json.dumps(selection)
 
 
 def test_missing_requested_target_fails_before_pipeline_db_work(monkeypatch):
@@ -451,6 +526,16 @@ def test_empty_selection_keeps_existing_frame_links_available_without_projection
     )
     assert selection["selected_gaia_source_count"] == 0
     assert selection["promotion_status"] == "SKIPPED_NO_SELECTION"
+    assert selection["matching_diagnostics"] == {
+        "detections_considered": 0,
+        "reciprocal_unique_matches": 0,
+        "ambiguous_detections": 0,
+        "conflicting_gaia_sources": 0,
+    }
+    assert selection["automatic_unique_sources"] == 0
+    assert selection["explicit_target_included"] is False
+    assert selection["promoted_new"] == 0
+    assert selection["promoted_existing"] == 0
 
 
 def test_working_catalog_and_arrays_never_enter_recipe_command_or_result_json(

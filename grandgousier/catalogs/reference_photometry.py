@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert
@@ -48,6 +49,18 @@ _CANONICAL_MAG_FIELDS = {
 
 _CANONICAL_BANDS = ("g", "r", "i", "z", "y", "b", "v", "j", "h", "k", "bp", "rp", "g_gaia")
 _IMPORT_CHUNK_SIZE = 500
+
+# Selected-identity acquisition is deliberately kept to small, bounded cones.
+# These limits apply only to that scoped path; manual and field/series cone
+# queries retain their existing provider behavior.
+_MAX_SELECTED_IDENTITIES = 25_000
+_MAX_SELECTED_GROUPS = 128
+_MAX_SELECTED_REQUEST_RADIUS_DEG = 0.1
+_MAX_SELECTED_RESPONSE_BYTES_PER_REQUEST = 4 * 1024 * 1024
+_MAX_SELECTED_RESPONSE_BYTES_TOTAL = 32 * 1024 * 1024
+_MAX_SELECTED_RESPONSE_ROWS = 50_000
+_MAX_SELECTED_CANDIDATE_COMPARISONS = 2_000_000
+_PANSTARRS_RADIUS_DECIMAL_PLACES = 8
 
 
 # Tonry et al. (2012), Table 6: Johnson/Cousins Vega magnitudes synthesized
@@ -183,6 +196,7 @@ def create_reference_photometry_csv(
         raise FileExistsError(f"Output file already exists: {out}. Use --overwrite to replace it.")
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    selected_reference_diagnostics = None
     if selected_sources is None:
         df, url, remote_filter_params, tls_info = _fetch_panstarrs_dr2_mean_csv(
             cone["ra_deg"],
@@ -198,33 +212,23 @@ def create_reference_photometry_csv(
         raw_rows = len(df)
         export = _standardize_panstarrs_reference_dataframe(df)
     else:
-        exports = []
-        raw_rows = 0
         url = None
-        remote_filter_params = {}
-        tls_info = {"source": None, "path": None}
-        radius_deg = float(selected_identity_match_radius_arcsec) / 3600.0
-        for identity in selected_sources:
-            df, request_url, filters, request_tls_info = _fetch_panstarrs_dr2_mean_csv(
-                identity["ra_deg"],
-                identity["dec_deg"],
-                radius_deg,
-                require_bands=require_bands,
-                min_mag=min_mag,
-                max_mag=max_mag,
-                max_mag_err=max_mag_err,
-                min_detections=min_detections,
-                use_remote_filters=use_remote_filters,
-            )
-            raw_rows += len(df)
-            standardized = _standardize_panstarrs_reference_dataframe(df)
-            standardized["selected_identity_source_id"] = identity["source_id"]
-            exports.append(standardized)
-            if url is None:
-                url = request_url
-                remote_filter_params = dict(filters)
-                tls_info = dict(request_tls_info)
-        export = pd.concat(exports, ignore_index=True) if exports else pd.DataFrame()
+        (
+            export,
+            raw_rows,
+            remote_filter_params,
+            tls_info,
+            selected_reference_diagnostics,
+        ) = _fetch_selected_identity_panstarrs_rows(
+            selected_sources,
+            match_radius_arcsec=float(selected_identity_match_radius_arcsec),
+            require_bands=require_bands,
+            min_mag=min_mag,
+            max_mag=max_mag,
+            max_mag_err=max_mag_err,
+            min_detections=min_detections,
+            use_remote_filters=use_remote_filters,
+        )
     skipped = raw_rows - len(export)
     filtered, filter_summary = _filter_reference_export_dataframe(
         export,
@@ -237,16 +241,20 @@ def create_reference_photometry_csv(
     filtered_rows = len(export) - len(filtered)
     filter_summary["remote_filters_enabled"] = bool(use_remote_filters)
     filter_summary["remote_filter_params"] = dict(remote_filter_params)
-    filter_summary["remote_query_rows"] = int(raw_rows)
+    if selected_sources is None:
+        filter_summary["remote_query_rows"] = int(raw_rows)
     if selected_sources is not None:
         filter_summary["scope"] = "selected_identity_sources"
         filter_summary["selected_identity_count"] = len(selected_sources)
         filter_summary["selected_identity_match_radius_arcsec"] = float(
             selected_identity_match_radius_arcsec
         )
+        filter_summary["selected_reference_diagnostics"] = selected_reference_diagnostics
     if limit is not None:
         filtered = filtered.head(limit)
         filter_summary["limit"] = int(limit)
+    if selected_sources is not None:
+        selected_reference_diagnostics["provider_rows_retained"] = int(len(filtered))
     filtered.to_csv(out, index=False)
 
     import_command = _make_reference_csv_import_command(out)
@@ -273,6 +281,429 @@ def create_reference_photometry_csv(
     )
 
 
+def _fetch_selected_identity_panstarrs_rows(
+    selected_sources: list[dict],
+    *,
+    match_radius_arcsec: float,
+    require_bands: Iterable[str] | None,
+    min_mag: dict[str, float] | None,
+    max_mag: dict[str, float] | None,
+    max_mag_err: dict[str, float] | None,
+    min_detections: int | None,
+    use_remote_filters: bool,
+) -> tuple[pd.DataFrame, int, dict, dict[str, str | None], dict]:
+    groups = _group_selected_identity_sources(
+        selected_sources,
+        match_radius_arcsec=match_radius_arcsec,
+    )
+    response_frames: list[pd.DataFrame] = []
+    response_bytes = 0
+    provider_rows_received = 0
+    provider_requests = 0
+    remote_filter_params: dict = {}
+    tls_info: dict[str, str | None] = {"source": None, "path": None}
+
+    for group in groups:
+        remaining_bytes = _MAX_SELECTED_RESPONSE_BYTES_TOTAL - response_bytes
+        if remaining_bytes <= 0:
+            raise RuntimeError(
+                "Selected-identity Pan-STARRS response-byte budget exhausted before all groups completed"
+            )
+        request_byte_limit = min(
+            _MAX_SELECTED_RESPONSE_BYTES_PER_REQUEST,
+            remaining_bytes,
+        )
+        provider_requests += 1
+        frame, _request_url, filters, request_tls_info = _fetch_panstarrs_dr2_mean_csv(
+            group["ra_deg"],
+            group["dec_deg"],
+            group["radius_deg"],
+            require_bands=require_bands,
+            min_mag=min_mag,
+            max_mag=max_mag,
+            max_mag_err=max_mag_err,
+            min_detections=min_detections,
+            use_remote_filters=use_remote_filters,
+            max_response_bytes=request_byte_limit,
+        )
+        received_bytes = _panstarrs_frame_response_bytes(frame)
+        if received_bytes > request_byte_limit:
+            raise RuntimeError(
+                "Selected-identity Pan-STARRS response exceeded its byte budget; refusing partial results"
+            )
+        response_bytes += received_bytes
+        provider_rows_received += len(frame)
+        if provider_rows_received > _MAX_SELECTED_RESPONSE_ROWS:
+            raise RuntimeError(
+                "Selected-identity Pan-STARRS response exceeded its row budget; refusing partial results"
+            )
+        response_frames.append(frame)
+        if len(response_frames) == 1:
+            remote_filter_params = dict(filters)
+            tls_info = dict(request_tls_info)
+
+    provider_rows = (
+        pd.concat(response_frames, ignore_index=True, sort=False)
+        if response_frames
+        else pd.DataFrame()
+    )
+    provider_rows, duplicate_diagnostics = _deduplicate_selected_panstarrs_rows(
+        provider_rows
+    )
+    matched_positions, matched_identity_ids, graph_diagnostics = (
+        _strict_selected_provider_row_matches(
+            provider_rows,
+            selected_sources,
+            match_radius_arcsec=match_radius_arcsec,
+        )
+    )
+    selected_rows = provider_rows.iloc[matched_positions].copy().reset_index(drop=True)
+    if not selected_rows.empty:
+        # Pan-STARRS may spell the wrap point as 360.0; normalize selected
+        # output so downstream RA validation sees the canonical [0, 360) form.
+        selected_rows["raMean"] = selected_rows["raMean"].astype(float) % 360.0
+    export = _standardize_panstarrs_reference_dataframe(selected_rows)
+    if len(export) != len(matched_identity_ids):
+        raise RuntimeError(
+            "A strict selected Pan-STARRS match could not be standardized; refusing partial results"
+        )
+    export["selected_identity_source_id"] = matched_identity_ids
+    if not export.empty:
+        output_order = sorted(
+            range(len(export)),
+            key=lambda position: (
+                _selected_identifier_sort_key(
+                    export.at[position, "selected_identity_source_id"]
+                ),
+                _selected_identifier_sort_key(export.at[position, "catalog_source_id"]),
+                float(export.at[position, "ra"]),
+                float(export.at[position, "dec"]),
+            ),
+        )
+        export = export.iloc[output_order].reset_index(drop=True)
+
+    diagnostics = {
+        "logical_query_groups": len(groups),
+        "provider_requests": provider_requests,
+        "provider_response_bytes_received": response_bytes,
+        "provider_rows_received": provider_rows_received,
+        **duplicate_diagnostics,
+        **graph_diagnostics,
+    }
+    return export, provider_rows_received, remote_filter_params, tls_info, diagnostics
+
+
+def _group_selected_identity_sources(
+    selected_sources: list[dict],
+    *,
+    match_radius_arcsec: float,
+) -> list[dict]:
+    """Greedily form deterministic, complete, capped spherical cone groups."""
+
+    if not math.isfinite(match_radius_arcsec) or match_radius_arcsec <= 0.0:
+        raise ValueError("Selected-identity match radius must be positive and finite")
+    if len(selected_sources) > _MAX_SELECTED_IDENTITIES:
+        raise ValueError("Selected-identity acquisition exceeds the identity-count cap")
+    if not selected_sources:
+        raise ValueError("Selected-identity acquisition requires at least one identity")
+
+    normalized_sources = []
+    seen_ids: set[str] = set()
+    for source in selected_sources:
+        source_id = _to_text(source.get("source_id"))
+        ra = _to_float(source.get("ra_deg"))
+        dec = _to_float(source.get("dec_deg"))
+        if not source_id or source_id in seen_ids:
+            raise ValueError("Selected identities must have unique, non-empty source IDs")
+        if (
+            ra is None
+            or dec is None
+            or not (0.0 <= ra < 360.0)
+            or not (-90.0 <= dec <= 90.0)
+        ):
+            raise ValueError("Selected identity coordinates are invalid")
+        seen_ids.add(source_id)
+        normalized_sources.append({**source, "source_id": source_id, "ra_deg": ra, "dec_deg": dec})
+    normalized_sources.sort(key=lambda source: source["source_id"])
+
+    max_request_radius_deg = float(_MAX_SELECTED_REQUEST_RADIUS_DEG)
+    if not math.isfinite(max_request_radius_deg) or max_request_radius_deg <= 0.0:
+        raise ValueError("Selected-identity request-radius cap must be positive and finite")
+    match_radius_deg = match_radius_arcsec / 3600.0
+    if match_radius_deg > max_request_radius_deg:
+        raise ValueError("Selected-identity match radius exceeds the request-radius cap")
+    minimum_request_radius = _ceil_panstarrs_radius(match_radius_deg)
+    if minimum_request_radius > max_request_radius_deg:
+        raise ValueError("Selected-identity match radius exceeds the request-radius cap")
+
+    ras = np.asarray([source["ra_deg"] for source in normalized_sources], dtype=float)
+    decs = np.asarray([source["dec_deg"] for source in normalized_sources], dtype=float)
+    remaining = np.ones(len(normalized_sources), dtype=bool)
+    groups: list[dict] = []
+    while remaining.any():
+        center_index = int(np.flatnonzero(remaining)[0])
+        available = np.flatnonzero(remaining)
+        separations_arcsec = _angular_separations_arcsec(
+            ras[center_index],
+            decs[center_index],
+            ras[available],
+            decs[available],
+        )
+        request_radii = np.ceil(
+            (separations_arcsec / 3600.0 + match_radius_deg)
+            * (10**_PANSTARRS_RADIUS_DECIMAL_PLACES)
+        ) / (10**_PANSTARRS_RADIUS_DECIMAL_PLACES)
+        in_group = request_radii <= max_request_radius_deg
+        member_indices = available[in_group]
+        if not len(member_indices):
+            # The center itself must fit; this also protects against invalid
+            # limits or precision changes in provider URL formatting.
+            raise ValueError("Selected identity cannot be covered by a capped provider cone")
+        group_radius = float(np.max(request_radii[in_group]))
+        if group_radius > max_request_radius_deg:
+            raise ValueError("Selected identity group exceeds the request-radius cap")
+        if len(groups) >= _MAX_SELECTED_GROUPS:
+            raise ValueError("Selected-identity acquisition exceeds the group/request cap")
+        groups.append(
+            {
+                "ra_deg": float(ras[center_index]),
+                "dec_deg": float(decs[center_index]),
+                "radius_deg": group_radius,
+                "source_indices": member_indices.tolist(),
+            }
+        )
+        remaining[member_indices] = False
+    return groups
+
+
+def _ceil_panstarrs_radius(radius_deg: float) -> float:
+    scale = 10**_PANSTARRS_RADIUS_DECIMAL_PLACES
+    return math.ceil(float(radius_deg) * scale) / scale
+
+
+def _panstarrs_frame_response_bytes(frame: pd.DataFrame) -> int:
+    value = frame.attrs.get("reference_response_bytes")
+    if value is None:
+        # Test doubles and other injected providers may not set transport
+        # metadata; use a deterministic serialized-size fallback for them.
+        return len(frame.to_csv(index=False).encode("utf-8"))
+    try:
+        size = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Pan-STARRS response byte metadata is invalid") from exc
+    if size < 0:
+        raise RuntimeError("Pan-STARRS response byte metadata is invalid")
+    return size
+
+
+def _selected_identifier_sort_key(value) -> tuple[int, int | str]:
+    text = _to_text(value)
+    try:
+        return 0, int(text)
+    except ValueError:
+        return 1, text
+
+
+def _selected_panstarrs_scientific_payload(row) -> dict[str, float | str | None]:
+    """Return normalized values used to standardize a selected Pan-STARRS row."""
+
+    ra = _to_float(row.get("raMean"))
+    if ra is not None and 0.0 <= ra <= 360.0:
+        ra %= 360.0
+    dec = _to_float(row.get("decMean"))
+    if dec == 0.0:
+        dec = 0.0
+
+    payload: dict[str, float | str | None] = {
+        "raMean": ra,
+        "decMean": dec,
+    }
+    for band in ("g", "r", "i", "z", "y"):
+        mag = _ps1_mag(row.get(f"{band}MeanPSFMag"))
+        mag_err = _ps1_magerr(row.get(f"{band}MeanPSFMagErr"))
+        payload[f"{band}MeanPSFMag"] = 0.0 if mag == 0.0 else mag
+        payload[f"{band}MeanPSFMagErr"] = 0.0 if mag_err == 0.0 else mag_err
+
+    detections = _to_float(row.get("nDetections"))
+    payload["nDetections"] = 0.0 if detections == 0.0 else detections
+    for field_name in ("qualityFlag", "objInfoFlag"):
+        flag = _to_text(row.get(field_name))
+        payload[field_name] = flag or None
+    return payload
+
+
+def _deduplicate_selected_panstarrs_rows(
+    provider_rows: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Collapse identical source payloads and reject every row for conflicting IDs."""
+
+    rows_by_external_id: dict[str, list[int]] = {}
+    unidentified_positions: list[int] = []
+    for position in range(len(provider_rows)):
+        external_id = _to_text(provider_rows.iloc[position].get("objID"))
+        if not external_id:
+            unidentified_positions.append(position)
+        else:
+            rows_by_external_id.setdefault(external_id, []).append(position)
+
+    records = []
+    exact_duplicates_collapsed = 0
+    conflicting_source_ids = 0
+    conflicting_rows = 0
+    for external_id in sorted(rows_by_external_id, key=_selected_identifier_sort_key):
+        positions = rows_by_external_id[external_id]
+        payloads = [
+            _selected_panstarrs_scientific_payload(provider_rows.iloc[position])
+            for position in positions
+        ]
+        payload_keys = [tuple(payload.items()) for payload in payloads]
+        if any(payload_key != payload_keys[0] for payload_key in payload_keys[1:]):
+            conflicting_source_ids += 1
+            conflicting_rows += len(positions)
+            continue
+
+        exact_duplicates_collapsed += len(positions) - 1
+        record = provider_rows.iloc[positions[0]].to_dict()
+        record.update(payloads[0])
+        record["objID"] = external_id
+        records.append(record)
+
+    records.extend(provider_rows.iloc[position].to_dict() for position in unidentified_positions)
+    deduplicated = pd.DataFrame.from_records(records, columns=provider_rows.columns)
+    return deduplicated, {
+        "provider_exact_duplicates_collapsed": exact_duplicates_collapsed,
+        "provider_conflicting_source_ids": conflicting_source_ids,
+        "provider_conflicting_rows": conflicting_rows,
+    }
+
+
+def _strict_selected_provider_row_matches(
+    provider_rows: pd.DataFrame,
+    selected_sources: list[dict],
+    *,
+    match_radius_arcsec: float,
+) -> tuple[list[int], list[str], dict]:
+    """Build a bounded spherical candidate graph and keep reciprocal 1:1 edges."""
+
+    required_columns = {"objID", "raMean", "decMean"}
+    if len(provider_rows) and not required_columns.issubset(provider_rows.columns):
+        raise RuntimeError("Pan-STARRS selected-scope response is missing identity columns")
+
+    identity_sources = sorted(selected_sources, key=lambda source: str(source["source_id"]))
+    identity_ids = [str(source["source_id"]) for source in identity_sources]
+    identity_id_set = set(identity_ids)
+    if len(identity_ids) != len(identity_id_set):
+        raise ValueError("Selected identities must have unique source IDs")
+    identity_ras = np.asarray([float(source["ra_deg"]) for source in identity_sources], dtype=float)
+    identity_decs = np.asarray([float(source["dec_deg"]) for source in identity_sources], dtype=float)
+    dec_order = np.argsort(identity_decs, kind="stable")
+    sorted_decs = identity_decs[dec_order]
+
+    rows_by_external_id: dict[str, int] = {}
+    conflicting_external_ids: set[str] = set()
+    invalid_external_rows = 0
+    for position in range(len(provider_rows)):
+        row = provider_rows.iloc[position]
+        external_id = _to_text(row.get("objID"))
+        ra = _to_float(row.get("raMean"))
+        dec = _to_float(row.get("decMean"))
+        if not external_id:
+            invalid_external_rows += 1
+            continue
+        if external_id in rows_by_external_id:
+            first = provider_rows.iloc[rows_by_external_id[external_id]]
+            first_ra = _to_float(first.get("raMean"))
+            first_dec = _to_float(first.get("decMean"))
+            if (
+                ra is None
+                or dec is None
+                or not (0.0 <= ra <= 360.0)
+                or not (-90.0 <= dec <= 90.0)
+                or first_ra is None
+                or first_dec is None
+                or angular_sep_arcsec(ra % 360.0, dec, first_ra % 360.0, first_dec) > 1e-6
+            ):
+                conflicting_external_ids.add(external_id)
+        elif (
+            ra is None
+            or dec is None
+            or not (0.0 <= ra <= 360.0)
+            or not (-90.0 <= dec <= 90.0)
+        ):
+            rows_by_external_id[external_id] = position
+            conflicting_external_ids.add(external_id)
+            continue
+        else:
+            rows_by_external_id[external_id] = position
+
+    radius_deg = match_radius_arcsec / 3600.0
+    candidate_ids_by_external: dict[str, list[str]] = {}
+    external_ids_by_identity: dict[str, set[str]] = {}
+    comparisons = 0
+    for external_id, position in rows_by_external_id.items():
+        if external_id in conflicting_external_ids:
+            continue
+        row = provider_rows.iloc[position]
+        ra = float(row["raMean"]) % 360.0
+        dec = float(row["decMean"])
+        lower = int(np.searchsorted(sorted_decs, dec - radius_deg, side="left"))
+        upper = int(np.searchsorted(sorted_decs, dec + radius_deg, side="right"))
+        candidate_indices = dec_order[lower:upper]
+        comparisons += len(candidate_indices)
+        if comparisons > _MAX_SELECTED_CANDIDATE_COMPARISONS:
+            raise RuntimeError(
+                "Selected-identity candidate graph exceeded its comparison cap; refusing partial results"
+            )
+        if not len(candidate_indices):
+            candidate_ids_by_external[external_id] = []
+            continue
+        separations = _angular_separations_arcsec(
+            ra,
+            dec,
+            identity_ras[candidate_indices],
+            identity_decs[candidate_indices],
+        )
+        matched_indices = candidate_indices[separations <= match_radius_arcsec]
+        matched_ids = [identity_ids[int(index)] for index in matched_indices]
+        candidate_ids_by_external[external_id] = matched_ids
+        for identity_id in matched_ids:
+            external_ids_by_identity.setdefault(identity_id, set()).add(external_id)
+
+    accepted_positions: list[int] = []
+    accepted_identity_ids: list[str] = []
+    ambiguous_external_ids: set[str] = set(conflicting_external_ids)
+    accepted_identity_set: set[str] = set()
+    for external_id, candidates in candidate_ids_by_external.items():
+        if len(candidates) != 1:
+            if candidates:
+                ambiguous_external_ids.add(external_id)
+            continue
+        identity_id = candidates[0]
+        if len(external_ids_by_identity.get(identity_id, ())) != 1:
+            ambiguous_external_ids.add(external_id)
+            continue
+        accepted_positions.append(rows_by_external_id[external_id])
+        accepted_identity_ids.append(identity_id)
+        accepted_identity_set.add(identity_id)
+
+    candidate_identity_ids = set(external_ids_by_identity)
+    ambiguous_identity_ids = candidate_identity_ids - accepted_identity_set
+    unmatched_rows = invalid_external_rows + sum(
+        not candidates
+        for external_id, candidates in candidate_ids_by_external.items()
+        if external_id not in conflicting_external_ids
+    )
+    unmatched_identities = len(identity_id_set - candidate_identity_ids)
+    diagnostics = {
+        "matched_rows": len(accepted_positions),
+        "ambiguous_rows": len(ambiguous_external_ids),
+        "ambiguous_identities": len(ambiguous_identity_ids),
+        "unmatched_rows": int(unmatched_rows),
+        "unmatched_identities": int(unmatched_identities),
+    }
+    return accepted_positions, accepted_identity_ids, diagnostics
+
+
 def import_reference_photometry(
     session: Session,
     *,
@@ -295,6 +726,7 @@ def import_reference_photometry(
     dry_run: bool = False,
     selected_identity_source_ids: Iterable[str] | None = None,
     requested_identity_source_id_col: str | None = None,
+    commit: bool = True,
 ) -> ImportReferencePhotometryResult:
     """Import external reference photometry into normalized source/band/point rows.
 
@@ -510,7 +942,8 @@ def import_reference_photometry(
         try:
             session.execute(stmt)
         except SQLAlchemyError as exc:
-            session.rollback()
+            if commit:
+                session.rollback()
             first_id = chunk[0].get("catalog_source_id") if chunk else None
             last_id = chunk[-1].get("catalog_source_id") if chunk else None
             raise RuntimeError(
@@ -561,7 +994,8 @@ def import_reference_photometry(
     for point_chunk in _chunks(point_rows, _IMPORT_CHUNK_SIZE):
         session.execute(insert(point_table).values(point_chunk))
 
-    session.commit()
+    if commit:
+        session.commit()
     return result
 
 
@@ -659,7 +1093,7 @@ def diagnose_reference_photometry(
     identity_catalog_name: str | None = None,
     reference_catalog_name: str | None = None,
 ) -> ReferencePhotometryDiagnostics:
-    identity_catalog_name = identity_catalog_name or "gaia_dr3_master"
+    identity_catalog_name = identity_catalog_name or "gaia_dr3"
     source_ids = _field_identity_source_ids(
         session,
         field_id=field_id,
@@ -1048,6 +1482,7 @@ def _fetch_panstarrs_dr2_mean_csv(
     max_mag_err: dict[str, float] | None = None,
     min_detections: int | None = None,
     use_remote_filters: bool = True,
+    max_response_bytes: int | None = None,
 ) -> tuple[pd.DataFrame, str, dict, dict[str, str | None]]:
     columns = [
         "objID",
@@ -1089,7 +1524,17 @@ def _fetch_panstarrs_dr2_mean_csv(
     ssl_context, tls_info = _build_reference_https_context()
     try:
         with urllib.request.urlopen(request, timeout=120, context=ssl_context) as response:
-            payload = response.read().decode("utf-8")
+            if max_response_bytes is None:
+                response_payload = response.read()
+            else:
+                byte_limit = int(max_response_bytes)
+                if byte_limit <= 0:
+                    raise ValueError("max_response_bytes must be positive")
+                response_payload = response.read(byte_limit + 1)
+                if len(response_payload) > byte_limit:
+                    raise RuntimeError(
+                        "Pan-STARRS response exceeded the configured byte limit; refusing partial results"
+                    )
     except urllib.error.URLError as exc:
         hint = ""
         if remote_filter_params:
@@ -1098,7 +1543,8 @@ def _fetch_panstarrs_dr2_mean_csv(
         raise RuntimeError(
             f"Failed to fetch Pan-STARRS DR2 CSV from MAST: {exc}.{hint}{tls_hint}"
         ) from exc
-    df = pd.read_csv(io.StringIO(payload))
+    df = pd.read_csv(io.StringIO(response_payload.decode("utf-8")))
+    df.attrs["reference_response_bytes"] = len(response_payload)
     return df, url, remote_filter_params, tls_info
 
 
@@ -1769,6 +2215,27 @@ def angular_sep_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> floa
     a = sd * sd + math.cos(d1) * math.cos(d2) * sr * sr
     a = min(1.0, max(0.0, a))
     return math.degrees(2.0 * math.asin(math.sqrt(a))) * 3600.0
+
+
+def _angular_separations_arcsec(
+    ra_deg: float,
+    dec_deg: float,
+    other_ra_deg: np.ndarray,
+    other_dec_deg: np.ndarray,
+) -> np.ndarray:
+    """Vectorized great-circle separations, stable across RA wrap and the poles."""
+
+    ra1 = math.radians(float(ra_deg))
+    dec1 = math.radians(float(dec_deg))
+    ra2 = np.radians(np.asarray(other_ra_deg, dtype=float))
+    dec2 = np.radians(np.asarray(other_dec_deg, dtype=float))
+    delta_dec = dec2 - dec1
+    delta_ra = (ra2 - ra1 + np.pi) % (2.0 * np.pi) - np.pi
+    haversine = (
+        np.sin(delta_dec / 2.0) ** 2
+        + math.cos(dec1) * np.cos(dec2) * np.sin(delta_ra / 2.0) ** 2
+    )
+    return np.degrees(2.0 * np.arcsin(np.sqrt(np.clip(haversine, 0.0, 1.0)))) * 3600.0
 
 
 def _field_identity_source_ids(session: Session, *, field_id: int | None, identity_catalog_name: str) -> list[str]:

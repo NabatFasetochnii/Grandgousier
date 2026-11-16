@@ -105,6 +105,105 @@ def test_equal_separation_ties_are_deterministic_by_detection_then_source_order(
     ]
 
 
+def test_reciprocal_unique_selection_accepts_one_detection_to_one_gaia():
+    catalog = gq.GaiaWorkingCatalog([_row("41", 10.0, 0.0)])
+
+    matches, diagnostics = catalog.select_unique_detection_matches(
+        [7], [10.0], [0.0], radius_arcsec=1.0
+    )
+
+    assert [(detection_id, source_id) for detection_id, source_id, _sep in matches] == [
+        (7, "41")
+    ]
+    assert diagnostics == {
+        "detections_considered": 1,
+        "reciprocal_unique_matches": 1,
+        "ambiguous_detections": 0,
+        "conflicting_gaia_sources": 0,
+    }
+
+
+def test_reciprocal_unique_selection_rejects_one_detection_to_two_gaia():
+    catalog = gq.GaiaWorkingCatalog(
+        [_row("41", 10.0 - 0.25 / 3600.0, 0.0), _row("42", 10.0 + 0.25 / 3600.0, 0.0)]
+    )
+
+    matches, diagnostics = catalog.select_unique_detection_matches(
+        [7], [10.0], [0.0], radius_arcsec=1.0
+    )
+
+    assert matches == []
+    assert diagnostics == {
+        "detections_considered": 1,
+        "reciprocal_unique_matches": 0,
+        "ambiguous_detections": 1,
+        "conflicting_gaia_sources": 0,
+    }
+
+
+def test_reciprocal_unique_selection_rejects_two_detections_competing_for_one_gaia():
+    catalog = gq.GaiaWorkingCatalog([_row("41", 10.0, 0.0)])
+
+    matches, diagnostics = catalog.select_unique_detection_matches(
+        [7, 8],
+        [10.0 - 0.25 / 3600.0, 10.0 + 0.25 / 3600.0],
+        [0.0, 0.0],
+        radius_arcsec=1.0,
+    )
+
+    assert matches == []
+    assert diagnostics == {
+        "detections_considered": 2,
+        "reciprocal_unique_matches": 0,
+        "ambiguous_detections": 0,
+        "conflicting_gaia_sources": 1,
+    }
+
+
+def test_reciprocal_unique_selection_keeps_separated_two_by_two_pairs():
+    catalog = gq.GaiaWorkingCatalog(
+        [_row("41", 10.0, 0.0), _row("42", 10.01, 0.0)]
+    )
+
+    matches, diagnostics = catalog.select_unique_detection_matches(
+        [7, 8], [10.0, 10.01], [0.0, 0.0], radius_arcsec=1.0
+    )
+
+    assert [(detection_id, source_id) for detection_id, source_id, _sep in matches] == [
+        (7, "41"),
+        (8, "42"),
+    ]
+    assert diagnostics == {
+        "detections_considered": 2,
+        "reciprocal_unique_matches": 2,
+        "ambiguous_detections": 0,
+        "conflicting_gaia_sources": 0,
+    }
+
+
+def test_equal_distance_tie_is_diagnostic_only_not_promotion_authority():
+    catalog = gq.GaiaWorkingCatalog(
+        [_row("2", 10.0 + 0.5 / 3600.0, 0.0), _row("1", 10.0 - 0.5 / 3600.0, 0.0)]
+    )
+
+    diagnostic_match = catalog.match_detections(
+        [7], [10.0], [0.0], radius_arcsec=1.0
+    )
+    selected, diagnostics = catalog.select_unique_detection_matches(
+        [7], [10.0], [0.0], radius_arcsec=1.0
+    )
+
+    assert diagnostic_match[0][1] == "1"
+    assert selected == []
+    assert diagnostics == {
+        "detections_considered": 1,
+        "reciprocal_unique_matches": 0,
+        "ambiguous_detections": 1,
+        "conflicting_gaia_sources": 0,
+    }
+    assert all(isinstance(value, int) for value in diagnostics.values())
+
+
 def test_working_catalog_match_handles_ra_wrap_and_poles():
     catalog = gq.GaiaWorkingCatalog(
         [_row("1", 359.9999, 0.0), _row("2", 200.0, 90.0)]

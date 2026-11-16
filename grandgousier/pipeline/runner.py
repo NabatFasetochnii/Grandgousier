@@ -663,15 +663,27 @@ def _select_and_promote_working_gaia_sources(
         limit=None,
     )
     eligible_frame_ids = [int(frame.frame_id) for frame in frames]
+    matching_diagnostics = {
+        "detections_considered": 0,
+        "reciprocal_unique_matches": 0,
+        "ambiguous_detections": 0,
+        "conflicting_gaia_sources": 0,
+    }
+    promotion_diagnostics = {"promoted_new": 0, "promoted_existing": 0}
+    automatic_unique_sources = 0
     if source_detection_run_id is None:
         return [], None, {
-            "eligible_frames": len(eligible_frame_ids),
+            "selected_frames": len(eligible_frame_ids),
             "eligible_detection_rows": 0,
             "matched_detection_rows": 0,
+            "automatic_unique_sources": 0,
             "selected_gaia_source_count": 0,
-            "target_source_included": False,
+            "explicit_target_included": False,
+            "promoted_new": 0,
+            "promoted_existing": 0,
             "promotion_status": "SKIPPED_NO_CURRENT_DETECTION_RUN",
             "canonical_catalog_source_count": 0,
+            "matching_diagnostics": matching_diagnostics,
         }
     detections_by_frame = _select_detections_bulk(
         session,
@@ -688,13 +700,20 @@ def _select_and_promote_working_gaia_sources(
         detections = detections_by_frame.get(frame_id, [])
         if not detections:
             continue
-        matches = working_catalog.match_detections(
+        matches, frame_diagnostics = working_catalog.select_unique_detection_matches(
             [int(detection.source_detection_id) for detection in detections],
             [float(detection.ra_deg) for detection in detections],
             [float(detection.dec_deg) for detection in detections],
             radius_arcsec=config.detection_match_radius_arcsec,
         )
         matched_detection_count += len(matches)
+        for diagnostic_name in (
+            "detections_considered",
+            "reciprocal_unique_matches",
+            "ambiguous_detections",
+            "conflicting_gaia_sources",
+        ):
+            matching_diagnostics[diagnostic_name] += int(frame_diagnostics[diagnostic_name])
         selected_source_ids.update(str(source_id) for _detection_id, source_id, _sep in matches)
 
     if config.working_catalog_mag_limit is not None:
@@ -711,6 +730,8 @@ def _select_and_promote_working_gaia_sources(
             if source_magnitudes.get(source_id, math.inf) <= magnitude_limit
         }
 
+    automatic_unique_sources = len(selected_source_ids)
+
     target_source_requested = config.target_source_id is not None
     if target_source_requested:
         if config.target_source_id not in working_catalog.source_ids:
@@ -721,13 +742,17 @@ def _select_and_promote_working_gaia_sources(
 
     if not selected_source_ids:
         return [], None, {
-            "eligible_frames": len(eligible_frame_ids),
+            "selected_frames": len(eligible_frame_ids),
             "eligible_detection_rows": eligible_detection_count,
             "matched_detection_rows": matched_detection_count,
+            "automatic_unique_sources": automatic_unique_sources,
             "selected_gaia_source_count": 0,
-            "target_source_included": False,
+            "explicit_target_included": False,
+            "promoted_new": 0,
+            "promoted_existing": 0,
             "promotion_status": "SKIPPED_NO_SELECTION",
             "canonical_catalog_source_count": 0,
+            "matching_diagnostics": matching_diagnostics,
         }
 
     ordered_source_ids = sorted(
@@ -739,6 +764,7 @@ def _select_and_promote_working_gaia_sources(
             session,
             working_catalog,
             ordered_source_ids,
+            diagnostics_out=promotion_diagnostics,
         )
         if set(promoted) != selected_source_ids:
             raise ValueError("promotion mapping is incomplete")
@@ -758,13 +784,17 @@ def _select_and_promote_working_gaia_sources(
     if promoted_source_ids_out is not None:
         promoted_source_ids_out.update(selected_source_ids)
     return canonical_catalog_source_ids, forced_target_catalog_source_id, {
-        "eligible_frames": len(eligible_frame_ids),
+        "selected_frames": len(eligible_frame_ids),
         "eligible_detection_rows": eligible_detection_count,
         "matched_detection_rows": matched_detection_count,
+        "automatic_unique_sources": automatic_unique_sources,
         "selected_gaia_source_count": len(selected_source_ids),
-        "target_source_included": target_source_requested,
+        "explicit_target_included": target_source_requested,
+        "promoted_new": promotion_diagnostics["promoted_new"],
+        "promoted_existing": promotion_diagnostics["promoted_existing"],
         "promotion_status": "PROMOTED",
         "canonical_catalog_source_count": len(canonical_catalog_source_ids),
+        "matching_diagnostics": matching_diagnostics,
     }
 
 
