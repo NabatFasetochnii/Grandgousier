@@ -40,11 +40,19 @@ def test_check_constraints_requires_core_dependency_names(tmp_path):
     path = tmp_path / "constraints.txt"
     names = [
         "astropy", "numpy", "pandas", "sqlalchemy", "psycopg", "pydantic",
-        "pydantic-settings", "PyYAML", "tqdm", "matplotlib", "certifi", "requests",
+        "pydantic-settings", "PyYAML", "tqdm", "matplotlib", "certifi", "requests", "TzData",
     ]
     path.write_text("\n".join(f"{name}==1.0" for name in names), encoding="utf-8")
     result = release_check.check_constraints(path)
     assert result.status == "OK"
+
+    path.write_text(
+        "\n".join(f"{name}==1.0" for name in names if name.casefold() != "tzdata"),
+        encoding="utf-8",
+    )
+    missing_tzdata = release_check.check_constraints(path)
+    assert missing_tzdata.status == "FAIL"
+    assert "tzdata" in missing_tzdata.detail
 
 
 def test_check_snapshot_binds_version_and_pyproject(tmp_path):
@@ -66,7 +74,10 @@ def test_check_snapshot_binds_version_and_pyproject(tmp_path):
 
 def test_wheel_inspection_rejects_private_paths_and_accepts_resources(tmp_path):
     wheel = tmp_path / "grandgousier-0.5.58.1-py3-none-any.whl"
-    metadata = "Metadata-Version: 2.4\nName: grandgousier\nVersion: 0.5.58.1\nRequires-Python: >=3.11\n"
+    metadata = (
+        "Metadata-Version: 2.4\nName: grandgousier\nVersion: 0.5.58.1\n"
+        "Requires-Python: >=3.11\nRequires-Dist: TZDATA >= 2024.1\n"
+    )
     with zipfile.ZipFile(wheel, "w") as zf:
         for resource in release_check.REQUIRED_WHEEL_RESOURCES:
             zf.writestr(resource, "x")
@@ -76,6 +87,19 @@ def test_wheel_inspection_rejects_private_paths_and_accepts_resources(tmp_path):
     assert checks["wheel_private_paths"].status == "FAIL"
     assert checks["wheel_resources"].status == "OK"
     assert checks["wheel_metadata"].status == "OK"
+
+
+def test_wheel_metadata_requires_runtime_tzdata(tmp_path):
+    wheel = tmp_path / "grandgousier-0.5.58.1-py3-none-any.whl"
+    metadata = "Metadata-Version: 2.4\nName: grandgousier\nVersion: 0.5.58.1\nRequires-Python: >=3.11\n"
+    with zipfile.ZipFile(wheel, "w") as zf:
+        for resource in release_check.REQUIRED_WHEEL_RESOURCES:
+            zf.writestr(resource, "x")
+        zf.writestr("grandgousier-0.5.58.1.dist-info/METADATA", metadata)
+
+    checks = {row.name: row for row in release_check.inspect_wheel(wheel, "0.5.58.1")}
+    assert checks["wheel_metadata"].status == "FAIL"
+    assert "tzdata" in checks["wheel_metadata"].detail
 
 
 def test_sdist_inspection_requires_release_tools_and_rejects_internal(tmp_path):

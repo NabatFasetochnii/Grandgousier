@@ -68,6 +68,7 @@ from grandgousier.archive.stage1_handoff import (
 )
 from grandgousier.archive.stage1_reclaim import _validate_product
 from grandgousier.cli import build_parser
+from grandgousier.db import legacy_gaia_catalog_cleanup as gaia_cleanup_identity
 from grandgousier.db.models import (
     Base,
     CatalogSource,
@@ -79,6 +80,7 @@ from grandgousier.db.models import (
     FrameStatus,
     FrameType,
     InstrumentUnit,
+    Object,
     Observation,
     ProcessingEvent,
     ProcessingEventLevel,
@@ -257,6 +259,79 @@ def _postgres_integration_raw_url(pytestconfig) -> str | None:
     return explicit_url
 
 
+def _require_postgres_integration_write_opt_in() -> None:
+    missing = []
+    test_url = os.environ.get("GRANDGOUSIER_TEST_DATABASE_URL")
+    if not test_url or not test_url.strip():
+        missing.append("GRANDGOUSIER_TEST_DATABASE_URL")
+    if os.environ.get("GRANDGOUSIER_ALLOW_TEST_DB_WRITES") != "1":
+        missing.append("GRANDGOUSIER_ALLOW_TEST_DB_WRITES=1")
+    if missing:
+        pytest.skip(
+            "BLOCKED_BY_TEST_DATABASE_IDENTITY: write-enabled PostgreSQL integration "
+            f"requires both opt-ins ({', '.join(missing)}); no engine or connection attempted"
+        )
+
+
+def _postgres_url_target(url) -> tuple[str, str, int | None, str | None]:
+    backend = url.get_backend_name()
+    default_port = 5432 if backend == "postgresql" else None
+    host = (url.host or "").casefold().rstrip(".")
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            host = "<loopback>"
+    except ValueError:
+        if host == "localhost":
+            host = "<loopback>"
+    return (
+        backend,
+        host,
+        url.port or default_port,
+        url.database,
+    )
+
+
+def _reject_application_database_target(raw_test_url: str) -> None:
+    environment_url = os.environ.get("GRANDGOUSIER_DATABASE_URL")
+    try:
+        settings_url = app_settings.get_settings().database_url
+    except Exception:
+        raise AssertionError(
+            "BLOCKED_BY_TEST_DATABASE_IDENTITY: could not safely load the configured "
+            "application database target; URLs and credentials are redacted"
+        ) from None
+
+    configured_urls = []
+    for configured_url in (environment_url, settings_url):
+        if configured_url is None or configured_url == "":
+            continue
+        if not isinstance(configured_url, str):
+            raise AssertionError(
+                "BLOCKED_BY_TEST_DATABASE_IDENTITY: could not safely compare the configured "
+                "application and test database targets; URLs and credentials are redacted"
+            )
+        if configured_url.strip() and configured_url not in configured_urls:
+            configured_urls.append(configured_url)
+
+    if not configured_urls:
+        return
+    try:
+        test_target = _postgres_url_target(make_url(raw_test_url))
+        application_targets = {
+            _postgres_url_target(make_url(configured_url)) for configured_url in configured_urls
+        }
+    except Exception:
+        raise AssertionError(
+            "BLOCKED_BY_TEST_DATABASE_IDENTITY: could not safely compare the configured "
+            "application and test database targets; URLs and credentials are redacted"
+        ) from None
+    if test_target in application_targets:
+        raise AssertionError(
+            "BLOCKED_BY_TEST_DATABASE_IDENTITY: test database target matches "
+            "the configured application database target; URLs and credentials are redacted"
+        )
+
+
 def _guard_postgres_integration_connection(
     connection, *, read_only: bool = False
 ) -> tuple[str, str, str]:
@@ -302,23 +377,45 @@ def _guard_postgres_integration_connection(
             and identity["server_port"] == _POSTGRES_IT_PORT
             and str(identity["database_name"]).startswith(_POSTGRES_IT_PREFIX)
         )
+        expected_transaction_read_only = "on" if read_only else "off"
+        if (
+            not identity_matches_target
+            or default_read_only != "off"
+            or transaction_read_only != expected_transaction_read_only
+        ):
+            raise AssertionError(
+                "BLOCKED_BY_TEST_DATABASE_IDENTITY: PostgreSQL integration "
+                "identity/read-only guard mismatch; observed safe fields: "
+                f"{identity_summary}, "
+                f"default_transaction_read_only={default_read_only!r}, "
+                f"transaction_read_only={transaction_read_only!r}; "
+                "URL and credentials are redacted"
+            )
+
+        if not read_only:
+            try:
+                cleanup_identity = gaia_cleanup_identity._database_identity(connection)
+                gaia_cleanup_identity._assert_apply_target(
+                    cleanup_identity, confirm_database=_POSTGRES_IT_DATABASE_NAME
+                )
+            except Exception:
+                raise AssertionError(
+                    "BLOCKED_BY_TEST_DATABASE_IDENTITY: PostgreSQL integration target "
+                    "was rejected by the legacy cleanup protected/frozen identity policy; "
+                    "URL and credentials are redacted"
+                ) from None
+    except AssertionError as exc:
+        if "BLOCKED_BY_TEST_DATABASE_IDENTITY" in str(exc):
+            raise
+        raise AssertionError(
+            "BLOCKED_BY_TEST_DATABASE_IDENTITY: PostgreSQL integration identity/read-only "
+            "probe failed; server details are suppressed"
+        ) from None
     except Exception:
         raise AssertionError(
-            "PostgreSQL integration identity/read-only probe failed; server details are suppressed"
+            "BLOCKED_BY_TEST_DATABASE_IDENTITY: PostgreSQL integration identity/read-only "
+            "probe failed; server details are suppressed"
         ) from None
-
-    expected_transaction_read_only = "on" if read_only else "off"
-    if (
-        not identity_matches_target
-        or default_read_only != "off"
-        or transaction_read_only != expected_transaction_read_only
-    ):
-        raise AssertionError(
-            "PostgreSQL integration identity/read-only guard mismatch; observed safe fields: "
-            f"{identity_summary}, "
-            f"default_transaction_read_only={default_read_only!r}, "
-            f"transaction_read_only={transaction_read_only!r}; URL and credentials are redacted"
-        )
 
     return identity_summary, default_read_only, transaction_read_only
 
@@ -326,11 +423,17 @@ def _guard_postgres_integration_connection(
 def _postgres_integration_session(
     pytestconfig, *, read_only: bool = False
 ) -> Iterator[Session]:
+    if not read_only:
+        _require_postgres_integration_write_opt_in()
+
     raw_url = _postgres_integration_raw_url(pytestconfig)
     if raw_url is None:
         pytest.skip(
-            "GRANDGOUSIER_TEST_DATABASE_URL is not set; no database connection attempted"
+            "BLOCKED_BY_TEST_DATABASE_IDENTITY: GRANDGOUSIER_TEST_DATABASE_URL is not set; "
+            "no database connection attempted"
         )
+
+    _reject_application_database_target(raw_url)
 
     try:
         database_url = make_url(raw_url)
@@ -346,13 +449,15 @@ def _postgres_integration_session(
         )
     except Exception:
         raise AssertionError(
-            "PostgreSQL integration URL is malformed or unsupported; "
+            "BLOCKED_BY_TEST_DATABASE_IDENTITY: PostgreSQL integration URL is malformed "
+            "or unsupported; "
             "URL and credentials are redacted"
         ) from None
 
     if not url_matches_target:
         raise AssertionError(
-            "PostgreSQL integration URL does not match the explicitly authorized "
+            "BLOCKED_BY_TEST_DATABASE_IDENTITY: PostgreSQL integration URL does not match "
+            "the explicitly authorized "
             "loopback test target; URL and credentials are redacted"
         )
 
@@ -445,6 +550,83 @@ def test_postgres_integration_fixture_smoke(
     assert postgres_integration_session.scalar(text("SELECT 1")) == 1
 
 
+def test_postgres_selected_gaia_promotion_persists_only_selected_source_once(
+    postgres_integration_session: Session,
+) -> None:
+    from grandgousier.catalogs.gaia_query import (
+        GaiaWorkingCatalog,
+        promote_selected_gaia_sources,
+    )
+    from grandgousier.identity.object import get_or_create_object_for_catalog_source
+
+    db_session = postgres_integration_session
+    # Keep both the source identity and sky position synthetic; random coordinates
+    # make association with any pre-existing TEST Object implausible.
+    synthetic_scope = uuid4().int
+    source_id_base = 9_000_000_000_000_000_000 + (synthetic_scope % 100_000_000)
+    selected_source_id = str(source_id_base)
+    unselected_source_id = str(source_id_base + 1)
+    selected_ra_deg = (synthetic_scope % 3_600_000_000) / 10_000_000
+    selected_dec_deg = ((synthetic_scope >> 64) % 1_600_000_000) / 10_000_000 - 80
+    working_catalog = GaiaWorkingCatalog(
+        [
+            {
+                "source_id": selected_source_id,
+                "ra": selected_ra_deg,
+                "dec": selected_dec_deg,
+                "phot_g_mean_mag": 15.25,
+            },
+            {
+                "source_id": unselected_source_id,
+                "ra": 210.123456,
+                "dec": 34.567890,
+                "phot_g_mean_mag": 16.5,
+            },
+        ]
+    )
+
+    first_mapping = promote_selected_gaia_sources(
+        db_session, working_catalog, [selected_source_id]
+    )
+    repeated_mapping = promote_selected_gaia_sources(
+        db_session, working_catalog, [selected_source_id]
+    )
+
+    assert first_mapping == repeated_mapping
+    selected_rows = db_session.scalars(
+        select(CatalogSource)
+        .where(
+            CatalogSource.catalog_name == "gaia_dr3",
+            CatalogSource.source_id.in_([selected_source_id, unselected_source_id]),
+        )
+        .order_by(CatalogSource.source_id)
+    ).all()
+    assert [row.source_id for row in selected_rows] == [selected_source_id]
+    selected_row = selected_rows[0]
+    assert selected_row.pmra_masyr is None
+    assert selected_row.pmdec_masyr is None
+    assert selected_row.ra_deg == selected_ra_deg
+    assert selected_row.dec_deg == selected_dec_deg
+    assert (
+        db_session.scalar(
+            select(func.count(CatalogSource.catalog_source_id)).where(
+                CatalogSource.catalog_name == "gaia_dr3",
+                CatalogSource.source_id == selected_source_id,
+            )
+        )
+        == 1
+    )
+
+    association = get_or_create_object_for_catalog_source(db_session, selected_row)
+    assert association.created is True
+    assert association.object_id is not None
+    db_session.expire_all()
+    persisted_object = db_session.get(Object, association.object_id)
+    assert persisted_object is not None
+    assert persisted_object.ra_deg == selected_ra_deg
+    assert persisted_object.dec_deg == selected_dec_deg
+
+
 def test_postgres_integration_connection_guard_only(
     postgres_integration_session: Session,
 ) -> None:
@@ -469,11 +651,18 @@ def _write_postgres_test_config(tmp_path: Path, database_url: str) -> Path:
     return path
 
 
+def _set_postgres_write_opt_in(monkeypatch, database_url: str) -> None:
+    monkeypatch.setenv("GRANDGOUSIER_TEST_DATABASE_URL", database_url)
+    monkeypatch.setenv("GRANDGOUSIER_ALLOW_TEST_DB_WRITES", "1")
+    monkeypatch.delenv("GRANDGOUSIER_DATABASE_URL", raising=False)
+
+
 def _install_fake_postgres_fixture(
     monkeypatch,
     *,
     identity_overrides=None,
     show_overrides=None,
+    cleanup_identity_overrides=None,
     connection_error: Exception | None = None,
 ):
     events = []
@@ -486,6 +675,20 @@ def _install_fake_postgres_fixture(
         "server_port": _POSTGRES_IT_PORT,
     }
     identity.update(identity_overrides or {})
+    cleanup_identity = {
+        "database_name": _POSTGRES_IT_DATABASE_NAME,
+        "database_oid": _POSTGRES_IT_DATABASE_OID,
+        "db_user": _POSTGRES_IT_ROLE,
+        "server_address": "127.0.0.1",
+        "server_port": _POSTGRES_IT_PORT,
+        "server_version": "18.4",
+        "server_version_num": _POSTGRES_IT_SERVER_VERSION_NUM,
+        "current_schema": "public",
+        "database_comment": None,
+        "database_allows_connections": True,
+        "database_is_template": False,
+    }
+    cleanup_identity.update(cleanup_identity_overrides or {})
     show_values = {
         "default_transaction_read_only": "off",
         "transaction_read_only": "off",
@@ -501,6 +704,9 @@ def _install_fake_postgres_fixture(
             return self
 
         def one(self):
+            return self.row
+
+        def first(self):
             return self.row
 
         def scalar_one(self):
@@ -524,6 +730,9 @@ def _install_fake_postgres_fixture(
 
         def execute(self, statement):
             query = str(statement).strip().casefold()
+            if "database_comment" in query and "current_schema" in query:
+                events.append("probe.cleanup_identity")
+                return FakeResult(row=cleanup_identity)
             if query.startswith("select"):
                 events.append("probe.identity")
                 return FakeResult(row=identity)
@@ -541,6 +750,11 @@ def _install_fake_postgres_fixture(
     connection = FakeConnection()
 
     class FakeEngine:
+        url = make_url(
+            f"postgresql://{_POSTGRES_IT_ROLE}@{_POSTGRES_IT_HOST}:"
+            f"{_POSTGRES_IT_PORT}/{_POSTGRES_IT_DATABASE_NAME}"
+        )
+
         def connect(self):
             events.append("connection.open")
             if connection_error is not None:
@@ -551,6 +765,7 @@ def _install_fake_postgres_fixture(
             events.append("engine.dispose")
 
     engine = FakeEngine()
+    connection.engine = engine
 
     class FakeSession:
         def __init__(self, *, bind, join_transaction_mode):
@@ -569,6 +784,155 @@ def _install_fake_postgres_fixture(
     monkeypatch.setattr(sys.modules[__name__], "create_engine", fake_create_engine)
     monkeypatch.setattr(sys.modules[__name__], "Session", FakeSession)
     return events, connection
+
+
+@pytest.mark.parametrize(
+    ("test_url", "allow_writes"),
+    [
+        (None, None),
+        ("postgresql://grandgousier:fake-secret@127.0.0.1:5432/test", None),
+        (None, "1"),
+        ("postgresql://grandgousier:fake-secret@127.0.0.1:5432/test", "0"),
+    ],
+    ids=["both-missing", "missing-write-allow", "missing-test-url", "write-allow-not-one"],
+)
+def test_postgres_write_requires_both_opt_ins_before_engine_or_connection(
+    monkeypatch, test_url: str | None, allow_writes: str | None
+) -> None:
+    monkeypatch.delenv("GRANDGOUSIER_TEST_DATABASE_URL", raising=False)
+    monkeypatch.delenv("GRANDGOUSIER_ALLOW_TEST_DB_WRITES", raising=False)
+    monkeypatch.delenv("GRANDGOUSIER_DATABASE_URL", raising=False)
+    if test_url is not None:
+        monkeypatch.setenv("GRANDGOUSIER_TEST_DATABASE_URL", test_url)
+    if allow_writes is not None:
+        monkeypatch.setenv("GRANDGOUSIER_ALLOW_TEST_DB_WRITES", allow_writes)
+    events, _connection = _install_fake_postgres_fixture(monkeypatch)
+
+    generator = _postgres_integration_session(_FakePytestConfig())
+    with pytest.raises(pytest.skip.Exception, match="BLOCKED_BY_TEST_DATABASE_IDENTITY"):
+        next(generator)
+
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    ("test_url", "allow_writes"),
+    [(None, "1"), ("postgresql://grandgousier@127.0.0.1:5432/test", None)],
+    ids=["missing-test-url", "missing-write-allow"],
+)
+def test_durable_postgres_fixture_skips_before_config_or_engine_without_both_opt_ins(
+    monkeypatch, tmp_path: Path, test_url: str | None, allow_writes: str | None
+) -> None:
+    monkeypatch.delenv("GRANDGOUSIER_TEST_DATABASE_URL", raising=False)
+    monkeypatch.delenv("GRANDGOUSIER_ALLOW_TEST_DB_WRITES", raising=False)
+    monkeypatch.delenv("GRANDGOUSIER_DATABASE_URL", raising=False)
+    if test_url is not None:
+        monkeypatch.setenv("GRANDGOUSIER_TEST_DATABASE_URL", test_url)
+    if allow_writes is not None:
+        monkeypatch.setenv("GRANDGOUSIER_ALLOW_TEST_DB_WRITES", allow_writes)
+
+    events = []
+
+    def forbidden_config_load(*_args, **_kwargs):
+        events.append("config.load")
+        raise AssertionError("config must not be loaded without both write opt-ins")
+
+    class FakeEngine:
+        def connect(self):
+            events.append("connection.open")
+            raise AssertionError("connection must not be opened without both write opt-ins")
+
+        def dispose(self):
+            events.append("engine.dispose")
+
+    def fake_create_engine(*_args, **_kwargs):
+        events.append("engine.create")
+        return FakeEngine()
+
+    monkeypatch.setattr(app_config, "read_config_file", forbidden_config_load)
+    monkeypatch.setattr(app_settings, "get_settings", forbidden_config_load)
+    monkeypatch.setattr(sys.modules[__name__], "create_engine", fake_create_engine)
+    pytestconfig = _FakePytestConfig(tmp_path / "configured-test.yaml")
+    generator = _durable_persist_only_postgres_harness_impl(pytestconfig, tmp_path)
+
+    with pytest.raises(pytest.skip.Exception, match="BLOCKED_BY_TEST_DATABASE_IDENTITY"):
+        next(generator)
+
+    assert pytestconfig.option_names == []
+    assert events == []
+
+
+def test_postgres_write_blocks_protected_live_identity_before_yield(
+    monkeypatch,
+) -> None:
+    test_url = (
+        f"postgresql://{_POSTGRES_IT_ROLE}:fake-protected-secret@{_POSTGRES_IT_HOST}:"
+        f"{_POSTGRES_IT_PORT}/{_POSTGRES_IT_DATABASE_NAME}"
+    )
+    _set_postgres_write_opt_in(monkeypatch, test_url)
+    events, _connection = _install_fake_postgres_fixture(
+        monkeypatch,
+        cleanup_identity_overrides={"database_comment": "frozen reference snapshot"},
+    )
+
+    generator = _postgres_integration_session(_FakePytestConfig())
+    with pytest.raises(AssertionError, match="BLOCKED_BY_TEST_DATABASE_IDENTITY") as exc:
+        next(generator)
+
+    assert "fake-protected-secret" not in str(exc.value)
+    assert "probe.cleanup_identity" in events
+    assert "session.create" not in events
+    assert events[-3:] == ["transaction.rollback", "connection.close", "engine.dispose"]
+
+
+def test_postgres_test_target_equal_to_application_database_blocks_before_engine(
+    monkeypatch,
+) -> None:
+    test_url = (
+        f"postgresql://{_POSTGRES_IT_ROLE}:fake-shared-secret@{_POSTGRES_IT_HOST}:"
+        f"{_POSTGRES_IT_PORT}/{_POSTGRES_IT_DATABASE_NAME}"
+    )
+    _set_postgres_write_opt_in(monkeypatch, test_url)
+    monkeypatch.setenv("GRANDGOUSIER_DATABASE_URL", test_url)
+    events, _connection = _install_fake_postgres_fixture(monkeypatch)
+
+    generator = _postgres_integration_session(_FakePytestConfig())
+    with pytest.raises(AssertionError, match="BLOCKED_BY_TEST_DATABASE_IDENTITY") as exc:
+        next(generator)
+
+    assert "fake-shared-secret" not in str(exc.value)
+    assert events == []
+
+
+def test_postgres_test_target_equal_to_settings_database_blocks_before_engine(
+    monkeypatch, tmp_path: Path
+) -> None:
+    test_url = (
+        f"postgresql://{_POSTGRES_IT_ROLE}:fake-test-settings-secret@{_POSTGRES_IT_HOST}:"
+        f"{_POSTGRES_IT_PORT}/{_POSTGRES_IT_DATABASE_NAME}"
+    )
+    _set_postgres_write_opt_in(monkeypatch, test_url)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "GRANDGOUSIER_DATABASE_URL="
+        f"postgresql://{_POSTGRES_IT_ROLE}:fake-app-settings-secret@localhost/"
+        f"{_POSTGRES_IT_DATABASE_NAME}\n",
+        encoding="utf-8",
+    )
+    engine_calls = []
+
+    def forbidden_engine(*_args, **_kwargs):
+        engine_calls.append(True)
+        raise AssertionError("engine must not be created")
+
+    monkeypatch.setattr(sys.modules[__name__], "create_engine", forbidden_engine)
+    generator = _postgres_integration_session(_FakePytestConfig())
+    with pytest.raises(AssertionError, match="BLOCKED_BY_TEST_DATABASE_IDENTITY") as exc:
+        next(generator)
+
+    assert "fake-test-settings-secret" not in str(exc.value)
+    assert "fake-app-settings-secret" not in str(exc.value)
+    assert engine_calls == []
 
 
 def test_postgres_test_config_option_precedence_and_source(monkeypatch, tmp_path: Path) -> None:
@@ -614,7 +978,7 @@ def test_explicit_config_failures_stop_before_engine_creation(
         f"postgresql://{_POSTGRES_IT_ROLE}:fake-config-secret@{_POSTGRES_IT_HOST}:"
         f"{_POSTGRES_IT_PORT}/{_POSTGRES_IT_DATABASE_NAME}"
     )
-    monkeypatch.setenv("GRANDGOUSIER_TEST_DATABASE_URL", explicit_url)
+    _set_postgres_write_opt_in(monkeypatch, explicit_url)
     path = tmp_path / "explicit-test-config.yaml"
     if failure == "missing":
         path = tmp_path / "missing-test-config.yaml"
@@ -654,6 +1018,7 @@ def test_postgres_integration_url_rejection_precedes_engine_creation(
         f"postgresql://{_POSTGRES_IT_ROLE}:fake-url-secret@{_POSTGRES_IT_HOST}:"
         f"{_POSTGRES_IT_PORT}/wrong_test_database"
     )
+    _set_postgres_write_opt_in(monkeypatch, wrong_url)
     path = _write_postgres_test_config(tmp_path, wrong_url)
     engine_calls = []
 
@@ -684,8 +1049,8 @@ def test_postgres_integration_url_rejection_precedes_engine_creation(
 def test_postgres_identity_and_readonly_mismatch_precedes_yield(
     monkeypatch, identity_overrides, show_overrides, capsys
 ) -> None:
-    monkeypatch.setenv(
-        "GRANDGOUSIER_TEST_DATABASE_URL",
+    _set_postgres_write_opt_in(
+        monkeypatch,
         f"postgresql://{_POSTGRES_IT_ROLE}:fake-guard-secret@{_POSTGRES_IT_HOST}:"
         f"{_POSTGRES_IT_PORT}/{_POSTGRES_IT_DATABASE_NAME}",
     )
@@ -711,7 +1076,7 @@ def test_postgres_fixture_redacts_connection_errors_and_rolls_back_in_order(
         f"postgresql://{_POSTGRES_IT_ROLE}:fake-driver-secret@{_POSTGRES_IT_HOST}:"
         f"{_POSTGRES_IT_PORT}/{_POSTGRES_IT_DATABASE_NAME}"
     )
-    monkeypatch.setenv("GRANDGOUSIER_TEST_DATABASE_URL", test_url)
+    _set_postgres_write_opt_in(monkeypatch, test_url)
     events, _connection = _install_fake_postgres_fixture(monkeypatch)
     generator = _postgres_integration_session(_FakePytestConfig())
     session = next(generator)
@@ -757,8 +1122,8 @@ def test_postgres_fixture_redacts_connection_errors_and_rolls_back_in_order(
 def test_postgres_guard_accepts_loopback_ip_and_cidr_forms(
     monkeypatch, server_address
 ) -> None:
-    monkeypatch.setenv(
-        "GRANDGOUSIER_TEST_DATABASE_URL",
+    _set_postgres_write_opt_in(
+        monkeypatch,
         f"postgresql://{_POSTGRES_IT_ROLE}:fake-guard-secret@{_POSTGRES_IT_HOST}:"
         f"{_POSTGRES_IT_PORT}/{_POSTGRES_IT_DATABASE_NAME}",
     )
@@ -780,8 +1145,8 @@ def test_postgres_guard_accepts_loopback_ip_and_cidr_forms(
 
 
 def test_postgres_guard_rejects_non_loopback_address(monkeypatch) -> None:
-    monkeypatch.setenv(
-        "GRANDGOUSIER_TEST_DATABASE_URL",
+    _set_postgres_write_opt_in(
+        monkeypatch,
         f"postgresql://{_POSTGRES_IT_ROLE}:fake-guard-secret@{_POSTGRES_IT_HOST}:"
         f"{_POSTGRES_IT_PORT}/{_POSTGRES_IT_DATABASE_NAME}",
     )
@@ -4109,6 +4474,12 @@ class _DurablePersistOnlyPostgresHarness:
 
 @pytest.fixture()
 def durable_persist_only_postgres_harness(pytestconfig, tmp_path: Path):
+    yield from _durable_persist_only_postgres_harness_impl(pytestconfig, tmp_path)
+
+
+def _durable_persist_only_postgres_harness_impl(pytestconfig, tmp_path: Path):
+    _require_postgres_integration_write_opt_in()
+
     config_path = pytestconfig.getoption("--grandgousier-test-config")
     if not config_path:
         raise AssertionError(
@@ -4117,6 +4488,7 @@ def durable_persist_only_postgres_harness(pytestconfig, tmp_path: Path):
     raw_url = _postgres_integration_raw_url(pytestconfig)
     if raw_url is None:
         raise AssertionError("Explicit durable PostgreSQL test config returned no database URL")
+    _reject_application_database_target(raw_url)
     try:
         database_url = make_url(raw_url)
         url_matches_target = (

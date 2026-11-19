@@ -5,6 +5,7 @@ import pytest
 
 from grandgousier.lightcurves import parquet_export as export
 from grandgousier.lightcurves.product import _science_row_from_db, light_curve_reject_flags
+from grandgousier.observing_day import ObservingDayPolicy
 
 
 def _tables():
@@ -38,10 +39,107 @@ def _tables():
     }
 
 
-def test_utc_observing_night_uses_noon_boundary():
-    assert export.observing_night("2024-01-02T11:59:59Z") == "2024-01-01"
-    assert export.observing_night(datetime(2024, 1, 2, 12, tzinfo=UTC)) == "2024-01-02"
-    assert export.observing_night(None) is None
+def test_parquet_observing_night_uses_site_local_noon_boundary():
+    policy = ObservingDayPolicy(site_timezones={"KAO": "Asia/Yekaterinburg"})
+    assert export.observing_night("2024-01-02T06:59:59Z", "KAO", policy) == "2024-01-01"
+    assert export.observing_night(datetime(2024, 1, 2, 7, tzinfo=UTC), "KAO", policy) == "2024-01-02"
+    assert export.observing_night(None, None, policy) is None
+
+
+def test_parquet_observing_night_is_site_specific_in_mixed_site_exports():
+    policy = ObservingDayPolicy(
+        site_timezones={"KAO": "Asia/Yekaterinburg", "NY": "America/New_York"}
+    )
+    value = "2024-01-02T11:00:00Z"
+
+    assert export.observing_night(value, "KAO", policy) == "2024-01-02"
+    assert export.observing_night(value, "NY", policy) == "2024-01-01"
+
+
+def test_parquet_observing_night_does_not_fall_back_to_utc_for_unknown_site():
+    with pytest.raises(ValueError, match="No IANA timezone configured"):
+        export.observing_night("2024-01-02T12:00:00Z", "UNKNOWN", ObservingDayPolicy())
+
+
+def test_parquet_operational_date_error_includes_site_path_and_original_date_obs():
+    value = "2024-01-02T12:00:00Z"
+    path = r"C:\archive\UNKNOWN\frame.fits"
+
+    with pytest.raises(ValueError) as exc_info:
+        export.observing_night(
+            value, "UNKNOWN", ObservingDayPolicy(), fits_path=path
+        )
+
+    diagnostic = str(exc_info.value)
+    assert "UNKNOWN" in diagnostic
+    assert path in diagnostic
+    assert f"DATE-OBS={value!r}" in diagnostic
+
+
+@pytest.mark.parametrize(
+    "command_args",
+    [
+        ["process-field-archive"],
+        [
+            "export-science-parquet",
+            "--database-url", "postgresql://unused",
+            "--series-id", "1",
+            "--out", "C:/unused",
+        ],
+    ],
+)
+def test_operational_date_cli_overrides_are_available_after_subcommand(command_args):
+    from grandgousier.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            *command_args,
+            "--config", "observing-days.yaml",
+            "--site-timezone", "KAO=Asia/Yekaterinburg",
+            "--site-timezone", "NY=America/New_York",
+            "--default-site-timezone", "Europe/Paris",
+            "--observing-day-boundary-local", "11:30:00",
+        ]
+    )
+
+    assert args.config_file == "observing-days.yaml"
+    assert args.site_timezones == ["KAO=Asia/Yekaterinburg", "NY=America/New_York"]
+    assert args.default_site_timezone == "Europe/Paris"
+    assert args.observing_day_boundary_local == "11:30:00"
+
+
+def test_cli_operational_date_overrides_merge_with_config(tmp_path):
+    from argparse import Namespace
+
+    from grandgousier.cli import _observing_day_policy_from_sources
+
+    config = tmp_path / "observing-days.yaml"
+    config.write_text(
+        "observing_days:\n"
+        "  boundary_local_time: '10:00:00'\n"
+        "  site_timezones:\n"
+        "    KAO: Asia/Yekaterinburg\n"
+        "    NY: America/New_York\n"
+        "  default_timezone: null\n",
+        encoding="utf-8",
+    )
+    args = Namespace(
+        site_timezones=["kao=Europe/Paris", "LON=Europe/London"],
+        default_site_timezone="UTC",
+        observing_day_boundary_local="09:30:00",
+    )
+
+    policy = _observing_day_policy_from_sources(args, [config])
+
+    assert policy.to_dict() == {
+        "boundary_local_time": "09:30:00",
+        "site_timezones": {
+            "NY": "America/New_York",
+            "KAO": "Europe/Paris",
+            "LON": "Europe/London",
+        },
+        "default_timezone": "UTC",
+    }
 
 
 def test_parquet_rejects_orphaned_m4_before_filtering_to_requested_series():
@@ -106,8 +204,22 @@ def test_explicit_schema_round_trip_nullable_and_zero_measurement_frame(tmp_path
     pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     target = tmp_path / "product"
-    result = export.export_parquet_product(_tables(), target, metadata={"database_logical_id": "test"}, batch_size=1)
+    policy = ObservingDayPolicy(site_timezones={"KAO": "Asia/Yekaterinburg"})
+    result = export.export_parquet_product(
+        _tables(),
+        target,
+        metadata={
+            "database_logical_id": "test",
+            "observing_night_definition": policy.definition,
+            "observing_day_policy": policy.to_dict(),
+            **policy.to_dict(),
+        },
+        batch_size=1,
+    )
     assert result["row_counts"] == {"sources": 1, "frames": 2, "photometry": 1, "series": 1}
+    assert result["boundary_local_time"] == "12:00:00"
+    assert result["site_timezones"] == {"KAO": "Asia/Yekaterinburg"}
+    assert result["observing_night_definition"] == policy.definition
     frames = pq.read_table(target / "frames.parquet")
     photometry = pq.read_table(target / "photometry.parquet")
     assert frames.schema == export._schemas()["frames.parquet"]

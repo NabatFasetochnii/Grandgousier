@@ -841,13 +841,22 @@ def test_process_archive_path_replay_does_not_queue_historical_series() -> None:
     process_end = source.index("\ndef process_archive_summary_rows", process_start)
     body = source[process_start:process_end]
 
-    guard_pos = body.index("if not science_input_frame_ids:")
+    guard_pos = body.index(
+        "if not science_input_frame_ids and not requested_resume_series_ids:"
+    )
     catalog_pos = body.index("if catalog_name is None:")
-    queue_pos = body.index("pipeline_series_ids = sorted(set(created_series_ids))")
-    load_pos = body.index("for series in _load_series_for_pipeline(session, pipeline_series_ids):")
+    queue_pos = body.index(
+        "pipeline_series_ids = sorted(\n"
+        "            set(created_series_ids).union(requested_resume_series_ids)\n"
+        "        )"
+    )
+    load_pos = body.index(
+        "pipeline_series_rows = _load_series_for_pipeline(session, pipeline_series_ids)"
+    )
 
     assert guard_pos < catalog_pos
     assert queue_pos < load_pos
+    assert "set(created_series_ids).union(existing_input_series_ids)" not in body
     assert "pipeline_series_ids = current_series_ids" not in body
 
 

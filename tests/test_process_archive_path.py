@@ -180,6 +180,89 @@ def test_open_series_are_reported_but_never_queued_for_pipeline():
     assert open_ids == [12]
 
 
+@pytest.mark.parametrize("actual_field_id", [2, None])
+def test_new_series_outside_required_field_fails_before_gaia_or_stage2(
+    monkeypatch, tmp_path, actual_field_id
+):
+    detected = _detected_master("NEW_WRONG_FIELD")
+    source_path = Path(detected.path)
+    gaia_calls = []
+    stage2_calls = []
+
+    monkeypatch.setattr(
+        auto_process_module,
+        "scan_archive_paths",
+        lambda *_args, **_kwargs: ([detected], [], []),
+    )
+    monkeypatch.setattr(auto_process_module, "load_auto_profiles", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        auto_process_module,
+        "index_detected_archive_files",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            indexed_paths=[str(source_path)],
+            indexed_frame_ids=[101],
+            index_results=[],
+            failed_files=0,
+        ),
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "select_persisted_science_frames",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            selected_frame_ids=[101], summary={}, rows=[]
+        ),
+    )
+    monkeypatch.setattr(auto_process_module, "_series_ids_for_paths", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        auto_process_module, "_frame_ids_by_instrument_unit", lambda *_a, **_k: {4: [101]}
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "build_field_series",
+        lambda *_a, **_k: SimpleNamespace(
+            rows=[{"series_id": 7, "status": "READY"}],
+            summary=lambda: {"ready_series_ids": [7]},
+            observation_selection_rows=[],
+        ),
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "_frame_ids_by_series_for_paths",
+        lambda *_a, **_k: {7: [101]},
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "_load_series_for_pipeline",
+        lambda *_a, **_k: [{"series_id": 7, "field_id": actual_field_id, "status": "READY"}],
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "_prepare_auto_working_catalog",
+        lambda *_a, **_k: gaia_calls.append("acquire")
+        or pytest.fail("Gaia acquisition must not run for a field-scope mismatch"),
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "run_field_pipeline",
+        lambda *_a, **_k: stage2_calls.append("stage2")
+        or pytest.fail("Stage 2 must not run for a field-scope mismatch"),
+    )
+
+    result = process_archive_path(
+        FakeSession(),
+        root=tmp_path,
+        exact_paths=[source_path],
+        execute=True,
+        required_field_id=1,
+        min_frames_per_series=1,
+    )
+
+    assert result.status == "FAILED_PRECONDITION_SERIES_SELECTION"
+    assert any("7" in warning and "field_id=1" in warning for warning in result.warnings)
+    assert gaia_calls == []
+    assert stage2_calls == []
+
+
 def test_process_archive_path_forwards_streaming_and_skips_open_tail_pipeline(
     monkeypatch, tmp_path
 ):
@@ -647,6 +730,125 @@ def _auto_series(series_id, field_id):
         "n_frames": 1,
         "status": "READY",
     }
+
+
+def test_mixed_new_and_resume_uses_exact_field_union_without_ready_or_other_field_frames(
+    monkeypatch, tmp_path
+):
+    from grandgousier.catalogs import gaia_query
+
+    series_rows = [
+        _auto_series(1, 10),  # explicitly resumed incomplete series
+        _auto_series(2, 10),  # already-ready series in the same exact input scope
+        _auto_series(3, 10),  # newly discovered series
+        _auto_series(4, 20),  # other field in the same exact input scope
+    ]
+    frame_map = {1: [101], 2: [202], 3: [303], 4: [404]}
+    source_path, _gaia, frame_queries, _lifecycle, _catalog_fields, _cones = (
+        _install_auto_field_harness(
+            monkeypatch,
+            tmp_path,
+            series_rows,
+            frame_map,
+            indexed_frame_ids=[101, 202, 303, 404],
+        )
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "select_persisted_science_frames",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            selected_frame_ids=[303, 404], summary={}, rows=[]
+        ),
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "_frame_ids_by_instrument_unit",
+        lambda *_args, **_kwargs: {4: [303, 404]},
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "build_field_series",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            rows=[
+                {"series_id": 3, "status": "READY"},
+            ],
+            summary=lambda: {},
+            observation_selection_rows=[],
+        ),
+    )
+    monkeypatch.setattr(
+        auto_process_module,
+        "_load_series_for_pipeline",
+        lambda _session, series_ids: [
+            dict(row) for row in series_rows if int(row["series_id"]) in set(series_ids)
+        ],
+    )
+
+    fetch_field_ids = []
+
+    async def fake_fetch(cones, **_kwargs):
+        cones = list(cones)
+        fetch_field_ids.append(10)
+        return gaia_query.GaiaWorkingCatalog(
+            [
+                {
+                    "source_id": "42",
+                    "ra": cones[0][0],
+                    "dec": cones[0][1],
+                    "phot_g_mean_mag": 15.0,
+                }
+            ]
+        ), {"logical_queries": 1, "rows_received": 1}
+
+    monkeypatch.setattr(gaia_query, "fetch_gaia_working_catalog", fake_fetch)
+    pipeline_series_ids = []
+
+    def fake_pipeline(session, config, **kwargs):
+        series_id = int(config.series_id)
+        pipeline_series_ids.append(series_id)
+        run_id = 5000 + series_id
+        kwargs["working_catalog_run_ids_by_series"][series_id] = run_id
+        session.register_pipeline_run(
+            pipeline_run_id=run_id,
+            field_id=int(kwargs["working_catalog_provenance"]["field_id"]),
+            series_id=series_id,
+            provenance=kwargs["working_catalog_provenance"],
+        )
+        result = _fake_pipeline_result()
+        result.pipeline_run_id = run_id
+        return result
+
+    monkeypatch.setattr(auto_process_module, "run_field_pipeline", fake_pipeline)
+    session = _WorkingCatalogPersistenceSession()
+    result = process_archive_path(
+        session,
+        root=tmp_path,
+        exact_paths=[source_path],
+        resume_series_ids=[1],
+        required_field_id=10,
+        execute=True,
+        make_light_curve_summary=False,
+    )
+
+    assert result.status in {"DONE", "DONE_WITH_WARNINGS"}
+    assert result.processed_series_ids == [1, 3]
+    assert pipeline_series_ids == [1, 3]
+    assert frame_queries == [[101, 303]]
+    assert fetch_field_ids == [10]
+
+    # An explicitly resumed series from another field fails before acquisition or Stage 2.
+    invalid = process_archive_path(
+        _WorkingCatalogPersistenceSession(),
+        root=tmp_path,
+        exact_paths=[source_path],
+        resume_series_ids=[4],
+        required_field_id=10,
+        execute=True,
+        make_light_curve_summary=False,
+    )
+    assert invalid.status == "FAILED_PRECONDITION_SERIES_SELECTION"
+    assert fetch_field_ids == [10]
+    assert pipeline_series_ids == [1, 3]
 
 
 def test_auto_working_catalog_hashes_are_deterministic_and_scope_sensitive():

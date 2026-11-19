@@ -2,6 +2,12 @@ processed_root: C:\master\gpx\smoke\processed
 field_id: 33
 catalog_name: auto_catalog_master_20180907_GPX_TF17_2_mixed
 instrument_profile: MASTER
+# Include/exclude dates are operational dates, not UTC calendar dates.
+observing_days:
+  boundary_local_time: "12:00:00"
+  site_timezones:
+    KAO: Asia/Yekaterinburg
+  default_timezone: null
 execute: false
 resume: true
 stage2_recipe: stage3_scale_v1

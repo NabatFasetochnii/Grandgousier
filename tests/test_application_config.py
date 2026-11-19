@@ -25,6 +25,11 @@ database:
   url: postgresql+psycopg://user:secret@db/grandgousier
 logging:
   level: WARNING
+observing_days:
+  boundary_local_time: "12:00:00"
+  site_timezones:
+    KAO: Asia/Yekaterinburg
+  default_timezone: null
 paths:
   processed_root: C:\\data\\processed
   out_root: reports\\field_archive
@@ -51,6 +56,11 @@ field_archive:
     assert field["database_url"] == app["database_url"]
     assert public["database_url"] == "<configured>"
     assert public["field_archive"]["database_url"] == "<configured>"
+    assert public["observing_days"] == {
+        "boundary_local_time": "12:00:00",
+        "site_timezones": {"KAO": "Asia/Yekaterinburg"},
+        "default_timezone": None,
+    }
     assert "secret" not in str(public)
 
 
@@ -100,6 +110,11 @@ def test_field_archive_job_accepts_general_config_and_cli_override(tmp_path: Pat
 paths:
   processed_root: from_paths
   out_root: reports/from_config
+observing_days:
+  boundary_local_time: "12:00:00"
+  site_timezones:
+    KAO: Asia/Yekaterinburg
+  default_timezone: null
 field_archive:
   field_id: 33
   catalog_name: shared
@@ -121,6 +136,13 @@ field_archive:
     assert config.field_id == 33
     assert config.stage3_policies[0].filter_name == "R"
     assert config.stage3_policies[0].reference_series_id == 89
+    assert config.observing_day_policy.to_dict() == {
+        "boundary_local_time": "12:00:00",
+        "site_timezones": {"KAO": "Asia/Yekaterinburg"},
+        "default_timezone": None,
+    }
+    assert config.workflow_kwargs()["observing_day_policy"] is config.observing_day_policy
+    assert config.public_dict()["observing_days"] == config.observing_day_policy.to_dict()
 
 
 def test_legacy_flat_field_archive_config_remains_supported(tmp_path: Path):

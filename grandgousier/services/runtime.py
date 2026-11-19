@@ -7,7 +7,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from grandgousier.config import field_archive_mapping, read_config_file
+from grandgousier.config import field_archive_mapping, observing_days_mapping, read_config_file
+from grandgousier.observing_day import ObservingDayPolicy
 
 from grandgousier.orchestration.field_archive import (
     STAGE2_RECIPE_STAGE3_SCALE_V1,
@@ -170,8 +171,15 @@ class FieldArchiveJobConfig:
     include_dates: tuple[str, ...] = ()
     out_root: str = "reports/field_archive"
     plot_max_points: int = 200
+    observing_day_policy: ObservingDayPolicy = field(default_factory=ObservingDayPolicy)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.observing_day_policy, ObservingDayPolicy):
+            object.__setattr__(
+                self,
+                "observing_day_policy",
+                ObservingDayPolicy.from_mapping(self.observing_day_policy),
+            )
         if not str(self.processed_root).strip():
             raise ValueError("processed_root is required")
         if int(self.field_id) < 1:
@@ -210,9 +218,13 @@ class FieldArchiveJobConfig:
         }
         merged.update(_env_mapping(environ))
         if config_file is not None:
-            merged.update(field_archive_mapping(read_config_file(config_file)))
+            config_payload = read_config_file(config_file)
+            merged.update(field_archive_mapping(config_payload))
+            merged["observing_day_policy"] = observing_days_mapping(config_payload)
         if overrides:
             merged.update({key: value for key, value in overrides.items() if value is not None})
+            if "observing_day_policy" not in overrides and overrides.get("observing_days") is not None:
+                merged["observing_day_policy"] = overrides["observing_days"]
 
         missing = []
         for key in ("processed_root", "field_id", "catalog_name", "stage3_policies"):
@@ -223,6 +235,13 @@ class FieldArchiveJobConfig:
             raise ValueError(
                 "Missing required field-archive job configuration: " + ", ".join(missing)
             )
+
+        raw_observing_policy = merged.get("observing_day_policy")
+        observing_policy = (
+            raw_observing_policy
+            if isinstance(raw_observing_policy, ObservingDayPolicy)
+            else ObservingDayPolicy.from_mapping(raw_observing_policy)
+        )
 
         return cls(
             database_url=(str(merged["database_url"]) if merged.get("database_url") else None),
@@ -239,6 +258,7 @@ class FieldArchiveJobConfig:
             include_dates=_parse_str_list(merged.get("include_dates")),
             out_root=str(merged.get("out_root") or "reports/field_archive"),
             plot_max_points=int(merged.get("plot_max_points", 200)),
+            observing_day_policy=observing_policy,
         )
 
     def workflow_kwargs(self) -> dict[str, Any]:
@@ -257,6 +277,7 @@ class FieldArchiveJobConfig:
             "include_dates": self.include_dates,
             "out_root": self.out_root,
             "plot_max_points": self.plot_max_points,
+            "observing_day_policy": self.observing_day_policy,
         }
 
     def public_dict(self) -> dict[str, Any]:
@@ -275,6 +296,7 @@ class FieldArchiveJobConfig:
             "include_dates": list(self.include_dates),
             "out_root": self.out_root,
             "plot_max_points": self.plot_max_points,
+            "observing_days": self.observing_day_policy.to_dict(),
         }
 
     def fingerprint(self) -> str:

@@ -6,6 +6,8 @@ from typing import Any, Mapping
 
 import yaml
 
+from grandgousier.observing_day import ObservingDayPolicy
+
 
 def read_config_file(path: str | Path) -> dict[str, Any]:
     """Read a Grandgousier YAML/JSON config without applying side effects."""
@@ -59,6 +61,15 @@ def product_store_mapping(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise ValueError("Grandgousier config 'products' must be a mapping")
     return dict(raw)
+
+
+def observing_days_mapping(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the validated, public-safe shared operational-date policy."""
+
+    raw = payload.get("observing_days")
+    if raw is not None and not isinstance(raw, Mapping):
+        raise ValueError("Grandgousier config 'observing_days' must be a mapping")
+    return ObservingDayPolicy.from_mapping(raw).to_dict()
 
 
 def _public_value(value: Any, *, key: str | None = None) -> Any:
@@ -149,6 +160,7 @@ def public_config_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
             key: ("<configured>" if key == "database_url" and value else value)
             for key, value in field_archive.items()
         },
+        "observing_days": observing_days_mapping(payload),
         "archives": _public_value(archive_sources_mapping(payload)),
         "products": _public_value(product_store_mapping(payload)),
     }

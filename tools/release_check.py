@@ -70,6 +70,32 @@ def read_versions() -> tuple[str, str]:
     return project_version, m.group(1)
 
 
+def _normalize_dependency_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name.strip().lower())
+
+
+def _normalize_requirement(requirement: str) -> str | None:
+    match = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)(.*)$", requirement)
+    if match is None:
+        return None
+    name, remainder = match.groups()
+    return _normalize_dependency_name(name) + re.sub(r"\s+", "", remainder)
+
+
+def _required_tzdata_requirement() -> str | None:
+    project = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    for requirement in project["project"].get("dependencies", []):
+        match = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
+        normalized = _normalize_requirement(requirement)
+        if (
+            match is not None
+            and normalized is not None
+            and _normalize_dependency_name(match.group(1)) == "tzdata"
+        ):
+            return normalized
+    return None
+
+
 def _archive_members(path: Path) -> list[str]:
     if path.suffix == ".whl" or path.suffix == ".zip":
         with zipfile.ZipFile(path) as zf:
@@ -100,8 +126,26 @@ def inspect_wheel(wheel: Path, version: str) -> list[Check]:
     else:
         with zipfile.ZipFile(wheel) as zf:
             meta = zf.read(dist_info[0]).decode("utf-8", errors="replace")
-        ok = f"Version: {version}" in meta and "Requires-Python: >=3.11" in meta
-        checks.append(Check("wheel_metadata", "OK" if ok else "FAIL", "version/requires-python OK" if ok else "version or Requires-Python mismatch"))
+        metadata_requirements = {
+            _normalize_requirement(line.split(":", 1)[1])
+            for line in meta.splitlines()
+            if line.casefold().startswith("requires-dist:")
+        }
+        required_tzdata = _required_tzdata_requirement()
+        has_runtime_tzdata = (
+            required_tzdata is not None and required_tzdata in metadata_requirements
+        )
+        ok = (
+            f"Version: {version}" in meta
+            and "Requires-Python: >=3.11" in meta
+            and has_runtime_tzdata
+        )
+        detail = (
+            "version/requires-python/tzdata metadata OK"
+            if ok
+            else "version, Requires-Python, or runtime tzdata metadata mismatch"
+        )
+        checks.append(Check("wheel_metadata", "OK" if ok else "FAIL", detail))
     return checks
 
 
@@ -252,10 +296,10 @@ def check_constraints(path: Path | None) -> Check:
         if not line or line.startswith("#") or "==" not in line:
             continue
         name, version = line.split("==", 1)
-        versions[re.sub(r"[-_.]+", "-", name.strip().lower())] = version.strip()
+        versions[_normalize_dependency_name(name)] = version.strip()
     required = {
         "astropy", "numpy", "pandas", "sqlalchemy", "psycopg", "pydantic", "pydantic-settings",
-        "pyyaml", "tqdm", "matplotlib", "certifi", "requests",
+        "pyyaml", "tqdm", "matplotlib", "certifi", "requests", "tzdata",
     }
     missing = sorted(required - set(versions))
     return Check("validated_constraints", "OK" if not missing else "FAIL", f"packages={len(versions)}" if not missing else "missing=" + ",".join(missing))

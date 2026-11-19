@@ -20,6 +20,7 @@ from grandgousier.orchestration.field_archive import (
     _write_reports,
     parse_stage3_policy,
 )
+from grandgousier.observing_day import ObservingDayPolicy
 
 
 
@@ -280,15 +281,18 @@ def test_group_detected_by_parent_creates_independent_leaf_batches(tmp_path: Pat
     a.mkdir(parents=True)
     b.mkdir(parents=True)
     rows = [
-        SimpleNamespace(path=str(a / "1.fits"), date_obs=datetime(2018, 9, 16, 18, tzinfo=timezone.utc), object_name="GPX", filter_name="V"),
-        SimpleNamespace(path=str(a / "2.fits"), date_obs=datetime(2018, 9, 16, 18, tzinfo=timezone.utc), object_name="GPX", filter_name="R"),
-        SimpleNamespace(path=str(b / "3.fits"), date_obs=datetime(2018, 9, 23, 18, tzinfo=timezone.utc), object_name="GPX", filter_name="V"),
+        SimpleNamespace(path=str(a / "1.fits"), date_obs=datetime(2018, 9, 16, 18, tzinfo=timezone.utc), site="KAO", object_name="GPX", filter_name="V"),
+        SimpleNamespace(path=str(a / "2.fits"), date_obs=datetime(2018, 9, 16, 18, tzinfo=timezone.utc), site="KAO", object_name="GPX", filter_name="R"),
+        SimpleNamespace(path=str(b / "3.fits"), date_obs=datetime(2018, 9, 23, 18, tzinfo=timezone.utc), site="KAO", object_name="GPX", filter_name="V"),
     ]
-    batches = _group_detected_by_parent(tmp_path, rows)
+    policy = ObservingDayPolicy(site_timezones={"KAO": "Asia/Yekaterinburg"})
+    batches = _group_detected_by_parent(tmp_path, rows, policy=policy)
     assert [row["observation_date"] for row in batches] == ["2018-09-16", "2018-09-23"]
-    assert batches[0]["relative_path"] == str(Path("2018") / "09" / "16")
+    assert batches[0]["relative_path"] == "2018-09-16"
     assert batches[0]["filters"] == ["R", "V"]
     assert len(batches[0]["paths"]) == 2
+    assert batches[0]["parents"] == [str(a)]
+    assert batches[0]["site_timezones"] == {"KAO": "Asia/Yekaterinburg"}
     assert batches[0]["max_series_like_group_files"] == 1
 
 
@@ -377,7 +381,12 @@ def test_execute_orchestration_runs_new_batch_then_stage3_and_m5(monkeypatch, tm
 
     root = tmp_path / "processed"
     batch = root / "2018" / "09" / "16"
-    batch.mkdir(parents=True)
+    resume_batch = root / "parent-b" / "2018-09-17"
+    ready_batch = root / "parent-c" / "2018-09-18"
+    excluded_batch = root / "parent-d" / "2018-09-19"
+    for parent in (batch, resume_batch, ready_batch, excluded_batch):
+        parent.mkdir(parents=True)
+    site_policy = ObservingDayPolicy(site_timezones={"KAO": "Asia/Yekaterinburg"})
 
     def module(name, **attrs):
         mod = types.ModuleType(name)
@@ -387,24 +396,21 @@ def test_execute_orchestration_runs_new_batch_then_stage3_and_m5(monkeypatch, tm
         return mod
 
     detected = [
-        *[
-            SimpleNamespace(
-                path=str(batch / f"v_{i:02d}.fits"),
-                date_obs=datetime(2018, 9, 16, 18, tzinfo=timezone.utc),
-                object_name="GPX",
-                filter_name="V",
-            )
-            for i in range(10)
-        ],
-        *[
-            SimpleNamespace(
-                path=str(batch / f"r_{i:02d}.fits"),
-                date_obs=datetime(2018, 9, 16, 18, tzinfo=timezone.utc),
-                object_name="GPX",
-                filter_name="R",
-            )
-            for i in range(10)
-        ],
+        SimpleNamespace(
+            path=str(parent / f"{filt.lower()}_{i:02d}.fits"),
+            date_obs=date_obs,
+            site="KAO",
+            object_name="GPX",
+            filter_name=filt,
+        )
+        for parent, date_obs in (
+            (batch, datetime(2018, 9, 16, 18, tzinfo=timezone.utc)),
+            (resume_batch, datetime(2018, 9, 17, 8, tzinfo=timezone.utc)),
+            (ready_batch, datetime(2018, 9, 18, 8, tzinfo=timezone.utc)),
+            (excluded_batch, datetime(2018, 9, 19, 8, tzinfo=timezone.utc)),
+        )
+        for filt in ("V", "R")
+        for i in range(10)
     ]
 
     class FakeArchiveResult:
@@ -412,8 +418,8 @@ def test_execute_orchestration_runs_new_batch_then_stage3_and_m5(monkeypatch, tm
         failed_files = 0
         processed_series_ids = [88, 89]
         pipeline_results = [
-            {"series_id": 88, "filter_name": "V", "status": "DONE_WITH_WARNINGS", "science_status": "OK", "quality_policy": {}},
-            {"series_id": 89, "filter_name": "R", "status": "DONE", "science_status": "OK", "quality_policy": {}},
+            {"series_id": 88, "pipeline_run_id": 1088, "filter_name": "V", "status": "DONE_WITH_WARNINGS", "science_status": "OK", "quality_policy": {}},
+            {"series_id": 89, "pipeline_run_id": 1089, "filter_name": "R", "status": "DONE", "science_status": "OK", "quality_policy": {}},
         ]
         warnings = ["target provenance disabled"]
 
@@ -428,9 +434,11 @@ def test_execute_orchestration_runs_new_batch_then_stage3_and_m5(monkeypatch, tm
 
     process_calls = []
 
+    process_response = {"result": FakeArchiveResult()}
+
     def fake_process_archive_path(session, **kwargs):
         process_calls.append(kwargs)
-        return FakeArchiveResult()
+        return process_response["result"]
 
     module(
         "grandgousier.archive.auto_process",
@@ -459,6 +467,14 @@ def test_execute_orchestration_runs_new_batch_then_stage3_and_m5(monkeypatch, tm
             params = params or {}
             if "FROM frames fr" in sql:
                 return FakeMappedResult([])
+            if "FROM frame_locations fl" in sql and "field_series_frames" in sql:
+                return FakeMappedResult([
+                    {
+                        "raw_path": path,
+                        "series_id": 88 if Path(path).name.startswith("v_") else 89,
+                    }
+                    for path in params["paths"]
+                ])
             if "FROM field_series" in sql and "WHERE series_id" in sql:
                 sid = int(params["series_id"])
                 return FakeMappedResult([{
@@ -474,6 +490,28 @@ def test_execute_orchestration_runs_new_batch_then_stage3_and_m5(monkeypatch, tm
         def begin(self): return FakeSession()
 
     module("grandgousier.db.session", make_session_factory=lambda url: FakeSessionFactory())
+
+    from grandgousier.orchestration import field_archive as field_archive_module
+
+    def batch_state(_session, *, paths, **_kwargs):
+        first_path = Path(paths[0])
+        if first_path.is_relative_to(ready_batch):
+            return {
+                "status": "READY", "indexed_files": len(paths),
+                "series_ids": [90, 91], "resume_series_ids": [], "reason": None,
+            }
+        if first_path.is_relative_to(resume_batch):
+            return {
+                "status": "INCOMPLETE", "indexed_files": len(paths),
+                "series_ids": [88, 89], "resume_series_ids": [88],
+                "reason": "series_id=88 has no READY SCIENCE generation",
+            }
+        return {
+            "status": "NEW", "indexed_files": 0,
+            "series_ids": [], "resume_series_ids": [], "reason": None,
+        }
+
+    monkeypatch.setattr(field_archive_module, "_inspect_batch_db_state", batch_state)
 
     class Candidate:
         def __init__(self, sid, filt, cv):
@@ -530,9 +568,15 @@ def test_execute_orchestration_runs_new_batch_then_stage3_and_m5(monkeypatch, tm
         p.write_text("{}", encoding="utf-8")
         return {"summary": p}
 
+    stage3_analysis_calls = []
+
+    def fake_analyze(*_args, **kwargs):
+        stage3_analysis_calls.append(kwargs.get("filter_name"))
+        return Analysis()
+
     module(
         "grandgousier.interseries.analysis",
-        analyze_interseries_calibration=lambda *a, **k: Analysis(),
+        analyze_interseries_calibration=fake_analyze,
         export_interseries_analysis=fake_export_analysis,
     )
 
@@ -589,7 +633,7 @@ def test_execute_orchestration_runs_new_batch_then_stage3_and_m5(monkeypatch, tm
         export_global_object_light_curve=fake_export_m5,
     )
 
-    from grandgousier.orchestration.field_archive import run_field_archive_workflow
+    run_field_archive_workflow = field_archive_module.run_field_archive_workflow
     result = run_field_archive_workflow(
         database_url=None,
         processed_root=root,
@@ -598,14 +642,47 @@ def test_execute_orchestration_runs_new_batch_then_stage3_and_m5(monkeypatch, tm
         policies=[parse_stage3_policy("V:15:76"), parse_stage3_policy("R:20:77")],
         control_object_ids=[30112],
         execute=True,
-        exclude_dates=[],
+        exclude_dates=["2018/09/19"],
+        observing_day_policy=site_policy,
         out_root=tmp_path / "report",
     )
     assert result.status == "READY"
     assert len(process_calls) == 1
+    assert len(result.stage2_runs) == 1
     assert result.stage2_runs[0]["pipeline_results"][0]["status"] == "DONE_WITH_WARNINGS"
+    assert result.stage2_runs[0]["batch_operational_dates"] == ["2018-09-16", "2018-09-17"]
     assert process_calls[0]["photometry_estimator"] == "adaptive_ellipse"
     assert process_calls[0]["enable_spatial_ensemble"] is False
+    assert process_calls[0]["root"] == str(root)
+    active_paths = tuple(sorted(
+        row.path for row in detected
+        if Path(row.path).is_relative_to(batch) or Path(row.path).is_relative_to(resume_batch)
+    ))
+    assert process_calls[0]["exact_paths"] == active_paths
+    assert process_calls[0]["resume_series_ids"] == [88]
+    assert process_calls[0]["required_field_id"] == 33
+    assert len(result.batches) == 4
+    assert result.batches[0]["observation_date"] == "2018-09-16"
+    assert result.batches[0]["operational_date"] == "2018-09-16"
+    assert result.batches[1]["operational_date"] == "2018-09-17"
+    assert len(result.batches[0]["parents"]) == 1
+    assert len(result.batches[0]["paths"]) == 20
+    assert len(result.batches[1]["paths"]) == 20
+    assert result.batches[1]["action"] == "RESUME_INCOMPLETE"
+    assert result.batches[2]["action"] == "SKIP_READY"
+    assert result.batches[3]["action"] == "SKIP_EXCLUDED"
+    assert result.batches[0]["series_ids"] == [88, 89]
+    assert result.batches[1]["series_ids"] == [88, 89]
+    assert result.batches[0]["series_run_ids"] == [
+        {"series_id": 88, "pipeline_run_id": 1088},
+        {"series_id": 89, "pipeline_run_id": 1089},
+    ]
+    assert result.batches[1]["pipeline_run_ids"] == [1088, 1089]
+    assert len(result.stage2_runs[0]["batch_series_run_map"]) == 2
+    assert not set(result.batches[2]["paths"]).intersection(process_calls[0]["exact_paths"])
+    assert not set(result.batches[3]["paths"]).intersection(process_calls[0]["exact_paths"])
+    assert result.batches[0]["site_timezones"] == {"KAO": "Asia/Yekaterinburg"}
+    assert result.observing_day_policy == site_policy.to_dict()
     assert [row["generation"]["interseries_generation_id"] for row in result.stage3] == [15, 16]
     assert result.control_objects[0]["accepted_rows"] == 1860
     expected_bundle = tmp_path / "report" / "m5" / "object_30112"
@@ -614,7 +691,51 @@ def test_execute_orchestration_runs_new_batch_then_stage3_and_m5(monkeypatch, tm
     assert result.control_objects[0]["summary_path"] == str(
         expected_bundle / "object_30112_summary.json"
     )
-    assert (tmp_path / "report" / "final_report.json").exists()
+    import json
+
+    report_json = tmp_path / "report" / "final_report.json"
+    assert report_json.exists()
+    report_data = json.loads(report_json.read_text(encoding="utf-8"))
+    assert report_data["batches"][0]["series_run_ids"] == result.batches[0]["series_run_ids"]
+    assert report_data["stage2_runs"][0]["batch_series_run_map"] == (
+        result.stage2_runs[0]["batch_series_run_map"]
+    )
+    assert "2018-09-16" in (tmp_path / "report" / "frame_qc.csv").read_text(
+        encoding="utf-8-sig"
+    )
+    assert "2018-09-17" in (tmp_path / "report" / "frame_qc.csv").read_text(
+        encoding="utf-8-sig"
+    )
+
+    calls_before_failure = len(stage3_analysis_calls)
+    process_response["result"] = SimpleNamespace(
+        status="FAILED",
+        failed_files=0,
+        processed_series_ids=[88],
+        pipeline_results=[
+            {"series_id": 88, "pipeline_run_id": 2088, "status": "FAILED"}
+        ],
+        to_dict=lambda: {
+            "status": "FAILED",
+            "processed_series_ids": [88],
+            "pipeline_results": [
+                {"series_id": 88, "pipeline_run_id": 2088, "status": "FAILED"}
+            ],
+        },
+    )
+    failed = run_field_archive_workflow(
+        database_url=None,
+        processed_root=root,
+        field_id=33,
+        catalog_name="shared",
+        policies=[parse_stage3_policy("V:15:76"), parse_stage3_policy("R:20:77")],
+        execute=True,
+        exclude_dates=["2018/09/19"],
+        observing_day_policy=site_policy,
+        out_root=tmp_path / "failed-report",
+    )
+    assert failed.status == "FAILED_STAGE2"
+    assert len(stage3_analysis_calls) == calls_before_failure
 
 
 def test_duplicate_filter_policies_are_rejected(tmp_path: Path):
@@ -632,21 +753,88 @@ def test_duplicate_filter_policies_are_rejected(tmp_path: Path):
         )
 
 
-def test_group_detected_marks_multidate_leaf_ambiguous(tmp_path: Path):
+def test_group_detected_combines_mixed_utc_dates_with_same_operational_date(tmp_path: Path):
     from grandgousier.orchestration.field_archive import _group_detected_by_parent
 
     root = tmp_path / "processed"
     leaf = root / "mixed"
     leaf.mkdir(parents=True)
     rows = [
-        SimpleNamespace(path=str(leaf / "a.fits"), date_obs=datetime(2018, 9, 16, 23, tzinfo=timezone.utc), object_name="GPX", filter_name="V"),
-        SimpleNamespace(path=str(leaf / "b.fits"), date_obs=datetime(2018, 9, 17, 0, tzinfo=timezone.utc), object_name="GPX", filter_name="R"),
+        SimpleNamespace(path=str(leaf / "a.fits"), date_obs=datetime(2018, 9, 16, 23, tzinfo=timezone.utc), site="KAO", object_name="GPX", filter_name="V"),
+        SimpleNamespace(path=str(leaf / "b.fits"), date_obs=datetime(2018, 9, 17, 0, tzinfo=timezone.utc), site="KAO", object_name="GPX", filter_name="R"),
     ]
-    grouped = _group_detected_by_parent(root, rows)
+    policy = ObservingDayPolicy(site_timezones={"KAO": "Asia/Yekaterinburg"})
+    grouped = _group_detected_by_parent(root, rows, policy=policy)
     assert len(grouped) == 1
-    assert grouped[0]["observation_date"] is None
-    assert grouped[0]["date_ambiguous"] is True
-    assert grouped[0]["observation_dates"] == ["2018-09-16", "2018-09-17"]
+    assert grouped[0]["observation_date"] == "2018-09-16"
+    assert grouped[0]["operational_date"] == "2018-09-16"
+    assert grouped[0]["date_ambiguous"] is False
+    assert grouped[0]["observation_dates"] == ["2018-09-16"]
+
+
+def test_group_detected_splits_operational_dates_and_coalesces_parents_with_exact_paths(tmp_path: Path):
+    root = tmp_path / "processed"
+    parent_a = root / "utc-calendar" / "day-a"
+    parent_b = root / "flat" / "day-b"
+    parent_a.mkdir(parents=True)
+    parent_b.mkdir(parents=True)
+    rows = [
+        SimpleNamespace(
+            path=str(parent_a / "before-noon.fits"),
+            date_obs=datetime(2024, 1, 2, 6, 59, 59, tzinfo=timezone.utc),
+            site="KAO", object_name="GPX", filter_name="V",
+        ),
+        SimpleNamespace(
+            path=str(parent_a / "after-noon.fits"),
+            date_obs=datetime(2024, 1, 2, 7, 0, tzinfo=timezone.utc),
+            site="KAO", object_name="GPX", filter_name="V",
+        ),
+        SimpleNamespace(
+            path=str(parent_b / "next-utc-date.fits"),
+            date_obs=datetime(2024, 1, 3, 6, 59, 59, tzinfo=timezone.utc),
+            site="KAO", object_name="GPX", filter_name="V",
+        ),
+    ]
+
+    grouped = _group_detected_by_parent(
+        root, rows, policy=ObservingDayPolicy(site_timezones={"KAO": "Asia/Yekaterinburg"})
+    )
+
+    assert [row["observation_date"] for row in grouped] == ["2024-01-01", "2024-01-02"]
+    assert grouped[0]["paths"] == [str(parent_a / "before-noon.fits")]
+    assert grouped[1]["paths"] == sorted([
+        str(parent_a / "after-noon.fits"),
+        str(parent_b / "next-utc-date.fits"),
+    ])
+    assert grouped[1]["parents"] == sorted(
+        [str(parent_a), str(parent_b)], key=str.casefold
+    )
+    assert grouped[1]["relative_parents"] == [
+        str(Path("flat") / "day-b"),
+        str(Path("utc-calendar") / "day-a"),
+    ]
+
+
+def test_group_detected_unknown_site_fails_with_exact_path_context(tmp_path: Path):
+    path = tmp_path / "unknown-site" / "frame.fits"
+    row = SimpleNamespace(
+        path=str(path),
+        date_obs=datetime(2024, 1, 2, 7, tzinfo=timezone.utc),
+        site="UNKNOWN",
+        object_name="GPX",
+        filter_name="V",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        _group_detected_by_parent(
+            tmp_path,
+            [row],
+            policy=ObservingDayPolicy(site_timezones={"KAO": "Asia/Yekaterinburg"}),
+        )
+    diagnostic = str(exc_info.value)
+    assert "UNKNOWN" in diagnostic
+    assert str(path) in diagnostic
+    assert "DATE-OBS=datetime.datetime(2024, 1, 2, 7, 0, tzinfo=datetime.timezone.utc)" in diagnostic
 
 
 def test_real_plan_shape_marks_6_and_3_frame_leaves_too_small(tmp_path: Path):
@@ -699,7 +887,9 @@ def test_real_plan_shape_marks_6_and_3_frame_leaves_too_small(tmp_path: Path):
             for i in range(3)
         ],
     ]
-    batches = _group_detected_by_parent(root, rows)
+    batches = _group_detected_by_parent(
+        root, rows, policy=ObservingDayPolicy(site_timezones={"KAO": "Asia/Yekaterinburg"})
+    )
     assert [(row["observation_date"], row["max_series_like_group_files"]) for row in batches] == [
         ("2018-09-08", 3),
         ("2018-10-02", 3),
@@ -756,7 +946,7 @@ def test_gaia_catalog_uses_scoped_archive_handoff(monkeypatch, tmp_path: Path):
     detected = [
         SimpleNamespace(
             path=str(batch_root / f"frame-{index:02}.fits"),
-            date_obs=datetime(2024, 1, 2, 12, tzinfo=timezone.utc),
+            date_obs=datetime(2024, 1, 2, 6, 59, 59, tzinfo=timezone.utc),
             site="KAO",
             object_name="TEST_FIELD",
             filter_name="V",
@@ -795,6 +985,11 @@ def test_gaia_catalog_uses_scoped_archive_handoff(monkeypatch, tmp_path: Path):
             "reason": None,
         },
     )
+    monkeypatch.setattr(
+        field_archive_module,
+        "_series_ids_by_archive_path",
+        lambda *_args, **_kwargs: {},
+    )
     process_calls = []
 
     def fake_process_archive_path(_session, **kwargs):
@@ -815,6 +1010,8 @@ def test_gaia_catalog_uses_scoped_archive_handoff(monkeypatch, tmp_path: Path):
         catalog_name="gaia_dr3",
         policies=[parse_stage3_policy("V:15:76")],
         execute=True,
+        include_dates=["2024/01/01"],
+        observing_day_policy=ObservingDayPolicy(site_timezones={"KAO": "Asia/Yekaterinburg"}),
         out_root=tmp_path / "reports",
     )
 
@@ -826,3 +1023,25 @@ def test_gaia_catalog_uses_scoped_archive_handoff(monkeypatch, tmp_path: Path):
     assert Path(handoff["root"]) == root
     assert handoff["recursive"] is False
     assert handoff["series_ids"] is None
+    assert handoff["resume_series_ids"] == []
+    assert handoff["required_field_id"] == 7
+    assert handoff["exact_paths"] == tuple(sorted(row.path for row in detected))
+    assert result.batches[0]["observation_date"] == "2024-01-01"
+    assert result.batches[0]["operational_date"] == "2024-01-01"
+
+    excluded = field_archive_module.run_field_archive_workflow(
+        database_url=None,
+        processed_root=root,
+        field_id=7,
+        catalog_name="gaia_dr3",
+        policies=[parse_stage3_policy("V:15:76")],
+        execute=False,
+        exclude_dates=["2024/01/01"],
+        observing_day_policy=ObservingDayPolicy(site_timezones={"KAO": "Asia/Yekaterinburg"}),
+        out_root=tmp_path / "excluded-reports",
+    )
+    assert excluded.status == "PLAN"
+    assert excluded.batches[0]["observation_date"] == "2024-01-01"
+    assert excluded.batches[0]["operational_date"] == "2024-01-01"
+    assert excluded.batches[0]["action"] == "SKIP_EXCLUDED"
+    assert len(process_calls) == 1

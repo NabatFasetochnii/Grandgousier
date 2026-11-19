@@ -7,6 +7,7 @@ import logging
 import re
 import sys
 import traceback
+from collections.abc import Mapping
 from pathlib import Path
 
 from grandgousier import __version__
@@ -116,6 +117,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_parquet.add_argument("--out", required=True, help="Absolute output path; must not already exist")
     p_parquet.add_argument("--db-logical-id", default="unspecified", help="Non-secret logical DB label for manifest")
     p_parquet.add_argument("--batch-size", type=int, default=4096)
+    p_parquet.add_argument(
+        "--config", dest="config_file", default=argparse.SUPPRESS,
+        help="Optional application config supplying observing_days timezone policy",
+    )
+    p_parquet.add_argument(
+        "--site-timezone", dest="site_timezones", action="append", default=None,
+        metavar="SITE=IANA", help="Override or add one observing-site timezone; may be repeated",
+    )
+    p_parquet.add_argument(
+        "--default-site-timezone", default=None,
+        help="Override the default observing-site IANA timezone",
+    )
+    p_parquet.add_argument(
+        "--observing-day-boundary-local", default=None, metavar="TIME",
+        help="Override the local wall-clock observing-day boundary (ISO time)",
+    )
     p_parquet.set_defaults(func=cmd_export_science_parquet)
 
     p_reclaim = sub.add_parser(
@@ -133,6 +150,39 @@ def build_parser() -> argparse.ArgumentParser:
     p_reclaim.add_argument("--execute", action="store_true", help="Delete after all safety checks pass")
     p_reclaim.add_argument("--format", choices=("table", "json"), default="table")
     p_reclaim.set_defaults(func=cmd_reclaim_stage1_products)
+
+    p_reference_cache_audit = sub.add_parser(
+        "audit-reference-photometry-cache",
+        help="Read-only audit of selected-reference generation cache files",
+    )
+    p_reference_cache_audit.add_argument(
+        "--cache-dir", required=True, help="Exact reference_photometry cache directory to inspect"
+    )
+    p_reference_cache_audit.set_defaults(func=cmd_audit_reference_photometry_cache)
+
+    p_reference_cache_prune = sub.add_parser(
+        "prune-reference-photometry-cache",
+        help="Dry-run by default; prune only old valid selected-reference generations",
+    )
+    p_reference_cache_prune.add_argument(
+        "--cache-dir", required=True, help="Exact reference_photometry cache directory to inspect"
+    )
+    p_reference_cache_prune.add_argument(
+        "--max-age-days", "--max-age", dest="max_age_days", type=float, required=True,
+        help="Minimum age for prune eligibility; younger valid generations are preserved",
+    )
+    p_reference_cache_prune.add_argument(
+        "--max-count", type=int, required=True,
+        help="Maximum recognized generation count to retain",
+    )
+    p_reference_cache_prune.add_argument(
+        "--max-bytes", type=int, required=True,
+        help="Maximum known generation bytes to retain",
+    )
+    p_reference_cache_prune.add_argument(
+        "--apply", action="store_true", help="Apply the reported plan; default is a read-only dry run"
+    )
+    p_reference_cache_prune.set_defaults(func=cmd_prune_reference_photometry_cache)
 
     p_legacy_cleanup = sub.add_parser(
         "legacy-prune-stage1-products",
@@ -1715,6 +1765,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--config", dest="config_file", default=argparse.SUPPRESS,
         help="Grandgousier application config; field_archive section is used (may also be specified before the subcommand)",
     )
+    p_field_archive.add_argument(
+        "--site-timezone", dest="site_timezones", action="append", default=None,
+        metavar="SITE=IANA", help="Override or add one observing-site timezone; may be repeated",
+    )
+    p_field_archive.add_argument(
+        "--default-site-timezone", default=None,
+        help="Override the default observing-site IANA timezone",
+    )
+    p_field_archive.add_argument(
+        "--observing-day-boundary-local", default=None, metavar="TIME",
+        help="Override the local wall-clock observing-day boundary (ISO time)",
+    )
     p_field_archive.add_argument("--processed-root", default=None, help="Root containing processed FITS batches; required unless supplied by job config/environment")
     p_field_archive.add_argument("--field-id", type=int, default=None, help="Target fields.field_id; required unless supplied by job config/environment")
     p_field_archive.add_argument("--catalog-name", default=None, help="Explicit shared catalog namespace; required unless supplied by job config/environment")
@@ -2475,6 +2537,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_gaia.add_argument("--dry-run", action="store_true", help="Query but do not write to DB")
     p_gaia.set_defaults(func=cmd_query_gaia_for_frames)
 
+    p_gaia_tap_smoke = sub.add_parser(
+        "gaia-tap-network-smoke",
+        help="Opt-in, no-DB Gaia TAP provider network smoke (default is blocked)",
+    )
+    p_gaia_tap_smoke.add_argument(
+        "--allow-network",
+        action="store_true",
+        help="Explicitly permit the bounded requests to public Gaia TAP providers",
+    )
+    p_gaia_tap_smoke.set_defaults(func=cmd_gaia_tap_network_smoke)
+
     p_match_det = sub.add_parser(
         "match-detections-to-catalog",
         help="Cross-match source_detections with projected catalog_sources and write frame QC",
@@ -2551,6 +2624,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("db-summary", help="Print basic DB counters")
     p_status.set_defaults(func=cmd_db_summary)
+
+    p_legacy_gaia_cleanup = sub.add_parser(
+        "cleanup-legacy-gaia-catalogs",
+        help="Audit old auto_catalog_field_* Gaia rows; dry-run by default",
+    )
+    p_legacy_gaia_cleanup.add_argument(
+        "--apply", action="store_true", help="Delete only audited legacy frame links and unreferenced sources"
+    )
+    p_legacy_gaia_cleanup.add_argument(
+        "--confirm-database",
+        default=None,
+        help="Exact current_database() name; required together with --apply and --confirm-catalog-cleanup",
+    )
+    p_legacy_gaia_cleanup.add_argument(
+        "--confirm-catalog-cleanup",
+        action="store_true",
+        help="Explicitly acknowledge legacy Gaia catalog cleanup",
+    )
+    p_legacy_gaia_cleanup.add_argument(
+        "--keep-source-id",
+        action="append",
+        default=[],
+        help="Keep this exact legacy catalog source_id; repeatable",
+    )
+    p_legacy_gaia_cleanup.add_argument(
+        "--keep-catalog-source-id",
+        action="append",
+        type=int,
+        default=[],
+        help="Keep this exact catalog_sources.catalog_source_id; repeatable",
+    )
+    p_legacy_gaia_cleanup.add_argument(
+        "--format", choices=("json", "table"), default="json", help="Audit/result format"
+    )
+    p_legacy_gaia_cleanup.set_defaults(func=cmd_cleanup_legacy_gaia_catalogs)
 
     return parser
 
@@ -2659,6 +2767,32 @@ def cmd_reclaim_stage1_products(args: argparse.Namespace) -> int:
         if not args.execute:
             print("PLAN ONLY: no files were changed.")
     return 0 if result.status in {"RECLAIMABLE", "RECLAIMED", "ALREADY_RECLAIMED"} else 2
+
+
+def cmd_audit_reference_photometry_cache(args: argparse.Namespace) -> int:
+    from grandgousier.archive.auto_process import audit_selected_reference_cache
+
+    report = audit_selected_reference_cache(args.cache_dir)
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 2 if report["errors"] else 0
+
+
+def cmd_prune_reference_photometry_cache(args: argparse.Namespace) -> int:
+    from grandgousier.archive.auto_process import prune_selected_reference_cache
+
+    try:
+        report = prune_selected_reference_cache(
+            args.cache_dir,
+            max_age_days=args.max_age_days,
+            max_count=args.max_count,
+            max_bytes=args.max_bytes,
+            apply=bool(args.apply),
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "INVALID_ARGUMENT", "error": str(exc)}, indent=2))
+        return 2
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 2 if report["errors"] or report["skipped"] else 0
 
 
 def cmd_legacy_prune_stage1_products(args: argparse.Namespace) -> int:
@@ -6116,6 +6250,83 @@ def cmd_field_archive_readiness(args: argparse.Namespace) -> int:
     return 0 if result.ready else 2
 
 
+def _observing_day_policy_from_sources(
+    args: argparse.Namespace,
+    config_files: list[str | Path | None],
+):
+    from grandgousier.config import read_config_file
+    from grandgousier.observing_day import DEFAULT_OBSERVING_DAY_POLICY, ObservingDayPolicy
+
+    policy = DEFAULT_OBSERVING_DAY_POLICY
+    for config_file in config_files:
+        if config_file is None:
+            continue
+        payload = read_config_file(config_file)
+        raw_policy = payload.get("observing_days")
+        if raw_policy is None:
+            continue
+        if not isinstance(raw_policy, Mapping):
+            raise ValueError("Grandgousier config 'observing_days' must be a mapping")
+
+        configured = ObservingDayPolicy.from_mapping(raw_policy)
+        site_timezones = dict(policy.site_timezones)
+        for site, timezone_name in configured.site_timezones.items():
+            canonical_site = next(
+                (
+                    existing_site
+                    for existing_site in site_timezones
+                    if existing_site.casefold() == site.casefold()
+                ),
+                site,
+            )
+            for existing_site in tuple(site_timezones):
+                if existing_site.casefold() == site.casefold():
+                    del site_timezones[existing_site]
+            site_timezones[canonical_site] = timezone_name
+        policy = ObservingDayPolicy(
+            boundary_local_time=raw_policy.get(
+                "boundary_local_time", policy.boundary_local_time
+            ),
+            site_timezones=site_timezones,
+            default_timezone=raw_policy.get("default_timezone", policy.default_timezone),
+        )
+
+    site_timezones = dict(policy.site_timezones)
+    for specification in getattr(args, "site_timezones", None) or ():
+        if not isinstance(specification, str):
+            raise ValueError("--site-timezone must use SITE=IANA format")
+        site, separator, timezone_name = specification.partition("=")
+        if not separator or not site.strip() or not timezone_name.strip() or "=" in timezone_name:
+            raise ValueError("--site-timezone must use SITE=IANA format")
+        site = site.strip()
+        canonical_site = next(
+            (
+                existing_site
+                for existing_site in site_timezones
+                if existing_site.casefold() == site.casefold()
+            ),
+            site,
+        )
+        for existing_site in tuple(site_timezones):
+            if existing_site.casefold() == site.casefold():
+                del site_timezones[existing_site]
+        site_timezones[canonical_site] = timezone_name.strip()
+
+    return ObservingDayPolicy(
+        boundary_local_time=(
+            getattr(args, "observing_day_boundary_local", None)
+            if getattr(args, "observing_day_boundary_local", None) is not None
+            else policy.boundary_local_time
+        ),
+        site_timezones=site_timezones,
+        default_timezone=(
+            getattr(args, "default_site_timezone", None)
+            if getattr(args, "default_site_timezone", None) is not None
+            else policy.default_timezone
+        ),
+    )
+
+
 def cmd_process_field_archive(args: argparse.Namespace) -> int:
     from grandgousier.services.field_archive_job import run_field_archive_job
     from grandgousier.services.runtime import FieldArchiveJobConfig
@@ -6137,6 +6348,10 @@ def cmd_process_field_archive(args: argparse.Namespace) -> int:
         "plot_max_points": args.plot_max_points,
     }
     try:
+        overrides["observing_day_policy"] = _observing_day_policy_from_sources(
+            args,
+            [getattr(args, "config_file", None), args.job_config],
+        )
         config = FieldArchiveJobConfig.from_sources(
             config_file=args.job_config or getattr(args, "config_file", None),
             overrides=overrides,
@@ -9796,9 +10011,80 @@ def cmd_db_summary(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_export_science_parquet(args: argparse.Namespace) -> int:
+def cmd_cleanup_legacy_gaia_catalogs(args: argparse.Namespace) -> int:
     from sqlalchemy import create_engine
+
+    from grandgousier.db.legacy_gaia_catalog_cleanup import (
+        LegacyGaiaCatalogCleanupError,
+        audit_legacy_gaia_catalogs,
+        validate_apply_acknowledgements,
+    )
+
+    try:
+        validate_apply_acknowledgements(
+            apply=bool(args.apply),
+            confirm_database=args.confirm_database,
+            confirm_catalog_cleanup=bool(args.confirm_catalog_cleanup),
+        )
+    except LegacyGaiaCatalogCleanupError as exc:
+        print(f"Refusing legacy Gaia catalog cleanup: {exc}", file=sys.stderr)
+        return 2
+
+    engine = create_engine(args.database_url or get_settings().database_url, pool_pre_ping=True, future=True)
+    try:
+        with engine.connect() as connection:
+            with connection.begin():
+                report = audit_legacy_gaia_catalogs(
+                    connection,
+                    apply=bool(args.apply),
+                    confirm_database=args.confirm_database,
+                    confirm_catalog_cleanup=bool(args.confirm_catalog_cleanup),
+                    keep_source_ids=args.keep_source_id,
+                    keep_catalog_source_ids=args.keep_catalog_source_id,
+                )
+        if args.format == "json":
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            identity = report["database"]
+            print(
+                f"mode={report['mode']} database={identity['database_name']} "
+                f"oid={identity['database_oid']} protected={identity['protected']}"
+            )
+            for catalog in report["catalogs"]:
+                print(
+                    f"{catalog['catalog_name']}: sources={catalog['catalog_source_count']} "
+                    f"keep={catalog['durable_keep_source_count']} "
+                    f"frame_links={catalog['frame_catalog_link_count']} "
+                    f"removable_links={catalog['removable_frame_link_count']} "
+                    f"removable_sources={catalog['removable_catalog_source_count']}"
+                )
+            print(
+                "estimated_reusable_bytes="
+                f"{report['estimated_reclaimable_bytes']['estimated_reusable_bytes']} "
+                "(DELETE does not directly free filesystem bytes)"
+            )
+        return 0
+    except LegacyGaiaCatalogCleanupError as exc:
+        print(f"Refusing legacy Gaia catalog cleanup: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        engine.dispose()
+
+
+def cmd_gaia_tap_network_smoke(args: argparse.Namespace) -> int:
+    from grandgousier.catalogs.gaia_tap_smoke import run_gaia_tap_network_smoke
+
+    summary, exit_code = run_gaia_tap_network_smoke(allow_network=bool(args.allow_network))
+    print(json.dumps(summary, sort_keys=True))
+    return exit_code
+
+
+def cmd_export_science_parquet(args: argparse.Namespace) -> int:
     from grandgousier.lightcurves.parquet_export import export_series
+    from sqlalchemy import create_engine
+
+    config_file = getattr(args, "config_file", None)
+    day_policy = _observing_day_policy_from_sources(args, [config_file])
 
     engine = create_engine(args.database_url, pool_pre_ping=True, future=True)
     try:
@@ -9811,6 +10097,7 @@ def cmd_export_science_parquet(args: argparse.Namespace) -> int:
                         session, args.series_id, args.out, logical_db_id=args.db_logical_id,
                         calibration_version_id=args.calibration_version_id,
                         interseries_generation_id=args.interseries_generation_id, batch_size=args.batch_size,
+                        observing_day_policy=day_policy,
                     )
         print(json.dumps(manifest, indent=2, sort_keys=True))
         return 0
@@ -9987,6 +10274,10 @@ def _run_main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
+    # This standalone probe is intentionally independent of Settings/configuration:
+    # its default path must not touch a database or request the network.
+    if args.command == "gaia-tap-network-smoke":
+        return args.func(args)
     config_file = getattr(args, "config_file", None)
     try:
         settings = get_settings(config_file=config_file)

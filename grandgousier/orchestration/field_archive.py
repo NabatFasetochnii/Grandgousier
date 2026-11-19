@@ -12,6 +12,12 @@ from typing import Any, Callable, Iterable, Sequence
 from sqlalchemy import text
 
 from grandgousier import __version__
+from grandgousier.observing_day import (
+    DEFAULT_OBSERVING_DAY_POLICY,
+    ObservingDayPolicy,
+    operational_date_iso,
+    resolve_site_timezone,
+)
 from grandgousier.pipeline.recipe_contracts import (
     MISSING_PROVENANCE,
     RECIPE_MISMATCH,
@@ -53,6 +59,13 @@ class ArchiveBatch:
     series_ids: tuple[int, ...]
     resume_series_ids: tuple[int, ...] = ()
     reason: str | None = None
+    operational_date: str | None = None
+    paths: tuple[str, ...] = ()
+    parents: tuple[str, ...] = ()
+    relative_parents: tuple[str, ...] = ()
+    site_timezones: dict[str, str] = field(default_factory=dict)
+    pipeline_run_ids: tuple[int, ...] = ()
+    series_run_ids: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         row = asdict(self)
@@ -60,6 +73,12 @@ class ArchiveBatch:
         row["filters"] = list(self.filters)
         row["series_ids"] = list(self.series_ids)
         row["resume_series_ids"] = list(self.resume_series_ids)
+        row["paths"] = list(self.paths)
+        row["parents"] = list(self.parents)
+        row["relative_parents"] = list(self.relative_parents)
+        row["site_timezones"] = dict(self.site_timezones)
+        row["pipeline_run_ids"] = list(self.pipeline_run_ids)
+        row["series_run_ids"] = [dict(value) for value in self.series_run_ids]
         return row
 
 
@@ -73,6 +92,7 @@ class FieldArchiveRunResult:
     stage2_recipe: str
     policies: list[Stage3Policy]
     control_object_ids: list[int]
+    observing_day_policy: dict[str, Any] = field(default_factory=dict)
     algorithm: str = FIELD_ARCHIVE_ALGORITHM
     version: str = __version__
     status: str = "PLANNED"
@@ -102,6 +122,7 @@ class FieldArchiveRunResult:
             "stage2_recipe": self.stage2_recipe,
             "policies": [row.to_dict() for row in self.policies],
             "control_object_ids": self.control_object_ids,
+            "observing_day_policy": self.observing_day_policy,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "batches": self.batches,
@@ -131,6 +152,129 @@ def _stage2_series_ids_for_batch(batch: ArchiveBatch) -> list[int] | None:
     if batch.action != "RESUME_INCOMPLETE" or not batch.resume_series_ids:
         return None
     return sorted({int(v) for v in batch.resume_series_ids})
+
+
+def _series_run_rows(
+    series_ids: Iterable[int],
+    ready_by_series: dict[int, Any],
+) -> tuple[tuple[int, ...], tuple[dict[str, Any], ...]]:
+    rows: list[dict[str, Any]] = []
+    for series_id in sorted({int(value) for value in series_ids}):
+        candidate = ready_by_series.get(series_id)
+        run_id = getattr(candidate, "pipeline_run_id", None) if candidate is not None else None
+        rows.append(
+            {
+                "series_id": series_id,
+                "pipeline_run_id": int(run_id) if run_id is not None else None,
+            }
+        )
+    run_ids = tuple(
+        sorted(
+            {
+                int(row["pipeline_run_id"])
+                for row in rows
+                if row["pipeline_run_id"] is not None
+            }
+        )
+    )
+    return run_ids, tuple(rows)
+
+
+def _series_ids_by_archive_path(
+    session: Any,
+    *,
+    paths: Sequence[str],
+    field_id: int,
+) -> dict[str, set[int]]:
+    if not paths:
+        return {}
+    rows = session.execute(
+        text(
+            """
+            SELECT fl.locator AS raw_path, fsf.series_id
+            FROM frame_locations fl
+            JOIN field_series_frames fsf ON fsf.frame_id = fl.frame_id
+            JOIN field_series fs ON fs.series_id = fsf.series_id
+            WHERE fl.is_primary
+              AND fl.locator = ANY(:paths)
+              AND fs.field_id = :field_id
+            ORDER BY fl.locator, fsf.series_id
+            """
+        ),
+        {"paths": list(paths), "field_id": int(field_id)},
+    ).mappings().all()
+    by_path: dict[str, set[int]] = defaultdict(set)
+    for row in rows:
+        by_path[str(row["raw_path"])].add(int(row["series_id"]))
+    return by_path
+
+
+def _attach_stage2_mapping(
+    batches: Sequence[ArchiveBatch],
+    batch_reports: Sequence[dict[str, Any]],
+    *,
+    series_ids_by_path: dict[str, set[int]],
+    pipeline_results: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    reports_by_scope = {
+        (
+            str(report.get("operational_date")),
+            tuple(str(path) for path in report.get("paths") or ()),
+        ): report
+        for report in batch_reports
+    }
+    run_id_by_series: dict[int, int | None] = {}
+    for row in pipeline_results:
+        series_id = row.get("series_id")
+        if series_id is None:
+            continue
+        run_id = row.get("pipeline_run_id")
+        run_id_by_series[int(series_id)] = int(run_id) if run_id is not None else None
+
+    date_mappings: list[dict[str, Any]] = []
+    for batch in batches:
+        report = reports_by_scope[(str(batch.operational_date), tuple(batch.paths))]
+        series_ids = set(int(value) for value in batch.series_ids)
+        for path in batch.paths:
+            series_ids.update(series_ids_by_path.get(str(path), set()))
+        ordered_series_ids = sorted(series_ids)
+        prior_run_ids = {
+            int(row["series_id"]): row.get("pipeline_run_id")
+            for row in report.get("series_run_ids") or []
+        }
+        series_runs = [
+            {
+                "series_id": series_id,
+                "pipeline_run_id": (
+                    run_id_by_series[series_id]
+                    if series_id in run_id_by_series
+                    else prior_run_ids.get(series_id)
+                ),
+            }
+            for series_id in ordered_series_ids
+        ]
+        pipeline_run_ids = sorted(
+            {
+                int(row["pipeline_run_id"])
+                for row in series_runs
+                if row["pipeline_run_id"] is not None
+            }
+        )
+        report["series_ids"] = ordered_series_ids
+        report["series_run_ids"] = series_runs
+        report["pipeline_run_ids"] = pipeline_run_ids
+        date_mappings.append(
+            {
+                "operational_date": batch.operational_date,
+                "relative_path": batch.relative_path,
+                "paths": list(batch.paths),
+                "parents": list(batch.parents),
+                "series_ids": ordered_series_ids,
+                "series_run_ids": series_runs,
+                "pipeline_run_ids": pipeline_run_ids,
+            }
+        )
+    return date_mappings
 
 
 def parse_stage3_policy(value: str) -> Stage3Policy:
@@ -191,6 +335,7 @@ def run_field_archive_workflow(
     stage2_recipe: str = STAGE2_RECIPE_STAGE3_SCALE_V1,
     exclude_dates: Iterable[str] = (),
     include_dates: Iterable[str] = (),
+    observing_day_policy: ObservingDayPolicy | None = None,
     out_root: str | Path = "reports/field_archive",
     plot_max_points: int = 200,
     event_callback: Callable[[str, dict[str, Any]], None] | None = None,
@@ -202,6 +347,9 @@ def run_field_archive_workflow(
         raise ValueError(
             f"Unsupported Stage-2 recipe {stage2_recipe!r}; supported: {', '.join(SUPPORTED_STAGE2_RECIPES)}"
         )
+    day_policy = observing_day_policy or DEFAULT_OBSERVING_DAY_POLICY
+    if not isinstance(day_policy, ObservingDayPolicy):
+        day_policy = ObservingDayPolicy.from_mapping(day_policy)
 
     root = Path(processed_root)
     if not root.exists() or not root.is_dir():
@@ -218,6 +366,7 @@ def run_field_archive_workflow(
         stage2_recipe=stage2_recipe,
         policies=list(policies),
         control_object_ids=sorted({int(v) for v in control_object_ids}),
+        observing_day_policy=day_policy.to_dict(),
     )
     from grandgousier.archive.auto_process import (
         DEFAULT_EXTENSIONS,
@@ -261,7 +410,7 @@ def run_field_archive_workflow(
         if not detected:
             return _finish(result, out, status="FAILED_NO_FITS", error="No readable FITS files found")
 
-        raw_batches = _group_detected_by_parent(root, detected)
+        raw_batches = _group_detected_by_parent(root, detected, policy=day_policy)
         include_set = {_normalize_date_token(v) for v in include_dates if str(v).strip()}
         exclude_set = {_normalize_date_token(v) for v in exclude_dates if str(v).strip()}
 
@@ -279,27 +428,7 @@ def run_field_archive_workflow(
 
             batches: list[ArchiveBatch] = []
             for item in raw_batches:
-                obs_date = item["observation_date"]
-                if item.get("date_ambiguous"):
-                    batches.append(
-                        ArchiveBatch(
-                            path=item["path"],
-                            relative_path=item["relative_path"],
-                            observation_date=None,
-                            n_files=len(item["paths"]),
-                            object_names=tuple(item["object_names"]),
-                            filters=tuple(item["filters"]),
-                            action="STOP_CONFLICT",
-                            db_status="AMBIGUOUS_BATCH_DATE",
-                            indexed_files=0,
-                            series_ids=(),
-                            reason=(
-                                "leaf batch contains multiple observing dates: "
-                                + ",".join(item.get("observation_dates") or [])
-                            ),
-                        )
-                    )
-                    continue
+                obs_date = item["operational_date"]
                 if include_set and obs_date not in include_set:
                     batches.append(_excluded_batch(item, "NOT_IN_INCLUDE_DATES"))
                     continue
@@ -324,11 +453,15 @@ def run_field_archive_workflow(
                         "NO_SERIES_GROUP_MEETS_MIN_FRAMES_PER_SERIES:"
                         f"min={STAGE2_MIN_FRAMES_PER_SERIES},max={max_group_files}"
                     )
+                batch_pipeline_run_ids, batch_series_run_ids = _series_run_rows(
+                    state["series_ids"], ready_by_series
+                )
                 batches.append(
                     ArchiveBatch(
                         path=item["path"],
                         relative_path=item["relative_path"],
                         observation_date=obs_date,
+                        operational_date=obs_date,
                         n_files=len(item["paths"]),
                         object_names=tuple(item["object_names"]),
                         filters=tuple(item["filters"]),
@@ -338,6 +471,12 @@ def run_field_archive_workflow(
                         series_ids=tuple(state["series_ids"]),
                         resume_series_ids=tuple(state.get("resume_series_ids") or ()),
                         reason=state.get("reason"),
+                        paths=tuple(item["paths"]),
+                        parents=tuple(item["parents"]),
+                        relative_parents=tuple(item["relative_parents"]),
+                        site_timezones=dict(item["site_timezones"]),
+                        pipeline_run_ids=batch_pipeline_run_ids,
+                        series_run_ids=batch_series_run_ids,
                     )
                 )
             result.batches = [row.to_dict() for row in batches]
@@ -363,38 +502,71 @@ def run_field_archive_workflow(
             return _finish(result, out, status="PLAN")
 
         processed_series_ids: set[int] = set()
-        for batch in batches:
-            if batch.action in {"SKIP_READY", "SKIP_EXCLUDED", "SKIP_TOO_SMALL"}:
-                continue
-            if batch.action not in {"RUN_NEW", "RESUME_INCOMPLETE"}:
-                return _finish(
-                    result,
-                    out,
-                    status="FAILED_BATCH_STATE",
-                    error=f"Unsupported batch action {batch.action} for {batch.relative_path}",
-                )
-            batch_token = _safe_token(batch.observation_date or batch.relative_path)
-            batch_out = out / "stage2" / batch_token
+        stage2_batches = [
+            batch for batch in batches
+            if batch.action in {"RUN_NEW", "RESUME_INCOMPLETE"}
+        ]
+        unsupported_batches = [
+            batch for batch in batches
+            if batch.action not in {
+                "SKIP_READY", "SKIP_EXCLUDED", "SKIP_TOO_SMALL",
+                "RUN_NEW", "RESUME_INCOMPLETE",
+            }
+        ]
+        if unsupported_batches:
+            details = "; ".join(
+                f"{batch.relative_path}: {batch.action}"
+                for batch in unsupported_batches
+            )
+            return _finish(
+                result,
+                out,
+                status="FAILED_BATCH_STATE",
+                error=f"Unsupported field-archive batch action: {details}",
+            )
+        if stage2_batches:
+            stage2_paths = tuple(
+                sorted({path for batch in stage2_batches for path in batch.paths})
+            )
+            resume_series_ids = sorted(
+                {
+                    int(series_id)
+                    for batch in stage2_batches
+                    if batch.action == "RESUME_INCOMPLETE"
+                    for series_id in batch.resume_series_ids
+                }
+            )
+            operational_dates = sorted(
+                {str(batch.operational_date) for batch in stage2_batches}
+            )
+            relative_paths = sorted({batch.relative_path for batch in stage2_batches})
+            batch_out = out / "stage2" / f"field_{int(field_id)}"
             manifest = batch_out / "manifest.json"
             _emit_workflow_event(
                 event_callback,
                 "stage2_batch_started",
                 stage="stage2",
                 status="RUNNING",
-                batch_date=batch.observation_date,
-                batch_relative_path=batch.relative_path,
-                action=batch.action,
-                n_files=batch.n_files,
+                consolidated=True,
+                field_id=int(field_id),
+                batch_date=operational_dates[0] if len(operational_dates) == 1 else None,
+                batch_operational_dates=operational_dates,
+                batch_relative_paths=relative_paths,
+                n_files=len(stage2_paths),
+                batch_paths=list(stage2_paths),
             )
             with Session() as session:
                 archive_result = process_archive_path(
                     session,
-                    root=batch.path,
+                    root=str(root),
                     catalog_name=None if str(catalog_name) == "gaia_dr3" else str(catalog_name),
                     execute=True,
                     instrument_profile=instrument_profile,
                     recursive=False,
-                    series_ids=_stage2_series_ids_for_batch(batch),
+                    exact_paths=stage2_paths,
+                    series_ids=None,
+                    resume_series_ids=resume_series_ids,
+                    required_field_id=int(field_id),
                     min_frames_per_series=STAGE2_MIN_FRAMES_PER_SERIES,
                     max_field_separation_arcmin=30.0,
                     max_series_gap_minutes=60.0,
@@ -407,36 +579,69 @@ def run_field_archive_workflow(
                     **_stage2_recipe_kwargs(stage2_recipe),
                 )
             run_row = archive_result.to_dict()
-            run_row["batch_relative_path"] = batch.relative_path
-            run_row["batch_date"] = batch.observation_date
+            run_row["consolidated_field_major"] = True
+            run_row["required_field_id"] = int(field_id)
+            run_row["batch_relative_paths"] = relative_paths
+            run_row["batch_date"] = operational_dates[0] if len(operational_dates) == 1 else None
+            run_row["batch_operational_dates"] = operational_dates
+            run_row["batch_paths"] = list(stage2_paths)
+            run_row["batch_parents"] = sorted(
+                {parent for batch in stage2_batches for parent in batch.parents},
+                key=str.casefold,
+            )
+            run_row["observing_day_policy"] = day_policy.to_dict()
+            pipeline_results = list(getattr(archive_result, "pipeline_results", []) or [])
+            with Session() as session:
+                series_ids_by_path = _series_ids_by_archive_path(
+                    session,
+                    paths=stage2_paths,
+                    field_id=int(field_id),
+                )
+            batch_series_run_map = _attach_stage2_mapping(
+                stage2_batches,
+                result.batches,
+                series_ids_by_path=series_ids_by_path,
+                pipeline_results=pipeline_results,
+            )
+            run_row["batch_series_run_map"] = batch_series_run_map
             result.stage2_runs.append(run_row)
-            processed_series_ids.update(int(v) for v in archive_result.processed_series_ids)
+            processed_ids = [
+                int(value)
+                for value in (getattr(archive_result, "processed_series_ids", []) or [])
+            ]
+            processed_series_ids.update(processed_ids)
             _emit_workflow_event(
                 event_callback,
                 "stage2_batch_completed",
                 stage="stage2",
                 status=archive_result.status,
-                batch_date=batch.observation_date,
-                batch_relative_path=batch.relative_path,
-                processed_series_ids=[int(v) for v in archive_result.processed_series_ids],
-                failed_files=int(archive_result.failed_files),
+                consolidated=True,
+                field_id=int(field_id),
+                batch_operational_dates=operational_dates,
+                processed_series_ids=processed_ids,
+                failed_files=int(getattr(archive_result, "failed_files", 0)),
+                batch_paths=list(stage2_paths),
+                batch_series_run_map=batch_series_run_map,
             )
             if archive_result.status not in {"DONE", "DONE_WITH_WARNINGS"}:
                 return _finish(
                     result,
                     out,
                     status="FAILED_STAGE2",
-                    error=f"Stage 2 failed for {batch.relative_path}: {archive_result.status}",
+                    error=f"Consolidated Stage 2 failed: {archive_result.status}",
                 )
-            if int(archive_result.failed_files) > 0:
+            if int(getattr(archive_result, "failed_files", 0)) > 0:
                 return _finish(
                     result,
                     out,
                     status="FAILED_STAGE2_FILES",
-                    error=f"Stage 2 reported {archive_result.failed_files} failed FITS files for {batch.relative_path}",
+                    error=(
+                        "Consolidated Stage 2 reported "
+                        f"{getattr(archive_result, 'failed_files', 0)} failed FITS files"
+                    ),
                 )
             failed_pipelines = [
-                row for row in archive_result.pipeline_results
+                row for row in pipeline_results
                 if str(row.get("status") or "").upper() not in {"DONE", "DONE_WITH_WARNINGS"}
             ]
             if failed_pipelines:
@@ -444,7 +649,7 @@ def run_field_archive_workflow(
                     result,
                     out,
                     status="FAILED_STAGE2_PIPELINE",
-                    error=f"Stage 2 pipeline failure in {batch.relative_path}",
+                    error="Pipeline failure in consolidated Stage 2",
                 )
 
         # Re-plan after every requested Stage-2 batch.  This selects the same newest
@@ -721,27 +926,67 @@ def _series_like_group_key(row: Any) -> tuple[str, ...]:
     )
 
 
-def _group_detected_by_parent(root: Path, detected: Sequence[Any]) -> list[dict[str, Any]]:
-    grouped: dict[Path, list[Any]] = defaultdict(list)
+def _group_detected_by_parent(
+    root: Path,
+    detected: Sequence[Any],
+    *,
+    policy: ObservingDayPolicy = DEFAULT_OBSERVING_DAY_POLICY,
+) -> list[dict[str, Any]]:
+    """Group exact FITS paths by site-local operational date across parent directories."""
+
+    grouped: dict[str, list[Any]] = defaultdict(list)
     for row in detected:
-        grouped[Path(row.path).parent].append(row)
+        path = str(row.path)
+        site = getattr(row, "site", None)
+        date_obs = getattr(row, "date_obs", None)
+        site_label = str(site).strip() if site is not None and str(site).strip() else "<missing>"
+        try:
+            if date_obs is None:
+                raise ValueError("DATE-OBS is missing")
+            operation_date = operational_date_iso(date_obs, site, policy)
+        except ValueError as exc:
+            raise ValueError(
+                f"Cannot assign an operational date for site {site_label!r}, "
+                f"FITS path {path}, DATE-OBS={date_obs!r}: {exc}"
+            ) from exc
+        if operation_date is None:
+            raise ValueError(
+                f"Cannot assign an operational date for site {site_label!r}, "
+                f"FITS path {path}, DATE-OBS={date_obs!r}: DATE-OBS is missing"
+            )
+        grouped[operation_date].append(row)
+
     result: list[dict[str, Any]] = []
-    for parent in sorted(grouped, key=lambda p: str(p).casefold()):
-        rows = grouped[parent]
-        dates = sorted({_date_from_value(row.date_obs) for row in rows if _date_from_value(row.date_obs)})
-        observation_date = dates[0] if len(dates) == 1 else None
-        relative = _relative_or_self(parent, root)
+    for observation_date in sorted(grouped):
+        rows = grouped[observation_date]
+        paths = sorted({str(row.path) for row in rows})
+        parents = sorted({str(Path(path).parent) for path in paths}, key=str.casefold)
+        relative_parents = sorted(
+            {_relative_or_self(Path(parent), root) for parent in parents},
+            key=str.casefold,
+        )
+        site_timezones: dict[str, str] = {}
+        for row in rows:
+            site = getattr(row, "site", None)
+            site_label = str(site).strip() if site is not None and str(site).strip() else "<missing>"
+            site_timezones[site_label] = resolve_site_timezone(site, policy)
+
         series_like_counts: dict[tuple[str, ...], int] = defaultdict(int)
         for row in rows:
             series_like_counts[_series_like_group_key(row)] += 1
         result.append(
             {
-                "path": str(parent),
-                "relative_path": relative,
+                # The date is the batch identity; exact_paths carry the only input scope.
+                "path": str(root),
+                "relative_path": observation_date,
                 "observation_date": observation_date,
-                "observation_dates": dates,
-                "date_ambiguous": len(dates) > 1,
-                "paths": sorted({str(Path(row.path)) for row in rows}),
+                "operational_date": observation_date,
+                "observation_dates": [observation_date],
+                "date_ambiguous": False,
+                "paths": paths,
+                "parents": parents,
+                "relative_parents": relative_parents,
+                "site_timezones": dict(sorted(site_timezones.items(), key=lambda pair: pair[0].casefold())),
                 "object_names": sorted({str(row.object_name) for row in rows if row.object_name}),
                 "filters": sorted({str(row.filter_name) for row in rows if row.filter_name}),
                 "max_series_like_group_files": max(series_like_counts.values(), default=0),
@@ -989,6 +1234,7 @@ def _excluded_batch(item: dict[str, Any], reason: str) -> ArchiveBatch:
         path=item["path"],
         relative_path=item["relative_path"],
         observation_date=item["observation_date"],
+        operational_date=item["operational_date"],
         n_files=len(item["paths"]),
         object_names=tuple(item["object_names"]),
         filters=tuple(item["filters"]),
@@ -998,6 +1244,10 @@ def _excluded_batch(item: dict[str, Any], reason: str) -> ArchiveBatch:
         series_ids=(),
         resume_series_ids=(),
         reason=reason,
+        paths=tuple(item["paths"]),
+        parents=tuple(item["parents"]),
+        relative_parents=tuple(item["relative_parents"]),
+        site_timezones=dict(item["site_timezones"]),
     )
 
 
@@ -1173,29 +1423,40 @@ def _write_reports(result: FieldArchiveRunResult, out: Path) -> None:
 
     frame_qc_rows: list[dict[str, Any]] = []
     for run in result.stage2_runs:
-        batch_date = run.get("batch_date")
-        batch_path = run.get("batch_relative_path")
+        dates_by_series: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for date_mapping in run.get("batch_series_run_map") or []:
+            for series_id in date_mapping.get("series_ids") or []:
+                dates_by_series[int(series_id)].append(date_mapping)
         for pipe in run.get("pipeline_results") or []:
             quality = pipe.get("quality_policy") or {}
-            frame_qc_rows.append({
-                "batch_date": batch_date,
-                "batch_path": batch_path,
-                "series_id": pipe.get("series_id"),
-                "filter_name": pipe.get("filter_name"),
-                "pipeline_status": pipe.get("status"),
-                "science_status": pipe.get("science_status"),
-                "total_points": pipe.get("total_points"),
-                "accepted_points": pipe.get("accepted_points"),
-                "good_frames": quality.get("photometric_frame_qc_good_frames"),
-                "suspect_frames": quality.get("photometric_frame_qc_suspect_frames"),
-                "bad_frames": quality.get("photometric_frame_qc_bad_frames"),
-                "frames_with_spatial_systematic": quality.get("photometric_frame_qc_frames_with_spatial_systematic"),
-                "median_residual_robust_sigma_mag": quality.get("photometric_frame_qc_median_residual_robust_sigma_mag"),
-                "median_sigma_frame_systematic_mag": quality.get("photometric_frame_qc_median_sigma_frame_systematic_mag"),
-                "max_sigma_frame_systematic_mag": quality.get("photometric_frame_qc_max_sigma_frame_systematic_mag"),
-                "error_policy": quality.get("photometric_frame_qc_error_policy"),
-                "science_calibration": pipe.get("science_calibration"),
-            })
+            series_id = pipe.get("series_id")
+            mappings = dates_by_series.get(int(series_id), []) if series_id is not None else []
+            if not mappings:
+                mappings = [{
+                    "operational_date": run.get("batch_date"),
+                    "relative_path": None,
+                }]
+            for date_mapping in mappings:
+                frame_qc_rows.append({
+                    "batch_date": date_mapping.get("operational_date"),
+                    "batch_path": date_mapping.get("relative_path"),
+                    "series_id": series_id,
+                    "filter_name": pipe.get("filter_name"),
+                    "pipeline_run_id": pipe.get("pipeline_run_id"),
+                    "pipeline_status": pipe.get("status"),
+                    "science_status": pipe.get("science_status"),
+                    "total_points": pipe.get("total_points"),
+                    "accepted_points": pipe.get("accepted_points"),
+                    "good_frames": quality.get("photometric_frame_qc_good_frames"),
+                    "suspect_frames": quality.get("photometric_frame_qc_suspect_frames"),
+                    "bad_frames": quality.get("photometric_frame_qc_bad_frames"),
+                    "frames_with_spatial_systematic": quality.get("photometric_frame_qc_frames_with_spatial_systematic"),
+                    "median_residual_robust_sigma_mag": quality.get("photometric_frame_qc_median_residual_robust_sigma_mag"),
+                    "median_sigma_frame_systematic_mag": quality.get("photometric_frame_qc_median_sigma_frame_systematic_mag"),
+                    "max_sigma_frame_systematic_mag": quality.get("photometric_frame_qc_max_sigma_frame_systematic_mag"),
+                    "error_policy": quality.get("photometric_frame_qc_error_policy"),
+                    "science_calibration": pipe.get("science_calibration"),
+                })
     _write_csv(frame_qc_path, frame_qc_rows)
     _write_csv(readiness_path, result.stage2_recipe_readiness)
     html_path.write_text(_render_html_report(result), encoding="utf-8")
@@ -1246,7 +1507,11 @@ def _render_html_report(result: FieldArchiveRunResult) -> str:
             "files": row.get("n_files"),
             "db_status": row.get("db_status"),
             "action": row.get("action"),
+            "parents": json.dumps(row.get("parents") or [], ensure_ascii=False),
+            "paths": json.dumps(row.get("paths") or [], ensure_ascii=False),
             "series": ",".join(str(v) for v in row.get("series_ids") or []),
+            "pipeline_runs": ",".join(str(v) for v in row.get("pipeline_run_ids") or []),
+            "series_run_ids": json.dumps(row.get("series_run_ids") or [], ensure_ascii=False),
             "reason": row.get("reason"),
         }
         for row in result.batches
@@ -1304,19 +1569,6 @@ def _csv_value(value: Any) -> Any:
     if isinstance(value, (dict, list, tuple, set)):
         return json.dumps(value, ensure_ascii=False, default=str)
     return value
-
-
-def _date_from_value(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.date().isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    text_value = str(value).strip()
-    if len(text_value) >= 10 and text_value[4:5] == "-" and text_value[7:8] == "-":
-        return text_value[:10]
-    return None
 
 
 def _normalize_date_token(value: Any) -> str:

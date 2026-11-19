@@ -50,6 +50,66 @@ from grandgousier.api import (
 and resumable execution over the same validated orchestration used by the CLI. It does not embed
 site credentials or private archive discovery logic.
 
+## Operational dates
+
+Archive batches and Parquet `observing_night` use the same site-local civil-date
+policy, with a local-noon boundary by default. FITS `DATE-OBS` remains UTC; the
+existing RoboPhot rule still interprets a timezone-naive `DATE-OBS` as UTC. For
+example, KAO uses `Asia/Yekaterinburg`, so its noon boundary is 07:00 UTC: an
+exposure at 06:59:59 UTC belongs to the preceding operational date, while one
+at 07:00:00 UTC belongs to the current local date. The IANA zone database
+(`tzdata`) is a runtime dependency, including on Windows.
+
+Set the policy in the general YAML/JSON application config. Site names are
+matched case-insensitively. A site absent from `site_timezones` must have an
+explicit `default_timezone`; otherwise date assignment fails rather than
+silently falling back to UTC. Use IANA names, not fixed UTC offsets.
+
+```yaml
+observing_days:
+  boundary_local_time: "12:00:00"
+  site_timezones:
+    KAO: Asia/Yekaterinburg
+  default_timezone: null
+```
+
+The field-archive planner groups the exact detected FITS paths by operational
+date across parent directories. `include_dates` and `exclude_dates` use these
+operational dates, and reports retain the contributing paths, parent directories,
+and effective site timezone mapping. `export-science-parquet --config <file>`
+uses the same policy for every row in mixed-site exports; its `date_obs` values
+remain the original UTC timestamps.
+
+Field-archive planning retains one batch and its gate decision per operational date,
+but execution consolidates eligible dates for one field into one field-major
+Stage-2 call over the exact union of selected FITS paths. It is not a separate
+Stage-2 run for each date. Reports keep per-date paths, parent directories,
+effective timezones, series IDs, and pipeline-run mappings. With resume enabled,
+ready, excluded, and too-small batches are skipped; field/recipe conflicts stop
+before Stage 2. The workflow re-plans and checks persisted SCIENCE before Stage 3.
+
+## Gaia working catalog and network smoke
+
+Automatic Gaia processing acquires a transient in-memory DR3 working catalog for
+the selected field and reuses it across that field's series. Only selected/used
+source identities are promoted to canonical `gaia_dr3`; acquisition and per-series
+selection provenance are retained. Compatible persisted identity/match evidence
+can be reused offline, but an offline reuse means no new source search was run and
+does not establish complete catalog coverage.
+
+The working rows use Gaia DR3 ICRS `ra`/`dec` at epoch 2016.0 and G magnitude; no
+proper-motion propagation is applied to frame-WCS detection positions. Catalog
+source coordinates are distinct from `Object` coordinates: promotion does not
+rewrite an object's stored position, and an existing catalog proper motion is not
+replaced by the compact working-catalog payload.
+
+`gaia-tap-network-smoke` is blocked by default. The explicit
+`--allow-network` opt-in runs only a fixed bright-star cone against the configured
+public providers (G<=12, MAXREC 20, at most one physical part, and 5-second request
+and wait bounds). It has no database access, uses a temporary workspace, and
+reports protocol/status/count summaries rather than response rows. No network
+smoke is implied by ordinary processing or by this documentation.
+
 ## Portable science export (Parquet)
 
 Install the optional exporter dependency from a published package release:

@@ -8,22 +8,44 @@ import os
 import shutil
 import tempfile
 from collections.abc import Iterable
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+from grandgousier.observing_day import (
+    DEFAULT_OBSERVING_DAY_POLICY,
+    ObservingDayPolicy,
+    operational_date_iso,
+)
+
 SCHEMA_VERSION = "1.0"
-OBSERVING_NIGHT_DEFINITION = "date(DATE-OBS_UTC - 12 hours); DATE-OBS is UTC"
+OBSERVING_NIGHT_DEFINITION = "local civil date with configured local-time boundary; DATE-OBS is UTC"
 
 
-def observing_night(value: datetime | str | None) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        value = datetime.fromisoformat(value)
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    return (value.astimezone(UTC) - timedelta(hours=12)).date().isoformat()
+def observing_night(
+    value: datetime | str | None,
+    site: str | None,
+    policy: ObservingDayPolicy,
+    *,
+    timezone_override: str | None = None,
+    fits_path: str | None = None,
+) -> str | None:
+    """Return the shared site-local operational date without changing DATE-OBS."""
+
+    try:
+        return operational_date_iso(
+            value,
+            site,
+            policy,
+            timezone_override=timezone_override,
+        )
+    except ValueError as exc:
+        site_label = str(site).strip() if site is not None and str(site).strip() else "<missing>"
+        path_label = fits_path if fits_path is not None else "<missing>"
+        raise ValueError(
+            f"Cannot assign an operational date for site {site_label!r}, "
+            f"FITS path {path_label}, DATE-OBS={value!r}: {exc}"
+        ) from exc
 
 
 def _json_default(value: Any) -> Any:
@@ -296,7 +318,17 @@ def export_parquet_product(
         raise
 
 
-def export_series(session, series_ids: list[int], out: str | Path, *, logical_db_id: str, calibration_version_id: int | None = None, interseries_generation_id: int | None = None, batch_size: int = 4096) -> dict[str, Any]:
+def export_series(
+    session,
+    series_ids: list[int],
+    out: str | Path,
+    *,
+    logical_db_id: str,
+    calibration_version_id: int | None = None,
+    interseries_generation_id: int | None = None,
+    batch_size: int = 4096,
+    observing_day_policy: ObservingDayPolicy | None = None,
+) -> dict[str, Any]:
     """Run export inside a PostgreSQL READ ONLY transaction; no ORM-wide materialization."""
     from sqlalchemy import func, select
     from sqlalchemy.dialects.postgresql import aggregate_order_by
@@ -309,6 +341,7 @@ def export_series(session, series_ids: list[int], out: str | Path, *, logical_db
         FieldSeries,
         FieldSeriesFrame,
         Frame,
+        FrameLocation,
         FrameQc,
         InterseriesCalibrationGeneration,
         InterseriesCalibrationSeries,
@@ -320,6 +353,10 @@ def export_series(session, series_ids: list[int], out: str | Path, *, logical_db
         PipelineRun,
         SciencePhotometry,
     )
+
+    day_policy = observing_day_policy or DEFAULT_OBSERVING_DAY_POLICY
+    if not isinstance(day_policy, ObservingDayPolicy):
+        day_policy = ObservingDayPolicy.from_mapping(day_policy)
 
     if Path(out).exists():
         raise FileExistsError(f"Output already exists: {out}")
@@ -356,6 +393,10 @@ def export_series(session, series_ids: list[int], out: str | Path, *, logical_db
     cv_ids = [selected[sid].calibration_version_id for sid in series_ids]
     series_by_cv = {cv.calibration_version_id: sid for sid, cv in selected.items()}
     cv_by_id = {cv.calibration_version_id: cv for cv in selected.values()}
+    primary_frame_paths = select(
+        FrameLocation.frame_id.label("frame_id"),
+        FrameLocation.locator.label("fits_path"),
+    ).where(FrameLocation.is_primary.is_(True)).subquery()
     stage3 = {}
     generation = None
     if interseries_generation_id is not None:
@@ -400,18 +441,23 @@ def export_series(session, series_ids: list[int], out: str | Path, *, logical_db
         ).where(FrameQc.frame_id.in_(select(FieldSeriesFrame.frame_id).where(
             FieldSeriesFrame.series_id.in_(series_ids)))).group_by(FrameQc.frame_id).subquery()
         stmt = select(FieldSeries.series_uid, Frame, Observation.observation_uid, Observation.identity_scheme,
-            Observation.native_identity, qc_rows.c.rows).join(FieldSeriesFrame,
+            Observation.native_identity, qc_rows.c.rows, primary_frame_paths.c.fits_path).join(FieldSeriesFrame,
             FieldSeriesFrame.series_id == FieldSeries.series_id).join(Frame,
             Frame.frame_id == FieldSeriesFrame.frame_id).outerjoin(Observation,
             Observation.observation_id == Frame.observation_id).outerjoin(qc_rows,
-            qc_rows.c.frame_id == Frame.frame_id).where(FieldSeries.series_id.in_(series_ids)).order_by(
+            qc_rows.c.frame_id == Frame.frame_id).outerjoin(primary_frame_paths,
+            primary_frame_paths.c.frame_id == Frame.frame_id).where(FieldSeries.series_id.in_(series_ids)).order_by(
             FieldSeries.series_id, FieldSeriesFrame.order_index, Frame.frame_id)
-        for uid, frame, observation_uid, identity_scheme, native_identity, aggregated_qc in session.execute(stmt).yield_per(batch_size):
+        for uid, frame, observation_uid, identity_scheme, native_identity, aggregated_qc, fits_path in session.execute(stmt).yield_per(batch_size):
             dt = frame.date_obs
             raw_qc = aggregated_qc or []
             yield {"series_uid": uid, "observation_uid": observation_uid, "frame_uid": frame.frame_uid,
                 "identity_scheme": identity_scheme, "native_identity": native_identity,
-                "date_obs": dt, "observing_night": observing_night(dt), "filter_name": frame.filter_name, "instrument": frame.instrument,
+                "date_obs": dt,
+                "observing_night": observing_night(
+                    dt, frame.site, day_policy, fits_path=fits_path
+                ),
+                "filter_name": frame.filter_name, "instrument": frame.instrument,
                 "site": frame.site, "tube": frame.tube, "camera": frame.camera, "exptime": frame.exptime,
                 "frame_quality_flags_json": json.dumps(frame.quality_flags or {}, sort_keys=True, default=_json_default),
                 "frame_qc_json": json.dumps({"processing_status": getattr(frame.processing_status, "value", frame.processing_status),
@@ -434,7 +480,9 @@ def export_series(session, series_ids: list[int], out: str | Path, *, logical_db
     def photometry_iterator():
         stmt = select(Object.object_uid, Observation.observation_uid, Frame.frame_uid,
             Observation.identity_scheme, Observation.native_identity, FieldSeries.series_uid, SciencePhotometry,
-            Measurement, CalibrationVersion.name, Frame.date_obs, Frame.quality_flags).join(Measurement, Measurement.measurement_id == SciencePhotometry.base_measurement_id).join(Object, Object.object_id == Measurement.object_id).join(Frame, Frame.frame_id == Measurement.frame_id).join(CalibrationVersion, CalibrationVersion.calibration_version_id == SciencePhotometry.calibration_version_id).join(FieldSeriesFrame, FieldSeriesFrame.frame_id == Frame.frame_id).join(FieldSeries, FieldSeries.series_id == FieldSeriesFrame.series_id).where(SciencePhotometry.calibration_version_id.in_(cv_ids)).order_by(FieldSeries.series_id, Measurement.measurement_id)
+            Measurement, CalibrationVersion.name, Frame.date_obs, Frame.site,
+            primary_frame_paths.c.fits_path, Frame.quality_flags).join(Measurement, Measurement.measurement_id == SciencePhotometry.base_measurement_id).join(Object, Object.object_id == Measurement.object_id).join(Frame, Frame.frame_id == Measurement.frame_id).join(CalibrationVersion, CalibrationVersion.calibration_version_id == SciencePhotometry.calibration_version_id).join(FieldSeriesFrame, FieldSeriesFrame.frame_id == Frame.frame_id).join(FieldSeries, FieldSeries.series_id == FieldSeriesFrame.series_id).where(SciencePhotometry.calibration_version_id.in_(cv_ids)).order_by(FieldSeries.series_id, Measurement.measurement_id)
+        stmt = stmt.outerjoin(primary_frame_paths, primary_frame_paths.c.frame_id == Frame.frame_id)
         stmt = stmt.where(CalibrationVersion.series_id == FieldSeries.series_id).outerjoin(Observation, Observation.observation_id == Frame.observation_id)
         from grandgousier.calibration.photometric_frame_qc import BAD_FRAME_REJECT_FLAG
         from grandgousier.lightcurves.product import light_curve_reject_flags
@@ -465,7 +513,7 @@ def export_series(session, series_ids: list[int], out: str | Path, *, logical_db
                     if key in qc_map:
                         raise ValueError(f"QC_AMBIGUOUS: multiple ObjectQc candidates for object={oid}, cv={cvid}")
                     qc_map[key] = flags or {}
-            for uid, obs_uid, frame_uid, identity_scheme, native_identity, series_uid, science, base, name, dt, frame_flags in chunk:
+            for uid, obs_uid, frame_uid, identity_scheme, native_identity, series_uid, science, base, name, dt, site, fits_path, frame_flags in chunk:
                 qc = qc_map.get((int(base.object_id), int(science.calibration_version_id)), {})
                 sid = series_by_cv[science.calibration_version_id]
                 cv = selected[sid]
@@ -501,7 +549,9 @@ def export_series(session, series_ids: list[int], out: str | Path, *, logical_db
                     "object_qc_flags_json": json.dumps(qc, sort_keys=True, default=_json_default),
                     "quality_flags_json": json.dumps(derived["quality_flags"], sort_keys=True, default=_json_default),
                     "is_rejected": derived["is_rejected"], "reject_reasons_json": json.dumps(derived["reject_reasons"]),
-                    "observing_night": observing_night(dt), "calibration_name": name}
+                    "observing_night": observing_night(
+                        dt, site, day_policy, fits_path=fits_path
+                    ), "calibration_name": name}
     def series_iterator():
         science_counts = dict(session.execute(select(
             SciencePhotometry.calibration_version_id, func.count(SciencePhotometry.base_measurement_id)
@@ -547,7 +597,11 @@ def export_series(session, series_ids: list[int], out: str | Path, *, logical_db
                  "frame_qc_bad_count": frame_counts["BAD"],
                  "qc_status": _series_qc_status(frame_counts, frames)}
     tables = {"sources.parquet": source_iterator(), "frames.parquet": frame_iterator(), "photometry.parquet": photometry_iterator(), "series.parquet": series_iterator()}
-    return export_parquet_product(tables, out, metadata={"database_logical_id": logical_db_id, "series_uids": [s.series_uid for s, _ in series_rows],
+    return export_parquet_product(tables, out, metadata={"database_logical_id": logical_db_id,
+        "observing_night_definition": day_policy.definition,
+        "observing_day_policy": day_policy.to_dict(),
+        **day_policy.to_dict(),
+        "series_uids": [s.series_uid for s, _ in series_rows],
         "calibration_versions": {selected[sid].name: {"generation": selected[sid].generation_no,
             "definition_fingerprint": selected[sid].definition_fingerprint_sha256, "input_fingerprint": selected[sid].input_fingerprint_sha256,
             "provenance_fingerprint": selected[sid].provenance_fingerprint_sha256} for sid in series_ids}}, batch_size=batch_size)

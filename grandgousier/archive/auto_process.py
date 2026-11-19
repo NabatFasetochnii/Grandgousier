@@ -11,6 +11,7 @@ import stat
 import tempfile
 import time
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -364,6 +365,8 @@ def process_archive_path(
     native_observation_ids: Iterable[str] | None = None,
     limit: int | None = None,
     series_ids: Iterable[int] | None = None,
+    resume_series_ids: Iterable[int] | None = None,
+    required_field_id: int | None = None,
     min_frames_per_series: int = 10,
     finalize_tail: bool = True,
     max_field_separation_arcmin: float = 30.0,
@@ -523,6 +526,10 @@ def process_archive_path(
     from grandgousier.lightcurves.target import validate_target_coordinates
 
     validate_target_coordinates(target_ra_deg, target_dec_deg)
+    if required_field_id is not None:
+        required_field_id = int(required_field_id)
+        if required_field_id < 1:
+            raise ValueError("required_field_id must be a positive integer")
     exact_path_list = [Path(value) for value in exact_paths] if exact_paths is not None else None
     if exact_path_list is None:
         detected, groups, warnings = scan_archive_path(
@@ -563,6 +570,10 @@ def process_archive_path(
     requested_native_ids = (
         tuple(str(value) for value in native_observation_ids)
         if native_observation_ids is not None else None
+    )
+    requested_series_ids = sorted({int(v) for v in (series_ids or [])})
+    requested_resume_series_ids = sorted(
+        {int(v) for v in (resume_series_ids or [])}
     )
     if requested_native_ids is not None:
         result.observation_selection_results.append({
@@ -631,17 +642,20 @@ def process_archive_path(
         warning = _observation_selection_warning(observation_plan.summary, mode="plan")
         if warning:
             result.warnings.append(warning)
-        requested_series_ids = sorted({int(v) for v in (series_ids or [])})
-        if requested_series_ids:
+        failed = False
+        requested_plan_series_ids = sorted(
+            set(requested_series_ids).union(requested_resume_series_ids)
+        )
+        if requested_plan_series_ids:
             scoped_paths = [item.path for item in detected]
             represented_ids = set(_series_ids_for_paths(session, scoped_paths))
             by_series = _frame_ids_by_series_for_paths(session, scoped_paths)
-            membership = _requested_series_membership(session, requested_series_ids)
+            membership = _requested_series_membership(session, requested_plan_series_ids)
             identities_by_path = {item.path: item.observation_uid for item in detected}
             scoped_identity_rows = _series_frame_identities_for_paths(session, scoped_paths)
             selection_rows = []
             failed = False
-            for series_id in requested_series_ids:
+            for series_id in requested_plan_series_ids:
                 selected = set(by_series.get(series_id, []))
                 all_frames = membership.get(series_id, {})
                 selected_identities = {
@@ -679,20 +693,39 @@ def process_archive_path(
                     ),
                     "identity_mismatch_frame_ids": mismatched,
                 })
+            if required_field_id is not None:
+                scoped_series = {
+                    int(row["series_id"]): row
+                    for row in _load_series_for_pipeline(
+                        session, requested_plan_series_ids
+                    )
+                }
+                for series_id in requested_plan_series_ids:
+                    row = scoped_series.get(series_id)
+                    if row is None or row.get("field_id") is None or int(row["field_id"]) != required_field_id:
+                        failed = True
+                        selection_rows.append({
+                            "series_id": series_id,
+                            "status": "FAILED_PRECONDITION_SERIES_FIELD_SCOPE",
+                            "required_field_id": required_field_id,
+                            "actual_field_id": row.get("field_id") if row else None,
+                        })
             result.observation_selection_results.append({
-                "mode": "PLAN_REQUESTED_SERIES",
+                "mode": "PLAN_REQUESTED_SERIES_AND_RESUMES",
                 "requested_series_ids": requested_series_ids,
-                "selected_series_ids": [] if failed else requested_series_ids,
+                "requested_resume_series_ids": requested_resume_series_ids,
+                "selected_series_ids": [] if failed else requested_plan_series_ids,
                 "rows": selection_rows,
             })
             if failed:
                 result.warnings.append(
-                    "requested --series-id selection has missing paths, series membership, "
+                    "requested series selection has missing paths, series membership, "
                     "or mismatched physical observation identities; no series selected"
                 )
         result.status = (
             "FAILED_PRECONDITION_SERIES_SELECTION"
-            if requested_series_ids and failed else "PLAN"
+            if (requested_series_ids or requested_resume_series_ids) and failed
+            else "PLAN"
         )
         _write_manifest_if_requested(result, manifest_out, session=session)
         return result
@@ -712,8 +745,18 @@ def process_archive_path(
 
     indexed_frame_ids = list(indexing.indexed_frame_ids)
     result.indexed_frame_ids = indexed_frame_ids
-    requested_series_ids = sorted({int(v) for v in (series_ids or [])})
     existing_input_series_ids = _series_ids_for_paths(session, indexed_paths)
+    missing_resume_series_ids = sorted(
+        set(requested_resume_series_ids) - set(existing_input_series_ids)
+    )
+    if missing_resume_series_ids:
+        result.status = "FAILED_PRECONDITION_SERIES_SELECTION"
+        result.warnings.append(
+            "requested resume_series_ids are not associated with FITS frames under --path: "
+            + ", ".join(str(v) for v in missing_resume_series_ids)
+        )
+        _write_manifest_if_requested(result, manifest_out, session=session)
+        return result
 
     science_input_frame_ids = list(indexed_frame_ids)
     if not requested_series_ids:
@@ -740,7 +783,7 @@ def process_archive_path(
         # are historical context, not an implicit request to rerun them.
         # Explicit --series-id remains the supported path for intentional
         # reprocessing of an existing series.
-        if not science_input_frame_ids:
+        if not science_input_frame_ids and not requested_resume_series_ids:
             result.status = "DONE_WITH_WARNINGS" if result.warnings else "DONE"
             _write_manifest_if_requested(result, manifest_out, session=session)
             return result
@@ -816,12 +859,47 @@ def process_archive_path(
             )
             _write_manifest_if_requested(result, manifest_out, session=session)
             return result
-        pipeline_series_ids = requested_series_ids
+        pipeline_series_ids = sorted(
+            set(requested_series_ids).union(requested_resume_series_ids)
+        )
     else:
-        pipeline_series_ids = sorted(set(created_series_ids))
+        pipeline_series_ids = sorted(
+            set(created_series_ids).union(requested_resume_series_ids)
+        )
     frame_ids_by_series_id = _frame_ids_by_series_for_paths(session, indexed_paths)
 
     pipeline_series_rows = _load_series_for_pipeline(session, pipeline_series_ids)
+    pipeline_rows_by_id = {
+        int(row["series_id"]): row for row in pipeline_series_rows
+    }
+    selected_pipeline_series_ids = set(pipeline_series_ids)
+    missing_loaded_series_ids = sorted(
+        selected_pipeline_series_ids - set(pipeline_rows_by_id)
+    )
+    field_scope_mismatches = sorted(
+        series_id
+        for series_id in selected_pipeline_series_ids
+        if required_field_id is not None
+        and (
+            pipeline_rows_by_id.get(series_id) is None
+            or pipeline_rows_by_id[series_id].get("field_id") is None
+            or int(pipeline_rows_by_id[series_id]["field_id"]) != required_field_id
+        )
+    )
+    if missing_loaded_series_ids or field_scope_mismatches:
+        result.status = "FAILED_PRECONDITION_SERIES_SELECTION"
+        if missing_loaded_series_ids:
+            result.warnings.append(
+                "selected series are not present in the assigned pipeline scope: "
+                + ", ".join(str(v) for v in missing_loaded_series_ids)
+            )
+        if field_scope_mismatches:
+            result.warnings.append(
+                f"selected series are not assigned to required field_id={required_field_id}: "
+                + ", ".join(str(v) for v in field_scope_mismatches)
+            )
+        _write_manifest_if_requested(result, manifest_out, session=session)
+        return result
     finalized_series_rows, open_ids = _separate_open_series(pipeline_series_rows)
     result.open_series_ids = sorted(set(result.open_series_ids).union(open_ids))
     if open_ids:
@@ -832,6 +910,12 @@ def process_archive_path(
     if catalog_name is None:
         # The pipeline and Gaia acquisition must share exactly the selected input frames.
         selected_frame_scope = {int(frame_id) for frame_id in science_input_frame_ids}
+        if not requested_series_ids:
+            selected_frame_scope.update(
+                int(frame_id)
+                for series_id in requested_resume_series_ids
+                for frame_id in frame_ids_by_series_id.get(series_id, [])
+            )
         frame_ids_by_series_id = {
             int(series_id): [
                 int(frame_id)
@@ -1347,6 +1431,8 @@ def process_archive_path(
                         "fwhm_header_unit": fwhm_header_unit,
                     },
                     "selected_series_ids": requested_series_ids or None,
+                    "resume_series_ids": requested_resume_series_ids or None,
+                    "required_field_id": required_field_id,
                     "enable_spatial_ensemble": bool(enable_spatial_ensemble),
                     "enable_photometric_frame_qc": bool(enable_photometric_frame_qc),
                     "enable_color_calibration": bool(enable_color_calibration),
@@ -2050,7 +2136,27 @@ def _frame_ids_by_instrument_unit(session: Session, frame_ids: list[int]) -> dic
 
 _REFERENCE_PHOTOMETRY_CACHE_SCHEMA_VERSION = 4
 _REFERENCE_PHOTOMETRY_PROVIDER_RELEASE = "dr2"
+_REFERENCE_PHOTOMETRY_PROVIDER_NAME = "panstarrs_dr2"
+_REFERENCE_PHOTOMETRY_CACHE_LOCK_FILENAME = ".selected-reference-cache.lock"
 _REFERENCE_PHOTOMETRY_MATCH_RADIUS_ARCSEC = 1.0
+_REFERENCE_CACHE_GENERATION_RE = re.compile(r"^panstarrs_dr2_([0-9a-f]{64})$")
+_REFERENCE_CACHE_TEMP_GENERATION_RE = re.compile(
+    r"^\.panstarrs_dr2_([0-9a-f]{64})\..+\.tmp$"
+)
+_REFERENCE_CACHE_PROVENANCE_KEYS = (
+    "schema_version",
+    "cache_schema_version",
+    "provider",
+    "provider_release",
+    "identity_catalog_name",
+    "identity_count",
+    "identity_set_sha256",
+    "identity_positions_sha256",
+    "required_bands",
+    "filters",
+    "match_radius_arcsec",
+    "grouping_algorithm",
+)
 _REFERENCE_PROVIDER_DIAGNOSTIC_KEYS = (
     "logical_query_groups",
     "provider_requests",
@@ -2174,14 +2280,16 @@ def _selected_reference_cache_fingerprint(
 
 def _file_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
+    with _open_reference_cache_regular_file(Path(path), "rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
 
 def _reference_cache_csv_row_count(path: Path) -> int:
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+    with _open_reference_cache_regular_file(
+        path, "r", encoding="utf-8-sig", newline=""
+    ) as stream:
         rows = csv.reader(stream)
         try:
             next(rows)
@@ -2195,10 +2303,54 @@ def _reference_cache_path_is_reparse_point(path: Path) -> bool:
         path_stat = path.lstat()
     except FileNotFoundError:
         return False
+    return _reference_cache_stat_is_reparse_point(path_stat)
+
+
+def _reference_cache_stat_is_reparse_point(path_stat: os.stat_result) -> bool:
     reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return stat.S_ISLNK(path_stat.st_mode) or bool(
         getattr(path_stat, "st_file_attributes", 0) & reparse_attribute
     )
+
+
+@contextmanager
+def _open_reference_cache_regular_file(
+    path: Path,
+    mode: str,
+    *,
+    encoding: str | None = None,
+    newline: str | None = None,
+):
+    """Open one regular cache file while rejecting links/reparse points."""
+
+    before = path.lstat()
+    if _reference_cache_stat_is_reparse_point(before) or not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"reference cache path is not a regular file: {path}")
+    if mode not in {"rb", "r"}:
+        raise ValueError("reference cache safe-open supports read-only modes only")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        current = path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _reference_cache_stat_is_reparse_point(current)
+            or not stat.S_ISREG(current.st_mode)
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise ValueError(f"reference cache path changed or is not a regular file: {path}")
+        if mode == "rb":
+            stream = os.fdopen(descriptor, mode)
+        else:
+            stream = os.fdopen(descriptor, mode, encoding=encoding, newline=newline)
+        descriptor = -1
+        with stream:
+            yield stream
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _validate_selected_reference_cache(
@@ -2207,18 +2359,51 @@ def _validate_selected_reference_cache(
     fingerprint: str,
     expected_provenance: dict[str, Any],
 ) -> dict[str, Any]:
-    if _reference_cache_path_is_reparse_point(generation_dir) or not generation_dir.is_dir():
+    try:
+        generation_stat = generation_dir.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError("cached reference generation is missing") from exc
+    if (
+        _reference_cache_stat_is_reparse_point(generation_stat)
+        or not stat.S_ISDIR(generation_stat.st_mode)
+    ):
         raise ValueError("cached reference generation is not a regular directory")
     csv_path = generation_dir / "data.csv"
     manifest_path = generation_dir / "manifest.json"
-    if _reference_cache_path_is_reparse_point(csv_path) or not csv_path.is_file():
-        raise ValueError("cached reference CSV is not a regular file")
-    if _reference_cache_path_is_reparse_point(manifest_path) or not manifest_path.is_file():
-        raise ValueError("cached reference manifest is not a regular file")
-    with manifest_path.open("r", encoding="utf-8") as stream:
+    for child_path, label in (
+        (csv_path, "cached reference CSV"),
+        (manifest_path, "cached reference manifest"),
+    ):
+        try:
+            child_stat = child_path.lstat()
+        except FileNotFoundError as exc:
+            raise ValueError(f"{label} is not a regular file") from exc
+        if (
+            _reference_cache_stat_is_reparse_point(child_stat)
+            or not stat.S_ISREG(child_stat.st_mode)
+        ):
+            raise ValueError(f"{label} is not a regular file")
+    with _open_reference_cache_regular_file(manifest_path, "r", encoding="utf-8") as stream:
         manifest = json.load(stream)
     if not isinstance(manifest, dict):
         raise ValueError("cached reference manifest is not a JSON object")
+    return _validate_selected_reference_cache_manifest(
+        manifest=manifest,
+        fingerprint=fingerprint,
+        expected_provenance=expected_provenance,
+        csv_sha256=_file_sha256(csv_path),
+        csv_row_count=_reference_cache_csv_row_count(csv_path),
+    )
+
+
+def _validate_selected_reference_cache_manifest(
+    *,
+    manifest: dict[str, Any],
+    fingerprint: str,
+    expected_provenance: dict[str, Any],
+    csv_sha256: str,
+    csv_row_count: int,
+) -> dict[str, Any]:
     if (
         type(manifest.get("schema_version")) is not int
         or manifest.get("schema_version") != _REFERENCE_PHOTOMETRY_CACHE_SCHEMA_VERSION
@@ -2275,11 +2460,921 @@ def _validate_selected_reference_cache(
     manifest_csv_sha256 = manifest.get("csv_sha256")
     if not isinstance(manifest_csv_sha256, str) or len(manifest_csv_sha256) != 64:
         raise ValueError("cached reference manifest has invalid CSV SHA-256")
-    if _file_sha256(csv_path) != manifest_csv_sha256:
+    if csv_sha256 != manifest_csv_sha256:
         raise ValueError("cached reference CSV SHA-256 mismatch")
-    if _reference_cache_csv_row_count(csv_path) != provider_diagnostics["provider_rows_retained"]:
+    if csv_row_count != provider_diagnostics["provider_rows_retained"]:
         raise ValueError("cached reference CSV row count mismatch")
     return manifest
+
+
+def _reference_cache_entry_kind(path_stat: os.stat_result) -> str:
+    if _reference_cache_stat_is_reparse_point(path_stat):
+        return "reparse_point"
+    if stat.S_ISDIR(path_stat.st_mode):
+        return "directory"
+    if stat.S_ISREG(path_stat.st_mode):
+        return "regular_file"
+    return "other"
+
+
+def _reference_cache_age_fields(mtimes: list[float], observed_at: float) -> dict[str, float | None]:
+    if not mtimes:
+        return {"age_seconds": None, "age_days": None}
+    newest_mtime = max(mtimes)
+    age_seconds = max(0.0, observed_at - newest_mtime)
+    return {"age_seconds": age_seconds, "age_days": age_seconds / 86400.0}
+
+
+def _reference_cache_record_unexpected(
+    unexpected_files: list[dict[str, Any]],
+    *,
+    path: Path,
+    scope: str,
+    path_stat: os.stat_result | None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "path": str(path),
+        "name": path.name,
+        "scope": scope,
+        "entry_type": _reference_cache_entry_kind(path_stat) if path_stat else "unreadable",
+    }
+    if path_stat is not None and stat.S_ISREG(path_stat.st_mode) and not _reference_cache_stat_is_reparse_point(path_stat):
+        record["bytes"] = int(path_stat.st_size)
+    if error is not None:
+        record["error"] = error
+    unexpected_files.append(record)
+    return record
+
+
+def _reference_cache_manifest_provenance(manifest: Any) -> dict[str, Any]:
+    if not isinstance(manifest, dict):
+        raise ValueError("cache manifest is not a JSON object")
+    missing = [key for key in _REFERENCE_CACHE_PROVENANCE_KEYS if key not in manifest]
+    if missing:
+        raise ValueError("cache manifest is missing provenance fields: " + ", ".join(missing))
+    provenance = {key: manifest[key] for key in _REFERENCE_CACHE_PROVENANCE_KEYS}
+    if (
+        type(provenance["schema_version"]) is not int
+        or provenance["schema_version"] != _REFERENCE_PHOTOMETRY_CACHE_SCHEMA_VERSION
+        or type(provenance["cache_schema_version"]) is not int
+        or provenance["cache_schema_version"] != _REFERENCE_PHOTOMETRY_CACHE_SCHEMA_VERSION
+    ):
+        raise ValueError("cache manifest schema version mismatch")
+    if provenance["provider"] != _REFERENCE_PHOTOMETRY_PROVIDER_NAME:
+        raise ValueError("cache manifest provider does not match the recognized generation name")
+    if provenance["provider_release"] != _REFERENCE_PHOTOMETRY_PROVIDER_RELEASE:
+        raise ValueError("cache manifest provider release is not supported by this cache generation")
+    if type(provenance["identity_count"]) is not int or provenance["identity_count"] < 1:
+        raise ValueError("cache manifest has invalid selected identity count")
+    if not isinstance(provenance["identity_catalog_name"], str) or not provenance[
+        "identity_catalog_name"
+    ].strip():
+        raise ValueError("cache manifest has invalid identity catalog name")
+    for key in ("identity_set_sha256", "identity_positions_sha256"):
+        value = provenance[key]
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"cache manifest has invalid {key}")
+    if (
+        not isinstance(provenance["required_bands"], list)
+        or any(not isinstance(value, str) or not value for value in provenance["required_bands"])
+        or not isinstance(provenance["filters"], dict)
+        or not isinstance(provenance["grouping_algorithm"], dict)
+    ):
+        raise ValueError("cache manifest has invalid acquisition provenance structure")
+    match_radius = provenance["match_radius_arcsec"]
+    if (
+        isinstance(match_radius, bool)
+        or not isinstance(match_radius, (int, float))
+        or not math.isfinite(float(match_radius))
+        or float(match_radius) <= 0.0
+    ):
+        raise ValueError("cache manifest has invalid match radius")
+    return provenance
+
+
+def _inspect_reference_cache_generation(
+    generation_dir: Path,
+    *,
+    fingerprint: str,
+    entry_stat: os.stat_result,
+    observed_at: float,
+    unexpected_files: list[dict[str, Any]],
+    reparse_points: list[dict[str, Any]],
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "name": generation_dir.name,
+        "path": str(generation_dir),
+        "fingerprint": fingerprint,
+        "manifest_fingerprint": None,
+        "status": "invalid",
+        "valid": False,
+        "provider": None,
+        "provider_release": None,
+        "selected_identity_count": None,
+        "bytes": 0,
+        "bytes_complete": True,
+        "reasons": [],
+        "unexpected_files": [],
+    }
+    mtimes = [float(entry_stat.st_mtime)]
+    if _reference_cache_stat_is_reparse_point(entry_stat):
+        point = {"path": str(generation_dir), "scope": "generation_directory"}
+        reparse_points.append(point)
+        record["reparse_point"] = True
+        record["bytes_complete"] = False
+        record["reasons"].append("generation directory is a reparse point")
+        record.update(_reference_cache_age_fields(mtimes, observed_at))
+        return record
+    if not stat.S_ISDIR(entry_stat.st_mode):
+        if stat.S_ISREG(entry_stat.st_mode):
+            record["bytes"] = int(entry_stat.st_size)
+        else:
+            record["bytes_complete"] = False
+        record["reasons"].append("recognized generation name is not a directory")
+        record.update(_reference_cache_age_fields(mtimes, observed_at))
+        return record
+
+    try:
+        with os.scandir(generation_dir) as iterator:
+            children = sorted(iterator, key=lambda item: item.name)
+    except OSError as exc:
+        record["bytes_complete"] = False
+        record["reasons"].append(f"cannot scan generation directory: {type(exc).__name__}: {exc}")
+        record.update(_reference_cache_age_fields(mtimes, observed_at))
+        return record
+
+    child_stats: dict[str, os.stat_result] = {}
+    for child in children:
+        child_path = generation_dir / child.name
+        try:
+            child_stat = child.stat(follow_symlinks=False)
+        except OSError as exc:
+            record["bytes_complete"] = False
+            record["reasons"].append(
+                f"cannot inspect generation entry {child.name!r}: {type(exc).__name__}: {exc}"
+            )
+            _reference_cache_record_unexpected(
+                unexpected_files,
+                path=child_path,
+                scope="generation",
+                path_stat=None,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            record["unexpected_files"].append(str(child_path))
+            continue
+        child_stats[child.name] = child_stat
+        mtimes.append(float(child_stat.st_mtime))
+        kind = _reference_cache_entry_kind(child_stat)
+        if kind == "reparse_point":
+            reparse_points.append({"path": str(child_path), "scope": "generation_entry"})
+            record["bytes_complete"] = False
+            record["reasons"].append(f"generation entry {child.name!r} is a reparse point")
+        elif kind == "regular_file":
+            record["bytes"] += int(child_stat.st_size)
+        else:
+            record["bytes_complete"] = False
+        if child.name not in {"data.csv", "manifest.json"}:
+            _reference_cache_record_unexpected(
+                unexpected_files,
+                path=child_path,
+                scope="generation",
+                path_stat=child_stat,
+            )
+            record["unexpected_files"].append(str(child_path))
+            if kind == "directory":
+                record["bytes_complete"] = False
+            record["reasons"].append(f"unexpected generation content: {child.name}")
+        elif kind != "regular_file":
+            record["reasons"].append(f"{child.name} is not a regular file")
+
+    for required_name in ("data.csv", "manifest.json"):
+        if required_name not in child_stats:
+            record["reasons"].append(f"missing {required_name}")
+
+    manifest: Any = None
+    manifest_stat = child_stats.get("manifest.json")
+    if (
+        manifest_stat is not None
+        and _reference_cache_entry_kind(manifest_stat) == "regular_file"
+    ):
+        try:
+            with _open_reference_cache_regular_file(
+                generation_dir / "manifest.json", "r", encoding="utf-8"
+            ) as stream:
+                manifest = json.load(stream)
+            if isinstance(manifest, dict):
+                record["manifest_fingerprint"] = manifest.get("fingerprint")
+                record["provider"] = manifest.get("provider")
+                record["provider_release"] = manifest.get("provider_release")
+                identity_count = manifest.get("identity_count")
+                if type(identity_count) is int and identity_count >= 0:
+                    record["selected_identity_count"] = identity_count
+        except Exception as exc:  # noqa: BLE001 - report malformed cache state, never repair it.
+            record["reasons"].append(f"cannot read manifest: {type(exc).__name__}: {exc}")
+
+    if not record["reasons"]:
+        try:
+            provenance = _reference_cache_manifest_provenance(manifest)
+            if manifest.get("fingerprint") != fingerprint:
+                raise ValueError("manifest fingerprint does not match generation directory")
+            if _canonical_json_sha256(provenance) != fingerprint:
+                raise ValueError("manifest provenance fingerprint mismatch")
+            _validate_selected_reference_cache(
+                generation_dir=generation_dir,
+                fingerprint=fingerprint,
+                expected_provenance=provenance,
+            )
+        except Exception as exc:  # noqa: BLE001 - the audit is deliberately fail-closed.
+            record["reasons"].append(f"{type(exc).__name__}: {exc}")
+        else:
+            record["status"] = "valid"
+            record["valid"] = True
+    record.update(_reference_cache_age_fields(mtimes, observed_at))
+    return record
+
+
+def _inspect_reference_cache_temp_generation(
+    temp_dir: Path,
+    *,
+    fingerprint: str,
+    entry_stat: os.stat_result,
+    unexpected_files: list[dict[str, Any]],
+    reparse_points: list[dict[str, Any]],
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "name": temp_dir.name,
+        "path": str(temp_dir),
+        "fingerprint": fingerprint,
+        "bytes": 0,
+        "bytes_complete": True,
+        "entry_type": _reference_cache_entry_kind(entry_stat),
+        "unexpected_files": [],
+    }
+    if _reference_cache_stat_is_reparse_point(entry_stat):
+        reparse_points.append({"path": str(temp_dir), "scope": "temporary_generation"})
+        record["bytes_complete"] = False
+        return record
+    if not stat.S_ISDIR(entry_stat.st_mode):
+        record["bytes_complete"] = False
+        return record
+    try:
+        with os.scandir(temp_dir) as iterator:
+            children = sorted(iterator, key=lambda item: item.name)
+    except OSError as exc:
+        record["bytes_complete"] = False
+        record["scan_error"] = f"{type(exc).__name__}: {exc}"
+        return record
+    for child in children:
+        path = temp_dir / child.name
+        try:
+            child_stat = child.stat(follow_symlinks=False)
+        except OSError as exc:
+            record["bytes_complete"] = False
+            record["unexpected_files"].append(str(path))
+            _reference_cache_record_unexpected(
+                unexpected_files,
+                path=path,
+                scope="temporary_generation",
+                path_stat=None,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            continue
+        kind = _reference_cache_entry_kind(child_stat)
+        if kind == "reparse_point":
+            reparse_points.append({"path": str(path), "scope": "temporary_generation_entry"})
+            record["bytes_complete"] = False
+        elif kind == "regular_file":
+            record["bytes"] += int(child_stat.st_size)
+        else:
+            record["bytes_complete"] = False
+        if child.name not in {"data.csv", "manifest.json"}:
+            record["unexpected_files"].append(str(path))
+            _reference_cache_record_unexpected(
+                unexpected_files,
+                path=path,
+                scope="temporary_generation",
+                path_stat=child_stat,
+            )
+    return record
+
+
+def audit_selected_reference_cache(cache_dir: str | Path) -> dict[str, Any]:
+    """Read-only, no-follow audit of schema-4 selected-reference generations."""
+
+    root = Path(cache_dir)
+    observed_at = time.time()
+    report: dict[str, Any] = {
+        "report_schema_version": 1,
+        "cache_schema_version": _REFERENCE_PHOTOMETRY_CACHE_SCHEMA_VERSION,
+        "cache_dir": str(root),
+        "observed_at_utc": datetime.fromtimestamp(observed_at, timezone.utc).isoformat(),
+        "observed_at_epoch": observed_at,
+        "root_exists": False,
+        "root_is_directory": False,
+        "root_reparse_point": False,
+        "generation_count": 0,
+        "valid_generation_count": 0,
+        "invalid_generation_count": 0,
+        "generation_bytes": 0,
+        "generation_bytes_complete": True,
+        "valid_generation_bytes": 0,
+        "invalid_generation_bytes": 0,
+        "generations": [],
+        "fingerprints": [],
+        "orphan_tmp_count": 0,
+        "orphan_tmp_bytes": 0,
+        "orphan_tmp_bytes_complete": True,
+        "orphan_tmp": [],
+        "reparse_point_count": 0,
+        "reparse_points": [],
+        "unexpected_file_count": 0,
+        "unexpected_files": [],
+        "lock_file_present": False,
+        "errors": [],
+    }
+    try:
+        root_stat = root.lstat()
+    except FileNotFoundError:
+        report["errors"].append("cache directory does not exist")
+        return report
+    except OSError as exc:
+        report["errors"].append(f"cannot inspect cache directory: {type(exc).__name__}: {exc}")
+        return report
+    report["root_exists"] = True
+    if _reference_cache_stat_is_reparse_point(root_stat):
+        report["root_reparse_point"] = True
+        report["reparse_points"].append({"path": str(root), "scope": "cache_root"})
+        report["errors"].append("cache directory is a reparse point; no entries were followed")
+        report["reparse_point_count"] = len(report["reparse_points"])
+        return report
+    if not stat.S_ISDIR(root_stat.st_mode):
+        report["errors"].append("cache path is not a directory")
+        return report
+    report["root_is_directory"] = True
+
+    try:
+        with os.scandir(root) as iterator:
+            entries = sorted(iterator, key=lambda item: item.name)
+    except OSError as exc:
+        report["errors"].append(f"cannot scan cache directory: {type(exc).__name__}: {exc}")
+        return report
+
+    for entry in entries:
+        path = root / entry.name
+        try:
+            entry_stat = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            _reference_cache_record_unexpected(
+                report["unexpected_files"],
+                path=path,
+                scope="cache_root",
+                path_stat=None,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            report["errors"].append(f"cannot inspect cache entry {entry.name!r}")
+            continue
+
+        match = _REFERENCE_CACHE_GENERATION_RE.fullmatch(entry.name)
+        if match:
+            record = _inspect_reference_cache_generation(
+                path,
+                fingerprint=match.group(1),
+                entry_stat=entry_stat,
+                observed_at=observed_at,
+                unexpected_files=report["unexpected_files"],
+                reparse_points=report["reparse_points"],
+            )
+            report["generations"].append(record)
+            report["generation_bytes"] += int(record["bytes"])
+            report["generation_bytes_complete"] = bool(
+                report["generation_bytes_complete"] and record["bytes_complete"]
+            )
+            continue
+
+        match = _REFERENCE_CACHE_TEMP_GENERATION_RE.fullmatch(entry.name)
+        if match:
+            record = _inspect_reference_cache_temp_generation(
+                path,
+                fingerprint=match.group(1),
+                entry_stat=entry_stat,
+                unexpected_files=report["unexpected_files"],
+                reparse_points=report["reparse_points"],
+            )
+            age_fields = _reference_cache_age_fields([float(entry_stat.st_mtime)], observed_at)
+            record.update(age_fields)
+            report["orphan_tmp"].append(record)
+            report["orphan_tmp_bytes"] += int(record["bytes"])
+            report["orphan_tmp_bytes_complete"] = bool(
+                report["orphan_tmp_bytes_complete"] and record["bytes_complete"]
+            )
+            continue
+
+        if entry.name == _REFERENCE_PHOTOMETRY_CACHE_LOCK_FILENAME:
+            if (
+                _reference_cache_entry_kind(entry_stat) == "regular_file"
+            ):
+                report["lock_file_present"] = True
+            else:
+                _reference_cache_record_unexpected(
+                    report["unexpected_files"],
+                    path=path,
+                    scope="cache_root",
+                    path_stat=entry_stat,
+                )
+                if _reference_cache_stat_is_reparse_point(entry_stat):
+                    report["reparse_points"].append({"path": str(path), "scope": "cache_lock"})
+            continue
+
+        _reference_cache_record_unexpected(
+            report["unexpected_files"],
+            path=path,
+            scope="cache_root",
+            path_stat=entry_stat,
+        )
+        if _reference_cache_stat_is_reparse_point(entry_stat):
+            report["reparse_points"].append({"path": str(path), "scope": "cache_root_entry"})
+
+    report["generations"].sort(key=lambda item: item["fingerprint"])
+    report["fingerprints"] = [
+        {
+            "fingerprint": item["fingerprint"],
+            "status": item["status"],
+            "provider": item["provider"],
+            "provider_release": item["provider_release"],
+        }
+        for item in report["generations"]
+    ]
+    report["generation_count"] = len(report["generations"])
+    report["valid_generation_count"] = sum(item["valid"] for item in report["generations"])
+    report["invalid_generation_count"] = report["generation_count"] - report[
+        "valid_generation_count"
+    ]
+    report["valid_generation_bytes"] = sum(
+        int(item["bytes"]) for item in report["generations"] if item["valid"]
+    )
+    report["invalid_generation_bytes"] = sum(
+        int(item["bytes"]) for item in report["generations"] if not item["valid"]
+    )
+    report["orphan_tmp"].sort(key=lambda item: item["name"])
+    report["orphan_tmp_count"] = len(report["orphan_tmp"])
+    report["reparse_points"].sort(key=lambda item: (item["path"], item["scope"]))
+    report["reparse_point_count"] = len(report["reparse_points"])
+    report["unexpected_files"].sort(key=lambda item: (item["path"], item["scope"]))
+    report["unexpected_file_count"] = len(report["unexpected_files"])
+    return report
+
+
+def _prepare_reference_cache_directory(cache_dir: Path) -> None:
+    try:
+        cache_stat = cache_dir.lstat()
+    except FileNotFoundError:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_stat = cache_dir.lstat()
+    if (
+        _reference_cache_stat_is_reparse_point(cache_stat)
+        or not stat.S_ISDIR(cache_stat.st_mode)
+    ):
+        raise ValueError("reference cache parent is not a regular directory")
+
+
+@contextmanager
+def _selected_reference_cache_lock(cache_dir: Path):
+    """Cooperate with cache readers before apply-prune; audit/dry-run never lock or write."""
+
+    root_stat = cache_dir.lstat()
+    if (
+        _reference_cache_stat_is_reparse_point(root_stat)
+        or not stat.S_ISDIR(root_stat.st_mode)
+    ):
+        raise ValueError("reference cache lock root is not a regular directory")
+    lock_path = cache_dir / _REFERENCE_PHOTOMETRY_CACHE_LOCK_FILENAME
+    try:
+        lock_stat = lock_path.lstat()
+    except FileNotFoundError:
+        lock_stat = None
+    if lock_stat is not None and (
+        _reference_cache_stat_is_reparse_point(lock_stat)
+        or not stat.S_ISREG(lock_stat.st_mode)
+    ):
+        raise ValueError("reference cache lock path is not a regular file")
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    locked = False
+    try:
+        opened = os.fstat(descriptor)
+        current = lock_path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _reference_cache_stat_is_reparse_point(current)
+            or not stat.S_ISREG(current.st_mode)
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise ValueError("reference cache lock path changed or is not a regular file")
+        if opened.st_size == 0:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        if locked:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _reference_cache_prune_plan(
+    audit: dict[str, Any], *, max_age_days: float, max_count: int, max_bytes: int
+) -> dict[str, Any]:
+    eligible = [
+        generation
+        for generation in audit["generations"]
+        if generation["valid"]
+        and generation["age_days"] is not None
+        and generation["age_days"] >= max_age_days
+    ]
+    eligible.sort(key=lambda item: (-item["age_seconds"], item["fingerprint"]))
+    remaining_count = int(audit["generation_count"])
+    remaining_bytes = int(audit["generation_bytes"])
+    selected: list[dict[str, Any]] = []
+    for generation in eligible:
+        if remaining_count <= max_count and remaining_bytes <= max_bytes:
+            break
+        selected.append(generation)
+        remaining_count -= 1
+        remaining_bytes -= int(generation["bytes"])
+    byte_status = (
+        "within_limit"
+        if audit["generation_bytes_complete"] and remaining_bytes <= max_bytes
+        else "over_limit"
+        if remaining_bytes > max_bytes
+        else "unknown_incomplete_accounting"
+    )
+    return {
+        "eligible_old_valid_generation_count": len(eligible),
+        "selected": [
+            {
+                "fingerprint": generation["fingerprint"],
+                "name": generation["name"],
+                "bytes": generation["bytes"],
+                "age_days": generation["age_days"],
+            }
+            for generation in selected
+        ],
+        "remaining_generation_count": remaining_count,
+        "remaining_generation_bytes_known": remaining_bytes,
+        "remaining_generation_bytes_complete": audit["generation_bytes_complete"],
+        "limits": {
+            "max_age_days": max_age_days,
+            "max_count": max_count,
+            "max_bytes": max_bytes,
+        },
+        "limit_status": {
+            "count": "within_limit" if remaining_count <= max_count else "over_limit",
+            "bytes": byte_status,
+        },
+        "fresh_generations_preserved": sum(
+            1
+            for generation in audit["generations"]
+            if generation["valid"]
+            and generation["age_days"] is not None
+            and generation["age_days"] < max_age_days
+        ),
+    }
+
+
+def _append_reference_cache_audit_errors(
+    result: dict[str, Any], audit: dict[str, Any], *, stage: str
+) -> None:
+    result["errors"].extend(f"{stage}: {error}" for error in audit.get("errors", []))
+
+
+def _reference_cache_prune_apply_blocker(platform_name: str | None = None) -> str | None:
+    """Require descriptor-relative no-follow deletion primitives for APPLY."""
+
+    platform_name = os.name if platform_name is None else platform_name
+    if platform_name == "nt":
+        return (
+            "APPLY is disabled on Windows: Python does not expose a race-safe, "
+            "handle-relative way to delete cache entries without following reparse points"
+        )
+    if platform_name != "posix":
+        return f"APPLY is disabled on unsupported platform {platform_name!r}"
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        return "APPLY requires O_NOFOLLOW and O_DIRECTORY support for safe cache deletion"
+    if any(
+        operation not in os.supports_dir_fd
+        for operation in (os.open, os.stat, os.unlink, os.rmdir)
+    ):
+        return "APPLY requires descriptor-relative open/stat/unlink/rmdir support"
+    if os.listdir not in os.supports_fd:
+        return "APPLY requires file-descriptor-based directory listing support"
+    return None
+
+
+def _reference_cache_open_flags(*, directory: bool = False) -> int:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    if directory:
+        flags |= os.O_DIRECTORY
+    return flags
+
+
+def _reference_cache_open_child_file(
+    directory_fd: int, name: str
+) -> tuple[int, os.stat_result]:
+    before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if (
+        _reference_cache_stat_is_reparse_point(before)
+        or not stat.S_ISREG(before.st_mode)
+    ):
+        raise ValueError(f"generation entry {name!r} is not a regular file")
+    descriptor = os.open(name, _reference_cache_open_flags(), dir_fd=directory_fd)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _reference_cache_stat_is_reparse_point(opened)
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise ValueError(f"generation entry {name!r} changed while opening")
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor, opened
+
+
+def _reference_cache_validate_open_files(
+    *, csv_fd: int, manifest_fd: int, fingerprint: str
+) -> None:
+    with os.fdopen(os.dup(manifest_fd), "r", encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    provenance = _reference_cache_manifest_provenance(manifest)
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("fingerprint") != fingerprint
+        or _canonical_json_sha256(provenance) != fingerprint
+    ):
+        raise ValueError("generation manifest no longer matches its recognized fingerprint")
+
+    digest = hashlib.sha256()
+    os.lseek(csv_fd, 0, os.SEEK_SET)
+    with os.fdopen(os.dup(csv_fd), "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    os.lseek(csv_fd, 0, os.SEEK_SET)
+    with os.fdopen(
+        os.dup(csv_fd), "r", encoding="utf-8-sig", newline=""
+    ) as stream:
+        rows = csv.reader(stream)
+        try:
+            next(rows)
+        except StopIteration as exc:
+            raise ValueError("cached reference CSV is empty") from exc
+        row_count = sum(1 for _ in rows)
+    _validate_selected_reference_cache_manifest(
+        manifest=manifest,
+        fingerprint=fingerprint,
+        expected_provenance=provenance,
+        csv_sha256=digest.hexdigest(),
+        csv_row_count=row_count,
+    )
+
+
+def _delete_reference_cache_generation(cache_dir: Path, fingerprint: str) -> None:
+    blocker = _reference_cache_prune_apply_blocker()
+    if blocker is not None:
+        raise ValueError(blocker)
+
+    root_stat = cache_dir.lstat()
+    if (
+        _reference_cache_stat_is_reparse_point(root_stat)
+        or not stat.S_ISDIR(root_stat.st_mode)
+    ):
+        raise ValueError("cache root is no longer a regular directory")
+    root_fd = os.open(cache_dir, _reference_cache_open_flags(directory=True))
+    generation_fd = -1
+    child_fds: dict[str, int] = {}
+    try:
+        opened_root = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or (root_stat.st_dev, root_stat.st_ino)
+            != (opened_root.st_dev, opened_root.st_ino)
+        ):
+            raise ValueError("cache root changed while opening")
+
+        generation_name = f"panstarrs_dr2_{fingerprint}"
+        generation_stat = os.stat(
+            generation_name, dir_fd=root_fd, follow_symlinks=False
+        )
+        if (
+            _reference_cache_stat_is_reparse_point(generation_stat)
+            or not stat.S_ISDIR(generation_stat.st_mode)
+        ):
+            raise ValueError("generation is no longer a regular directory")
+        generation_fd = os.open(
+            generation_name,
+            _reference_cache_open_flags(directory=True),
+            dir_fd=root_fd,
+        )
+        opened_generation = os.fstat(generation_fd)
+        if (
+            not stat.S_ISDIR(opened_generation.st_mode)
+            or (generation_stat.st_dev, generation_stat.st_ino)
+            != (opened_generation.st_dev, opened_generation.st_ino)
+        ):
+            raise ValueError("generation changed while opening")
+
+        if sorted(os.listdir(generation_fd)) != ["data.csv", "manifest.json"]:
+            raise ValueError(
+                "generation contents changed; expected only data.csv and manifest.json"
+            )
+        for name in ("data.csv", "manifest.json"):
+            child_fds[name], _ = _reference_cache_open_child_file(generation_fd, name)
+        _reference_cache_validate_open_files(
+            csv_fd=child_fds["data.csv"],
+            manifest_fd=child_fds["manifest.json"],
+            fingerprint=fingerprint,
+        )
+
+        # unlinkat-style operations are anchored to the already-open generation.
+        # A raced-in symlink can at most be unlinked as a directory entry; it is
+        # never traversed. Rechecks catch changes observed before each operation.
+        for name in ("data.csv", "manifest.json"):
+            current = os.stat(name, dir_fd=generation_fd, follow_symlinks=False)
+            opened = os.fstat(child_fds[name])
+            if (
+                _reference_cache_stat_is_reparse_point(current)
+                or not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                raise ValueError(f"generation entry {name!r} changed before deletion")
+            os.unlink(name, dir_fd=generation_fd)
+
+        current_generation = os.stat(
+            generation_name, dir_fd=root_fd, follow_symlinks=False
+        )
+        if (
+            _reference_cache_stat_is_reparse_point(current_generation)
+            or not stat.S_ISDIR(current_generation.st_mode)
+            or (current_generation.st_dev, current_generation.st_ino)
+            != (opened_generation.st_dev, opened_generation.st_ino)
+        ):
+            raise ValueError("generation changed before directory removal")
+        os.rmdir(generation_name, dir_fd=root_fd)
+    finally:
+        for descriptor in child_fds.values():
+            os.close(descriptor)
+        if generation_fd >= 0:
+            os.close(generation_fd)
+        os.close(root_fd)
+
+
+def prune_selected_reference_cache(
+    cache_dir: str | Path,
+    *,
+    max_age_days: float,
+    max_count: int,
+    max_bytes: int,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Plan or apply conservative pruning of old, valid schema-4 generations.
+
+    Generations younger than ``max_age_days`` are never selected. Older valid
+    generations are removed only while the generation count or known bytes exceed
+    the explicit retention limits. Invalid generations, orphan temporaries,
+    unexpected contents and reparse points are never deleted. Apply uses
+    descriptor-relative no-follow deletion on POSIX and fails closed on Windows
+    or platforms without the required primitives; audit and dry-run stay available.
+    """
+
+    if (
+        isinstance(max_age_days, bool)
+        or not isinstance(max_age_days, (int, float))
+        or not math.isfinite(float(max_age_days))
+        or float(max_age_days) < 0.0
+    ):
+        raise ValueError("max_age_days must be a finite non-negative number")
+    if type(max_count) is not int or max_count < 0:
+        raise ValueError("max_count must be a non-negative integer")
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValueError("max_bytes must be a non-negative integer")
+    max_age_days = float(max_age_days)
+    root = Path(cache_dir)
+    audit_before = audit_selected_reference_cache(root)
+    result: dict[str, Any] = {
+        "mode": "APPLY" if apply else "DRY_RUN",
+        "status": "PLANNED" if not apply else "PENDING",
+        "apply": bool(apply),
+        "cache_dir": str(root),
+        "limits": {
+            "max_age_days": max_age_days,
+            "max_count": max_count,
+            "max_bytes": max_bytes,
+        },
+        "audit_before": audit_before,
+        "plan": _reference_cache_prune_plan(
+            audit_before,
+            max_age_days=max_age_days,
+            max_count=max_count,
+            max_bytes=max_bytes,
+        ),
+        "deleted": [],
+        "skipped": [],
+        "errors": [],
+        "lock_acquired": False,
+    }
+    _append_reference_cache_audit_errors(result, audit_before, stage="pre-lock audit")
+    if result["errors"]:
+        result["status"] = "PARTIAL"
+        result["audit_after"] = audit_before
+        return result
+
+    if not apply:
+        if not result["plan"]["selected"]:
+            result["status"] = "NOOP"
+        result["audit_after"] = audit_before
+        return result
+
+    if not audit_before["root_is_directory"] or audit_before["root_reparse_point"]:
+        result["skipped"].append({"reason": "cache root is not a safe directory"})
+        result["status"] = "PARTIAL"
+        result["audit_after"] = audit_before
+        return result
+
+    if not result["plan"]["selected"]:
+        result["status"] = "NOOP"
+        result["audit_after"] = audit_before
+        return result
+
+    apply_blocker = _reference_cache_prune_apply_blocker()
+    if apply_blocker is not None:
+        result["errors"].append(apply_blocker)
+        result["status"] = "PARTIAL"
+        result["audit_after"] = audit_before
+        return result
+
+    try:
+        with _selected_reference_cache_lock(root):
+            result["lock_acquired"] = True
+            audit_locked = audit_selected_reference_cache(root)
+            plan = _reference_cache_prune_plan(
+                audit_locked,
+                max_age_days=max_age_days,
+                max_count=max_count,
+                max_bytes=max_bytes,
+            )
+            result["audit_before"] = audit_locked
+            result["plan"] = plan
+            _append_reference_cache_audit_errors(result, audit_locked, stage="locked audit")
+            if result["errors"]:
+                result["status"] = "PARTIAL"
+                result["audit_after"] = audit_locked
+                return result
+            if not plan["selected"]:
+                result["status"] = "NOOP"
+                result["audit_after"] = audit_locked
+                return result
+            for selected in plan["selected"]:
+                fingerprint = selected["fingerprint"]
+                try:
+                    _delete_reference_cache_generation(root, fingerprint)
+                except Exception as exc:  # noqa: BLE001 - report partial apply without recursive recovery.
+                    result["skipped"].append(
+                        {
+                            "fingerprint": fingerprint,
+                            "reason": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                else:
+                    result["deleted"].append(selected)
+            audit_after = audit_selected_reference_cache(root)
+            result["audit_after"] = audit_after
+            _append_reference_cache_audit_errors(result, audit_after, stage="post-apply audit")
+    except Exception as exc:  # noqa: BLE001 - fail closed on lock/target errors.
+        result["errors"].append(f"{type(exc).__name__}: {exc}")
+        audit_after = audit_selected_reference_cache(root)
+        result["audit_after"] = audit_after
+        _append_reference_cache_audit_errors(result, audit_after, stage="post-failure audit")
+    result["status"] = "APPLIED" if not result["errors"] and not result["skipped"] else "PARTIAL"
+    return result
 
 
 def _new_reference_cache_temp_generation_dir(cache_dir: Path, *, fingerprint: str) -> Path:
@@ -2514,6 +3609,51 @@ def _ensure_reference_photometry_for_series(
         if out_dir
         else Path("exports") / "reference_photometry"
     )
+    try:
+        _prepare_reference_cache_directory(target_dir)
+        with _selected_reference_cache_lock(target_dir):
+            return _ensure_reference_photometry_cache_locked(
+                session,
+                target_dir=target_dir,
+                series_id=series_id,
+                policy=policy,
+                identity_catalog_name=identity_catalog_name,
+                selected_ids=selected_ids,
+                missing_identity_source_ids=missing_identity_source_ids,
+                persisted_identity_sources=persisted_identity_sources,
+                required_bands=required_bands,
+                minimum_sources=minimum_sources,
+                provider_catalog_name=provider_catalog_name,
+                scoped_catalog_name=scoped_catalog_name,
+                process_local_cache=process_local_cache,
+                base=base,
+            )
+    except Exception as exc:  # noqa: BLE001 - maintenance must fail closed on unsafe cache paths.
+        base["cache_invalid"] = True
+        return {
+            **base,
+            "status": "REFERENCE_CACHE_INVALID",
+            "reason": f"reference cache lock/path unavailable: {type(exc).__name__}: {exc}",
+        }
+
+
+def _ensure_reference_photometry_cache_locked(
+    session: Session,
+    *,
+    target_dir: Path,
+    series_id: int,
+    policy: ColorCalibrationPolicy,
+    identity_catalog_name: str,
+    selected_ids: list[str],
+    missing_identity_source_ids: list[str],
+    persisted_identity_sources: list[dict[str, Any]],
+    required_bands: list[str],
+    minimum_sources: int,
+    provider_catalog_name: str,
+    scoped_catalog_name: str,
+    process_local_cache: dict[str, _ValidatedReferenceCacheEntry] | None,
+    base: dict[str, Any],
+) -> dict[str, Any]:
     max_mag_err = None
     if policy.max_reference_mag_err is not None:
         max_mag_err = {band: float(policy.max_reference_mag_err) for band in required_bands}
@@ -2529,14 +3669,6 @@ def _ensure_reference_photometry_for_series(
         "use_remote_filters": True,
         "limit": None,
     }
-    target_dir.mkdir(parents=True, exist_ok=True)
-    if _reference_cache_path_is_reparse_point(target_dir) or not target_dir.is_dir():
-        base["cache_invalid"] = True
-        return {
-            **base,
-            "status": "REFERENCE_CACHE_INVALID",
-            "reason": "reference cache parent is not a regular directory",
-        }
     missing_identity_ids = set(missing_identity_source_ids)
     fingerprint, cache_provenance = _selected_reference_cache_fingerprint(
         provider=provider_catalog_name,

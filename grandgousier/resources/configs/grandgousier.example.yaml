@@ -11,6 +11,14 @@ paths:
   processed_root: C:\master\gpx\smoke\processed
   out_root: reports\field_archive
 
+# DATE-OBS remains stored/interpreted as UTC. Unknown sites require an explicit
+# site mapping or default; do not use a fixed UTC offset in place of an IANA zone.
+observing_days:
+  boundary_local_time: "12:00:00"
+  site_timezones:
+    KAO: Asia/Yekaterinburg
+  default_timezone: null
+
 field_archive:
   field_id: 33
   catalog_name: auto_catalog_master_20180907_GPX_TF17_2_mixed
