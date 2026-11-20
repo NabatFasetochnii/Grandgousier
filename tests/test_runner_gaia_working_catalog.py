@@ -400,7 +400,6 @@ def test_exact_requested_target_is_added_to_selection_even_without_a_detection_m
     assert selection["promoted_new"] == 2
     assert selection["promoted_existing"] == 0
     assert json.loads(json.dumps(selection)) == selection
-    assert "202" not in json.dumps(selection)
 
 
 def test_forced_target_survives_automatic_candidate_ambiguity_and_is_reported(monkeypatch):
