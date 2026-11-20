@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 
@@ -425,11 +426,30 @@ def test_forced_target_survives_automatic_candidate_ambiguity_and_is_reported(mo
         "match_catalog_to_frames",
         lambda _session, **kwargs: projected.append(kwargs) or {"linked": 1},
     )
+    promoted_source_ids = set()
+    elapsed_clock = 0.0
+    selection_clock_calls = 0
+
+    def deterministic_perf_counter():
+        nonlocal elapsed_clock, selection_clock_calls
+        current_step = sys._getframe(1).f_locals.get("step_name")
+        if current_step == "select_and_promote_working_gaia_sources":
+            selection_clock_calls += 1
+            if selection_clock_calls == 2:
+                elapsed_clock += float(target_source_id)
+            return elapsed_clock
+        elapsed_clock += 0.01
+        return elapsed_clock
+
+    monkeypatch.setattr(
+        runner, "time", SimpleNamespace(perf_counter=deterministic_perf_counter)
+    )
 
     result = runner.run_field_pipeline(
         object(),
         _config(target_source_id=target_source_id),
         working_catalog=catalog,
+        working_catalog_promoted_source_ids=promoted_source_ids,
     )
 
     selection = next(
@@ -449,7 +469,10 @@ def test_forced_target_survives_automatic_candidate_ambiguity_and_is_reported(mo
     assert selection["automatic_unique_sources"] == 0
     assert selection["explicit_target_included"] is True
     assert selection["selected_gaia_source_count"] == 1
-    assert target_source_id not in json.dumps(selection)
+    assert promoted_source_ids == {target_source_id}
+    assert selection_clock_calls == 2
+    assert selection["elapsed_sec"] == float(target_source_id)
+    assert target_source_id in str(selection["elapsed_sec"])
 
 
 def test_missing_requested_target_fails_before_pipeline_db_work(monkeypatch):
